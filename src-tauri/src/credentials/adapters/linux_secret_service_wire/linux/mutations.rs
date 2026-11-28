@@ -1,21 +1,17 @@
 //! Noninteractive writes and deletes, with a fresh read-back after dispatch.
 
 use super::{
-    Attributes, CLOSE_BUDGET, Client, Failure, ITEM, SecretBytes, WireError, WireResult, drive,
-    map_crypto_error, map_error, session_address, until,
+    Address, Attributes, CLOSE_BUDGET, Client, Failure, ITEM, Method, OwnedObjectPath, SecretBytes,
+    Variant, WireError, WireResult, drive, map_crypto_error, session_address, until,
 };
 use crate::credentials::adapters::native_interaction::{
     ForbidPrompt, MutationInvocation, ensure_forbid_prompt,
 };
-use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::time::Duration;
-use zbus::message::Type;
-use zbus::{Address, MatchRule, MessageStream, OwnedObjectPath, OwnedVariant, Variant};
 use zeroize::Zeroizing;
 
 const COLLECTION: &str = "org.freedesktop.Secret.Collection";
-const PROMPT: &str = "org.freedesktop.Secret.Prompt";
 
 // One ten-second deadline covers preparation, dispatch, dismissal, both
 // session closes and fresh verification. Half is reserved for cleanup and
@@ -109,7 +105,7 @@ pub(super) fn mutate_at(
         let evidence = match reply {
             Ok(None) => Dispatch::Acknowledged,
             Ok(Some(prompt_path)) => Dispatch::Prompt(
-                until(dispatch_by, dismiss(&client, &prompt_path))
+                until(dispatch_by, client.dismiss_mutation_prompt(&prompt_path))
                     .await
                     .ok(),
             ),
@@ -123,7 +119,7 @@ pub(super) fn mutate_at(
             Err(_) => Dispatch::Uncertain,
         };
 
-        let owner = client.owner.clone();
+        let owner = client.owner().clone();
         let bus = client.connection.server_guid().clone();
         client.close_session(dispatch_by + CLOSE_BUDGET).await;
         drop(client);
@@ -131,7 +127,7 @@ pub(super) fn mutate_at(
         let read_by = end - CLOSE_BUDGET;
         let after = async {
             let mut verifier = until(read_by, Client::connect(address)).await?;
-            if verifier.owner != owner || verifier.connection.server_guid() != &bus {
+            if verifier.owner() != &owner || verifier.connection.server_guid() != &bus {
                 return Err(Failure::Unavailable.into());
             }
             let after = until(read_by, snapshot(&mut verifier, attributes, &mutation)).await;
@@ -168,7 +164,7 @@ async fn interrupt_send(
         Some(DispatchInterruption::Disconnect(observed)) => {
             let disconnect = async {
                 observed.await.expect("peer observed the mutation");
-                client.connection.clone().close().await.unwrap();
+                client.connection.disconnect().await;
                 std::future::pending::<()>().await;
             };
             match select(pin!(send), pin!(disconnect)).await {
@@ -289,6 +285,7 @@ async fn send(
     invocation: &mut MutationInvocation<'_>,
     started: &mut bool,
 ) -> WireResult<Option<OwnedObjectPath>> {
+    client.connection.require_current().await?;
     let prompt = match (&plan.request, &plan.before) {
         (Request::Write { iv, ciphertext, .. }, Some(before)) => {
             let secret = (
@@ -300,7 +297,7 @@ async fn send(
             *started = true;
             invocation.mark_started();
             client
-                .call::<_, ()>(before.item.as_str(), ITEM, "SetSecret", &(secret,))
+                .call::<_, ()>(Method::SetSecret(&before.item), &(secret,))
                 .await?;
             return Ok(None);
         }
@@ -333,12 +330,7 @@ async fn send(
             *started = true;
             invocation.mark_started();
             let (item, prompt): (OwnedObjectPath, OwnedObjectPath) = client
-                .call(
-                    collection.as_str(),
-                    COLLECTION,
-                    "CreateItem",
-                    &(properties, secret, false),
-                )
+                .call(Method::CreateItem(collection), &(properties, secret, false))
                 .await?;
             if item.as_str() == "/" && prompt.as_str() == "/" {
                 return Err(Failure::Internal.into());
@@ -348,38 +340,11 @@ async fn send(
         (Request::Delete, Some(before)) => {
             *started = true;
             invocation.mark_started();
-            client
-                .call(before.item.as_str(), ITEM, "Delete", &())
-                .await?
+            client.call(Method::DeleteItem(&before.item), &()).await?
         }
         (Request::Delete, None) => return Err(Failure::Internal.into()),
     };
     Ok((prompt.as_str() != "/").then_some(prompt))
-}
-
-async fn dismiss(client: &Client, path: &OwnedObjectPath) -> WireResult<bool> {
-    let rule = MatchRule::builder()
-        .msg_type(Type::Signal)
-        .sender(client.owner.as_str())
-        .path(path.as_str())
-        .interface(PROMPT)
-        .member("Completed")
-        .build()
-        .map_err(map_error)?;
-    let mut completions = MessageStream::for_match_rule(rule, &client.connection, None)
-        .await
-        .map_err(map_error)?;
-    client
-        .call::<_, ()>(path.as_str(), PROMPT, "Dismiss", &())
-        .await?;
-    let completion = completions
-        .next()
-        .await
-        .ok_or(Failure::Unavailable)?
-        .map_err(map_error)?;
-    let (dismissed, _): (bool, OwnedVariant) =
-        completion.body().deserialize().map_err(map_error)?;
-    Ok(dismissed)
 }
 
 enum Dispatch {

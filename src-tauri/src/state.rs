@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::audio::AudioCaptureManager;
 use crate::audio::consumer::{
@@ -197,6 +197,8 @@ pub struct AppState {
     /// Writes framed span revisions and returns a receipt after synchronization.
     pub transcript_event_writer: Arc<Mutex<Option<TranscriptEventWriter>>>,
 
+    /// Fence caption side effects against replacement of the active session.
+    pub(crate) transcript_publication: Arc<RwLock<()>>,
     /// Canonical transcript span ledger for projection-basis checks.
     pub transcript_ledger: Arc<Mutex<TranscriptLedger>>,
 
@@ -513,7 +515,13 @@ impl RotateOutcome {
 pub struct ProjectionRuntimeApplyResult {
     pub session_id: String,
     pub outcome: MaterializedProjectionApplyOutcome,
+    /// Compatibility field: successful application now requires the source
+    /// frame receipt before publishing this result.
     pub projection_event_enqueued: bool,
+    #[serde(default)]
+    pub already_accepted: bool,
+    #[serde(skip)]
+    publication_owner: Option<projection_apply::ProjectionOwner>,
     /// Whether the rebuildable materialized JSON cache was refreshed. A false
     /// value means the canonical patch was accepted and live state advanced,
     /// but restart must rebuild the snapshot from the event stream.
@@ -556,6 +564,9 @@ pub enum ProjectionRuntimeApplyError {
         session_id: String,
         error: String,
     },
+    ProjectionStorage {
+        reason: ProjectionSaveError,
+    },
     ProjectionEventWriterUnavailable {
         session_id: String,
     },
@@ -568,6 +579,20 @@ pub enum ProjectionRuntimeApplyError {
     },
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionSaveError {
+    ConfirmationPending,
+    StorageFull,
+    InvalidHistory,
+    Refused,
+    Uncommitted,
+    WriteFailed,
+}
+
+mod projection_apply;
+pub(crate) use projection_apply::{PendingProjectionApply, ProjectionApplyCommand};
+
 /// Cloneable subset of `AppState` needed by background projection workers.
 ///
 /// Speech ingestion should not depend on the full Tauri state object. This
@@ -577,6 +602,7 @@ pub enum ProjectionRuntimeApplyError {
 pub struct ProjectionRuntimeHandle {
     session_id: Arc<RwLock<String>>,
     rotation_in_progress: Arc<AtomicBool>,
+    pub(crate) transcript_publication: Arc<RwLock<()>>,
     transcript_ledger: Arc<Mutex<TranscriptLedger>>,
     materialized_projection_state: Arc<Mutex<MaterializedProjectionState>>,
     projection_event_writer: Arc<Mutex<Option<ProjectionEventWriter>>>,
@@ -589,6 +615,7 @@ impl ProjectionRuntimeHandle {
         Self {
             session_id: Arc::new(RwLock::new(session_id.clone())),
             rotation_in_progress: Arc::new(AtomicBool::new(false)),
+            transcript_publication: Arc::default(),
             transcript_ledger: Arc::new(Mutex::new(TranscriptLedger::new(session_id.clone()))),
             materialized_projection_state: Arc::new(Mutex::new(MaterializedProjectionState::new(
                 session_id,
@@ -672,208 +699,148 @@ impl ProjectionRuntimeHandle {
         patch: ProjectionPatch,
     ) -> Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError> {
         let repository = FileMemoryRepository::user_data();
+        let notes = repository.clone();
         self.apply_runtime_projection_patch_with_savers(
             expected_session_id,
             expected_basis,
             patch,
-            |session_id, notes| repository.save_materialized_notes(session_id, notes),
-            |session_id, graph| repository.save_materialized_graph(session_id, graph),
+            move |id, state| notes.save_materialized_notes(id, state),
+            move |id, state| repository.save_materialized_graph(id, state),
         )
     }
 
-    /// Commit a worker result while its immutable job still owns this lane.
-    /// ASR observation takes the same ledger -> scheduler lock order.
     pub(crate) fn apply_projection_job_patch(
         &self,
         schedulers: &Mutex<ProjectionSchedulers>,
         job: &crate::projections::ProjectionJob,
         patch: ProjectionPatch,
-    ) -> Option<Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError>> {
-        let ledger = self
-            .transcript_ledger
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let owner = schedulers.lock().unwrap_or_else(|p| p.into_inner());
-        if ledger.session_id != job.session_id
-            || !owner.owns_in_flight(&job.kind, &job.id, &job.session_id)
-        {
-            return None;
-        }
-        if patch.kind != job.kind {
-            return Some(Err(ProjectionRuntimeApplyError::Apply {
-                error: ProjectionApplyError::WrongKind {
-                    expected: job.kind.clone(),
-                    actual: patch.kind,
-                },
-            }));
-        }
-        let repository = FileMemoryRepository::user_data();
-        Some(self.apply_runtime_projection_patch_with_ledger_and_savers(
-            &job.session_id,
-            &job.basis,
-            patch,
-            &ledger,
-            |id, notes| repository.save_materialized_notes(id, notes),
-            |id, graph| repository.save_materialized_graph(id, graph),
-        ))
+    ) -> Option<projection_apply::ApplyResult> {
+        let response = {
+            let _epoch = self
+                .transcript_publication
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let ledger = self
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let owner = schedulers.lock().unwrap_or_else(|e| e.into_inner());
+            if ledger.session_id != job.session_id
+                || !owner.owns_in_flight(&job.kind, &job.id, &job.session_id)
+            {
+                return None;
+            }
+            if patch.kind != job.kind {
+                return Some(Err(ProjectionRuntimeApplyError::Apply {
+                    error: ProjectionApplyError::WrongKind {
+                        expected: job.kind.clone(),
+                        actual: patch.kind,
+                    },
+                }));
+            }
+            let repository = FileMemoryRepository::user_data();
+            let notes = repository.clone();
+            self.queue_projection_apply(
+                &job.session_id,
+                &job.basis,
+                patch,
+                &ledger.session_id,
+                owner.repair_ids_for_job(job).to_vec(),
+                projection_apply::Savers::new(
+                    move |id, state| notes.save_materialized_notes(id, state),
+                    move |id, state| repository.save_materialized_graph(id, state),
+                ),
+            )
+        };
+        Some(response.and_then(|rx| rx.recv().map_err(|_| projection_apply::pending())?))
     }
 
-    fn apply_runtime_projection_patch_with_savers<SaveNotes, SaveGraph>(
+    fn apply_runtime_projection_patch_with_savers<N, G>(
         &self,
-        expected_session_id: &str,
-        expected_basis: &ProjectionBasis,
+        session: &str,
+        basis: &ProjectionBasis,
         patch: ProjectionPatch,
-        save_notes: SaveNotes,
-        save_graph: SaveGraph,
-    ) -> Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError>
+        notes: N,
+        graph: G,
+    ) -> projection_apply::ApplyResult
     where
-        SaveNotes: FnMut(&str, &MaterializedNotes) -> Result<(), String>,
-        SaveGraph: FnMut(&str, &MaterializedGraph) -> Result<(), String>,
+        N: FnOnce(&str, &MaterializedNotes) -> Result<(), String> + Send + 'static,
+        G: FnOnce(&str, &MaterializedGraph) -> Result<(), String> + Send + 'static,
     {
-        let ledger = self.transcript_ledger_snapshot();
-        self.apply_runtime_projection_patch_with_ledger_and_savers(
-            expected_session_id,
-            expected_basis,
-            patch,
-            &ledger,
-            save_notes,
-            save_graph,
-        )
+        let response = {
+            let _epoch = self
+                .transcript_publication
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            self.queue_projection_apply(
+                session,
+                basis,
+                patch,
+                &self
+                    .transcript_ledger
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .session_id,
+                Vec::new(),
+                projection_apply::Savers::new(notes, graph),
+            )?
+        };
+        response
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| projection_apply::pending())?
     }
 
-    fn apply_runtime_projection_patch_with_ledger_and_savers<SaveNotes, SaveGraph>(
+    fn queue_projection_apply(
         &self,
-        expected_session_id: &str,
-        expected_basis: &ProjectionBasis,
-        mut patch: ProjectionPatch,
-        ledger: &TranscriptLedger,
-        mut save_notes: SaveNotes,
-        mut save_graph: SaveGraph,
-    ) -> Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError>
-    where
-        SaveNotes: FnMut(&str, &MaterializedNotes) -> Result<(), String>,
-        SaveGraph: FnMut(&str, &MaterializedGraph) -> Result<(), String>,
+        session: &str,
+        basis: &ProjectionBasis,
+        patch: ProjectionPatch,
+        ledger_session: &str,
+        repair: Vec<String>,
+        savers: projection_apply::Savers,
+    ) -> Result<std::sync::mpsc::Receiver<projection_apply::ApplyResult>, ProjectionRuntimeApplyError>
     {
         if self.rotation_in_progress.load(Ordering::SeqCst) {
             return Err(ProjectionRuntimeApplyError::RotationInProgress {
                 current_session_id: self.current_session_id(),
             });
         }
-
-        let current_session_id = self.current_session_id();
-
-        let mut materialized_guard = match self.materialized_projection_state.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        if current_session_id != expected_session_id
-            || ledger.session_id != expected_session_id
-            || materialized_guard.session_id != expected_session_id
-        {
+        if ledger_session != session || self.current_session_id() != session {
             return Err(ProjectionRuntimeApplyError::SessionMismatch {
-                expected_session_id: expected_session_id.to_string(),
-                current_session_id,
-                ledger_session_id: ledger.session_id.clone(),
-                materialized_session_id: materialized_guard.session_id.clone(),
+                expected_session_id: session.into(),
+                current_session_id: self.current_session_id(),
+                ledger_session_id: ledger_session.into(),
+                materialized_session_id: self
+                    .materialized_projection_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .session_id
+                    .clone(),
             });
         }
-
-        if patch.basis != *expected_basis {
+        if patch.basis != *basis {
             return Err(ProjectionRuntimeApplyError::PatchBasisMismatch {
-                expected: Box::new(expected_basis.clone()),
+                expected: Box::new(basis.clone()),
                 actual: Box::new(patch.basis),
             });
         }
-
-        {
-            let guard = match self.projection_event_writer.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if guard.is_none() {
-                return Err(
-                    ProjectionRuntimeApplyError::ProjectionEventWriterUnavailable {
-                        session_id: expected_session_id.to_string(),
-                    },
-                );
-            }
-        }
-
-        let apply_started = Instant::now();
-        let mut next_materialized = materialized_guard.clone();
-        let (outcome, basis_currency_at_apply) = next_materialized
-            .apply_validated_patch_reporting_currency(ledger, &patch)
-            .map_err(|error| ProjectionRuntimeApplyError::Apply { error })?;
-
-        patch.apply_latency_ms.get_or_insert(
-            apply_started
-                .elapsed()
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64,
-        );
-
-        let projection_event_enqueued = {
-            let guard = match self.projection_event_writer.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let Some(writer) = guard.as_ref() else {
-                return Err(
-                    ProjectionRuntimeApplyError::ProjectionEventWriterUnavailable {
-                        session_id: expected_session_id.to_string(),
-                    },
-                );
-            };
-            writer.append(&patch)
-        };
-        if !projection_event_enqueued {
-            return Err(ProjectionRuntimeApplyError::ProjectionEventEnqueueFailed {
-                session_id: expected_session_id.to_string(),
-            });
-        }
-
-        let snapshot_save = match &patch.kind {
-            ProjectionKind::Notes => save_notes(expected_session_id, &next_materialized.notes),
-            ProjectionKind::Graph => save_graph(expected_session_id, &next_materialized.graph),
-        };
-        let materialized_snapshot_saved = match snapshot_save {
-            Ok(()) => true,
-            Err(error) => {
-                // The projection event is the canonical accepted record; the
-                // JSON snapshot is a rebuildable cache. Returning an apply
-                // failure here used to leave live last_sequence stale after an
-                // accepted event, so the next patch reused that sequence and
-                // made canonical replay fail. Advance live state and surface
-                // cache lag explicitly instead.
-                log::warn!(
-                    "Materialized projection snapshot lagging after canonical enqueue session_id={} kind={:?}: {}",
-                    expected_session_id,
-                    patch.kind,
-                    error
-                );
-                false
-            }
-        };
-
-        let current_session_id = self.current_session_id();
-        if self.rotation_in_progress.load(Ordering::SeqCst)
-            || current_session_id != expected_session_id
-        {
-            return Err(ProjectionRuntimeApplyError::SessionChangedDuringApply {
-                expected_session_id: expected_session_id.to_string(),
-                current_session_id,
-            });
-        }
-
-        *materialized_guard = next_materialized;
-        Ok(ProjectionRuntimeApplyResult {
-            session_id: expected_session_id.to_string(),
-            outcome,
-            projection_event_enqueued,
-            materialized_snapshot_saved,
-            basis_currency_at_apply,
-        })
+        let (command, response) = ProjectionApplyCommand::new(self, patch, session, repair, savers);
+        self.projection_event_writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .ok_or_else(
+                || ProjectionRuntimeApplyError::ProjectionEventWriterUnavailable {
+                    session_id: session.into(),
+                },
+            )?
+            .submit_apply(command)
+            .map_err(
+                |_| ProjectionRuntimeApplyError::ProjectionEventEnqueueFailed {
+                    session_id: session.into(),
+                },
+            )?;
+        Ok(response)
     }
 }
 
@@ -980,6 +947,7 @@ impl AppState {
             transcript_writer: Arc::new(Mutex::new(transcript_writer)),
             display_transcript_write_misses: Arc::new(AtomicU64::new(0)),
             transcript_event_writer: Arc::new(Mutex::new(transcript_event_writer)),
+            transcript_publication: Arc::default(),
             transcript_ledger: Arc::new(Mutex::new(transcript_ledger)),
             speaker_timeline: Arc::new(Mutex::new(speaker_timeline)),
             materialized_projection_state: Arc::new(Mutex::new(materialized_projection_state)),
@@ -1055,6 +1023,7 @@ impl AppState {
         ProjectionRuntimeHandle {
             session_id: self.session_id.clone(),
             rotation_in_progress: self.rotation_in_progress.clone(),
+            transcript_publication: self.transcript_publication.clone(),
             transcript_ledger: self.transcript_ledger.clone(),
             materialized_projection_state: self.materialized_projection_state.clone(),
             projection_event_writer: self.projection_event_writer.clone(),
@@ -1074,36 +1043,8 @@ impl AppState {
         expected_basis: &ProjectionBasis,
         patch: ProjectionPatch,
     ) -> Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError> {
-        let repository = FileMemoryRepository::user_data();
-        self.apply_runtime_projection_patch_with_savers(
-            expected_session_id,
-            expected_basis,
-            patch,
-            |session_id, notes| repository.save_materialized_notes(session_id, notes),
-            |session_id, graph| repository.save_materialized_graph(session_id, graph),
-        )
-    }
-
-    fn apply_runtime_projection_patch_with_savers<SaveNotes, SaveGraph>(
-        &self,
-        expected_session_id: &str,
-        expected_basis: &ProjectionBasis,
-        patch: ProjectionPatch,
-        save_notes: SaveNotes,
-        save_graph: SaveGraph,
-    ) -> Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError>
-    where
-        SaveNotes: FnMut(&str, &MaterializedNotes) -> Result<(), String>,
-        SaveGraph: FnMut(&str, &MaterializedGraph) -> Result<(), String>,
-    {
         self.projection_runtime_handle()
-            .apply_runtime_projection_patch_with_savers(
-                expected_session_id,
-                expected_basis,
-                patch,
-                save_notes,
-                save_graph,
-            )
+            .apply_runtime_projection_patch(expected_session_id, expected_basis, patch)
     }
 
     /// Rotate to a new session in-process.
@@ -1112,8 +1053,8 @@ impl AppState {
     ///    rotate returns `RotateOutcome::AlreadyRotating(current_id)` without
     ///    touching state.
     /// 2. Prepares transcript, transcript-event, and projection-event writers
-    ///    for the new session. Failure returns `RotateOutcome::Failed` while
-    ///    the current session remains published and unchanged.
+    ///    for the new session. Projection preparation retries once on failure.
+    ///    A persistent failure returns `RotateOutcome::Failed` with the old session active.
     /// 3. Shuts down and swaps the old writers, resets every active
     ///    session-scoped ledger/view/queue, then publishes the new session ID
     ///    last so readers cannot observe a new ID paired with old aggregates.
@@ -1124,6 +1065,14 @@ impl AppState {
     /// The guard in step 1 is released on return via an RAII guard, so the
     /// flag is cleared even on early returns / panics inside step 3.
     pub fn rotate_session(&self, new_session_id: &str) -> RotateOutcome {
+        self.rotate_session_with_projection_writer(new_session_id, ProjectionEventWriter::spawn)
+    }
+
+    fn rotate_session_with_projection_writer(
+        &self,
+        new_session_id: &str,
+        mut open_projection: impl FnMut(&str) -> Option<ProjectionEventWriter>,
+    ) -> RotateOutcome {
         // Step 1: concurrent-rotate guard. `compare_exchange(false, true)`
         // fails iff another thread already claimed it — in that case we skip
         // the rotation entirely and return the current ID. Using SeqCst to
@@ -1168,7 +1117,7 @@ impl AppState {
                 }
             };
         let new_projection_event_writer =
-            match crate::persistence::ProjectionEventWriter::spawn(new_session_id) {
+            match open_projection(new_session_id).or_else(|| open_projection(new_session_id)) {
                 Some(writer) => writer,
                 None => {
                     let _ = new_transcript_writer
@@ -1185,6 +1134,10 @@ impl AppState {
         // Keep the old id published until every session-scoped aggregate and
         // canonical writer has been reset. The graph autosave loop also sees
         // `rotation_in_progress` and skips this entire transition.
+        let publication = self
+            .transcript_publication
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         let prev = self.current_session_id();
 
         {
@@ -1310,6 +1263,18 @@ impl AppState {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .replace(new_projection_event_writer);
+        // Publish the new ownership epoch last. Readers can observe either the
+        // complete old session or the complete new session, never a new id with
+        // old writers/graphs/buffers.
+        {
+            let mut guard = match self.session_id.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *guard = new_session_id.to_string();
+        }
+
+        drop(publication);
         if let Some(old) = old_display
             && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
         {
@@ -1324,17 +1289,6 @@ impl AppState {
             && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
         {
             log::warn!("Previous projection event writer has not finished shutdown");
-        }
-
-        // Publish the new ownership epoch last. Readers can observe either the
-        // complete old session or the complete new session, never a new id with
-        // old writers/graphs/buffers.
-        {
-            let mut guard = match self.session_id.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *guard = new_session_id.to_string();
         }
 
         RotateOutcome::Rotated(prev)
@@ -1397,7 +1351,12 @@ impl Default for AppState {
 // belt-and-braces proof for a human spot-check.
 
 #[cfg(test)]
+pub(crate) use rotation_tests::snapshot_replace_child;
+
+#[cfg(test)]
 mod rotation_tests {
+    include!("state/projection_receipt_tests.rs");
+    include!("state/projection_fault_tests.rs");
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1534,6 +1493,38 @@ mod rotation_tests {
         }
     }
 
+    fn persisted_projection_input(
+        repo: &FileMemoryRepository,
+        session: &str,
+        event: crate::projections::TranscriptEvent,
+    ) -> crate::projections::TranscriptEvent {
+        repo.append_transcript_event(session, &event)
+            .expect("seed verified transcript basis");
+        event
+    }
+
+    // Load/export compute coverage from the transcript at read time. Compare
+    // the complete materialized state at the same read head on both sides.
+    fn materialized_with_read_coverage(
+        runtime: &ProjectionRuntimeHandle,
+        events: &[ProjectionPatch],
+    ) -> MaterializedProjectionState {
+        let ledger = runtime.transcript_ledger_snapshot();
+        let mut live = runtime.materialized_projection_snapshot();
+        let last_basis = |kind| {
+            events
+                .iter()
+                .rev()
+                .find(|patch| patch.kind == kind)
+                .map(|patch| &patch.basis)
+        };
+        live.notes.transcript_coverage =
+            ledger.projection_coverage(last_basis(ProjectionKind::Notes));
+        live.graph.transcript_coverage =
+            ledger.projection_coverage(last_basis(ProjectionKind::Graph));
+        live
+    }
+
     fn runtime_note_patch(
         sequence: u64,
         basis: ProjectionBasis,
@@ -1557,10 +1548,11 @@ mod rotation_tests {
             confidence: 0.91,
             provenance: crate::projections::ProjectionProvenance {
                 provider: "openrouter".into(),
-                model: "anthropic/claude-sonnet-4".into(),
+                model: "claude-sonnet-4".into(),
                 prompt_id: "notes-v1".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -1587,10 +1579,11 @@ mod rotation_tests {
             confidence: 0.87,
             provenance: crate::projections::ProjectionProvenance {
                 provider: "openrouter".into(),
-                model: "anthropic/claude-sonnet-4".into(),
+                model: "claude-sonnet-4".into(),
                 prompt_id: "graph-v1".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -1647,10 +1640,14 @@ mod rotation_tests {
         let basis = {
             let mut ledger = app.transcript_ledger.lock().unwrap();
             ledger
-                .apply_event(projection_transcript_event(
-                    "span-1",
-                    1,
-                    "We decided to persist projection patches.",
+                .apply_event(persisted_projection_input(
+                    &FileMemoryRepository::user_data(),
+                    &session_id,
+                    projection_transcript_event(
+                        "span-1",
+                        1,
+                        "We decided to persist projection patches.",
+                    ),
                 ))
                 .expect("seed transcript ledger");
             ledger.current_basis()
@@ -1715,10 +1712,14 @@ mod rotation_tests {
         let basis = {
             let mut ledger = runtime.transcript_ledger.lock().unwrap();
             ledger
-                .apply_event(projection_transcript_event(
-                    "span-repository-writer",
-                    1,
-                    "Repository writers should preserve runtime projection patches.",
+                .apply_event(persisted_projection_input(
+                    repo.as_ref(),
+                    session_id,
+                    projection_transcript_event(
+                        "span-repository-writer",
+                        1,
+                        "Repository writers should preserve runtime projection patches.",
+                    ),
                 ))
                 .expect("seed transcript ledger");
             ledger.current_basis()
@@ -1792,10 +1793,14 @@ mod rotation_tests {
         let first_basis = {
             let mut ledger = runtime.transcript_ledger.lock().unwrap();
             ledger
-                .apply_event(projection_transcript_event(
-                    "span-cache-lag-1",
-                    1,
-                    "The first canonical patch outlives its derived cache.",
+                .apply_event(persisted_projection_input(
+                    repo.as_ref(),
+                    session_id,
+                    projection_transcript_event(
+                        "span-cache-lag-1",
+                        1,
+                        "The first canonical patch outlives its derived cache.",
+                    ),
                 ))
                 .expect("seed first transcript event");
             ledger.current_basis()
@@ -1826,10 +1831,14 @@ mod rotation_tests {
         let second_basis = {
             let mut ledger = runtime.transcript_ledger.lock().unwrap();
             ledger
-                .apply_event(projection_transcript_event(
-                    "span-cache-lag-2",
-                    1,
-                    "The next basis must receive a fresh sequence.",
+                .apply_event(persisted_projection_input(
+                    repo.as_ref(),
+                    session_id,
+                    projection_transcript_event(
+                        "span-cache-lag-2",
+                        1,
+                        "The next basis must receive a fresh sequence.",
+                    ),
                 ))
                 .expect("seed second transcript event");
             ledger.current_basis()
@@ -1872,9 +1881,14 @@ mod rotation_tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
-        let replayed = MaterializedProjectionState::replay_accepted_patches(session_id, events)
-            .expect("canonical history remains replayable");
-        assert_eq!(replayed, runtime.materialized_projection_snapshot());
+        let replayed = repo
+            .replay_projection_state(session_id)
+            .expect("verify source and projection heads");
+        assert_eq!(replayed.validation.invalid_patch_count, 0);
+        assert_eq!(
+            replayed.state,
+            materialized_with_read_coverage(&runtime, &events)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1955,10 +1969,14 @@ mod rotation_tests {
         let basis = {
             let mut ledger = app.transcript_ledger.lock().unwrap();
             ledger
-                .apply_event(projection_transcript_event(
-                    "span-graph",
-                    1,
-                    "AudioGraph connects transcripts to temporal graph state.",
+                .apply_event(persisted_projection_input(
+                    &FileMemoryRepository::user_data(),
+                    &session_id,
+                    projection_transcript_event(
+                        "span-graph",
+                        1,
+                        "AudioGraph connects transcripts to temporal graph state.",
+                    ),
                 ))
                 .expect("seed transcript ledger");
             ledger.current_basis()
@@ -2017,11 +2035,19 @@ mod rotation_tests {
         let old_basis = {
             let mut ledger = app.transcript_ledger.lock().unwrap();
             ledger
-                .apply_event(projection_transcript_event("span-1", 1, "Old context."))
+                .apply_event(persisted_projection_input(
+                    &FileMemoryRepository::user_data(),
+                    &session_id,
+                    projection_transcript_event("span-1", 1, "Old context."),
+                ))
                 .expect("seed first transcript event");
             let basis = ledger.current_basis();
             ledger
-                .apply_event(projection_transcript_event("span-2", 1, "New context."))
+                .apply_event(persisted_projection_input(
+                    &FileMemoryRepository::user_data(),
+                    &session_id,
+                    projection_transcript_event("span-2", 1, "New context."),
+                ))
                 .expect("seed newer transcript event");
             basis
         };
@@ -2086,11 +2112,19 @@ mod rotation_tests {
         let old_basis = {
             let mut ledger = app.transcript_ledger.lock().unwrap();
             ledger
-                .apply_event(projection_transcript_event("span-1", 1, "Old context."))
+                .apply_event(persisted_projection_input(
+                    &FileMemoryRepository::user_data(),
+                    &session_id,
+                    projection_transcript_event("span-1", 1, "Old context."),
+                ))
                 .expect("seed first transcript event");
             let basis = ledger.current_basis();
             ledger
-                .apply_event(projection_transcript_event("span-1", 2, "Revised context."))
+                .apply_event(persisted_projection_input(
+                    &FileMemoryRepository::user_data(),
+                    &session_id,
+                    projection_transcript_event("span-1", 2, "Revised context."),
+                ))
                 .expect("seed revised transcript event");
             basis
         };
@@ -2152,6 +2186,10 @@ mod rotation_tests {
 
         let old_event = projection_transcript_event("span-1", 1, "Old context.");
         let new_event = projection_transcript_event("span-2", 1, "New context.");
+        repo.append_transcript_event(session_id, &old_event)
+            .unwrap();
+        repo.append_transcript_event(session_id, &new_event)
+            .unwrap();
         let old_basis = {
             let mut ledger = runtime.transcript_ledger.lock().unwrap();
             ledger
@@ -2189,7 +2227,6 @@ mod rotation_tests {
             result.basis_currency_at_apply,
             AppliedBasisCurrency::AppendedTail { .. }
         ));
-        let live_state = runtime.materialized_projection_snapshot();
 
         let writer = runtime
             .projection_event_writer
@@ -2204,34 +2241,47 @@ mod rotation_tests {
             .expect("load persisted projection events");
         assert_eq!(events.len(), 1);
 
-        let replay = MaterializedProjectionState::replay_accepted_patches_with_history(
-            session_id,
-            vec![old_event, new_event],
-            None,
-            events,
-        )
-        .expect("an accepted append-only patch must replay");
+        let replay = repo
+            .replay_projection_state(session_id)
+            .expect("an accepted append-only patch must replay");
         assert_eq!(
             replay.validation.invalid_patch_count, 0,
             "an accepted append-only patch must not be rejected on replay — this is the \
              invariant load_session_impl relies on to load derived caches"
         );
-        assert_eq!(replay.state, live_state);
+        assert_eq!(
+            replay.state,
+            materialized_with_read_coverage(&runtime, &events)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn rotate_session_swaps_session_id_atomically() {
-        // Pure in-memory — we do NOT rely on HOME resolving to anything in
-        // particular. `AppState::new()` may or may not spawn a transcript
-        // writer depending on ambient HOME, but the id swap is independent.
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("atomic-rotation");
+        let _home = HomeGuard::set(&dir);
         let app = AppState::new();
         let original = app.current_session_id();
         assert!(!original.is_empty(), "session_id must be populated at init");
 
         let new_id = "rotated-session-aaa";
-        let outcome = app.rotate_session(new_id);
+        // A transient readiness refusal leaves all three old writers in place
+        // until the second preparation succeeds.
+        let mut attempts = 0;
+        let outcome = app.rotate_session_with_projection_writer(new_id, |id| {
+            attempts += 1;
+            assert_eq!(app.current_session_id(), original);
+            if attempts == 1 {
+                None
+            } else {
+                ProjectionEventWriter::spawn(id)
+            }
+        });
+        assert_eq!(attempts, 2);
         assert_eq!(
             outcome,
             RotateOutcome::Rotated(original.clone()),
@@ -2245,6 +2295,116 @@ mod rotation_tests {
 
         // Drain any spawned writers so their threads don't linger past the test.
         drain_writers(&app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rotation_releases_both_old_attempts_to_historical_replay_without_restart() {
+        use crate::persistence::canonical_durability::transcript_coordination_path;
+        use crate::persistence::canonical_log::TranscriptCommitError;
+        use std::{fs::File, sync::mpsc};
+
+        let _serial = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("retirement");
+        let _home = HomeGuard::set(&dir);
+        let app = AppState::new();
+        let old = app.current_session_id();
+        crate::sessions::register_session(&old).unwrap();
+        let repo = FileMemoryRepository::user_data();
+        let path = crate::user_data::resolve_transcript_events_path(&old).unwrap();
+        let projections = crate::user_data::resolve_projection_events_path(&old).unwrap();
+        let seed = projection_transcript_event("fern", 1, "green");
+        let kept = projection_transcript_event("stem", 1, "leaf");
+        let limit = Duration::from_secs(20);
+        let writer_slot = app.transcript_event_writer.lock().unwrap();
+        let writer = writer_slot.as_ref().unwrap();
+        let client = writer.client();
+        client
+            .append_live(&seed, app.transcript_ledger.clone())
+            .unwrap();
+        let patch = runtime_note_patch(
+            1,
+            app.transcript_ledger.lock().unwrap().current_basis(),
+            "reed",
+            "blue",
+        );
+        {
+            let slot = app.projection_event_writer.lock().unwrap();
+            let projection = slot.as_ref().unwrap();
+            projection.fail_next_projection_sync();
+            assert!(!projection.append(&patch));
+        }
+        let (start, stopped, resume) = writer.pause_recovery_after_next_sync_failure();
+        start.send(()).unwrap();
+        let confirmation = client
+            .submit_live_observed(&kept, app.transcript_ledger.clone(), limit, None)
+            .unwrap();
+        stopped.recv_timeout(limit).unwrap();
+        assert_eq!(
+            confirmation.wait(),
+            Err(TranscriptCommitError::ConfirmationPending)
+        );
+
+        // The old worker's final attempt cannot take this exclusive stream lock.
+        // The two real OS attempt leases keep deletion out until recovery settles.
+        let shared = File::open(transcript_coordination_path(&path)).unwrap();
+        shared.lock_shared().unwrap();
+        for source in [&path, &projections] {
+            let owner = File::open(source.with_added_extension("attempt-lock")).unwrap();
+            assert!(matches!(
+                owner.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+        }
+        assert_eq!(
+            repo.load_transcript_events(&old).unwrap().as_slice(),
+            std::slice::from_ref(&seed)
+        );
+        writer.shutdown();
+        resume.send(()).unwrap();
+        drop(writer_slot);
+        assert_eq!(
+            app.rotate_session("meadow"),
+            RotateOutcome::Rotated(old.clone())
+        );
+        assert!(path.with_added_extension("attempt").exists());
+        assert!(projections.with_added_extension("attempt").exists());
+        drop(shared);
+
+        // Lock release is the completion witness. The deadline bounds a hang
+        // on the regression, without polling or guessing when the disk recovered.
+        let leases = [&path, &projections]
+            .map(|p| File::open(p.with_added_extension("attempt-lock")).unwrap());
+        let (settled, completion) = mpsc::channel();
+        let wait = std::thread::spawn(move || {
+            for lease in leases {
+                lease.lock().unwrap();
+            }
+            let _ = settled.send(());
+        });
+        completion.recv_timeout(limit).unwrap();
+        wait.join().unwrap();
+        assert_eq!(repo.load_transcript_events(&old).unwrap(), [seed, kept]);
+        assert_eq!(repo.load_projection_patches(&old).unwrap(), [patch]);
+        assert_eq!(
+            app.transcript_ledger.lock().unwrap().accepted_event_count,
+            0
+        );
+        assert_eq!(
+            app.materialized_projection_state
+                .lock()
+                .unwrap()
+                .notes
+                .last_sequence,
+            0
+        );
+        let deletion = crate::sessions::permanently_delete_session(&old).unwrap();
+        assert!(deletion.failed_files.is_empty());
+        assert!(!path.exists() && !projections.exists());
+        drain_writers(&app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

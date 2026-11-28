@@ -70,6 +70,13 @@ pub(crate) enum StrictCanonicalRead<T> {
 }
 
 impl<T> StrictCanonicalRead<T> {
+    pub(crate) fn records(&self) -> &[super::canonical_log::CanonicalRecord<T>] {
+        match self {
+            Self::Missing => &[],
+            Self::Present(snapshot) => &snapshot.records,
+        }
+    }
+
     /// Compatibility projection for callers whose contract still models a
     /// missing stream and a present-empty stream as the same empty row list.
     pub(crate) fn into_payloads(self) -> Vec<T> {
@@ -90,6 +97,7 @@ impl<T> StrictCanonicalRead<T> {
 pub(crate) enum CanonicalReaderError {
     Canonical(CanonicalLogError),
     TranscriptAttemptUnreadable,
+    TranscriptLockContended,
     DataMovementSessionMismatch { record_index: usize },
     DataMovementSchemaVersionMismatch { record_index: usize },
 }
@@ -98,6 +106,7 @@ impl fmt::Display for CanonicalReaderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Canonical(error) => error.fmt(formatter),
+            Self::TranscriptLockContended => formatter.write_str("transcript coordination is busy"),
             Self::TranscriptAttemptUnreadable => {
                 formatter.write_str("transcript attempt requires verified recovery")
             }
@@ -128,6 +137,8 @@ fn load_strict_canonical_stream<T: DeserializeOwned>(
 ) -> Result<StrictCanonicalRead<T>, CanonicalReaderError> {
     let result = if descriptor == TRANSCRIPT_REVISIONS {
         super::canonical_log::read_committed(path, session_id)
+    } else if descriptor == PROJECTION_PATCHES {
+        super::canonical_log::read_committed_projection(path, session_id)
     } else {
         load_canonical_stream(
             path,
@@ -329,6 +340,7 @@ mod tests {
                 // defaults when reading a patch written before the route table.
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             route: None,
             queued_at_ms: None,
@@ -631,6 +643,138 @@ mod tests {
         assert_eq!(replayed.notes.notes.len(), 1);
         assert_eq!(fs::read(&path).expect("re-read legacy bytes"), bytes);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stored_model_id_is_read_by_where_its_model_ran_and_the_file_is_left_alone() {
+        use crate::llm::route::model_id_fixtures::{PATH_CANARY, SECRET_CANARY, STORED};
+
+        // (provider, route, whether a record from it says the model ran off
+        // the user's network)
+        for (provider, route_id, remote) in [
+            ("llm.api", Some("route.openai_compatible"), false),
+            ("llm.local_llama", Some("route.local_llama"), false),
+            // A record written before ADR-0038 named the provider this way.
+            ("local_llama", None, false),
+            // A custom base URL can put OpenRouter on the user's machine.
+            ("llm.openrouter", Some("route.openrouter"), false),
+            ("openrouter", None, false),
+            ("llm.cerebras", Some("route.cerebras_direct"), true),
+            ("llm.aws_bedrock", None, true),
+        ] {
+            for (stored, local, hosted) in STORED {
+                let expected = if remote { hosted } else { local };
+                let root = unique_tempdir("stored-model-id");
+                let path = root.join("projection.jsonl");
+                let session_id = "session-stored-model-id";
+                let mut legacy = projection_patch(1);
+                legacy.provenance.provider = provider.to_string();
+                legacy.provenance.route_id = route_id.map(str::to_string);
+                legacy.provenance.model = stored.to_string();
+                let mut bytes = serde_json::to_vec(&legacy).expect("serialize legacy patch");
+                bytes.push(b'\n');
+                fs::create_dir_all(&root).expect("create fixture root");
+                fs::write(&path, &bytes).expect("write legacy accepted patch");
+
+                let read = load_projection_patches(&path, session_id).expect("decode the patch");
+                let patch = &present_snapshot(&read).records[0].payload;
+                assert_eq!(patch.provenance.model, expected, "{provider} {stored}");
+
+                // Every item the patch materializes carries the same id, and
+                // so does the patch when it is written again.
+                let replayed = MaterializedProjectionState::replay_accepted_patches(
+                    session_id,
+                    [patch.clone()],
+                )
+                .expect("replay the patch");
+                assert_eq!(replayed.notes.notes[0].provenance.model, expected);
+                let rewritten = serde_json::to_string(patch).expect("serialize the read patch");
+                assert!(!rewritten.contains(SECRET_CANARY), "{rewritten}");
+                if !remote {
+                    assert!(!rewritten.contains(PATH_CANARY), "{rewritten}");
+                }
+
+                assert_eq!(fs::read(&path).expect("re-read legacy bytes"), bytes);
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[test]
+    fn a_marked_model_id_is_read_as_written() {
+        use audio_graph_ipc_contract::model_id::ModelPlacement;
+
+        // (served at, what a build with the rule wrote, what it reads back as)
+        for (placement, written, read_back) in [
+            // OpenRouter's real host: the hosted id, namespace and all.
+            (
+                ModelPlacement::Remote,
+                "anthropic/claude-sonnet-4",
+                "anthropic/claude-sonnet-4",
+            ),
+            // OpenRouter at a loopback base URL: a display name.
+            (ModelPlacement::Local, "private.gguf", "private.gguf"),
+            // The credential screen runs on a marked record too.
+            (
+                ModelPlacement::Remote,
+                "Bearer Ym9i/c2VjcmV0",
+                crate::llm::route::WITHHELD_MODEL_PLACEHOLDER,
+            ),
+        ] {
+            let root = unique_tempdir("marked-model-id");
+            let path = root.join("projection.jsonl");
+            let session_id = "session-marked-model-id";
+            let mut patch = projection_patch(1);
+            patch.provenance.provider = "llm.openrouter".to_string();
+            patch.provenance.route_id = Some("route.openrouter".to_string());
+            patch.provenance.model = written.to_string();
+            patch.provenance.model_placement = Some(placement);
+            let mut bytes = serde_json::to_vec(&patch).expect("serialize patch");
+            bytes.push(b'\n');
+            fs::create_dir_all(&root).expect("create fixture root");
+            fs::write(&path, &bytes).expect("write accepted patch");
+
+            let read = load_projection_patches(&path, session_id).expect("decode the patch");
+            let provenance = &present_snapshot(&read).records[0].payload.provenance;
+            assert_eq!(provenance.model, read_back, "{placement:?} {written}");
+            assert_eq!(provenance.model_placement, Some(placement));
+            assert_eq!(fs::read(&path).expect("re-read bytes"), bytes);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn an_unknown_placement_reads_as_unmarked_and_keeps_the_stream_readable() {
+        let root = unique_tempdir("unknown-placement");
+        let path = root.join("projection.jsonl");
+        let session_id = "session-unknown-placement";
+        let mut bytes = Vec::new();
+        for (sequence, placement) in [
+            (1, serde_json::json!("elsewhere")),
+            (2, serde_json::json!(["remote"])),
+        ] {
+            let mut patch = projection_patch(sequence);
+            patch.provenance.provider = "llm.openrouter".to_string();
+            patch.provenance.route_id = Some("route.openrouter".to_string());
+            patch.provenance.model = "anthropic/claude-sonnet-4".to_string();
+            let mut value = serde_json::to_value(&patch).expect("serialize patch");
+            value["provenance"]["model_placement"] = placement;
+            serde_json::to_writer(&mut bytes, &value).expect("serialize stored patch");
+            bytes.push(b'\n');
+        }
+        fs::create_dir_all(&root).expect("create fixture root");
+        fs::write(&path, &bytes).expect("write accepted patches");
+
+        let read = load_projection_patches(&path, session_id).expect("the stream decodes");
+        let records = &present_snapshot(&read).records;
+        assert_eq!(records.len(), 2);
+        for record in records {
+            // Read as an unmarked OpenRouter record: by the local rule.
+            assert_eq!(record.payload.provenance.model, "claude-sonnet-4");
+            assert_eq!(record.payload.provenance.model_placement, None);
+        }
+        assert_eq!(fs::read(&path).expect("re-read bytes"), bytes);
         let _ = fs::remove_dir_all(root);
     }
 

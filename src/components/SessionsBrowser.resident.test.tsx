@@ -7,11 +7,20 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import i18n from "../i18n";
 import { useReviewStore } from "../session/reviewStore";
 import { loadedSession, segment } from "../session/reviewTestUtils";
 import { useAudioGraphStore } from "../store";
+import { preloadGraphLens } from "../test/lazyChunks";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
 import NowStrip from "./NowStrip";
 import SessionsBrowser from "./SessionsBrowser";
@@ -33,6 +42,8 @@ vi.mock("react-force-graph-2d", async () => {
 });
 
 const mockedInvoke = vi.mocked(invoke);
+
+beforeAll(preloadGraphLens);
 
 /**
  * The just-stopped session B's data stays resident in the global store after
@@ -99,10 +110,9 @@ async function expectResident(): Promise<void> {
   expect(
     within(pane).queryByText(/this view needs the session loaded/i),
   ).not.toBeInTheDocument();
-  // The Graph lens is a lazy chunk, so allow it a moment to mount.
-  await waitFor(() => expect(pane).not.toBeEmptyDOMElement(), {
-    timeout: 8000,
-  });
+  // The Graph lens is a lazy chunk (preloaded in `beforeAll`), so it mounts
+  // after a tick rather than synchronously.
+  await waitFor(() => expect(pane).not.toBeEmptyDOMElement());
 }
 
 /**
@@ -235,7 +245,7 @@ describe("SessionsBrowser: the just-stopped session's resident data", () => {
     expect(moreActions()).not.toBeNull();
     expect(loadSessionIds()).toEqual([]);
     expect(mockedInvoke).not.toHaveBeenCalledWith("synthesize_notes");
-  }, 20_000);
+  });
 
   it("selecting A loads A (clearing the slot), and returning to B loads B through the ordinary click path", async () => {
     seedJustStoppedB([SESSION_A, SESSION_B]);

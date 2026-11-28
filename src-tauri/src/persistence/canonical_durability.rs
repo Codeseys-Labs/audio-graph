@@ -854,6 +854,16 @@ struct ParentDurabilityBarrier {
     algorithm_test: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    static PARENT_FLUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn completed_parent_flushes() -> u64 {
+    PARENT_FLUSHES.get()
+}
+
 impl ParentDurabilityBarrier {
     fn is_available(&self) -> bool {
         #[cfg(test)]
@@ -874,6 +884,8 @@ impl ParentDurabilityBarrier {
             .as_ref()
             .ok_or_else(|| io::Error::other("parent durability barrier unavailable"))?;
         directory.sync_all()?;
+        #[cfg(test)]
+        PARENT_FLUSHES.set(PARENT_FLUSHES.get() + 1);
         #[cfg(windows)]
         {
             let reopened = windows_ntfs::open_attributes(&self.path)?;
@@ -3487,6 +3499,11 @@ pub(super) fn sync_unqualified_transcript_parent(path: &Path) -> io::Result<()> 
         Err(error) => return Err(error),
     };
     match directory.sync_all() {
+        #[cfg(test)]
+        Ok(()) => {
+            PARENT_FLUSHES.set(PARENT_FLUSHES.get() + 1);
+            Ok(())
+        }
         Err(error) if unsupported(&error) => Ok(()),
         result => result,
     }
@@ -3598,6 +3615,8 @@ fn open_transcript_lock(
             .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))?
     };
     // Bound a stuck peer while allowing ordinary readers and writers to finish.
+    #[cfg(all(test, not(debug_assertions)))]
+    let mut lock_wait = super::projection_profile::LockWait::new(shared);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
         let result = if shared {
@@ -3608,6 +3627,8 @@ fn open_transcript_lock(
         match result {
             Ok(()) => return Ok(file),
             Err(TryLockError::WouldBlock) if wait && std::time::Instant::now() < deadline => {
+                #[cfg(all(test, not(debug_assertions)))]
+                lock_wait.blocked();
                 #[cfg(test)]
                 if let Some(sender) = TRANSCRIPT_WAITER.take() {
                     let _ = sender.send(());

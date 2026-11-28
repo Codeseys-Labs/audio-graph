@@ -836,6 +836,8 @@
       "needsLoad": "Esta visualização precisa que a sessão seja carregada primeiro.",
       "loadSession": "Carregar sessão",
       "staleView": "Esta visualização pode estar desatualizada: a última atualização falhou. Mostrando a última cópia carregada.",
+      "projectionBehindTranscript": "Esta visualização ainda não inclui todas as revisões salvas da transcrição.",
+      "projectionGap": "Não foi possível recuperar uma alteração da projeção. Esta visualização mostra as últimas alterações verificadas.",
       "emptyNotes": "Esta sessão não tem notas.",
       "viewUnavailable": "Não foi possível carregar esta sessão.",
       "emptyTranscript": "Esta sessão não tem transcrição."
@@ -1447,9 +1449,10 @@
     "stageCapture": "Captura",
     "stageResample": "Reamostragem",
     "stageAsr": "ASR",
+    "transcriptCaptionsLost": "Não foi possível salvar algumas legendas desta sessão.",
     "transcriptCrashSafetyUnverified": "Transcrição salva. A recuperação após uma falha não foi verificada neste armazenamento.",
     "transcriptNotSaving": {
-      "confirmation_delayed": "Aguardando confirmação de que a transcrição foi salva",
+      "confirmation_delayed": "Aguardando confirmação do salvamento da transcrição",
       "writer_absent": "A transcrição não está sendo salva",
       "storage_full": "A transcrição não está sendo salva porque o armazenamento está cheio",
       "write_failed": "A transcrição não está sendo salva porque houve uma falha na gravação"
@@ -1462,6 +1465,17 @@
     "statusCredentialRejected": "O provedor rejeitou a credencial.",
     "statusCredentialExpired": "A credencial do provedor expirou.",
     "statusReconnecting": "Reconectando ao provedor.",
+    "reconnectReason": {
+      "session_rollover": "Iniciando uma nova sessão de transmissão.",
+      "connection_lost": "A conexão de transmissão foi interrompida.",
+      "provider_retry_later": "O provedor solicitou uma pausa antes da próxima tentativa."
+    },
+    "reconnectDelay": {
+      "immediate": "Tentando novamente agora.",
+      "short": "Nova tentativa em alguns segundos.",
+      "medium": "Nova tentativa em até meio minuto.",
+      "long": "Nova tentativa após uma espera maior."
+    },
     "statusDegraded": "Degradado: {{reason}}",
     "diarizationDegradedReason": {
       "engine_not_compiled": "A detecção de locutor está em modo básico — esta versão não inclui o motor neural de diarização.",

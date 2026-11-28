@@ -640,10 +640,20 @@ export interface GraphSnapshot {
 }
 
 // Pipeline status types
+export type AsrReconnectReason =
+  | "session_rollover"
+  | "connection_lost"
+  | "provider_retry_later";
+
 export type StageStatus =
   | { type: "Idle" }
   | { type: "Running"; processed_count: number }
   | { type: "Error"; diagnostic: RuntimeDiagnostic }
+  | {
+      type: "Reconnecting";
+      reason: AsrReconnectReason;
+      retry_delay: RuntimeRetryDelayBucket;
+    }
   /**
    * The stage is running, but not with the backend/fidelity the user's
    * configuration asked for (audio-graph-586b) — e.g. diarization silently
@@ -681,6 +691,7 @@ export interface PipelineStatus extends PipelineStages {
     | "write_failed"
     | "confirmation_delayed";
   transcript_crash_safety_unverified?: boolean;
+  transcript_captions_lost?: boolean;
 }
 
 /**
@@ -2279,7 +2290,13 @@ export interface MaterializedNote {
   valid_until_ms?: number | null;
 }
 
-export interface MaterializedNotes {
+/** Read-only diagnostics from this lens's verified projection generation. */
+interface ProjectionReadStatus {
+  projection_recovery?: "recompute_required";
+  transcript_coverage?: "behind_transcript";
+}
+
+export interface MaterializedNotes extends ProjectionReadStatus {
   schema_version: number;
   session_id: string;
   last_sequence: number;
@@ -2316,7 +2333,7 @@ export interface MaterializedGraphEdge {
   provenance: unknown;
 }
 
-export interface MaterializedGraph {
+export interface MaterializedGraph extends ProjectionReadStatus {
   schema_version: number;
   session_id: string;
   last_sequence: number;

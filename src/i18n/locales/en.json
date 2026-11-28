@@ -836,6 +836,8 @@
       "needsLoad": "This view needs the session loaded first.",
       "loadSession": "Load session",
       "staleView": "This view may be out of date: the latest refresh failed. Showing the last copy that loaded.",
+      "projectionBehindTranscript": "This view does not yet include all saved transcript revisions.",
+      "projectionGap": "A saved projection change could not be recovered. This view shows the last verified changes.",
       "emptyNotes": "This session has no notes.",
       "viewUnavailable": "This session could not be loaded.",
       "emptyTranscript": "This session has no transcript."
@@ -1447,9 +1449,10 @@
     "stageCapture": "Capture",
     "stageResample": "Resample",
     "stageAsr": "ASR",
+    "transcriptCaptionsLost": "Some captions in this session could not be saved.",
     "transcriptCrashSafetyUnverified": "Transcript saved. Crash recovery is unverified on this storage.",
     "transcriptNotSaving": {
-      "confirmation_delayed": "Waiting for confirmation that the transcript was saved",
+      "confirmation_delayed": "Transcript save confirmation pending",
       "writer_absent": "Transcript is not being saved",
       "storage_full": "Transcript is not being saved because storage is full",
       "write_failed": "Transcript is not being saved because the write failed"
@@ -1462,6 +1465,17 @@
     "statusCredentialRejected": "The provider rejected the credential.",
     "statusCredentialExpired": "The provider credential expired.",
     "statusReconnecting": "Reconnecting to the provider.",
+    "reconnectReason": {
+      "session_rollover": "Starting a new streaming session.",
+      "connection_lost": "The streaming connection was interrupted.",
+      "provider_retry_later": "The provider asked us to wait before retrying."
+    },
+    "reconnectDelay": {
+      "immediate": "Retrying now.",
+      "short": "Retrying in a few seconds.",
+      "medium": "Retrying within half a minute.",
+      "long": "Retrying after a longer delay."
+    },
     "statusDegraded": "Degraded: {{reason}}",
     "diarizationDegradedReason": {
       "engine_not_compiled": "Speaker detection is running in basic mode — this build doesn't include the neural diarization engine.",

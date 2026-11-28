@@ -577,6 +577,7 @@ dependencies = [
  "futures-util",
  "gcp_auth",
  "getrandom 0.4.3",
+ "h2",
  "hex",
  "hkdf",
  "keyring",

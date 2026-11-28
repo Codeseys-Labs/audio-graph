@@ -114,15 +114,11 @@ describe("PipelineStatusBar", () => {
       "write_failed",
       "A transcrição não está sendo salva porque houve uma falha na gravação",
     ],
-    [
-      "en",
-      "confirmation_delayed",
-      "Waiting for confirmation that the transcript was saved",
-    ],
+    ["en", "confirmation_delayed", "Transcript save confirmation pending"],
     [
       "pt",
       "confirmation_delayed",
-      "Aguardando confirmação de que a transcrição foi salva",
+      "Aguardando confirmação do salvamento da transcrição",
     ],
   ] as const)("reports %s %s until saving resumes", async (locale, reason, sentence) => {
     const previous = i18n.language;
@@ -141,6 +137,30 @@ describe("PipelineStatusBar", () => {
       expect(within(bar).getByText(sentence)).toBe(warning);
       publish(allIdle());
       expect(within(bar).queryByText(sentence)).toBeNull();
+    } finally {
+      view.unmount();
+      await i18n.changeLanguage(previous);
+    }
+  });
+
+  it.each([
+    ["en", "Some captions in this session could not be saved."],
+    ["pt", "Não foi possível salvar algumas legendas desta sessão."],
+  ])("keeps the %s caption loss visible after saving resumes until rotation", async (locale, sentence) => {
+    const previous = i18n.language;
+    await i18n.changeLanguage(locale);
+    const view = render(<PipelineStatusBar />);
+    try {
+      publish({
+        ...allIdle(),
+        transcript_not_saving: "storage_full",
+        transcript_captions_lost: true,
+      });
+      const notice = within(screen.getByRole("status")).getByText(sentence);
+      publish({ ...allIdle(), transcript_captions_lost: true });
+      expect(screen.getByText(sentence)).toBe(notice);
+      publish(allIdle());
+      expect(notice).not.toBeInTheDocument();
     } finally {
       view.unmount();
       await i18n.changeLanguage(previous);
@@ -346,7 +366,7 @@ describe("PipelineStatusBar", () => {
       "network_unreachable",
       "retry_after_delay",
       "short",
-      "Reconnecting to the provider.",
+      "The app could not reach the provider. Check your connection.",
     ],
     [
       "en",
@@ -360,7 +380,7 @@ describe("PipelineStatusBar", () => {
       "network_unreachable",
       "retry_after_delay",
       "short",
-      "Reconectando ao provedor.",
+      "O aplicativo não conseguiu acessar o provedor. Verifique sua conexão.",
     ],
   ] as const)("presents %s %s with %s and delay %s", async (locale, code, recovery_action, retry_delay, expected) => {
     resetStore({
@@ -391,6 +411,38 @@ describe("PipelineStatusBar", () => {
       expect(
         screen.getByRole("img", { name: `ASR: ${expected}` }),
       ).toBeInTheDocument();
+    } finally {
+      view.unmount();
+      await i18n.changeLanguage(previousLanguage);
+    }
+  });
+
+  it.each([
+    [
+      "en",
+      "Reconnecting to the provider. Starting a new streaming session. Retrying in a few seconds.",
+    ],
+    [
+      "pt",
+      "Reconectando ao provedor. Iniciando uma nova sessão de transmissão. Nova tentativa em alguns segundos.",
+    ],
+  ] as const)("renders a routine reconnect as a warning in %s", async (locale, label) => {
+    const previousLanguage = i18n.language;
+    await i18n.changeLanguage(locale);
+    const view = render(<PipelineStatusBar />);
+    try {
+      publish({
+        ...allIdle(),
+        asr: {
+          type: "Reconnecting",
+          reason: "session_rollover",
+          retry_delay: "short",
+        },
+      });
+      expect(screen.getByRole("img", { name: `ASR: ${label}` })).toHaveClass(
+        "bg-accent-yellow",
+      );
+      expect(view.container.innerHTML).not.toContain("session_rollover");
     } finally {
       view.unmount();
       await i18n.changeLanguage(previousLanguage);

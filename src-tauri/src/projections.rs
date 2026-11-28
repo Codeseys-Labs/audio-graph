@@ -135,7 +135,7 @@ fn event_is_newer_or_tie_winner(candidate: &TranscriptEvent, current: &Transcrip
             && candidate.received_at_ms > current.received_at_ms)
 }
 
-fn projection_event_is_eligible(event: &TranscriptEvent) -> bool {
+pub(crate) fn projection_event_is_eligible(event: &TranscriptEvent) -> bool {
     event.is_final
         || event.end_of_turn
         || matches!(event.stability, TranscriptEventStability::Final)
@@ -1591,6 +1591,10 @@ pub(crate) struct TranscriptLiveIndex {
 }
 
 impl TranscriptLiveIndex {
+    pub(crate) fn position(&self, id: &str) -> Option<usize> {
+        self.positions.get(id).copied()
+    }
+
     pub(crate) fn apply(
         &mut self,
         ledger: &mut TranscriptLedger,
@@ -2068,7 +2072,11 @@ impl fmt::Debug for DebugGraphNodeDraft<'_> {
 
 /// Per-item LLM provenance, cloned into every materialized note / node / edge and
 /// persisted, so per-item byte cost governs what may live here (ADR-0038).
+///
+/// Decoded through [`StoredProjectionProvenance`], so a stored model id is read
+/// by where the record says the model ran.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(from = "StoredProjectionProvenance")]
 pub struct ProjectionProvenance {
     /// The REGISTRY provider id the route was authorized against (`llm.openrouter`,
     /// `llm.cerebras`, …). Before ADR-0038 this carried a fourth ad-hoc naming
@@ -2077,6 +2085,10 @@ pub struct ProjectionProvenance {
     /// The SERVED model when the response reported one; see
     /// [`model_source`](Self::model_source), which says which it is rather than
     /// leaving a reader to assume.
+    ///
+    /// A hosted identifier for a model that ran at a remote endpoint, and a
+    /// display name for a local one: never a filesystem path (see
+    /// `ipc_contract::model_id`).
     pub model: String,
     pub prompt_id: String,
     /// The stamped route id (`route.cerebras_via_openrouter`, …). `None` on records
@@ -2088,6 +2100,61 @@ pub struct ProjectionProvenance {
     /// mistaken for served identity.
     #[serde(default)]
     pub model_source: crate::llm::route::ModelIdentitySource,
+    /// Where the model ran, written with the model rule applied at the
+    /// endpoint the client dialled. `None` on records written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_placement: Option<audio_graph_ipc_contract::model_id::ModelPlacement>,
+}
+
+/// A [`ProjectionProvenance`] as a patch, note or graph item stores it.
+///
+/// Records written before the model rule can hold a local model's path, or
+/// what the old character filter left of a Windows path, and carry no
+/// `model_placement`. Building the typed value from this one applies the rule
+/// on every read: a marked record is read by its placement, and an unmarked
+/// one by what its provider and route say. Nothing loaded, exported or
+/// written again carries the path, and the stored record is not rewritten.
+#[derive(serde::Deserialize)]
+struct StoredProjectionProvenance {
+    provider: String,
+    model: String,
+    prompt_id: String,
+    #[serde(default)]
+    route_id: Option<String>,
+    #[serde(default)]
+    model_source: crate::llm::route::ModelIdentitySource,
+    #[serde(
+        default,
+        deserialize_with = "audio_graph_ipc_contract::model_id::lenient_placement"
+    )]
+    model_placement: Option<audio_graph_ipc_contract::model_id::ModelPlacement>,
+}
+
+impl From<StoredProjectionProvenance> for ProjectionProvenance {
+    fn from(stored: StoredProjectionProvenance) -> Self {
+        let mut provenance = Self {
+            model: stored.model,
+            provider: stored.provider,
+            prompt_id: stored.prompt_id,
+            route_id: stored.route_id,
+            model_source: stored.model_source,
+            model_placement: stored.model_placement,
+        };
+        provenance.normalize_stored_model();
+        provenance
+    }
+}
+
+impl ProjectionProvenance {
+    pub(crate) fn normalize_stored_model(&mut self) {
+        let legacy_remote =
+            crate::llm::route::recorded_as_remote(&self.provider, self.route_id.as_deref());
+        self.model = audio_graph_ipc_contract::model_id::stored_for_place(
+            std::mem::take(&mut self.model),
+            self.model_placement,
+            legacy_remote,
+        );
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema, PartialEq)]
@@ -2425,11 +2492,75 @@ impl fmt::Debug for MaterializedNote {
     }
 }
 
+/// Historical views retain their verified contents until a scheduled repair commits.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionRecoveryStatus {
+    RecomputeRequired,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionCoverageStatus {
+    BehindTranscript,
+}
+
+impl TranscriptLedger {
+    /// Fold the verified source in canonical order, checking replacement
+    /// rules once per revision and sorting the final spans only once.
+    pub(crate) fn replay_source_prefix(
+        session_id: &str,
+        events_prefix: &[TranscriptEvent],
+    ) -> Result<TranscriptLedger, TranscriptLedgerError> {
+        let mut map = BTreeMap::new();
+        let mut accepted = 0u64;
+        for event in events_prefix {
+            fast_apply_transcript_event(&mut map, event.clone())?;
+            accepted += 1;
+        }
+        let mut ledger = TranscriptLedger {
+            schema_version: TranscriptLedger::SCHEMA_VERSION,
+            session_id: session_id.to_string(),
+            accepted_event_count: accepted,
+            latest_spans: map.into_values().collect(),
+        };
+        ledger.sort_latest_spans();
+        Ok(ledger)
+    }
+
+    /// Only an eligible span missing at its exact current revision is evidence
+    /// that this lane trails the transcript. A speaker-only change or a saved
+    /// interim is not a recovered final.
+    pub(crate) fn projection_coverage(
+        &self,
+        basis: Option<&ProjectionBasis>,
+    ) -> Option<ProjectionCoverageStatus> {
+        let covered = basis?.resolve_covered_events(&self.latest_spans);
+        let identities: std::collections::BTreeSet<_> = covered
+            .iter()
+            .map(|e| (&e.span_id, e.revision_number))
+            .collect();
+        self.latest_spans
+            .iter()
+            .filter(|e| projection_event_is_eligible(e))
+            .any(|e| !identities.contains(&(&e.span_id, e.revision_number)))
+            .then_some(ProjectionCoverageStatus::BehindTranscript)
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct MaterializedNotes {
     pub schema_version: u32,
     pub session_id: String,
     pub last_sequence: u64,
+    /// Global sequence and hash of the last projection patch materialized for this kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_log_head: Option<crate::persistence::canonical_log::VerifiedTranscriptHead>,
+    /// Calculated from the canonical gap evidence and its receipted repairs.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub projection_recovery: Option<ProjectionRecoveryStatus>,
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub transcript_coverage: Option<ProjectionCoverageStatus>,
     pub notes: Vec<MaterializedNote>,
 }
 
@@ -2454,6 +2585,9 @@ impl MaterializedNotes {
             schema_version: Self::SCHEMA_VERSION,
             session_id: session_id.into(),
             last_sequence: 0,
+            projection_log_head: None,
+            projection_recovery: None,
+            transcript_coverage: None,
             notes: Vec::new(),
         }
     }
@@ -2922,6 +3056,14 @@ pub struct MaterializedGraph {
     pub schema_version: u32,
     pub session_id: String,
     pub last_sequence: u64,
+    /// Global sequence and hash of the last projection patch materialized for this kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_log_head: Option<crate::persistence::canonical_log::VerifiedTranscriptHead>,
+    /// Calculated from the canonical gap evidence and its receipted repairs.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub projection_recovery: Option<ProjectionRecoveryStatus>,
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub transcript_coverage: Option<ProjectionCoverageStatus>,
     pub nodes: Vec<MaterializedGraphNode>,
     pub edges: Vec<MaterializedGraphEdge>,
     /// Raw model-supplied node id -> the id `upsert_node` ACTUALLY landed it
@@ -2966,6 +3108,9 @@ impl MaterializedGraph {
             schema_version: Self::SCHEMA_VERSION,
             session_id: session_id.into(),
             last_sequence: 0,
+            projection_log_head: None,
+            projection_recovery: None,
+            transcript_coverage: None,
             nodes: Vec::new(),
             edges: Vec::new(),
             id_aliases: BTreeMap::new(),
@@ -4021,26 +4166,6 @@ impl<'a> LedgerHistory<'a> {
         timeline
     }
 
-    fn fresh_fold_transcript_or_error(
-        session_id: &str,
-        events_prefix: &[TranscriptEvent],
-    ) -> Result<TranscriptLedger, TranscriptLedgerError> {
-        let mut map = BTreeMap::new();
-        let mut accepted = 0u64;
-        for event in events_prefix {
-            fast_apply_transcript_event(&mut map, event.clone())?;
-            accepted += 1;
-        }
-        let mut ledger = TranscriptLedger {
-            schema_version: TranscriptLedger::SCHEMA_VERSION,
-            session_id: session_id.to_string(),
-            accepted_event_count: accepted,
-            latest_spans: map.into_values().collect(),
-        };
-        ledger.sort_latest_spans();
-        Ok(ledger)
-    }
-
     fn fresh_fold_speaker_or_error(
         session_id: &str,
         events_prefix: &[DiarizationSpanRevision],
@@ -4127,7 +4252,7 @@ impl<'a> LedgerHistory<'a> {
             Ok(self.materialize_transcript_ledger())
         } else {
             debug_assert!(target_len < self.transcript_applied_len);
-            Self::fresh_fold_transcript_or_error(
+            TranscriptLedger::replay_source_prefix(
                 self.session_id,
                 &self.transcript_events[..target_len],
             )
@@ -4209,6 +4334,17 @@ impl<'a> LedgerHistory<'a> {
 }
 
 impl MaterializedProjectionState {
+    pub(crate) fn bind_projection_head(
+        &mut self,
+        kind: &ProjectionKind,
+        head: crate::persistence::canonical_log::VerifiedTranscriptHead,
+    ) {
+        match kind {
+            ProjectionKind::Notes => self.notes.projection_log_head = Some(head),
+            ProjectionKind::Graph => self.graph.projection_log_head = Some(head),
+        }
+    }
+
     pub fn new(session_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
         Self {
@@ -4596,21 +4732,26 @@ pub(crate) fn resolve_claim_evidence_basis_events(
     patch_basis
         .resolve_covered_events(&ledger.latest_spans)
         .into_iter()
-        .map(|mut event| {
-            if let Some(winners) = attribution.as_ref()
-                && let Some(winner) = crate::timeline::resolve_speaker(
-                    event.source_id.as_str(),
-                    event.transcript_segment_id.as_deref(),
-                    event.span_id.as_str(),
-                    winners,
-                )
-            {
-                event.speaker_id = winner.speaker_id.clone();
-                event.speaker_label = winner.speaker_label.clone();
-            }
-            event
-        })
+        .map(|event| overlay_evidence_speaker(event, attribution.as_ref()))
         .collect()
+}
+
+pub(crate) fn overlay_evidence_speaker(
+    mut event: TranscriptEvent,
+    winners: Option<&std::collections::HashMap<String, &DiarizationSpanRevision>>,
+) -> TranscriptEvent {
+    if let Some(winners) = winners
+        && let Some(winner) = crate::timeline::resolve_speaker(
+            &event.source_id,
+            event.transcript_segment_id.as_deref(),
+            &event.span_id,
+            winners,
+        )
+    {
+        event.speaker_id.clone_from(&winner.speaker_id);
+        event.speaker_label.clone_from(&winner.speaker_label);
+    }
+    event
 }
 
 /// Resolve a node id referenced by a graph operation (edge endpoint,
@@ -4952,20 +5093,25 @@ pub fn transcript_events_hash_v1(events: &[TranscriptEvent]) -> String {
             .then(a.revision_number.cmp(&b.revision_number))
     });
 
-    let mut hash = 14_695_981_039_346_656_037u64;
+    let mut hash = TRANSCRIPT_HASH_V1_INITIAL;
     for event in ordered {
-        update_hash(&mut hash, &event.span_id);
-        update_hash(&mut hash, &event.provider);
-        update_hash(&mut hash, &event.source_id);
-        update_hash(&mut hash, event.speaker_id.as_deref().unwrap_or(""));
-        update_hash(&mut hash, event.speaker_label.as_deref().unwrap_or(""));
-        update_hash(&mut hash, &event.text);
-        update_hash(&mut hash, &millis(event.start_time).to_string());
-        update_hash(&mut hash, &millis(event.end_time).to_string());
-        update_hash(&mut hash, &event.revision_number.to_string());
-        update_hash(&mut hash, if event.is_final { "final" } else { "partial" });
+        update_transcript_hash_v1(&mut hash, event);
     }
     format!("fnv1a64:{hash:016x}")
+}
+
+pub(crate) const TRANSCRIPT_HASH_V1_INITIAL: u64 = 14_695_981_039_346_656_037;
+pub(crate) fn update_transcript_hash_v1(hash: &mut u64, event: &TranscriptEvent) {
+    update_hash(hash, &event.span_id);
+    update_hash(hash, &event.provider);
+    update_hash(hash, &event.source_id);
+    update_hash(hash, event.speaker_id.as_deref().unwrap_or(""));
+    update_hash(hash, event.speaker_label.as_deref().unwrap_or(""));
+    update_hash(hash, &event.text);
+    update_hash(hash, &millis(event.start_time).to_string());
+    update_hash(hash, &millis(event.end_time).to_string());
+    update_hash(hash, &event.revision_number.to_string());
+    update_hash(hash, if event.is_final { "final" } else { "partial" });
 }
 
 /// Compatibility name for callers written before transcript hash versions
@@ -6096,10 +6242,11 @@ mod tests {
             confidence: 0.86,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -6176,6 +6323,7 @@ mod tests {
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -6305,10 +6453,11 @@ mod tests {
             confidence: 0.86,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -7188,10 +7337,11 @@ mod tests {
             confidence: 0.86,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -7234,10 +7384,11 @@ mod tests {
             confidence: 0.81,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -7648,6 +7799,7 @@ mod tests {
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -9373,6 +9525,7 @@ mod tests {
                     prompt_id: "complexity_v1".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 },
                 queued_at_ms: Some(created_at_ms),
                 generation_latency_ms: Some(5),
@@ -10012,9 +10165,10 @@ mod tests {
             "runtime scheduler must not start consuming speaker-timeline basis spans"
         );
 
-        let state_source = include_str!("state.rs");
+        let state_source = include_str!("state/projection_apply.rs");
         assert!(
-            state_source.contains(".apply_validated_patch_reporting_currency(ledger, &patch)"),
+            state_source.contains("storage.live_basis(&patch, observed_count)")
+                && state_source.contains("!patch.basis.diarization_span_revisions.is_empty()"),
             "live runtime apply must retain the transcript-only validation seam"
         );
         assert!(
@@ -11719,10 +11873,11 @@ mod tests {
                 confidence: 0.9,
                 provenance: ProjectionProvenance {
                     provider: "openrouter".to_string(),
-                    model: "anthropic/claude-sonnet-4".to_string(),
+                    model: "claude-sonnet-4".to_string(),
                     prompt_id: "graph-v1".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 },
                 queued_at_ms: None,
                 generation_latency_ms: None,
@@ -11841,10 +11996,11 @@ mod tests {
             confidence: 0.9,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -11897,10 +12053,11 @@ mod tests {
             confidence: 0.9,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,

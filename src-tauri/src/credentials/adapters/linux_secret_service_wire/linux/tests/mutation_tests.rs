@@ -28,6 +28,7 @@ enum Behavior {
     PromptNeverSettles,
     PromptChangedState,
     PromptCompleted,
+    PromptCompletedPrior,
     LostCommitted,
     LostUnchanged,
     LostReadFails,
@@ -79,6 +80,18 @@ impl Store {
     }
 
     async fn serve(&mut self, connection: &Connection, message: &Message) {
+        let header = message.header();
+        if header
+            .interface()
+            .is_some_and(|interface| interface.as_str() == PROMPT_INTERFACE)
+        {
+            assert!(
+                header
+                    .member()
+                    .is_some_and(|member| member.as_str() == "Dismiss"),
+                "a mutation may dismiss a prompt but must never display one"
+            );
+        }
         let call = inspect_call(message);
         let header = message.header();
         let sender = header.sender().unwrap().as_str();
@@ -198,6 +211,7 @@ impl Store {
                         | Behavior::PromptNeverSettles
                         | Behavior::PromptChangedState
                         | Behavior::PromptCompleted
+                        | Behavior::PromptCompletedPrior
                 ));
                 if self.behavior != Behavior::PromptNeverSettles {
                     // Emit before replying. A client that subscribes after
@@ -209,7 +223,10 @@ impl Store {
                             PROMPT_INTERFACE,
                             "Completed",
                             &(
-                                self.behavior != Behavior::PromptCompleted,
+                                !matches!(
+                                    self.behavior,
+                                    Behavior::PromptCompleted | Behavior::PromptCompletedPrior
+                                ),
                                 Variant::from("/"),
                             ),
                         )
@@ -297,7 +314,8 @@ impl Store {
             Behavior::Prompt
             | Behavior::PromptNeverSettles
             | Behavior::PromptChangedState
-            | Behavior::PromptCompleted => {
+            | Behavior::PromptCompleted
+            | Behavior::PromptCompletedPrior => {
                 if matches!(
                     self.behavior,
                     Behavior::PromptChangedState | Behavior::PromptCompleted
@@ -362,6 +380,43 @@ impl Store {
     }
 }
 
+#[test]
+fn mutations_never_display_prompts() {
+    for (initial, behavior, mutation, expected, dismissals) in [
+        (
+            Initial::Absent,
+            Behavior::Prompt,
+            put(),
+            MutationOutcome::InteractionRequired,
+            1,
+        ),
+        (
+            Initial::Present,
+            Behavior::Acknowledge,
+            put(),
+            MutationOutcome::Committed,
+            0,
+        ),
+        (
+            Initial::Present,
+            Behavior::Prompt,
+            Mutation::Delete,
+            MutationOutcome::InteractionRequired,
+            1,
+        ),
+    ] {
+        let calls = run(initial, behavior, mutation, Ok(expected));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|step| step.call == Call::Dismiss)
+                .count(),
+            dismissals
+        );
+        assert_eq!(mutation_calls(&calls).len(), 1);
+    }
+}
+
 fn path(value: &'static str) -> OwnedObjectPath {
     OwnedObjectPath::try_from(value).unwrap()
 }
@@ -390,6 +445,7 @@ fn run(
             let connection = Builder::address(address).build().await.unwrap();
             let mut messages = MessageStream::from(&connection);
             connection.request_name(SERVICE_NAME).await.unwrap();
+            connection.request_name(GNOME_NAME).await.unwrap();
             ready.send(()).unwrap();
             let mut store = Store::new(initial, behavior, disconnect);
             let mut stopped = pin!(stopped);
@@ -444,6 +500,13 @@ fn run(
                 None,
             ),
             Err(Failure::StalledWorker.into())
+        );
+    }
+    drop(lease);
+    if behavior == Behavior::ExpireBeforeSend {
+        assert!(
+            gate.acquire().is_ok(),
+            "pre-send expiration must leave the gate healthy"
         );
     }
     let _ = stop.send(());
@@ -776,4 +839,17 @@ fn completed_prompt_is_verified_and_disconnect_of_only_the_client_can_commit() {
             .iter()
             .any(|step| step.client == 1 && step.call == Call::Close)
     );
+}
+
+#[test]
+fn non_dismissed_completion_with_prior_state_requires_interaction() {
+    let calls = run(
+        Initial::Absent,
+        Behavior::PromptCompletedPrior,
+        put(),
+        Ok(MutationOutcome::InteractionRequired),
+    );
+    assert_eq!(mutation_calls(&calls), [Call::Create]);
+    assert!(calls.iter().any(|step| step.call == Call::Dismiss));
+    assert_readback(&calls);
 }

@@ -132,12 +132,7 @@ function stageStatusInfo(
           : code === "credential_expired"
             ? "pipeline.statusCredentialExpired"
             : presentation.translationKey;
-      const message =
-        presentation.recoveryAction === "retry_after_delay" &&
-        presentation.diagnostic.kind === "runtime" &&
-        presentation.diagnostic.detail.context.retry_delay
-          ? t("pipeline.statusReconnecting")
-          : t(summaryKey);
+      const message = t(summaryKey);
       return {
         modifier: "error",
         tooltip: presentation.recoveryTranslationKey
@@ -145,6 +140,19 @@ function stageStatusInfo(
           : message,
       };
     }
+    case "Reconnecting":
+      return {
+        modifier: "warning",
+        tooltip: [
+          t("pipeline.statusReconnecting"),
+          t(`pipeline.reconnectReason.${status.reason}`, { defaultValue: "" }),
+          t(`pipeline.reconnectDelay.${status.retry_delay}`, {
+            defaultValue: "",
+          }),
+        ]
+          .filter(Boolean)
+          .join(" "),
+      };
     case "Degraded":
       // audio-graph-586b: reuses the already-provisioned `warning` dot
       // modifier (yellow — distinct from healthy `running` green and
@@ -502,6 +510,12 @@ function PipelineStatusBar() {
           {t(
             `pipeline.transcriptNotSaving.${pipelineStatus.transcript_not_saving}`,
           )}
+        </span>
+      )}
+      {pipelineStatus.transcript_captions_lost && (
+        <span className={STAGE_BASE}>
+          <Icon name="warning" size={14} />
+          {t("pipeline.transcriptCaptionsLost")}
         </span>
       )}
       {!pipelineStatus.transcript_not_saving &&

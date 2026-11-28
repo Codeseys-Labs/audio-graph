@@ -7,15 +7,22 @@ use std::path::Path;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 
-use super::transcript_commit::{TranscriptGap, decode_gap, transcript_recovery_artifacts};
+use super::transcript_commit::{
+    GapStream, TranscriptGap, decode_gap, transcript_recovery_artifacts,
+};
 use crate::persistence::canonical_durability::{
     CanonicalCoordinationError, transcript_coordination_path, wait_for_transcript_lock,
 };
 
 #[derive(Serialize)]
 pub(crate) struct TranscriptRecoveryExport {
+    /// Content-free storage provenance for the active descriptor only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unqualified_attempt_id: Option<String>,
     gaps: Vec<TranscriptGap>,
     evidence: Vec<Evidence>,
+    #[serde(skip)]
+    pub(crate) gap_positions: Vec<(String, TranscriptGap)>,
 }
 
 impl fmt::Debug for TranscriptRecoveryExport {
@@ -35,6 +42,7 @@ struct Evidence {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum EvidenceKind {
     Attempt,
+    AttemptOrigin,
     Gap { attempt_id: String },
     Quarantine { attempt_id: String },
 }
@@ -44,6 +52,9 @@ impl EvidenceKind {
         // The shared inventory accepts only this Session's exact filenames and
         // canonical UUIDs. The portable bundle carries no filesystem address.
         let extension = path.extension()?.to_str()?;
+        if extension == "attempt-origin" {
+            return Some(Self::AttemptOrigin);
+        }
         if extension == "attempt" {
             return Some(Self::Attempt);
         }
@@ -93,10 +104,16 @@ fn read_evidence(path: &Path, remaining: &mut u64) -> io::Result<Vec<u8>> {
 
 fn inventory(path: &Path) -> Result<Vec<std::path::PathBuf>, String> {
     let mut paths = transcript_recovery_artifacts(path).map_err(evidence_io)?;
+    let has_attempt = paths
+        .iter()
+        .any(|p| p.extension().is_some_and(|ext| ext == "attempt"));
     paths.retain(|path| {
         path.extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| matches!(extension, "attempt" | "quarantine" | "gap"))
+            .is_some_and(|extension| {
+                matches!(extension, "attempt" | "quarantine" | "gap")
+                    || (has_attempt && extension == "attempt-origin")
+            })
     });
     Ok(paths)
 }
@@ -115,6 +132,40 @@ pub(crate) fn read_for_export<T>(
     path: &Path,
     ceiling: u64,
     read_transcript: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, Option<TranscriptRecoveryExport>), String> {
+    capture(
+        path,
+        ceiling,
+        read_transcript,
+        true,
+        GapStream::TranscriptRevisions,
+    )
+}
+
+/// Holding a shared lock binds the evidence inventory to the captured projection
+/// bytes. A history view needs only gap records. Portable exports retain raw
+/// quarantine bytes as well. Parsing and encoding happen after releasing it.
+pub(crate) fn capture_projection<T>(
+    path: &Path,
+    ceiling: u64,
+    capture_source: impl FnOnce() -> Result<T, String>,
+    portable: bool,
+) -> Result<(T, Option<TranscriptRecoveryExport>), String> {
+    capture(
+        path,
+        ceiling,
+        capture_source,
+        portable,
+        GapStream::ProjectionPatches,
+    )
+}
+
+fn capture<T>(
+    path: &Path,
+    ceiling: u64,
+    read_transcript: impl FnOnce() -> Result<T, String>,
+    portable: bool,
+    stream: GapStream,
 ) -> Result<(T, Option<TranscriptRecoveryExport>), String> {
     let lock = transcript_coordination_path(path);
     let acquire = || wait_for_transcript_lock(&lock, true, false);
@@ -147,6 +198,9 @@ pub(crate) fn read_for_export<T>(
         let Some(kind) = EvidenceKind::from_path(artifact) else {
             continue;
         };
+        if !portable && !matches!(kind, EvidenceKind::Gap { .. }) {
+            continue;
+        }
         let bytes = read_evidence(artifact, &mut remaining).map_err(evidence_io)?;
         captured_evidence.push((kind, bytes));
     }
@@ -159,22 +213,57 @@ pub(crate) fn read_for_export<T>(
     drop(guard);
     let mut evidence = Vec::new();
     let mut gaps = Vec::new();
-    for (kind, bytes) in captured_evidence {
-        if matches!(kind, EvidenceKind::Gap { .. }) {
-            gaps.push(
-                decode_gap(&bytes)
-                    .map_err(|error| format!("Transcript recovery gap unavailable: {error:?}"))?,
-            );
+    let mut gap_positions = Vec::new();
+    #[derive(serde::Deserialize)]
+    struct DescriptorId<'a> {
+        attempt: &'a str,
+    }
+    let origin = captured_evidence
+        .iter()
+        .find(|(kind, _)| matches!(kind, EvidenceKind::AttemptOrigin));
+    let unqualified_attempt_id = origin.and_then(|(_, bytes)| {
+        let id = std::str::from_utf8(bytes).ok()?;
+        let uuid = uuid::Uuid::parse_str(id).ok()?;
+        if uuid.to_string() != id {
+            return None;
         }
-        evidence.push(Evidence {
-            kind,
-            data_base64: STANDARD.encode(bytes),
-        });
+        captured_evidence.iter().find_map(|(kind, bytes)| {
+            if !matches!(kind, EvidenceKind::Attempt) {
+                return None;
+            }
+            let descriptor: DescriptorId = serde_json::from_slice(bytes).ok()?;
+            (descriptor.attempt == id).then(|| id.to_owned())
+        })
+    });
+    for (kind, bytes) in captured_evidence {
+        if matches!(kind, EvidenceKind::AttemptOrigin) {
+            continue;
+        }
+        if let EvidenceKind::Gap { attempt_id } = &kind {
+            let gap = decode_gap(&bytes)
+                .map_err(|error| format!("Recovery gap unavailable: {error:?}"))?;
+            if gap.stream != stream {
+                return Err("Recovery gap stream mismatch".into());
+            }
+            gap_positions.push((attempt_id.clone(), gap.clone()));
+            gaps.push(gap);
+        }
+        if portable {
+            evidence.push(Evidence {
+                kind,
+                data_base64: STANDARD.encode(bytes),
+            });
+        }
     }
     gaps.sort_by_key(|gap| gap.after.as_ref().map(|head| head.sequence));
     Ok((
         transcript,
-        (!evidence.is_empty()).then_some(TranscriptRecoveryExport { gaps, evidence }),
+        Some(TranscriptRecoveryExport {
+            unqualified_attempt_id,
+            gaps,
+            evidence,
+            gap_positions,
+        }),
     ))
 }
 

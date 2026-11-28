@@ -283,6 +283,10 @@ pub struct ProjectionScheduler {
     ttft_estimate_source: ProjectionTtftEstimateSource,
     next_job_index: u64,
     in_flight: Option<ProjectionJob>,
+    /// Gap identities captured when this live session resumed. Moved to the
+    /// job exactly once. Historical readers never construct these requests.
+    resume_gaps: Vec<String>,
+    repair_job: Option<(String, Vec<String>)>,
     pending_basis: Option<ProjectionBasis>,
     last_completed_basis: Option<ProjectionBasis>,
     last_failed_basis: Option<ProjectionBasis>,
@@ -353,6 +357,8 @@ impl ProjectionScheduler {
             ttft_estimate_source,
             next_job_index: 0,
             in_flight: None,
+            resume_gaps: Vec::new(),
+            repair_job: None,
             pending_basis: None,
             last_completed_basis: None,
             last_failed_basis: None,
@@ -488,6 +494,10 @@ impl ProjectionScheduler {
             return ProjectionSchedulerDecision::Idle;
         }
 
+        if !self.resume_gaps.is_empty() && self.in_flight.is_none() {
+            return self.take_resume_repair_at_basis(basis, now_ms);
+        }
+
         if let Some(in_flight) = self.in_flight.as_ref() {
             let in_flight_age_ms = now_ms.saturating_sub(in_flight.queued_at_ms);
             let queued_span_count = basis.covered_span_count();
@@ -513,6 +523,14 @@ impl ProjectionScheduler {
             };
         }
 
+        self.observe_idle_basis(basis, now_ms)
+    }
+
+    fn observe_idle_basis(
+        &mut self,
+        basis: ProjectionBasis,
+        now_ms: u64,
+    ) -> ProjectionSchedulerDecision {
         if self.last_completed_basis.as_ref() == Some(&basis) {
             return ProjectionSchedulerDecision::Idle;
         }
@@ -677,6 +695,10 @@ impl ProjectionScheduler {
         self.metrics.failed_jobs += 1;
         self.pending_basis = None;
 
+        let resumed_repair = self
+            .repair_job
+            .take()
+            .is_some_and(|(id, _)| id == failed.id);
         match ledger.classify_basis_currency(&failed.basis, None) {
             BasisCurrency::Current => {
                 if self.last_failed_basis.as_ref() == Some(&failed.basis) {
@@ -688,6 +710,9 @@ impl ProjectionScheduler {
                     // `start_job` and cleared only on success, per its
                     // field doc.
                     self.failed_attempts = 1;
+                }
+                if resumed_repair {
+                    self.failed_attempts = PROJECTION_LANE_ATTEMPT_BUDGET;
                 }
                 self.last_failed_basis = Some(failed.basis);
                 // ADR-0045 decision 3 (audio-graph-bf5d): arm exactly one
@@ -841,6 +866,7 @@ impl ProjectionScheduler {
         priority: ProjectionPriority,
         now_ms: u64,
     ) -> ProjectionJob {
+        self.repair_job = None;
         self.next_job_index += 1;
         let job = ProjectionJob {
             id: self.current_job_id(),
@@ -923,6 +949,35 @@ impl ProjectionScheduler {
         } else {
             ProjectionCoalescingReason::TtftWindow
         }
+    }
+
+    /// Consume the outstanding gaps once for this capture, even at an already covered basis.
+    #[cfg(test)]
+    fn take_resume_repair(
+        &mut self,
+        ledger: &TranscriptLedger,
+        now_ms: u64,
+    ) -> ProjectionSchedulerDecision {
+        if self.resume_gaps.is_empty()
+            || self.in_flight.is_some()
+            || self.session_id != ledger.session_id
+        {
+            return ProjectionSchedulerDecision::Idle;
+        }
+        self.take_resume_repair_at_basis(ledger.current_projection_basis(), now_ms)
+    }
+
+    fn take_resume_repair_at_basis(
+        &mut self,
+        basis: ProjectionBasis,
+        now_ms: u64,
+    ) -> ProjectionSchedulerDecision {
+        if basis.span_revisions.is_empty() {
+            return ProjectionSchedulerDecision::Idle;
+        }
+        let job = self.start_job(basis, ProjectionPriority::Background, now_ms);
+        self.repair_job = Some((job.id.clone(), std::mem::take(&mut self.resume_gaps)));
+        ProjectionSchedulerDecision::StartJob { job }
     }
 
     /// Per-lane half of [`ProjectionSchedulers::reseed_coverage_heads`]
@@ -1071,6 +1126,8 @@ pub struct SchedulerQueueState {
 pub struct ProjectionSchedulers {
     notes: ProjectionScheduler,
     graph: ProjectionScheduler,
+    coverage_check: Option<std::sync::Arc<()>>,
+    observed_while_checking: Option<ProjectionBasis>,
 }
 
 impl ProjectionSchedulers {
@@ -1079,6 +1136,8 @@ impl ProjectionSchedulers {
         Self {
             notes: ProjectionScheduler::new(session_id.clone(), ProjectionKind::Notes),
             graph: ProjectionScheduler::new(session_id, ProjectionKind::Graph),
+            coverage_check: None,
+            observed_while_checking: None,
         }
     }
 
@@ -1101,6 +1160,13 @@ impl ProjectionSchedulers {
         ledger: &TranscriptLedger,
         now_ms: u64,
     ) -> ProjectionSchedulersObservation {
+        if self.coverage_check.is_some() {
+            self.observed_while_checking = Some(ledger.current_projection_basis());
+            return ProjectionSchedulersObservation {
+                notes: ProjectionSchedulerDecision::Idle,
+                graph: ProjectionSchedulerDecision::Idle,
+            };
+        }
         ProjectionSchedulersObservation {
             notes: self.notes.observe_ledger(ledger, now_ms),
             graph: self.graph.observe_ledger(ledger, now_ms),
@@ -1331,6 +1397,117 @@ impl ProjectionSchedulers {
         }
     }
 
+    pub(crate) fn begin_coverage_check(&mut self) -> std::sync::Arc<()> {
+        self.clear_orphaned_deferred_retries();
+        self.notes.resume_gaps.clear();
+        self.graph.resume_gaps.clear();
+        self.observed_while_checking = None;
+        let check = std::sync::Arc::new(());
+        self.coverage_check = Some(check.clone());
+        check
+    }
+
+    pub(crate) fn owns_coverage_check(&self, session: &str, check: &std::sync::Arc<()>) -> bool {
+        self.notes.session_id == session
+            && self
+                .coverage_check
+                .as_ref()
+                .is_some_and(|active| std::sync::Arc::ptr_eq(active, check))
+    }
+
+    pub(crate) fn cancel_coverage_check(&mut self) {
+        self.coverage_check = None;
+        self.observed_while_checking = None;
+    }
+
+    /// The capture starts only after old workers drain. While the check is
+    /// pending, observations queue one fresh evaluation instead of launching jobs.
+    pub(crate) fn finish_coverage_check(
+        &mut self,
+        heads: (Option<ProjectionBasis>, Option<ProjectionBasis>),
+        [notes_gaps, graph_gaps]: [Vec<String>; 2],
+        verified: bool,
+        resume_basis: Option<ProjectionBasis>,
+        now_ms: u64,
+    ) -> ProjectionSchedulersObservation {
+        self.coverage_check = None;
+        let observed = self.observed_while_checking.take();
+        let finish =
+            |lane: &mut ProjectionScheduler, head: Option<ProjectionBasis>, gaps: Vec<String>| {
+                lane.last_completed_basis = head;
+                lane.resume_gaps = gaps;
+                if !verified {
+                    lane.last_failed_basis = None;
+                    lane.failed_attempts = 0;
+                    lane.deferred_retry_at_ms = None;
+                    lane.pending_since_ms = None;
+                    lane.in_flight = None;
+                    lane.pending_basis = None;
+                    lane.repair_job = None;
+                }
+                if lane.in_flight.is_some() {
+                    return ProjectionSchedulerDecision::Idle;
+                }
+                if !lane.resume_gaps.is_empty()
+                    && let Some(basis) = observed.as_ref().or(resume_basis.as_ref())
+                {
+                    return lane.take_resume_repair_at_basis(basis.clone(), now_ms);
+                }
+                if let Some(basis) = &observed
+                    && !basis.span_revisions.is_empty()
+                {
+                    return lane.observe_idle_basis(basis.clone(), now_ms);
+                }
+                ProjectionSchedulerDecision::Idle
+            };
+        ProjectionSchedulersObservation {
+            notes: finish(&mut self.notes, heads.0, notes_gaps),
+            graph: finish(&mut self.graph, heads.1, graph_gaps),
+        }
+    }
+
+    /// Seed the live session from one read of its accepted patches and recovery gaps.
+    #[cfg(test)]
+    pub(crate) fn attach_capture(
+        &mut self,
+        session: &str,
+        heads: (Option<ProjectionBasis>, Option<ProjectionBasis>),
+        notes_gaps: &[String],
+        graph_gaps: &[String],
+    ) -> Result<(), String> {
+        if self.notes.session_id != session || self.graph.session_id != session {
+            return Err("projection capture session changed".into());
+        }
+        self.clear_orphaned_deferred_retries();
+        self.reseed_coverage_heads(heads);
+        self.notes.resume_gaps = notes_gaps.to_vec();
+        self.graph.resume_gaps = graph_gaps.to_vec();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_capture_repairs(
+        &mut self,
+        ledger: &TranscriptLedger,
+        now_ms: u64,
+    ) -> ProjectionSchedulersObservation {
+        ProjectionSchedulersObservation {
+            notes: self.notes.take_resume_repair(ledger, now_ms),
+            graph: self.graph.take_resume_repair(ledger, now_ms),
+        }
+    }
+
+    pub(crate) fn repair_ids_for_job(&self, job: &ProjectionJob) -> &[String] {
+        let lane = match job.kind {
+            ProjectionKind::Notes => &self.notes,
+            ProjectionKind::Graph => &self.graph,
+        };
+        lane.repair_job
+            .as_ref()
+            .filter(|(id, _)| id == &job.id && lane.session_id == job.session_id)
+            .map_or(&[], |(_, ids)| ids.as_slice())
+    }
+
     /// ADR-0045 decision 6's disk-to-scheduler channel (audio-graph-5fd1):
     /// seed each lane's `last_completed_basis` from [`derive_coverage_heads`]'s
     /// output over the session's accepted `projection_patches` log. Callers
@@ -1438,6 +1615,71 @@ mod tests {
             asr_latency_ms: None,
             received_at_ms: 1_700_000_000_000 + revision_number,
         }
+    }
+
+    #[test]
+    fn capture_repair_bypasses_already_covered_basis_exactly_once_per_resume() {
+        let mut ledger = TranscriptLedger::new("orchard");
+        ledger.apply_event(event("oak", 1, "leaf")).unwrap();
+        let basis = ledger.current_projection_basis();
+        let heads = (Some(basis.clone()), Some(basis));
+        let ids = vec!["projection-gap-branch".to_string()];
+        let mut lanes = ProjectionSchedulers::new("orchard");
+        lanes
+            .attach_capture("orchard", heads.clone(), &ids, &[])
+            .unwrap();
+        let repairs = lanes.take_capture_repairs(&ledger, 1);
+        let ProjectionSchedulerDecision::StartJob { job } = repairs.notes else {
+            panic!("notes repair should start")
+        };
+        assert!(matches!(repairs.graph, ProjectionSchedulerDecision::Idle));
+        assert_eq!(lanes.repair_ids_for_job(&job), ids.as_slice());
+        assert!(matches!(
+            lanes.take_capture_repairs(&ledger, 2).notes,
+            ProjectionSchedulerDecision::Idle
+        ));
+        assert!(matches!(
+            lanes.fail_notes_in_flight(&job.id, "orchard", &ledger, 3),
+            ProjectionSchedulerDecision::FailedCurrent {
+                deferred_retry_at_ms: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            lanes.take_capture_repairs(&ledger, 4).notes,
+            ProjectionSchedulerDecision::Idle
+        ));
+        assert!(!matches!(
+            lanes.observe_ledger(&ledger, u64::MAX).notes,
+            ProjectionSchedulerDecision::StartJob { .. }
+        ));
+        lanes.attach_capture("orchard", heads, &ids, &[]).unwrap();
+        assert!(matches!(
+            lanes.take_capture_repairs(&ledger, 5).notes,
+            ProjectionSchedulerDecision::StartJob { .. }
+        ));
+    }
+
+    #[test]
+    fn another_sessions_gap_cannot_dispatch_a_capture_repair() {
+        let mut historical = TranscriptLedger::new("earlier");
+        historical.apply_event(event("oak", 1, "leaf")).unwrap();
+        let mut capture = ProjectionSchedulers::new("current");
+        let ids = vec!["projection-gap-branch".to_owned()];
+        assert!(
+            capture
+                .attach_capture(
+                    "earlier",
+                    (Some(historical.current_projection_basis()), None),
+                    &ids,
+                    &[]
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            capture.take_capture_repairs(&historical, 1).notes,
+            ProjectionSchedulerDecision::Idle
+        ));
     }
 
     fn partial_event(span_id: &str, revision_number: u64, text: &str) -> TranscriptEvent {
@@ -3326,6 +3568,7 @@ mod tests {
                 prompt_id: "coverage-head-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: Some(1_700_000_000_000 + sequence),
             generation_latency_ms: Some(500 + sequence),
@@ -3813,6 +4056,7 @@ mod tests {
                     prompt_id: "synth_v1".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 },
                 queued_at_ms: Some(queued_at_ms),
                 generation_latency_ms: Some(generation_latency_ms),

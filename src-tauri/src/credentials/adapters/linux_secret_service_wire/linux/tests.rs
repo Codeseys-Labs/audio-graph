@@ -10,8 +10,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use tokio::sync::oneshot;
+use zbus::connection::Builder;
 use zbus::message::{Flags, Type};
-use zbus::{Message, MessageStream};
+use zbus::{Connection, Message, MessageStream};
 
 pub(in crate::credentials::adapters) const GUARD: Duration = Duration::from_secs(15);
 pub(in crate::credentials::adapters) const ITEM_PATH: &str =
@@ -25,7 +26,7 @@ pub(in crate::credentials::adapters) const ATTRIBUTE: &str = "attribute canary t
 pub(in crate::credentials::adapters) const LOCATOR: &str = "locator_canary";
 
 pub(in crate::credentials::adapters) fn wanted() -> Attributes {
-    Attributes::from([("slot".to_owned(), ATTRIBUTE.to_owned())])
+    attributes_for(&crate::credentials::adapters::keyring_entry::EntryLocator::authority())
 }
 
 pub(in crate::credentials::adapters) struct Bus {
@@ -35,10 +36,10 @@ pub(in crate::credentials::adapters) struct Bus {
 }
 
 impl Bus {
-    pub(in crate::credentials::adapters) fn start() -> Self {
+    fn configure() -> Self {
         let root = std::env::temp_dir().join(format!("ag-bus-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).expect("create private bus directory");
-        let mut bus = Self {
+        let bus = Self {
             root,
             daemon: None,
             address: String::new(),
@@ -72,10 +73,15 @@ impl Bus {
             ),
         )
         .unwrap();
+        bus
+    }
+
+    pub(in crate::credentials::adapters) fn start() -> Self {
+        let mut bus = Self::configure();
         bus.daemon = Some(
             Command::new("dbus-daemon")
                 .arg("--config-file")
-                .arg(config)
+                .arg(bus.root.join("session.conf"))
                 .args(["--nofork", "--print-address=1"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -136,6 +142,8 @@ pub(in crate::credentials::adapters) enum Scenario {
     LockedItemMissing,
     UnlockedItemMissing,
     Disconnect,
+    AliasMovesAfterSession,
+    ServiceMovesAfterSession,
     Silent,
     SilentAtGet,
     CloseFails,
@@ -159,6 +167,13 @@ pub(in crate::credentials::adapters) enum Call {
     Dismiss,
 }
 
+#[derive(Clone, Copy)]
+enum Identity {
+    Gnome,
+    Missing,
+    Different,
+}
+
 struct Peer {
     stop: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<Vec<Call>>>,
@@ -166,12 +181,16 @@ struct Peer {
 
 impl Peer {
     fn start(bus: &Bus, scenario: Scenario) -> Self {
+        Self::start_with_identity(bus, scenario, Identity::Gnome)
+    }
+
+    fn start_with_identity(bus: &Bus, scenario: Scenario, identity: Identity) -> Self {
         let (stop, stopped) = oneshot::channel();
         let (ready, response) = mpsc::sync_channel(1);
         let address = bus.address();
         let peer = thread::spawn(move || {
             zbus::block_on(async {
-                let connection = Builder::address(address)
+                let connection = Builder::address(address.clone())
                     .build()
                     .await
                     .expect("fake bus client");
@@ -180,6 +199,18 @@ impl Peer {
                     .request_name(SERVICE_NAME)
                     .await
                     .expect("own service name");
+                let mut other_owner = match identity {
+                    Identity::Gnome => {
+                        connection.request_name(GNOME_NAME).await.unwrap();
+                        None
+                    }
+                    Identity::Missing => None,
+                    Identity::Different => {
+                        let other = Builder::address(address.clone()).build().await.unwrap();
+                        other.request_name(GNOME_NAME).await.unwrap();
+                        Some(other)
+                    }
+                };
                 ready.send(()).unwrap();
                 let mut calls = Vec::new();
                 let mut key = None;
@@ -200,8 +231,23 @@ impl Peer {
                         connection.close().await.expect("close peer mid-call");
                         break;
                     }
+                    if call == Call::Session {
+                        let moved_name = match scenario {
+                            Scenario::AliasMovesAfterSession => Some(GNOME_NAME),
+                            Scenario::ServiceMovesAfterSession => Some(SERVICE_NAME),
+                            _ => None,
+                        };
+                        if let Some(moved_name) = moved_name {
+                            connection.release_name(moved_name).await.unwrap();
+                            let replacement =
+                                Builder::address(address.clone()).build().await.unwrap();
+                            replacement.request_name(moved_name).await.unwrap();
+                            other_owner = Some(replacement);
+                        }
+                    }
                     serve(&connection, &message, call, scenario, &mut key, &calls).await;
                 }
+                drop(other_owner);
                 calls
             })
         });
@@ -585,6 +631,87 @@ fn assert_missing_outcome(scenario: Scenario, expected: Result<bool, Failure>, c
 }
 
 #[test]
+fn ordinary_operations_refuse_missing_or_different_gnome_owner_without_service_calls() {
+    use crate::credentials::adapters::native_interaction::NativeInteractionGate;
+    use mutations::{Mutation, mutate_at};
+
+    for identity in [Identity::Missing, Identity::Different] {
+        let bus = Bus::start();
+        let peer = Peer::start_with_identity(&bus, Scenario::Found, identity);
+        let attributes = wanted();
+        assert_eq!(
+            read_at(bus.address(), &attributes, DEADLINE).unwrap_err().0,
+            Failure::Unsupported
+        );
+        for mutation in [
+            Mutation::Write(Zeroizing::new(b"fixture secret".to_vec())),
+            Mutation::Delete,
+        ] {
+            let mut lease = NativeInteractionGate::isolated_for_test()
+                .acquire()
+                .unwrap();
+            let (prompt, invocation) = lease.mutation_capabilities();
+            assert_eq!(
+                mutate_at(
+                    bus.address(),
+                    prompt,
+                    invocation,
+                    &attributes,
+                    mutation,
+                    DEADLINE,
+                    None
+                ),
+                Err(WireError(Failure::Unsupported))
+            );
+        }
+        assert!(peer.finish().is_empty());
+    }
+}
+
+#[test]
+fn a_second_read_rechecks_the_names_after_an_owner_change() {
+    let bus = Bus::start();
+    let original = Peer::start(&bus, Scenario::Found);
+    assert!(
+        read_at(bus.address(), &wanted(), DEADLINE)
+            .unwrap()
+            .is_some()
+    );
+    assert!(original.finish().contains(&Call::Secret));
+    let replacement = Peer::start_with_identity(&bus, Scenario::Found, Identity::Different);
+    assert_eq!(
+        read_at(bus.address(), &wanted(), DEADLINE).unwrap_err().0,
+        Failure::Unsupported
+    );
+    assert!(replacement.finish().is_empty());
+}
+
+#[test]
+fn an_owner_change_after_open_session_refuses_get_secret_and_closes_the_original_session() {
+    for scenario in [
+        Scenario::AliasMovesAfterSession,
+        Scenario::ServiceMovesAfterSession,
+    ] {
+        let bus = Bus::start();
+        let peer = Peer::start(&bus, scenario);
+        assert_eq!(
+            read_at(bus.address(), &wanted(), DEADLINE).unwrap_err().0,
+            Failure::Unsupported
+        );
+        assert_eq!(
+            peer.finish(),
+            [
+                Call::Search,
+                Call::Attributes,
+                Call::Locked,
+                Call::Session,
+                Call::Close
+            ]
+        );
+    }
+}
+
+#[test]
 fn reads_default_alias_explicitly() {
     let bus = Bus::start();
     let peer = Peer::start(&bus, Scenario::Found);
@@ -725,27 +852,44 @@ fn plain_worker_thread_can_read_while_tokio_is_running() {
 }
 
 #[test]
-fn current_thread_tokio_keeps_running_during_spawn_blocking_read() {
+fn runtime_contexts_refuse_blocking_facades_without_sending_messages() {
     let bus = Bus::start();
     let peer = Peer::start(&bus, Scenario::Found);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .unwrap();
-    let address = bus.address();
-    let read = runtime.block_on(async {
+    let read = |context| {
+        read_at(bus.address(), &wanted(), DEADLINE)
+            .expect_err(context)
+            .0
+    };
+    runtime.block_on(async {
+        assert_eq!(read("Tokio task"), Failure::Unsupported);
+        let address = bus.address();
         let worker = tokio::task::spawn_blocking(move || read_at(address, &wanted(), DEADLINE));
-        tokio::time::timeout(GUARD, worker).await
+        let read = tokio::time::timeout(GUARD, worker).await.unwrap().unwrap();
+        assert_eq!(read.unwrap_err().0, Failure::Unsupported);
     });
     runtime.shutdown_timeout(GUARD);
-    assert!(
-        read.expect("runtime deadline")
-            .expect("blocking worker")
+    let address = bus.address();
+    let code = zbus::block_on(async {
+        zruntime::spawn(async move { read_at(address, &wanted(), DEADLINE).unwrap_err().0 })
+            .await
             .unwrap()
-            .is_some()
-    );
-    assert_eq!(peer.finish().last(), Some(&Call::Close));
+    });
+    assert_eq!(code, Failure::Unsupported);
+    let local = zruntime::LocalRuntime::new().unwrap();
+    let address = bus.address();
+    let task = local.spawn("test runtime guard", async move {
+        read_at(address, &wanted(), DEADLINE)
+            .expect_err("zruntime local task")
+            .0
+    });
+    assert_eq!(local.block_on(task).unwrap(), Failure::Unsupported);
+    assert!(peer.finish().is_empty());
 }
 
-#[path = "linux_secret_service_mutations_tests.rs"]
 mod mutation_tests;
+
+mod qualification_tests;
