@@ -615,6 +615,43 @@ impl ProjectionRuntimeHandle {
         )
     }
 
+    /// Commit a worker result while its immutable job still owns this lane.
+    /// ASR observation takes the same ledger -> scheduler lock order.
+    pub(crate) fn apply_projection_job_patch(
+        &self,
+        schedulers: &Mutex<ProjectionSchedulers>,
+        job: &crate::projections::ProjectionJob,
+        patch: ProjectionPatch,
+    ) -> Option<Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError>> {
+        let ledger = self
+            .transcript_ledger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let owner = schedulers.lock().unwrap_or_else(|p| p.into_inner());
+        if ledger.session_id != job.session_id
+            || !owner.owns_in_flight(&job.kind, &job.id, &job.session_id)
+        {
+            return None;
+        }
+        if patch.kind != job.kind {
+            return Some(Err(ProjectionRuntimeApplyError::Apply {
+                error: ProjectionApplyError::WrongKind {
+                    expected: job.kind.clone(),
+                    actual: patch.kind,
+                },
+            }));
+        }
+        let repository = FileMemoryRepository::user_data();
+        Some(self.apply_runtime_projection_patch_with_ledger_and_savers(
+            &job.session_id,
+            &job.basis,
+            patch,
+            &ledger,
+            |id, notes| repository.save_materialized_notes(id, notes),
+            |id, graph| repository.save_materialized_graph(id, graph),
+        ))
+    }
+
     fn apply_runtime_projection_patch_with_savers<SaveNotes, SaveGraph>(
         &self,
         expected_session_id: &str,

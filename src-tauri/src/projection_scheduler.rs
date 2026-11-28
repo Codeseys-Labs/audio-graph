@@ -305,6 +305,8 @@ pub struct ProjectionScheduler {
     // Like `failed_attempts`, only meaningful while `last_failed_basis` is
     // `Some`; `observe_ledger`'s same-basis branch is the only reader.
     deferred_retry_at_ms: Option<u64>,
+    // Diagnostics for the current stop, cleared when transcription restarts.
+    discarded_retry_at_stop_ms: Option<u64>,
     // Contract (shared with the render ticket, audio-graph-1e1e): stamped in
     // `start_job` the first time a basis goes pending (only when currently
     // `None`), so it survives retries/follow-ups/repairs without resetting.
@@ -356,6 +358,7 @@ impl ProjectionScheduler {
             last_failed_basis: None,
             failed_attempts: 0,
             deferred_retry_at_ms: None,
+            discarded_retry_at_stop_ms: None,
             pending_since_ms: None,
             metrics: ProjectionSchedulerMetrics::default(),
         }
@@ -805,89 +808,31 @@ impl ProjectionScheduler {
     /// immediately due (`deferred_retry_at_ms: None` is already handled as
     /// due, defense-in-depth, by the same-basis branch above) instead of
     /// waiting on a clock that will never fire.
-    pub fn abandon_deferred_retry(&mut self, deferred_retry_at_ms: u64) {
-        if self.deferred_retry_at_ms == Some(deferred_retry_at_ms) {
-            self.deferred_retry_at_ms = None;
+    fn abandon_deferred_retry(&mut self, failed_job_id: &str, deferred_retry_at_ms: u64) {
+        if self.deferred_retry_at_ms == Some(deferred_retry_at_ms)
+            && self.current_job_id() == failed_job_id
+        {
+            self.discarded_retry_at_stop_ms = self.deferred_retry_at_ms.take();
         }
     }
 
-    /// True when this lane still carries an armed deferred-retry deadline
-    /// (`deferred_retry_at_ms.is_some()`) with no clock thread left alive to
-    /// fire it.
-    ///
-    /// audio-graph-fa56: the sole production caller is
-    /// [`ProjectionSchedulers::kinds_with_armed_deferred_retry`], invoked
-    /// from `stop_capture_impl` strictly AFTER `drain_projection_job_workers`
-    /// has returned. At that point every `spawn_deferred_lane_observation`
-    /// clock thread for this Stop has either exited or, if
-    /// `drain_projection_job_workers` hit its `PROJECTION_JOB_FLUSH_TIMEOUT`
-    /// deadline and spilled an un-joined handle into
-    /// `retired_session_workers`, can no longer fire a retry even if still
-    /// technically running — either it fired (which, if it re-failed under
-    /// budget, arms a NEW deferral through `dispatch_projection_decision`,
-    /// itself discarded post-stopping via `abandon_discarded_deferred_retry`,
-    /// clearing this field back to `None`) or it observed
-    /// `projection_lane_stopping` and returned without touching scheduler
-    /// state at all (`clear_orphaned_deferred_retry`'s doc comment
-    /// establishes the same invariant for the symmetric restart-time sweep).
-    /// So `true` here, read after the drain, can only mean one thing: a
-    /// same-basis failure armed this deferral under
-    /// `PROJECTION_LANE_ATTEMPT_BUDGET`, and the clock that would have fired
-    /// it exited early because Stop began first — exactly the abandoned-retry
-    /// gap field evidence surfaced (session c95d21e6, build c9f167e).
-    ///
-    /// Known blind spot (undisclosed until this note — see
-    /// audio-graph-fa56's review): `false` does NOT mean "nothing was lost".
-    /// A projection job still in flight when Stop begins can finish and fail
-    /// DURING the drain, arming a deferral via `fail_in_flight` that
-    /// `dispatch_projection_decision`'s stopping check then immediately
-    /// discards via `abandon_discarded_deferred_retry` — clearing this field
-    /// back to `None` before this method is ever called. That path leaves
-    /// the exact same user-facing gap (a failed apply near Stop whose retry
-    /// never runs) with only a `log::debug!` signal, invisible to both this
-    /// method and the WARN it feeds. Closing that hole needs a signal at the
-    /// discard site itself, not here; tracked as a follow-up, out of scope
-    /// for the detection primitive this method provides.
+    /// A deadline is armed only while the scheduler can still fire it.
     pub fn has_armed_deferred_retry(&self) -> bool {
         self.deferred_retry_at_ms.is_some()
     }
 
-    /// Unconditionally clear a still-armed deferred retry — the restart-time
-    /// half of audio-graph-1609's deferral-orphan fix, invoked by
-    /// [`ProjectionSchedulers::clear_orphaned_deferred_retries`]. Unlike
-    /// [`Self::abandon_deferred_retry`], this does not match a specific
-    /// deadline value: on the `stop_capture_impl` → `start_transcribe`
-    /// restart route, ALL `projection-retry-<kind>` clock threads for the
-    /// PRIOR Stop have already been joined by `stop_capture_impl`'s drain
-    /// before this can run, so any `deferred_retry_at_ms` still set at this
-    /// point has no clock behind it no matter how it got there — whether
-    /// `dispatch_projection_decision` discarded the clock-spawn before it
-    /// ever started, or the clock thread itself spawned and then quit early
-    /// on its own `projection_lane_stopping` check
-    /// (`spawn_deferred_lane_observation`'s two self-exit points, neither of
-    /// which mutates scheduler state).
-    ///
-    /// That "no clock alive" invariant does NOT hold on the
-    /// `stop_transcribe` → `start_transcribe` route: `stop_transcribe` joins
-    /// only the sp/asr threads, never drains `projection_job_workers`, and
-    /// never sets `projection_lane_stopping`, so a still-armed deferred
-    /// retry's clock can legitimately be alive when this sweep runs and
-    /// clears the deadline out from under it. That is still safe — the
-    /// clock fires at its original deadline regardless, and
-    /// `deferred_retry_at_ms: None` is already treated as immediately due
-    /// by the same-basis branch in `observe_ledger` (defense-in-depth,
-    /// documented on `abandon_deferred_retry` above) — but the safety here
-    /// rests on that None-is-due handling plus observing against current
-    /// truth, not on no clock existing. Do not simplify this method (e.g. by
-    /// also clearing `last_failed_basis`, or by treating the same-basis
-    /// branch as unreachable) on the assumption that no clock can be alive
-    /// when it runs.
-    ///
-    /// Same field-touching contract as `abandon_deferred_retry`: only
-    /// `deferred_retry_at_ms` moves, `last_failed_basis`/`failed_attempts`
-    /// stay exactly as the last real failure left them.
     fn clear_orphaned_deferred_retry(&mut self) {
         self.deferred_retry_at_ms = None;
+        self.discarded_retry_at_stop_ms = None;
+    }
+
+    fn current_job_id(&self) -> String {
+        format!(
+            "projection:{}:{}:{}",
+            self.session_id,
+            projection_kind_key(&self.kind),
+            self.next_job_index
+        )
     }
 
     fn start_job(
@@ -898,12 +843,7 @@ impl ProjectionScheduler {
     ) -> ProjectionJob {
         self.next_job_index += 1;
         let job = ProjectionJob {
-            id: format!(
-                "projection:{}:{}:{}",
-                self.session_id,
-                projection_kind_key(&self.kind),
-                self.next_job_index
-            ),
+            id: self.current_job_id(),
             session_id: self.session_id.clone(),
             kind: self.kind.clone(),
             basis,
@@ -1119,15 +1059,8 @@ pub struct SchedulerQueueState {
     pub notes_in_flight: Option<crate::projections::ProjectionJob>,
     pub graph_pending_basis: Option<crate::projections::ProjectionBasis>,
     pub graph_in_flight: Option<crate::projections::ProjectionJob>,
-    /// audio-graph-fa56: mirrors [`ProjectionScheduler::has_armed_deferred_retry`]
-    /// at snapshot time. A snapshot written by a pre-fa56 build is missing
-    /// this key entirely and still deserializes as `None` — i.e. "no
-    /// deferral known to be armed", the same conservative reading an absent
-    /// WARN line would get. `#[serde(default)]` documents that contract
-    /// explicitly; see `scheduler_queue_state_deserializes_pre_fa56_snapshots_missing_deferred_retry_fields`
-    /// for why it is not the mechanism actually providing it (`Option<T>`
-    /// fields already default on a missing key in this repo's serde
-    /// version).
+    /// Active deadline, or the deadline discarded during the stop drain.
+    /// Missing in older snapshots. Both lanes use these values only for diagnostics.
     #[serde(default)]
     pub notes_deferred_retry_at_ms: Option<u64>,
     #[serde(default)]
@@ -1233,10 +1166,19 @@ impl ProjectionSchedulers {
     /// [`ProjectionScheduler::abandon_deferred_retry`] (audio-graph-1609) —
     /// the sole entry point `dispatch_projection_decision` uses to release an
     /// armed-but-never-clocked deferral on the same discard path.
-    pub fn abandon_deferred_retry(&mut self, kind: &ProjectionKind, deferred_retry_at_ms: u64) {
+    pub fn abandon_deferred_retry(
+        &mut self,
+        kind: &ProjectionKind,
+        failed_job_id: &str,
+        deferred_retry_at_ms: u64,
+    ) {
         match kind {
-            ProjectionKind::Notes => self.notes.abandon_deferred_retry(deferred_retry_at_ms),
-            ProjectionKind::Graph => self.graph.abandon_deferred_retry(deferred_retry_at_ms),
+            ProjectionKind::Notes => self
+                .notes
+                .abandon_deferred_retry(failed_job_id, deferred_retry_at_ms),
+            ProjectionKind::Graph => self
+                .graph
+                .abandon_deferred_retry(failed_job_id, deferred_retry_at_ms),
         }
     }
 
@@ -1253,24 +1195,7 @@ impl ProjectionSchedulers {
         self.graph.clear_orphaned_deferred_retry();
     }
 
-    /// Kinds whose lane still carries an armed deferred retry after Stop
-    /// (audio-graph-fa56) — see
-    /// [`ProjectionScheduler::has_armed_deferred_retry`] for why reading this
-    /// is only safe to interpret as "abandoned, not merely not-yet-due" when
-    /// called after `drain_projection_job_workers` has returned. Order is
-    /// fixed (Notes, then Graph) so a caller logging the returned `Vec` gets
-    /// a stable, content-free rendering.
-    ///
-    /// `stop_capture_impl` uses this to emit a single count-only WARN naming
-    /// the abandoned lane(s) — the clock thread's own debug-level exit log
-    /// (`spawn_deferred_lane_observation`, speech/mod.rs) is easy to miss
-    /// under the default log filter; this is the visible signal a support
-    /// session or a future replay/audit pass can grep for. The WARN's log
-    /// line is not the only durable artifact of this state: `snapshot_queue`
-    /// separately captures each lane's raw `deferred_retry_at_ms` (not just
-    /// this bool), and `stop_capture_impl` persists that snapshot to disk in
-    /// the same post-drain step, so a session that ends without ever
-    /// rotating still leaves the gap detectable from disk.
+    /// Inspect live clocks independently of the stop diagnostic snapshot.
     pub fn kinds_with_armed_deferred_retry(&self) -> Vec<ProjectionKind> {
         let mut kinds = Vec::new();
         if self.notes.has_armed_deferred_retry() {
@@ -1395,8 +1320,14 @@ impl ProjectionSchedulers {
             notes_in_flight: self.notes.in_flight.clone(),
             graph_pending_basis: self.graph.pending_basis.clone(),
             graph_in_flight: self.graph.in_flight.clone(),
-            notes_deferred_retry_at_ms: self.notes.deferred_retry_at_ms,
-            graph_deferred_retry_at_ms: self.graph.deferred_retry_at_ms,
+            notes_deferred_retry_at_ms: self
+                .notes
+                .deferred_retry_at_ms
+                .or(self.notes.discarded_retry_at_stop_ms),
+            graph_deferred_retry_at_ms: self
+                .graph
+                .deferred_retry_at_ms
+                .or(self.graph.discarded_retry_at_stop_ms),
         }
     }
 
@@ -1833,6 +1764,41 @@ mod tests {
             scheduler.complete_in_flight(&active_job_id, "session-2", &ledger, 40),
             ProjectionSchedulerDecision::CompletedCurrent { .. }
         ));
+    }
+
+    #[test]
+    fn projection_old_success_and_failure_after_rotation_preserve_replacement() {
+        let mut lanes = ProjectionSchedulers::new("old");
+        let mut old_ledger = TranscriptLedger::new("old");
+        old_ledger
+            .apply_event(event("old-span", 1, "private old text"))
+            .unwrap();
+        let ProjectionSchedulerDecision::StartJob { job: old } =
+            lanes.observe_ledger(&old_ledger, 1).notes
+        else {
+            panic!("missing old job");
+        };
+        lanes.reset("new");
+        let mut new_ledger = TranscriptLedger::new("new");
+        new_ledger
+            .apply_event(event("new-span", 1, "private new text"))
+            .unwrap();
+        let ProjectionSchedulerDecision::StartJob { job: new } =
+            lanes.observe_ledger(&new_ledger, 2).notes
+        else {
+            panic!("missing replacement");
+        };
+        for late in [
+            lanes.complete_notes_in_flight(&old.id, &old.session_id, &new_ledger, 3),
+            lanes.fail_notes_in_flight(&old.id, &old.session_id, &new_ledger, 4),
+        ] {
+            assert!(
+                matches!(late, ProjectionSchedulerDecision::IgnoredSupersededCompletion { active_job_id: Some(ref id), .. } if id == &new.id)
+            );
+            assert!(!format!("{late:?}").contains("private"));
+        }
+        assert!(lanes.owns_in_flight(&new.kind, &new.id, &new.session_id));
+        assert_eq!(lanes.notes().metrics().superseded_completions_ignored, 2);
     }
 
     #[test]
@@ -2808,7 +2774,7 @@ mod tests {
         // The dispatcher never spawned the clock thread for this deferral
         // (the `projection_lane_stopping` check) — this is the abandon call
         // it makes on that path.
-        scheduler.abandon_deferred_retry(deferred_retry_at_ms);
+        scheduler.abandon_deferred_retry(&job_id, deferred_retry_at_ms);
 
         assert_eq!(
             scheduler.deferred_retry_at_ms, None,
@@ -2857,7 +2823,12 @@ mod tests {
         let current_deferred_retry_at_ms = stale_deferred_retry_at_ms + 1;
         scheduler.deferred_retry_at_ms = Some(current_deferred_retry_at_ms);
 
-        scheduler.abandon_deferred_retry(stale_deferred_retry_at_ms);
+        scheduler.abandon_deferred_retry(&job_id, stale_deferred_retry_at_ms);
+        scheduler.abandon_deferred_retry(
+            "projection:other-session:graph:1",
+            current_deferred_retry_at_ms,
+        );
+        assert_eq!(scheduler.discarded_retry_at_stop_ms, None);
 
         assert_eq!(
             scheduler.deferred_retry_at_ms,

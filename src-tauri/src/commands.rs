@@ -1211,97 +1211,23 @@ fn drain_projection_job_workers(
     }
 }
 
-/// audio-graph-fa56 field bug: a same-basis projection failure under
-/// `PROJECTION_LANE_ATTEMPT_BUDGET` arms exactly one deferred retry
-/// (ADR-0045 decision 3), fired by a one-shot clock thread
-/// (`spawn_deferred_lane_observation`, speech/mod.rs) unless a final ASR
-/// revision drives it event-driven first. That clock thread polls
-/// `projection_lane_stopping` and exits WITHOUT firing the retry the moment
-/// Stop is observed — correct, since firing it is a full re-GENERATION (a
-/// fresh LLM call via `generate_projection_patch`, not a cheap re-apply of
-/// an already-generated patch), and blocking Stop on an unbounded LLM call
-/// would blow well past the existing `PROJECTION_JOB_FLUSH_TIMEOUT` (20s)
-/// shutdown budget. But the ONLY signal that this happened was a
-/// `log::debug!` inside the clock thread itself — invisible under the
-/// default log filter, and exactly the line field evidence (session
-/// c95d21e6) had to go digging for.
-///
-/// Called strictly AFTER `drain_projection_job_workers` has returned (the
-/// caller's contract, not enforced here): at that point every
-/// `projection-retry-<kind>` clock thread for THIS Stop has either exited or
-/// — on the rare `PROJECTION_JOB_FLUSH_TIMEOUT` drain-timeout path — can no
-/// longer fire a retry even if still technically running, so a lane
-/// [`ProjectionSchedulers::kinds_with_armed_deferred_retry`] still reports
-/// is reliably "abandoned", never "still ticking" — see that method's doc
-/// and `ProjectionScheduler::has_armed_deferred_retry`'s for the full
-/// invariant (including its disclosed blind spot for jobs that fail and get
-/// discarded DURING the drain itself).
-///
-/// Logs a single count-only WARN naming the abandoned lane kind(s) — never
-/// the basis, transcript content, or generated patch (ADR-0025's
-/// counts-only-in-logs rule) — so a support session or a future replay/
-/// audit pass has a visible, greppable signal instead of a debug-level line
-/// that is easy to miss. Deliberately a no-op when no lane is armed: most
-/// Stops have nothing to report, and a WARN on every Stop would train
-/// operators to ignore it.
-///
-/// This is the "at minimum" fix (ticket audio-graph-fa56), which asked for
-/// both (a) a visible signal and (b) enough persisted state that a later
-/// session load or replay pass can detect the gap. Forcing a synchronous
-/// heal re-generation into the stop path was rejected (see the report) as
-/// both a shutdown-budget violation and a re-opening of
-/// `dispatch_projection_decision`'s `projection_lane_stopping` race guard
-/// (ADR-0045 decision 4 / audio-graph-9cc1), which is exactly the
-/// detached-thread teardown-ordering territory shared with seeds
-/// `audio-graph-64e3`/`audio-graph-84e0` this ticket is scoped to stay out
-/// of.
-///
-/// (b) is NOT satisfied by the log line alone: this also persists a
-/// [`crate::projection_scheduler::SchedulerQueueState`] diagnostics snapshot
-/// via `persistence::save_scheduler_queue_state` — the same disk artifact
-/// `state.rs`'s `rotate_session` already writes on every session rotation,
-/// extended (audio-graph-fa56) with `notes_deferred_retry_at_ms` /
-/// `graph_deferred_retry_at_ms` fields that mirror
-/// [`ProjectionSchedulers::kinds_with_armed_deferred_retry`]'s output.
-/// ADR-0045 decision 6 rejected reading this snapshot back into a live
-/// scheduler as a second authority — it did NOT reject writing to it, and
-/// the snapshot's writer/loader (`persistence::save_scheduler_queue_state`/
-/// `load_scheduler_queue_state`) already exist and already run in
-/// production today. So a session that ends at this Stop without ever
-/// rotating to a new session still leaves the gap detectable from disk, not
-/// only from the log line — best-effort, like every other
-/// `save_scheduler_queue_state` call: `save_json`'s error path only logs and
-/// never propagates, so a failed write here cannot fail or delay Stop.
-///
-/// One lock acquisition covers both the WARN's read and the snapshot build,
-/// so this adds no additional contention over the pre-fa56 baseline of zero
-/// reads here. It is not, however, a zero-cost no-op: the snapshot write is
-/// a real (small, local, synchronous) JSON file write, run on the same
-/// `spawn_blocking` thread as the drain immediately before it, not on the
-/// async executor.
-///
-/// Known gap, disclosed rather than fixed here (see
-/// [`ProjectionScheduler::has_armed_deferred_retry`]'s doc for the
-/// mechanism): a projection job still in flight when Stop begins can finish
-/// and fail *during* the drain this function runs after. That failure arms
-/// a deferral that `dispatch_projection_decision`'s `projection_lane_stopping`
-/// discard branch clears back to `None` via `abandon_discarded_deferred_retry`
-/// (speech/mod.rs) before this function ever runs — invisible to both the
-/// WARN below and the snapshot it persists, with only a `log::debug!` left
-/// behind. Closing that hole needs a signal at that discard site, not here.
+/// Report the lanes whose retry clocks stopped or were discarded during the drain.
+/// Persist the deadlines for diagnostics. Restart derives coverage from accepted patches.
 fn log_abandoned_deferred_retries_after_stop(
     schedulers: &Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
     session_id: &str,
 ) {
-    let (abandoned_kinds, snapshot) = {
-        let guard = schedulers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (
-            guard.kinds_with_armed_deferred_retry(),
-            guard.snapshot_queue(),
-        )
-    };
+    let snapshot = schedulers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .snapshot_queue();
+    let mut abandoned_kinds = Vec::new();
+    if snapshot.notes_deferred_retry_at_ms.is_some() {
+        abandoned_kinds.push(crate::projections::ProjectionKind::Notes);
+    }
+    if snapshot.graph_deferred_retry_at_ms.is_some() {
+        abandoned_kinds.push(crate::projections::ProjectionKind::Graph);
+    }
     if !abandoned_kinds.is_empty() {
         log::warn!(
             "projection_scheduler.deferred_retry_abandoned_at_stop abandoned_count={} kinds={:?}",
@@ -2698,21 +2624,6 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             .projection_schedulers
             .lock()
             .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?;
-        // audio-graph-1609 fold-in of the bf5d orphaned-deferral gap: sweep
-        // any deferred retry left armed by the prior Stop before reseeding.
-        // On the stop_capture_impl -> start_transcribe restart route this is
-        // sound because that drain already joined every
-        // `projection-retry-<kind>` clock thread, so no clock can possibly
-        // still be alive for either lane by this point, regardless of
-        // whether the deferral was orphaned by a
-        // `dispatch_projection_decision` discard or by the clock thread's
-        // own graceful stopping-check exit. On the stop_transcribe ->
-        // start_transcribe route (no capture stop in between) that
-        // clock-drain does NOT happen, so a still-armed clock can survive
-        // this sweep — see `ProjectionSchedulers::clear_orphaned_deferred_retries`
-        // for why clearing the deadline out from under a live clock is still
-        // safe (None-is-due handling in `observe_ledger`, not "no clock
-        // exists").
         schedulers.clear_orphaned_deferred_retries();
         schedulers.reseed_coverage_heads(heads);
     }
@@ -2974,6 +2885,10 @@ async fn stop_transcribe_impl(state: &AppState, app: &tauri::AppHandle) -> AppRe
     log::info!("stop_transcribe called");
     let _session_lifecycle = state.session_lifecycle.lock().await;
 
+    state.projection_lane_stopping.store(true, Ordering::SeqCst);
+    let projection_job_workers = state.projection_job_workers.clone();
+    let projection_schedulers = state.projection_schedulers.clone();
+
     // Signal the speech processor to stop via AtomicBool
     state.is_transcribing.store(false, Ordering::SeqCst);
 
@@ -2996,7 +2911,7 @@ async fn stop_transcribe_impl(state: &AppState, app: &tauri::AppHandle) -> AppRe
     let retired_speech_workers = state.retired_session_workers.clone();
     let display_transcript_write_misses = state.display_transcript_write_misses.clone();
     let stop_session_id = state.current_session_id();
-    let _ = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         if let Some(h) = sp {
             join_worker_with_timeout(
                 h,
@@ -3013,6 +2928,12 @@ async fn stop_transcribe_impl(state: &AppState, app: &tauri::AppHandle) -> AppRe
                 &retired_speech_workers,
             );
         }
+        drain_projection_job_workers(
+            &projection_job_workers,
+            PROJECTION_JOB_FLUSH_TIMEOUT,
+            &retired_speech_workers,
+        );
+        log_abandoned_deferred_retries_after_stop(&projection_schedulers, &stop_session_id);
         // audio-graph-64e3: `stop_capture_impl` is not the only session-end
         // transition that joins sp/asr through the same bounded-join/receiver
         // tail — a transcribe-only session ends here instead. Without this
@@ -3026,7 +2947,8 @@ async fn stop_transcribe_impl(state: &AppState, app: &tauri::AppHandle) -> AppRe
             &stop_session_id,
         );
     })
-    .await;
+    .await
+    .map_err(|error| AppError::Unknown(format!("Transcription worker drain failed: {error}")))?;
 
     // Update pipeline status — ASR and downstream stages go idle
     if let Ok(mut status) = state.pipeline_status.write() {
@@ -22236,6 +22158,307 @@ mod tests {
 
         drain_test_writers(&state);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn projection_start_job(
+        decision: crate::projection_scheduler::ProjectionSchedulerDecision,
+    ) -> crate::projections::ProjectionJob {
+        match decision {
+            crate::projection_scheduler::ProjectionSchedulerDecision::StartJob { job } => job,
+            other => panic!("expected a new projection job, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_apply_boundary_rejects_replaced_job_in_same_session() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("projection-apply-replacement");
+        let _guard = HomeGuard::set(&dir);
+        let state = AppState::new();
+        let session = state.current_session_id();
+        let (old, replacement) = {
+            let mut ledger = state.transcript_ledger.lock().unwrap();
+            ledger
+                .apply_event(projection_status_test_event("first"))
+                .unwrap();
+            let mut lanes = state.projection_schedulers.lock().unwrap();
+            let old = projection_start_job(lanes.observe_ledger(&ledger, 1).notes);
+            assert!(lanes.owns_in_flight(&old.kind, &old.id, &session));
+            lanes.reset(&session);
+            let new = projection_start_job(lanes.observe_ledger(&ledger, 2).notes);
+            (old, new)
+        };
+        let runtime = state.projection_runtime_handle();
+        let patch = report_note_patch(1, old.basis.clone(), "stale");
+        assert!(
+            runtime
+                .apply_projection_job_patch(&state.projection_schedulers, &old, patch)
+                .is_none()
+        );
+        assert_eq!(
+            runtime
+                .materialized_projection_snapshot()
+                .notes
+                .last_sequence,
+            0
+        );
+        assert!(state.projection_schedulers.lock().unwrap().owns_in_flight(
+            &replacement.kind,
+            &replacement.id,
+            &session
+        ));
+        drain_test_writers(&state);
+        assert!(
+            FileMemoryRepository::user_data()
+                .load_projection_patches(&session)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn projection_notes_and_graph_commit_under_concurrent_asr_observation() {
+        use crate::projection_scheduler::ProjectionSchedulerDecision::CompletedCurrent;
+        use crate::projections::ProjectionKind;
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("projection-concurrent-asr");
+        let _guard = HomeGuard::set(&dir);
+        let state = AppState::new();
+        let mut ledger = state.transcript_ledger.lock().unwrap();
+        ledger
+            .apply_event(projection_status_test_event("first"))
+            .unwrap();
+        let observation = state
+            .projection_schedulers
+            .lock()
+            .unwrap()
+            .observe_ledger(&ledger, 1);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (finished, results) = std::sync::mpsc::channel();
+        for decision in [observation.notes, observation.graph] {
+            let job = projection_start_job(decision);
+            let runtime = state.projection_runtime_handle();
+            let lanes = state.projection_schedulers.clone();
+            let transcript = state.transcript_ledger.clone();
+            let barrier = barrier.clone();
+            let finished = finished.clone();
+            std::thread::spawn(move || {
+                let patch = match job.kind {
+                    ProjectionKind::Notes => report_note_patch(1, job.basis.clone(), "current"),
+                    ProjectionKind::Graph => report_graph_patch(1, job.basis.clone()),
+                };
+                barrier.wait();
+                runtime
+                    .apply_projection_job_patch(&lanes, &job, patch)
+                    .unwrap()
+                    .unwrap();
+                let ledger = transcript.lock().unwrap();
+                let mut lanes = lanes.lock().unwrap();
+                let decision = match job.kind {
+                    ProjectionKind::Notes => {
+                        lanes.complete_notes_in_flight(&job.id, &job.session_id, &ledger, 3)
+                    }
+                    ProjectionKind::Graph => {
+                        lanes.complete_graph_in_flight(&job.id, &job.session_id, &ledger, 3)
+                    }
+                };
+                assert!(matches!(decision, CompletedCurrent { .. }));
+                finished.send(job.kind).unwrap();
+            });
+        }
+        barrier.wait();
+        // ASR owns the ledger first. Bound acquisition so a reversed lock
+        // order fails the test without wedging the rest of the suite.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(mut lanes) = state.projection_schedulers.try_lock() {
+                lanes.observe_ledger(&ledger, 2);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "scheduler held while waiting for ASR ledger"
+            );
+            std::thread::yield_now();
+        }
+        drop(ledger);
+        let wait = std::time::Duration::from_secs(5);
+        assert_ne!(
+            results.recv_timeout(wait).unwrap(),
+            results.recv_timeout(wait).unwrap()
+        );
+        let materialized = state
+            .projection_runtime_handle()
+            .materialized_projection_snapshot();
+        assert_eq!(
+            (
+                materialized.notes.last_sequence,
+                materialized.graph.last_sequence
+            ),
+            (1, 1)
+        );
+        drain_test_writers(&state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    #[allow(clippy::await_holding_lock)]
+    async fn stop_transcribe_drains_projection_workers_and_restart_reseeds_in_same_capture() {
+        use crate::projection_scheduler::ProjectionSchedulerDecision::{FailedCurrent, Idle};
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("stop-transcribe-reseed");
+        let _guard = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        let session = state.current_session_id();
+        *state.is_capturing.write().unwrap() = true;
+        state.is_transcribing.store(true, Ordering::SeqCst);
+        // A same-session restart begins with an already configured client.
+        {
+            let mut settings = state.app_settings.write().unwrap();
+            settings.privacy_mode = crate::settings::PrivacyMode::ByokCloud;
+            settings.asr_provider = crate::settings::AsrProvider::DeepgramStreaming {
+                api_key: "fixture".into(),
+                model: "nova-3".into(),
+                enable_diarization: true,
+                endpointing_ms: 300,
+                utterance_end_ms: 1000,
+                vad_events: true,
+                eot_threshold: 0.5,
+                eager_eot_threshold: 0.0,
+                eot_timeout_ms: 0,
+                max_speakers: 2,
+                keyterms: vec![],
+            };
+            settings.llm_provider = crate::settings::LlmProvider::Api {
+                endpoint: crate::settings::CEREBRAS_BASE_URL.into(),
+                api_key: "fixture".into(),
+                model: audio_graph_provider_registry::CEREBRAS_DEFAULT_MODEL.into(),
+            };
+        }
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| sync_llm_api_client_from_settings_cache(&state))
+                .join()
+                .unwrap()
+                .unwrap();
+        });
+        let (notes, graph) = {
+            let mut ledger = state.transcript_ledger.lock().unwrap();
+            ledger
+                .apply_event(projection_status_test_event("first"))
+                .unwrap();
+            let observation = state
+                .projection_schedulers
+                .lock()
+                .unwrap()
+                .observe_ledger(&ledger, 1);
+            (
+                projection_start_job(observation.notes),
+                projection_start_job(observation.graph),
+            )
+        };
+        state
+            .projection_runtime_handle()
+            .apply_projection_job_patch(
+                &state.projection_schedulers,
+                &notes,
+                report_note_patch(1, notes.basis.clone(), "accepted"),
+            )
+            .unwrap()
+            .unwrap();
+        state
+            .projection_schedulers
+            .lock()
+            .unwrap()
+            .abandon_in_flight(&notes.kind, &notes.id, &session);
+
+        // Establish an on-disk accepted patch with the real writer. Its
+        // BufWriter flushes on shutdown; keep the capture session writable.
+        {
+            let mut writer = state.projection_event_writer.lock().unwrap();
+            assert!(
+                writer
+                    .take()
+                    .unwrap()
+                    .shutdown_with_timeout(std::time::Duration::from_secs(3))
+            );
+            *writer = Some(crate::persistence::ProjectionEventWriter::spawn(&session).unwrap());
+        }
+
+        let stopping = state.projection_lane_stopping.clone();
+        let lanes = state.projection_schedulers.clone();
+        let transcript = state.transcript_ledger.clone();
+        let old = graph.clone();
+        let worker = std::thread::spawn(move || {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !stopping.load(Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "stop fence was never set"
+                );
+                std::thread::yield_now();
+            }
+            let ledger = transcript.lock().unwrap();
+            let mut lanes = lanes.lock().unwrap();
+            let FailedCurrent {
+                deferred_retry_at_ms: Some(due),
+                ..
+            } = lanes.fail_graph_in_flight(&old.id, &old.session_id, &ledger, 2)
+            else {
+                panic!("expected retry");
+            };
+            lanes.abandon_deferred_retry(&old.kind, &old.id, due);
+        });
+        state.projection_job_workers.lock().unwrap().push((
+            graph.kind.clone(),
+            graph.id.clone(),
+            worker,
+        ));
+        stop_transcribe_impl(&state, &app).await.unwrap();
+        assert!(*state.is_capturing.read().unwrap());
+        assert_eq!(state.current_session_id(), session);
+        assert!(state.projection_lane_stopping.load(Ordering::SeqCst));
+        assert!(state.projection_job_workers.lock().unwrap().is_empty());
+        ensure_session_workers_quiesced(&state).unwrap();
+        let saved = crate::persistence::load_scheduler_queue_state(&session).unwrap();
+        assert!(saved.graph_deferred_retry_at_ms.is_some());
+        assert!(saved.notes_deferred_retry_at_ms.is_none());
+
+        // Stand in for the audio consumer while the real Start command runs.
+        *state.speech_processor_thread.lock().unwrap() = Some(std::thread::spawn(|| {}));
+        start_transcribe(manager.state::<AppState>(), app.clone())
+            .await
+            .unwrap();
+        assert!(state.is_transcribing.load(Ordering::SeqCst));
+        assert!(!state.projection_lane_stopping.load(Ordering::SeqCst));
+        let ledger = state.transcript_ledger.lock().unwrap();
+        let mut lanes = state.projection_schedulers.lock().unwrap();
+        let observed = lanes.observe_ledger(&ledger, 3);
+        assert!(matches!(observed.notes, Idle));
+        let retry = projection_start_job(observed.graph);
+        assert_eq!(retry.session_id, session);
+        assert_ne!(retry.id, graph.id);
+        assert!(lanes.owns_in_flight(&retry.kind, &retry.id, &session));
+        assert!(lanes.snapshot_queue().graph_deferred_retry_at_ms.is_none());
+        drop(lanes);
+        drop(ledger);
+        stop_transcribe_impl(&state, &app).await.unwrap();
+        drain_test_writers(&state);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// audio-graph-64e3 (finding: stop_transcribe never read the counter):
