@@ -3545,19 +3545,23 @@ pub async fn configure_api_endpoint(
 // Chat commands (backed by native LLM engine or API client)
 // ---------------------------------------------------------------------------
 
+/// One chat request: the messages to send (the stored history plus
+/// `user_turn`), its graph + transcript system context, and the history
+/// generation those messages were read at. The history itself is left
+/// untouched until the call succeeds (see [`record_chat_turns`]).
+struct PreparedChat {
+    messages: Vec<ChatMessage>,
+    graph_context: String,
+    user_turn: ChatMessage,
+    history_generation: u64,
+}
+
 /// Build the per-request graph + transcript context block used as the chat
-/// system prompt, and the message list for this request.
-///
-/// Returns `(messages, graph_context, user_turn)` ready to feed either the
-/// streaming or blocking chat path. `messages` is the stored history plus
-/// `user_turn`; the history itself is left untouched until the call
-/// succeeds (see [`push_chat_turn`]). Locks are taken under short critical
-/// sections and released before any string formatting (I4 fix carried over
-/// from the legacy `send_chat_message` body).
-fn prepare_chat_request(
-    state: &AppState,
-    message: String,
-) -> Result<(Vec<ChatMessage>, String, ChatMessage), String> {
+/// system prompt, and the message list for this request, ready to feed
+/// either the streaming or blocking chat path. Locks are taken under short
+/// critical sections and released before any string formatting (I4 fix
+/// carried over from the legacy `send_chat_message` body).
+fn prepare_chat_request(state: &AppState, message: String) -> Result<PreparedChat, String> {
     let snapshot = {
         let kg = state
             .knowledge_graph
@@ -3598,66 +3602,65 @@ fn prepare_chat_request(
         role: "user".to_string(),
         content: message,
     };
-    let mut messages: Vec<ChatMessage> = state
-        .chat_history
-        .read()
-        .map_err(|e| format!("Lock error: {}", e))?
-        .clone();
+    let (mut messages, history_generation) = {
+        let history = state
+            .chat_history
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        (history.messages().to_vec(), history.generation())
+    };
     messages.push(user_turn.clone());
-    cap_chat_history(&mut messages);
-    Ok((messages, graph_context, user_turn))
+    crate::state::cap_chat_messages(&mut messages);
+    Ok(PreparedChat {
+        messages,
+        graph_context,
+        user_turn,
+        history_generation,
+    })
 }
 
-/// Append one finished chat turn. A failed call appends nothing, neither its
-/// user message nor any partial reply, so the next request replays exactly
-/// the history that preceded the failed one.
-fn push_chat_turn(
-    history: &mut Vec<ChatMessage>,
-    user_turn: ChatMessage,
-    assistant_turn: Option<ChatMessage>,
+/// Record a finished request's turns, unless the chat was cleared or the
+/// session rotated (which clears it) since the request read its history at
+/// `generation`. A stale write is dropped, so a cleared message never comes
+/// back. A failed call records nothing, neither its user message nor any
+/// partial reply, so the next request replays exactly the history that
+/// preceded it.
+fn record_chat_turns(
+    history: &std::sync::RwLock<crate::state::ChatHistory>,
+    generation: u64,
+    turns: impl IntoIterator<Item = ChatMessage>,
 ) {
-    history.push(user_turn);
-    history.extend(assistant_turn);
-    cap_chat_history(history);
+    let mut history = history
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !history.append_if_current(generation, turns) {
+        log::info!("Chat history was cleared during the request; its turn is not recorded");
+    }
 }
 
-/// Record a finished turn in `state.chat_history` and return its assistant
-/// message.
+/// Record a finished turn and return its assistant message.
 fn record_chat_turn(
     state: &AppState,
+    generation: u64,
     user_turn: ChatMessage,
     reply: String,
-) -> Result<ChatMessage, String> {
+) -> ChatMessage {
     let assistant_turn = ChatMessage {
         role: "assistant".to_string(),
         content: reply,
     };
-    let mut history = state
-        .chat_history
-        .write()
-        .map_err(|e| format!("Lock error: {}", e))?;
-    push_chat_turn(&mut history, user_turn, Some(assistant_turn.clone()));
-    Ok(assistant_turn)
+    record_chat_turns(
+        &state.chat_history,
+        generation,
+        [user_turn, assistant_turn.clone()],
+    );
+    assistant_turn
 }
 
 fn llm_internal_diagnostic() -> RuntimeDiagnostic {
     RuntimeDiagnostic::internal(RuntimeDiagnosticContext::new(
         RuntimeOperation::LanguageModelInference,
     ))
-}
-
-/// Maximum chat messages retained in memory. Chat history is unbounded by
-/// nature (a long session could push thousands of turns) and is cloned whole
-/// into every chat request, so cap it to bound memory and prompt-build cost.
-/// Keeps the most recent messages.
-const MAX_CHAT_HISTORY: usize = 200;
-
-/// Trim `history` in place to the most recent [`MAX_CHAT_HISTORY`] messages.
-fn cap_chat_history(history: &mut Vec<ChatMessage>) {
-    if history.len() > MAX_CHAT_HISTORY {
-        let drop = history.len() - MAX_CHAT_HISTORY;
-        history.drain(0..drop);
-    }
 }
 
 /// Returns `true` when the active LLM provider has a streaming code path.
@@ -3754,24 +3757,20 @@ fn stream_params_from_settings(
 /// deltas/sec, so it uses `tauri::ipc::Channel` rather than
 /// `AppHandle::emit`). Removes the request from `state.stream_registry` on
 /// terminal so a stale id cannot be cancelled later. Only a completed or
-/// cancelled stream records `user_turn` in chat history.
+/// cancelled stream records its user turn in chat history.
 ///
 /// At most one active chat stream per session: any prior live registry entry
 /// is cancelled before the new stream registers (AUD-STR1 P1). The frontend
 /// tracks only a single `streamingChatRequestId`, so a stream left running
 /// from an earlier `start_streaming_chat` would burn tokens unreachably.
-#[allow(clippy::too_many_arguments)]
 fn spawn_stream_task(
     app: tauri::AppHandle,
     channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     state: &AppState,
     request_id: String,
     provider: crate::settings::LlmProvider,
-    history: Vec<ChatMessage>,
-    graph_context: String,
+    prepared: PreparedChat,
     settings: crate::settings::AppSettings,
-    user_turn: ChatMessage,
-    persist_to_history: bool,
 ) {
     use crate::events::ChatStreamFrame;
     use crate::llm::streaming::{
@@ -3798,7 +3797,13 @@ fn spawn_stream_task(
         &settings,
         provider.requires_cloud_content_transfer(),
     );
-    let request = StreamChatRequest::new(provider, history, graph_context, params)
+    let PreparedChat {
+        messages,
+        graph_context,
+        user_turn,
+        history_generation,
+    } = prepared;
+    let request = StreamChatRequest::new(provider, messages, graph_context, params)
         .with_content_egress_policy(content_egress_policy)
         .with_backend_handles(stream_backend_handles_from_state(state))
         .with_source_metadata(StreamSourceMetadata {
@@ -3890,16 +3895,17 @@ fn spawn_stream_task(
                     usage,
                     finish_reason,
                 } => {
-                    if persist_to_history && let Ok(mut history) = chat_history.write() {
-                        push_chat_turn(
-                            &mut history,
+                    record_chat_turns(
+                        &chat_history,
+                        history_generation,
+                        [
                             user_turn,
-                            Some(ChatMessage {
+                            ChatMessage {
                                 role: "assistant".to_string(),
                                 content: full_text.clone(),
-                            }),
-                        );
-                    }
+                            },
+                        ],
+                    );
                     if let Some(p) = pipe.take()
                         && let Err(e) = p.finish()
                     {
@@ -3948,9 +3954,7 @@ fn spawn_stream_task(
                 }
                 TokenDelta::Cancelled { full_text } => {
                     // A cancel keeps the user's turn but not the partial reply.
-                    if persist_to_history && let Ok(mut history) = chat_history.write() {
-                        push_chat_turn(&mut history, user_turn, None);
-                    }
+                    record_chat_turns(&chat_history, history_generation, [user_turn]);
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
@@ -4049,7 +4053,7 @@ pub async fn start_streaming_chat(
     }
 
     sync_llm_clients(state.inner()).await?;
-    let (messages, graph_context, user_turn) = prepare_chat_request(state.inner(), message)?;
+    let prepared = prepare_chat_request(state.inner(), message)?;
     let request_id = uuid::Uuid::new_v4().to_string();
     spawn_stream_task(
         app,
@@ -4057,11 +4061,8 @@ pub async fn start_streaming_chat(
         state.inner(),
         request_id.clone(),
         llm_provider,
-        messages,
-        graph_context,
+        prepared,
         settings,
-        user_turn,
-        true, // record the finished turn in chat history
     );
     Ok(request_id)
 }
@@ -4129,7 +4130,12 @@ pub async fn send_chat_message(
     }
 
     sync_llm_clients(state.inner()).await?;
-    let (messages, graph_context, user_turn) = prepare_chat_request(state.inner(), message)?;
+    let PreparedChat {
+        messages,
+        graph_context,
+        user_turn,
+        history_generation,
+    } = prepare_chat_request(state.inner(), message)?;
 
     // Streaming path — accumulate to full text via the same producer the
     // event-driven command uses. The shim doesn't fire IPC events itself;
@@ -4188,7 +4194,8 @@ pub async fn send_chat_message(
                     return Err(diagnostic.into());
                 }
                 TokenDelta::Cancelled { full_text: partial } => {
-                    let assistant_msg = record_chat_turn(state.inner(), user_turn, partial)?;
+                    let assistant_msg =
+                        record_chat_turn(state.inner(), history_generation, user_turn, partial);
                     // No usage signal: a cancelled stream is dropped before the
                     // terminal `usage` block arrives, so no real count exists.
                     return Ok(ChatResponse {
@@ -4198,7 +4205,8 @@ pub async fn send_chat_message(
                 }
             }
         }
-        let assistant_msg = record_chat_turn(state.inner(), user_turn, full_text)?;
+        let assistant_msg =
+            record_chat_turn(state.inner(), history_generation, user_turn, full_text);
         persist_llm_usage_for_session(&app, &state.current_session_id(), tokens_used);
         return Ok(ChatResponse {
             message: assistant_msg,
@@ -4225,7 +4233,12 @@ pub async fn send_chat_message(
         log::warn!("send_chat_message failed: {diagnostic}");
         AppError::from(diagnostic)
     })?;
-    let assistant_msg = record_chat_turn(state.inner(), user_turn, outcome.text)?;
+    let assistant_msg = record_chat_turn(
+        state.inner(),
+        history_generation,
+        user_turn,
+        outcome.text,
+    );
     persist_llm_usage_for_session(&app, &state.current_session_id(), outcome.tokens_used);
     Ok(ChatResponse {
         message: assistant_msg,
@@ -4330,7 +4343,7 @@ pub async fn get_chat_history(state: State<'_, AppState>) -> AppResult<Vec<ChatM
         .chat_history
         .read()
         .map_err(|e| format!("Lock error: {}", e))?;
-    Ok(history.clone())
+    Ok(history.messages().to_vec())
 }
 
 /// Clear the chat message history.
@@ -4718,11 +4731,10 @@ fn approve_agent_proposal_impl(
             .chat_history
             .write()
             .map_err(|e| format!("Lock error: {}", e))?;
-        history.push(ChatMessage {
+        history.append([ChatMessage {
             role: "assistant".to_string(),
             content: message.clone(),
-        });
-        cap_chat_history(&mut history);
+        }]);
     }
 
     events::emit_or_log(
@@ -19250,7 +19262,10 @@ mod tests {
                 state.speech_processor_thread.lock().unwrap().is_none(),
                 "{row}"
             );
-            assert!(state.chat_history.read().unwrap().is_empty(), "{row}");
+            assert!(
+                state.chat_history.read().unwrap().messages().is_empty(),
+                "{row}"
+            );
             assert!(*state.is_capturing.read().unwrap(), "{row}");
             assert_eq!(
                 state.capture_manager.lock().unwrap().active_captures(),
@@ -26585,7 +26600,7 @@ mod tests {
                 end_time: 2.0,
                 confidence: 0.9,
             });
-        *state.chat_history.write().unwrap() = vec![
+        state.chat_history.write().unwrap().append([
             ChatMessage {
                 role: "user".to_string(),
                 content: "earlier question".to_string(),
@@ -26594,12 +26609,12 @@ mod tests {
                 role: "assistant".to_string(),
                 content: "earlier answer".to_string(),
             },
-        ];
+        ]);
         chat_history_json(state)
     }
 
     fn chat_history_json(state: &AppState) -> serde_json::Value {
-        serde_json::to_value(&*state.chat_history.read().unwrap()).unwrap()
+        serde_json::to_value(state.chat_history.read().unwrap().messages()).unwrap()
     }
 
     type ChatFrames = tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>;
@@ -26771,8 +26786,9 @@ mod tests {
         // Neither failed call recorded a turn, so the next request sends the
         // earlier history plus only its own question.
         assert_eq!(chat_history_json(&state), prior);
-        let (next, _, _) = prepare_chat_request(&state, "next question".to_string())
-            .expect("prepare the next request");
+        let next = prepare_chat_request(&state, "next question".to_string())
+            .expect("prepare the next request")
+            .messages;
         let mut expected = prior.as_array().unwrap().clone();
         expected.push(serde_json::json!({ "role": "user", "content": "next question" }));
         assert_eq!(
@@ -26787,6 +26803,150 @@ mod tests {
             .take();
         drain_test_writers(&state);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    const CLEARED_QUESTION: &str = "question-the-user-cleared";
+
+    /// A provider stream that completes normally.
+    fn complete_sse_response(text: &str) -> String {
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// What happens to a streaming chat after it read the history and before
+    /// its task first runs. A current-thread runtime runs the spawned stream
+    /// task only at the test's next await, so each step lands inside the
+    /// request's lifetime, deterministically.
+    #[derive(Clone, Copy)]
+    enum MidStream {
+        Clear,
+        ClearThenCancel,
+        CancelThenRotate,
+    }
+
+    /// Stream a chat for [`CLEARED_QUESTION`], apply `step` mid-request, and
+    /// wait for the terminal frame. Returns that frame, the history
+    /// afterwards, and the messages the next request would send.
+    fn chat_with_mid_stream_step(
+        step: MidStream,
+        dir_name: &str,
+    ) -> (serde_json::Value, serde_json::Value, Vec<ChatMessage>) {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir(dir_name);
+        let _guard = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        seed_chat_session(&state);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let frame = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(complete_sse_response("the private answer")).await,
+            );
+            let (channel, mut frames) = recording_chat_channel();
+            let request_id = start_streaming_chat(
+                CLEARED_QUESTION.to_string(),
+                channel,
+                app.clone(),
+                manager.state(),
+            )
+            .await
+            .expect("the stream starts");
+            match step {
+                MidStream::Clear => clear_chat_history(manager.state()).await.expect("clear"),
+                MidStream::ClearThenCancel => {
+                    clear_chat_history(manager.state()).await.expect("clear");
+                    cancel_streaming_chat(request_id, manager.state())
+                        .await
+                        .expect("cancel");
+                }
+                MidStream::CancelThenRotate => {
+                    cancel_streaming_chat(request_id, manager.state())
+                        .await
+                        .expect("cancel");
+                    // The cancel already freed the registry slot, so the
+                    // rotation runs before the stream task records anything.
+                    ensure_session_idle_for_rotation(&state).expect("idle once cancelled");
+                    assert!(matches!(
+                        state.rotate_session("rotated-session"),
+                        crate::state::RotateOutcome::Rotated(_)
+                    ));
+                }
+            }
+            terminal_chat_frame(&mut frames).await
+        });
+        let history = chat_history_json(&state);
+        let next = prepare_chat_request(&state, "next question".to_string())
+            .expect("prepare the next request")
+            .messages;
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(dir);
+        (frame, history, next)
+    }
+
+    fn assert_cleared_question_stays_gone(history: &serde_json::Value, next: &[ChatMessage]) {
+        assert_eq!(history, &serde_json::json!([]), "history after the clear");
+        assert_eq!(
+            serde_json::to_value(next).unwrap(),
+            serde_json::json!([{ "role": "user", "content": "next question" }]),
+            "the next request carries only its own question"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_chat_that_completes_after_a_clear_records_nothing() {
+        let (frame, history, next) =
+            chat_with_mid_stream_step(MidStream::Clear, "chat-clear-then-complete");
+        assert_eq!(frame["event"], "done", "{frame}");
+        assert_eq!(frame["data"]["finish_reason"], "stop", "{frame}");
+        assert_cleared_question_stays_gone(&history, &next);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_chat_cancelled_after_a_clear_records_nothing() {
+        let (frame, history, next) =
+            chat_with_mid_stream_step(MidStream::ClearThenCancel, "chat-clear-then-cancel");
+        assert_eq!(frame["data"]["finish_reason"], "cancelled", "{frame}");
+        assert_cleared_question_stays_gone(&history, &next);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_cancelled_chat_records_nothing_into_a_session_that_rotated_first() {
+        let (frame, history, next) =
+            chat_with_mid_stream_step(MidStream::CancelThenRotate, "chat-rotate-during-cancel");
+        assert_eq!(frame["data"]["finish_reason"], "cancelled", "{frame}");
+        assert_cleared_question_stays_gone(&history, &next);
     }
 
     #[test]
