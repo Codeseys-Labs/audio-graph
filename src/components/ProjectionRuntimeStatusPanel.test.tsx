@@ -560,6 +560,26 @@ describe("ProjectionRuntimeStatusPanel", () => {
     expect(within(replay).getByText("20ms")).toBeInTheDocument();
   });
 
+  it("marks the replayed views when a report has an unavailable source basis", async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "get_projection_runtime_status_cmd"
+        ? status()
+        : replayReport({
+            basis_unavailable: { first_sequence: 2, last_sequence: 3 },
+          }),
+    );
+    render(<ProjectionRuntimeStatusPanel />);
+    const replay = within(
+      await screen.findByRole("article", { name: /replay parity/i }),
+    );
+    await userEvent.click(
+      replay.getByRole("button", { name: /check projection replay parity/i }),
+    );
+    expect(await replay.findByRole("status")).toHaveTextContent(
+      "Part of the source for these notes and graph changes is unavailable.",
+    );
+  });
+
   it("surfaces replay report failures without dropping runtime telemetry", async () => {
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "get_projection_runtime_status_cmd") {

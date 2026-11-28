@@ -62,6 +62,43 @@ impl FrameBasis {
     }
 }
 
+/// A lane needs repair at every log head from the gap's anchor up to its
+/// first causally linked repair. A later repair only counts if it was replayed.
+struct LaneGap {
+    after: u64,
+    repaired_at: Option<u64>,
+}
+
+#[derive(Default)]
+struct ProjectionGaps {
+    notes: BTreeMap<String, LaneGap>,
+    graph: BTreeMap<String, LaneGap>,
+}
+
+impl ProjectionGaps {
+    fn lane(&mut self, kind: &ProjectionKind) -> &mut BTreeMap<String, LaneGap> {
+        match kind {
+            ProjectionKind::Notes => &mut self.notes,
+            ProjectionKind::Graph => &mut self.graph,
+        }
+    }
+
+    fn plan_at(&self, head: u64) -> ProjectionRepairPlan {
+        let pending = |lane: &BTreeMap<String, LaneGap>| {
+            lane.iter()
+                .filter(|(_, gap)| {
+                    gap.after <= head && gap.repaired_at.is_none_or(|seq| head < seq)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        ProjectionRepairPlan {
+            notes: pending(&self.notes),
+            graph: pending(&self.graph),
+        }
+    }
+}
+
 pub(crate) struct ProjectionHistory {
     frames: Vec<FrameBasis>,
     replay_transcript_len: Option<usize>,
@@ -69,7 +106,7 @@ pub(crate) struct ProjectionHistory {
     pub(crate) basis_unavailable: Option<ProjectionBasisUnavailable>,
     pub(crate) receipt_evidence: super::canonical_log::StreamReceiptEvidence,
     pub(crate) patches: Vec<ProjectionPatch>,
-    pub(crate) repair: ProjectionRepairPlan,
+    gaps: ProjectionGaps,
     pub(crate) present: bool,
     notes_head: Option<VerifiedTranscriptHead>,
     graph_head: Option<VerifiedTranscriptHead>,
@@ -82,7 +119,7 @@ impl ProjectionHistory {
     ) -> Result<Self, String> {
         let present = snapshot.is_some() || recovery.is_some();
         let records = snapshot.map(|s| s.records).unwrap_or_default();
-        let mut gaps = BTreeMap::new();
+        let mut gaps = ProjectionGaps::default();
         if let Some(recovery) = recovery {
             for (id, gap) in &recovery.gap_positions {
                 let base = match &gap.after {
@@ -100,16 +137,17 @@ impl ProjectionHistory {
                         head.sequence
                     }
                 };
-                let affected =
-                    |kind| gap.projection_lanes.is_empty() || gap.projection_lanes.contains(&kind);
-                gaps.insert(
-                    format!("projection-gap-{id}"),
-                    (
-                        base,
-                        affected(ProjectionKind::Notes),
-                        affected(ProjectionKind::Graph),
-                    ),
-                );
+                for kind in [ProjectionKind::Notes, ProjectionKind::Graph] {
+                    if gap.projection_lanes.is_empty() || gap.projection_lanes.contains(&kind) {
+                        gaps.lane(&kind).insert(
+                            format!("projection-gap-{id}"),
+                            LaneGap {
+                                after: base,
+                                repaired_at: None,
+                            },
+                        );
+                    }
+                }
             }
         }
         let mut view = Self {
@@ -119,7 +157,7 @@ impl ProjectionHistory {
             basis_unavailable: None,
             receipt_evidence: Default::default(),
             patches: Vec::with_capacity(records.len()),
-            repair: ProjectionRepairPlan::default(),
+            gaps,
             present,
             notes_head: None,
             graph_head: None,
@@ -133,14 +171,12 @@ impl ProjectionHistory {
             }) {
                 return Err("Unsupported projection basis stream".into());
             }
+            let lane = view.gaps.lane(&record.payload.kind);
             for cause in &record.causal_event_ids {
-                if let Some((base, notes, graph)) = gaps.get_mut(cause)
-                    && record.sequence > *base
+                if let Some(gap) = lane.get_mut(cause)
+                    && record.sequence > gap.after
                 {
-                    match record.payload.kind {
-                        ProjectionKind::Notes => *notes = false,
-                        ProjectionKind::Graph => *graph = false,
-                    }
+                    gap.repaired_at.get_or_insert(record.sequence);
                 }
             }
             let head = match record.payload.kind {
@@ -159,15 +195,12 @@ impl ProjectionHistory {
             });
             view.patches.push(record.payload);
         }
-        for (id, (_, notes, graph)) in gaps {
-            if notes {
-                view.repair.notes.push(id.clone());
-            }
-            if graph {
-                view.repair.graph.push(id);
-            }
-        }
         Ok(view)
+    }
+
+    fn repair_plan(&self) -> ProjectionRepairPlan {
+        self.gaps
+            .plan_at(self.frames.last().map_or(0, |row| row.head.sequence))
     }
 
     /// Compare each referenced physical position to the very source snapshot
@@ -266,19 +299,8 @@ impl ProjectionHistory {
         )
     }
 
-    pub(crate) fn take_export_loss(
-        &mut self,
-        notes: &mut Option<crate::projections::MaterializedNotes>,
-        graph: &mut Option<crate::projections::MaterializedGraph>,
-    ) -> Option<ExportProjectionBasisLoss> {
+    pub(crate) fn take_export_loss(&mut self) -> Option<ExportProjectionBasisLoss> {
         let basis_unavailable = self.basis_unavailable.take()?;
-        // One range and bilingual notice cover both portable materialized views.
-        if let Some(n) = notes {
-            n.basis_unavailable = None;
-        }
-        if let Some(g) = graph {
-            g.basis_unavailable = None;
-        }
         Some(ExportProjectionBasisLoss {
             basis_unavailable,
             projection_notice: ProjectionExportNotice::basis_unavailable(),
@@ -296,7 +318,7 @@ impl ProjectionHistory {
     pub(super) fn into_capture_coverage(self) -> ProjectionCaptureCoverage {
         let notes = self.last_basis(ProjectionKind::Notes).cloned();
         let graph = self.last_basis(ProjectionKind::Graph).cloned();
-        ((notes, graph), self.repair)
+        ((notes, graph), self.repair_plan())
     }
 
     pub(crate) fn bind(
@@ -306,6 +328,11 @@ impl ProjectionHistory {
     ) {
         state.notes.projection_log_head.clone_from(&self.notes_head);
         state.graph.projection_log_head.clone_from(&self.graph_head);
+        let repair = self.repair_plan();
+        state.notes.projection_recovery =
+            (!repair.notes.is_empty()).then_some(ProjectionRecoveryStatus::RecomputeRequired);
+        state.graph.projection_recovery =
+            (!repair.graph.is_empty()).then_some(ProjectionRecoveryStatus::RecomputeRequired);
         if let Some(loss) = &self.basis_unavailable {
             let summary = loss.summary();
             state.notes.basis_unavailable = Some(summary.clone());
@@ -316,10 +343,6 @@ impl ProjectionHistory {
             ledger.projection_coverage(self.last_basis(ProjectionKind::Notes));
         state.graph.transcript_coverage =
             ledger.projection_coverage(self.last_basis(ProjectionKind::Graph));
-        state.notes.projection_recovery =
-            (!self.repair.notes.is_empty()).then_some(ProjectionRecoveryStatus::RecomputeRequired);
-        state.graph.projection_recovery =
-            (!self.repair.graph.is_empty()).then_some(ProjectionRecoveryStatus::RecomputeRequired);
     }
 }
 

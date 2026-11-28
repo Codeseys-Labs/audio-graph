@@ -2564,6 +2564,7 @@ pub struct ProjectionBasisUnavailable {
 pub struct ProjectionBasisSummary {
     pub first_sequence: u64,
     pub last_sequence: u64,
+    /// Positions whose own source bases verify. These patches were not replayed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub verified_sequences: Vec<u64>,
 }

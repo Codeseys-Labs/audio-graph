@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
+import { hasUnavailableProjectionBasis } from "../session/projectionBasisUnavailable";
 import { useAudioGraphStore } from "../store";
 import type {
   ProjectionOperation,
@@ -302,6 +303,11 @@ function ReplayReportCard({
 
       {report && (
         <div className="flex flex-col gap-(--space-3)">
+          {hasUnavailableProjectionBasis(report.basis_unavailable) && (
+            <p role="status" className="m-0 text-xs text-text-secondary">
+              {t("sessions.review.projectionBasisUnavailable")}
+            </p>
+          )}
           <dl className="grid grid-cols-2 md:grid-cols-4 gap-x-(--space-4) gap-y-(--space-3) m-0">
             <Metric
               label={t("projectionDiagnostics.transcriptEvents")}
