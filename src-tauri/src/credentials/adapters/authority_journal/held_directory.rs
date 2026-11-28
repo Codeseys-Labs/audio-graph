@@ -199,16 +199,25 @@ mod unix_held {
             self.file.write_all(bytes)
         }
 
-        /// Flushes the staged bytes, renames them over `name` relative to the
-        /// held directory, then flushes that directory so the rename itself is
+        /// Flushes the staged bytes to the file.
+        pub(in crate::credentials::adapters) fn sync(&mut self) -> std::io::Result<()> {
+            self.file.sync_all()
+        }
+
+        /// Renames the flushed bytes over `name` relative to the held
+        /// directory, then flushes that directory so the rename itself is
         /// durable.
-        pub(in crate::credentials::adapters) fn commit(mut self) -> std::io::Result<()> {
-            self.file.sync_all()?;
+        pub(in crate::credentials::adapters) fn publish(mut self) -> std::io::Result<()> {
             let directory = self.directory.fd.as_fd();
             renameat(directory, self.temp.as_str(), directory, self.name.as_str())?;
             self.published = true;
             fsync(directory)?;
             Ok(())
+        }
+
+        pub(in crate::credentials::adapters) fn commit(mut self) -> std::io::Result<()> {
+            self.sync()?;
+            self.publish()
         }
     }
 
@@ -225,22 +234,26 @@ mod unix_held {
 mod windows_held {
     use super::{read_at_most, staged_name};
     use crate::credentials::domain::CredentialStoreFailure;
+    use ::windows::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+    };
     use ::windows::Win32::Foundation::{CloseHandle, HANDLE};
     use ::windows::Win32::Security::TOKEN_QUERY;
     use ::windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, GetFinalPathNameByHandleW,
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, READ_CONTROL, SYNCHRONIZE,
-        VOLUME_NAME_GUID, WRITE_DAC,
+        DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo, GetFinalPathNameByHandleW,
+        READ_CONTROL, SYNCHRONIZE, SetFileInformationByHandle, VOLUME_NAME_GUID, WRITE_DAC,
     };
+    use ::windows::Win32::System::IO::IO_STATUS_BLOCK;
     use ::windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use ::windows::Win32::UI::Shell::GetUserProfileDirectoryW;
-    use ::windows::core::{PCWSTR, PWSTR};
+    use ::windows::core::PWSTR;
     use std::ffi::OsString;
     use std::fs::{File, OpenOptions};
     use std::io::{ErrorKind, Write};
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
@@ -249,8 +262,9 @@ mod windows_held {
 
     /// A directory handle opened without `FILE_SHARE_DELETE`, so the held
     /// directory cannot be renamed or deleted out from under its operations.
+    /// Renames into it are resolved relative to this handle.
     pub(in crate::credentials::adapters) struct HeldDirectory {
-        _handle: File,
+        handle: File,
         path: PathBuf,
         final_path: PathBuf,
     }
@@ -258,7 +272,6 @@ mod windows_held {
     pub(in crate::credentials::adapters) struct StagedFile<'directory> {
         directory: &'directory HeldDirectory,
         file: Option<File>,
-        temp: String,
         name: String,
         published: bool,
     }
@@ -328,19 +341,85 @@ mod windows_held {
             .map_err(|_| CredentialStoreFailure::PermissionHardeningFailed)
     }
 
+    /// Marks the open file for deletion when its last handle closes. The
+    /// handle names the object, whatever its path resolves to by then.
+    fn dispose(file: &File) -> std::io::Result<()> {
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: `info` is the exact structure `FileDispositionInfo` takes and
+        // outlives the call; the handle stays open throughout.
+        unsafe {
+            SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileDispositionInfo,
+                std::ptr::addr_of!(info).cast(),
+                size_of_val(&info) as u32,
+            )
+        }
+        .map_err(|_| std::io::Error::from(ErrorKind::Other))
+    }
+
+    /// Renames the open `file` to `name` inside the directory `root` is a
+    /// handle to, replacing an existing entry. Both objects are named by
+    /// handle: the kernel resolves `name` relative to `root` and nothing
+    /// else. The Win32 `SetFileInformationByHandle(FileRenameInfo)` wrapper is
+    /// not used because it resolves a relative target against the process
+    /// working directory and refuses one paired with a root handle (measured
+    /// on Windows 11 for #521).
+    fn rename_within(file: &File, root: &File, name: &str) -> std::io::Result<()> {
+        let invalid = || std::io::Error::from(ErrorKind::InvalidInput);
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let name_bytes = units.len().checked_mul(2).ok_or_else(invalid)?;
+        let length = (std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName) + name_bytes)
+            .max(size_of::<FILE_RENAME_INFORMATION>());
+        // `u64` storage gives the 8-byte alignment the structure needs.
+        let mut buffer = vec![0_u64; length.div_ceil(8)];
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        // SAFETY: `buffer` is aligned for and at least as large as the header
+        // plus `units`, and is written only within those bounds.
+        unsafe {
+            (*info).Anonymous.ReplaceIfExists = true;
+            (*info).RootDirectory = HANDLE(root.as_raw_handle());
+            (*info).FileNameLength = u32::try_from(name_bytes).map_err(|_| invalid())?;
+            std::ptr::copy_nonoverlapping(
+                units.as_ptr(),
+                std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+                units.len(),
+            );
+        }
+        let mut status_block = IO_STATUS_BLOCK::default();
+        // SAFETY: both handles stay open for the call, `info` points to a
+        // complete `FILE_RENAME_INFORMATION` of the stated length, and
+        // `status_block` is writable.
+        let status = unsafe {
+            NtSetInformationFile(
+                HANDLE(file.as_raw_handle()),
+                &mut status_block,
+                info.cast_const().cast(),
+                u32::try_from(buffer.len() * size_of::<u64>()).map_err(|_| invalid())?,
+                FileRenameInformation,
+            )
+        };
+        if status.is_ok() {
+            Ok(())
+        } else {
+            Err(std::io::Error::from(ErrorKind::Other))
+        }
+    }
+
+    /// Whether an opened child was created by the open that returned it, and
+    /// so is ours to remove if it fails verification.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ChildOrigin {
+        CreatedByThisOpen,
+        MayPreexist,
+    }
+
     fn open_failure(kind: ErrorKind) -> CredentialStoreFailure {
         match kind {
             // Opening a directory as a file is refused with access denied.
             ErrorKind::PermissionDenied => CredentialStoreFailure::PermissionHardeningFailed,
             _ => CredentialStoreFailure::Unavailable,
         }
-    }
-
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
     }
 
     impl HeldDirectory {
@@ -369,7 +448,7 @@ mod windows_held {
             let final_path =
                 final_path(&handle).ok_or(CredentialStoreFailure::PermissionHardeningFailed)?;
             Ok(Some(Self {
-                _handle: handle,
+                handle,
                 path: path.to_owned(),
                 final_path,
             }))
@@ -394,11 +473,13 @@ mod windows_held {
 
         /// Opens a child without following a final reparse point, refuses it
         /// unless its final path names a direct child of the held directory,
-        /// and hardens it through the handle before returning it.
+        /// and hardens it through the handle before returning it. A child this
+        /// open created is deleted through its handle if it is refused.
         fn open_child(
             &self,
             name: &str,
             options: &mut OpenOptions,
+            origin: ChildOrigin,
         ) -> Result<Option<File>, CredentialStoreFailure> {
             let file = match options
                 .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
@@ -409,22 +490,37 @@ mod windows_held {
                 Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(open_failure(error.kind())),
             };
-            require_kind(&file, false)?;
+            match self.verify_and_harden_child(&file) {
+                Ok(()) => Ok(Some(file)),
+                Err(failure) => {
+                    if origin == ChildOrigin::CreatedByThisOpen {
+                        let _ = dispose(&file);
+                    }
+                    Err(failure)
+                }
+            }
+        }
+
+        fn verify_and_harden_child(&self, file: &File) -> Result<(), CredentialStoreFailure> {
+            require_kind(file, false)?;
             let child =
-                final_path(&file).ok_or(CredentialStoreFailure::PermissionHardeningFailed)?;
+                final_path(file).ok_or(CredentialStoreFailure::PermissionHardeningFailed)?;
             if child.parent() != Some(self.final_path.as_path()) {
                 return Err(CredentialStoreFailure::PermissionHardeningFailed);
             }
-            harden(&file)?;
-            Ok(Some(file))
+            harden(file)
         }
 
         pub(in crate::credentials::adapters) fn open_lock_file(
             &self,
             name: &str,
         ) -> Result<File, CredentialStoreFailure> {
-            self.open_child(name, OpenOptions::new().read(true).write(true).create(true))?
-                .ok_or(CredentialStoreFailure::Unavailable)
+            self.open_child(
+                name,
+                OpenOptions::new().read(true).write(true).create(true),
+                ChildOrigin::MayPreexist,
+            )?
+            .ok_or(CredentialStoreFailure::Unavailable)
         }
 
         pub(in crate::credentials::adapters) fn read_capped(
@@ -432,7 +528,11 @@ mod windows_held {
             name: &str,
             limit: usize,
         ) -> Result<Option<Vec<u8>>, CredentialStoreFailure> {
-            match self.open_child(name, OpenOptions::new().read(true))? {
+            match self.open_child(
+                name,
+                OpenOptions::new().read(true),
+                ChildOrigin::MayPreexist,
+            )? {
                 Some(file) => read_at_most(file, limit).map(Some),
                 None => Ok(None),
             }
@@ -442,21 +542,20 @@ mod windows_held {
             &self,
             name: &str,
         ) -> Result<StagedFile<'_>, CredentialStoreFailure> {
-            let temp = staged_name(name);
-            let file = match self.open_child(&temp, OpenOptions::new().write(true).create_new(true))
-            {
-                Ok(Some(file)) => file,
-                Ok(None) => return Err(CredentialStoreFailure::Unavailable),
-                Err(failure) => {
-                    // The uniquely named file may exist without its hardening.
-                    let _ = std::fs::remove_file(self.path.join(&temp));
-                    return Err(failure);
-                }
-            };
+            let file = self
+                .open_child(
+                    &staged_name(name),
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        // The rename and the discard both go through this handle.
+                        .access_mode(FILE_GENERIC_WRITE.0 | DELETE.0),
+                    ChildOrigin::CreatedByThisOpen,
+                )?
+                .ok_or(CredentialStoreFailure::Unavailable)?;
             Ok(StagedFile {
                 directory: self,
                 file: Some(file),
-                temp,
                 name: name.to_owned(),
                 published: false,
             })
@@ -474,40 +573,44 @@ mod windows_held {
             }
         }
 
-        /// Flushes the staged bytes and replaces `name` with them. The move
-        /// names the held directory, which cannot be renamed while open; if an
-        /// ancestor swap redirected it anyway, the readback through the held
-        /// directory would not see the new bytes. `MOVEFILE_WRITE_THROUGH`
-        /// only flushes a move that degrades to copy-and-delete; same-volume
-        /// rename durability stays unproven (#521 item 7).
-        pub(in crate::credentials::adapters) fn commit(mut self) -> std::io::Result<()> {
+        /// Flushes the staged bytes to the file.
+        pub(in crate::credentials::adapters) fn sync(&mut self) -> std::io::Result<()> {
+            match self.file.as_ref() {
+                Some(file) => file.sync_all(),
+                None => Err(std::io::Error::from(ErrorKind::BrokenPipe)),
+            }
+        }
+
+        /// Renames the flushed staged file over `name` in the held root and
+        /// closes it. The rename names both objects by handle, so an ancestor
+        /// that points elsewhere by now cannot redirect it. No directory
+        /// barrier follows: same-volume rename survival across power loss
+        /// stays unproven (#521 item 7).
+        pub(in crate::credentials::adapters) fn publish(mut self) -> std::io::Result<()> {
             let file = self
                 .file
-                .take()
+                .as_ref()
                 .ok_or_else(|| std::io::Error::from(ErrorKind::BrokenPipe))?;
-            file.sync_all()?;
-            drop(file);
-            let source = wide(&self.directory.path.join(&self.temp));
-            let destination = wide(&self.directory.path.join(&self.name));
-            // SAFETY: both paths are NUL-terminated and outlive the call.
-            unsafe {
-                MoveFileExW(
-                    PCWSTR(source.as_ptr()),
-                    PCWSTR(destination.as_ptr()),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-            }
-            .map_err(|_| std::io::Error::from(ErrorKind::Other))?;
+            rename_within(file, &self.directory.handle, &self.name)?;
             self.published = true;
+            drop(self.file.take());
             Ok(())
+        }
+
+        pub(in crate::credentials::adapters) fn commit(mut self) -> std::io::Result<()> {
+            self.sync()?;
+            self.publish()
         }
     }
 
+    /// An unpublished staged file is deleted through its own handle, never by
+    /// a name that might now resolve elsewhere.
     impl Drop for StagedFile<'_> {
         fn drop(&mut self) {
-            if !self.published {
-                drop(self.file.take());
-                let _ = std::fs::remove_file(self.directory.path.join(&self.temp));
+            if !self.published
+                && let Some(file) = self.file.take()
+            {
+                let _ = dispose(&file);
             }
         }
     }

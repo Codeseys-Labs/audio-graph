@@ -130,8 +130,12 @@ rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.gi
 # volume/cloud-root probes behind the dormant filesystem policy, and
 # `GetUserProfileDirectoryW` (`Win32_UI_Shell`), which names the namespace
 # lock from the process token; `SHGetKnownFolderPath` expands `%USERPROFILE%`
-# from the process environment instead.
+# from the process environment instead. `Wdk_Storage_FileSystem` provides
+# `NtSetInformationFile`, which renames the authority journal relative to the
+# held root handle; the Win32 `SetFileInformationByHandle` wrapper resolves a
+# relative rename target against the process working directory.
 windows = { version = "0.62.2", features = [
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",

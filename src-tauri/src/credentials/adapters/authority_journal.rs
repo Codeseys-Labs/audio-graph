@@ -1213,4 +1213,205 @@ mod tests {
         std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
         std::fs::remove_dir_all(&base).expect("remove isolated Windows swap test directory");
     }
+
+    /// Points the `parent` junction in `base` at `target`, replacing it if it
+    /// already exists.
+    #[cfg(windows)]
+    fn point_parent_junction(base: &Path, target: &str) {
+        if base.join("parent").exists() {
+            std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
+        }
+        windows_command(
+            "cmd.exe",
+            &[
+                "/d".as_ref(),
+                "/c".as_ref(),
+                "mklink".as_ref(),
+                "/j".as_ref(),
+                "parent".as_ref(),
+                target.as_ref(),
+            ],
+            base,
+        );
+    }
+
+    /// A held root reached through `parent` -> `held`, plus a decoy root
+    /// holding a decoy journal, for ancestor-swap tests.
+    #[cfg(windows)]
+    fn junction_swap_fixture(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = scratch(label);
+        let held = base.join("held").join("journal");
+        let decoy = base.join("decoy").join("journal");
+        std::fs::create_dir_all(&held).expect("create held journal root");
+        std::fs::create_dir_all(&decoy).expect("create decoy journal root");
+        std::fs::write(decoy.join(JOURNAL_FILE_NAME), b"decoy").expect("write decoy journal");
+        point_parent_junction(&base, "held");
+        (base, held, decoy)
+    }
+
+    #[cfg(windows)]
+    fn staged_leftovers(root: &Path) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(root)
+            .expect("list journal root")
+            .map(|entry| entry.expect("journal root entry").file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect()
+    }
+
+    /// Points the ancestor at the decoy after the staged bytes are flushed and
+    /// before they are published, then points it back for the readback.
+    #[cfg(windows)]
+    struct SwapBetweenFlushAndRename {
+        base: PathBuf,
+    }
+
+    #[cfg(windows)]
+    struct SwapBetweenFlushAndRenameWriter<'directory> {
+        staged: super::held_directory::StagedFile<'directory>,
+        base: PathBuf,
+    }
+
+    #[cfg(windows)]
+    impl AtomicJournalWriter for SwapBetweenFlushAndRenameWriter<'_> {
+        fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.staged.write_all(bytes)
+        }
+
+        fn commit(self: Box<Self>) -> std::io::Result<()> {
+            let Self { mut staged, base } = *self;
+            staged.sync()?;
+            point_parent_junction(&base, "decoy");
+            let published = staged.publish();
+            point_parent_junction(&base, "held");
+            published
+        }
+    }
+
+    #[cfg(windows)]
+    impl AtomicJournalFileSystem for SwapBetweenFlushAndRename {
+        fn open_atomic<'directory>(
+            &self,
+            directory: &'directory HeldDirectory,
+            name: &str,
+        ) -> Result<Box<dyn AtomicJournalWriter + 'directory>, CredentialStoreFailure> {
+            Ok(Box::new(SwapBetweenFlushAndRenameWriter {
+                staged: directory.create_staged(name)?,
+                base: self.base.clone(),
+            }))
+        }
+
+        fn read(
+            &self,
+            directory: &HeldDirectory,
+            name: &str,
+            limit: usize,
+        ) -> Result<Option<Vec<u8>>, CredentialStoreFailure> {
+            super::SystemAtomicJournalFileSystem.read(directory, name, limit)
+        }
+    }
+
+    /// The rename is bound to the held root and the staged file, not to the
+    /// path they were reached by: an ancestor pointing elsewhere at the moment
+    /// of publication neither redirects it nor touches the decoy.
+    #[cfg(windows)]
+    #[test]
+    fn windows_ancestor_swap_between_flush_and_rename_publishes_into_the_held_root() {
+        let (base, held, decoy) = junction_swap_fixture("windows-swap-publish");
+        let journal = FileAuthorityJournalBoundary::with_file_system(
+            base.join("parent").join("journal"),
+            base.join("namespace"),
+            Arc::new(SwapBetweenFlushAndRename { base: base.clone() }),
+        );
+
+        assert_eq!(journal.replace(b"published"), Ok(()));
+        assert_eq!(
+            std::fs::read(held.join(JOURNAL_FILE_NAME)).expect("read held journal"),
+            b"published"
+        );
+        assert_eq!(
+            std::fs::read(decoy.join(JOURNAL_FILE_NAME)).expect("read decoy journal"),
+            b"decoy"
+        );
+        assert!(staged_leftovers(&held).is_empty());
+        assert!(staged_leftovers(&decoy).is_empty());
+
+        std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
+        std::fs::remove_dir_all(&base).expect("remove isolated Windows publish-swap directory");
+    }
+
+    /// Points the ancestor at the decoy, then fails the write, so the staged
+    /// file is discarded while its path names the decoy.
+    #[cfg(windows)]
+    struct SwapThenFailWrite {
+        base: PathBuf,
+    }
+
+    #[cfg(windows)]
+    struct SwapThenFailWriteWriter<'directory> {
+        _staged: super::held_directory::StagedFile<'directory>,
+        base: PathBuf,
+    }
+
+    #[cfg(windows)]
+    impl AtomicJournalWriter for SwapThenFailWriteWriter<'_> {
+        fn write_all(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+            point_parent_junction(&self.base, "decoy");
+            Err(std::io::Error::from(std::io::ErrorKind::Other))
+        }
+
+        fn commit(self: Box<Self>) -> std::io::Result<()> {
+            unreachable!("the write always fails")
+        }
+    }
+
+    #[cfg(windows)]
+    impl AtomicJournalFileSystem for SwapThenFailWrite {
+        fn open_atomic<'directory>(
+            &self,
+            directory: &'directory HeldDirectory,
+            name: &str,
+        ) -> Result<Box<dyn AtomicJournalWriter + 'directory>, CredentialStoreFailure> {
+            Ok(Box::new(SwapThenFailWriteWriter {
+                _staged: directory.create_staged(name)?,
+                base: self.base.clone(),
+            }))
+        }
+
+        fn read(
+            &self,
+            _directory: &HeldDirectory,
+            _name: &str,
+            _limit: usize,
+        ) -> Result<Option<Vec<u8>>, CredentialStoreFailure> {
+            unreachable!("a failed write never reads back")
+        }
+    }
+
+    /// Discarding a staged file deletes that file, not whatever its path
+    /// names once an ancestor points elsewhere.
+    #[cfg(windows)]
+    #[test]
+    fn windows_ancestor_swap_before_cleanup_deletes_only_the_held_staged_file() {
+        let (base, held, decoy) = junction_swap_fixture("windows-swap-cleanup");
+        let journal = FileAuthorityJournalBoundary::with_file_system(
+            base.join("parent").join("journal"),
+            base.join("namespace"),
+            Arc::new(SwapThenFailWrite { base: base.clone() }),
+        );
+
+        assert_eq!(
+            journal.replace(b"journal"),
+            Err(CredentialStoreFailure::Unavailable)
+        );
+        assert!(staged_leftovers(&held).is_empty(), "staged file leaked");
+        assert!(!held.join(JOURNAL_FILE_NAME).exists());
+        assert_eq!(
+            std::fs::read(decoy.join(JOURNAL_FILE_NAME)).expect("read decoy journal"),
+            b"decoy"
+        );
+        assert!(staged_leftovers(&decoy).is_empty());
+
+        std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
+        std::fs::remove_dir_all(&base).expect("remove isolated Windows cleanup-swap directory");
+    }
 }
