@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -353,6 +353,56 @@ impl StreamLoss {
     }
 }
 
+/// One start's release. Ready workers park on it and forward audio only once
+/// every source of the aggregate committed: the command decides once (GO or
+/// ABORT) and drops the wake sender, which wakes every parked worker. A
+/// dropped owner without a decision is an ABORT.
+#[derive(Clone)]
+struct BatchRelease {
+    decision: Arc<AtomicU8>,
+    wake: crossbeam_channel::Receiver<()>,
+}
+
+const RELEASE_PENDING: u8 = 0;
+const RELEASE_GO: u8 = 1;
+const RELEASE_ABORT: u8 = 2;
+
+/// The command's side of a [`BatchRelease`].
+struct BatchReleaseOwner {
+    decision: Arc<AtomicU8>,
+    wake: Option<crossbeam_channel::Sender<()>>,
+}
+
+impl BatchReleaseOwner {
+    fn new() -> (Self, BatchRelease) {
+        let decision = Arc::new(AtomicU8::new(RELEASE_PENDING));
+        let (wake_tx, wake) = crossbeam_channel::bounded(0);
+        (
+            Self {
+                decision: Arc::clone(&decision),
+                wake: Some(wake_tx),
+            },
+            BatchRelease { decision, wake },
+        )
+    }
+
+    /// Decide once, then wake every parked worker. Never blocks.
+    fn decide(&mut self, go: bool) {
+        self.decision.store(
+            if go { RELEASE_GO } else { RELEASE_ABORT },
+            Ordering::Release,
+        );
+        self.wake = None;
+    }
+}
+
+/// A Ready worker's commit gate. The command moves it WAITING -> COMMITTED;
+/// a worker that stops waiting moves it WAITING -> ABANDONED, so whichever
+/// side gets there first decides, and the command never waits on a worker.
+const GATE_WAITING: u8 = 0;
+const GATE_COMMITTED: u8 = 1;
+const GATE_ABANDONED: u8 = 2;
+
 /// Values owned by one capture worker for its entire rsac stream lifetime.
 /// Keeping the handoff explicit makes the thread boundary auditable and avoids
 /// a long positional argument list as lifecycle metadata grows.
@@ -363,7 +413,8 @@ struct CaptureThreadContext {
     stop_signal: Arc<AtomicBool>,
     startup_acknowledged: Arc<AtomicBool>,
     startup_tx: Sender<StartupReport>,
-    startup_commit_rx: Receiver<()>,
+    commit_gate: Arc<AtomicU8>,
+    release: BatchRelease,
     commit_timeout: Duration,
     pipeline_tx: Sender<AudioPipelineInput>,
     app_handle: AppHandle,
@@ -400,25 +451,63 @@ fn cancel_requested(cancel_rx: &crossbeam_channel::Receiver<()>) -> bool {
     !matches!(cancel_rx.try_recv(), Err(TryRecvError::Empty))
 }
 
-fn await_capture_commit(commit_rx: &Receiver<()>, timeout: Duration) -> bool {
-    commit_rx.recv_timeout(timeout).is_ok()
+/// Report this worker's startup result. Zero capacity: this returns true only
+/// once the command consumed a Ready report, and fails if the command stopped
+/// waiting (timeout or cancel).
+fn report_startup(context: &CaptureThreadContext, report: StartupReport) -> bool {
+    let ready = report.is_ok();
+    context.startup_tx.send(report).is_ok() && ready
 }
 
-/// Report this worker's startup result, then hold a Ready stream behind the
-/// commit gate. Returns true once the command committed this worker, the
-/// only point from which captured audio may enter the pipeline.
+/// Stop waiting for the commit, observably: the command reads an abandoned
+/// gate as a source that failed the commit. False when the command already
+/// committed this worker.
+fn abandon_commit(gate: &AtomicU8) -> bool {
+    gate.compare_exchange(
+        GATE_WAITING,
+        GATE_ABANDONED,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    )
+    .is_ok()
+}
+
+/// Hold a Ready stream until the command decides the aggregate. True only
+/// when this worker committed and the command released the whole aggregate:
+/// the only point from which captured audio may enter the pipeline.
+fn await_capture_release(context: &CaptureThreadContext) -> bool {
+    let go = await_release(
+        &context.commit_gate,
+        &context.release,
+        context.commit_timeout,
+    );
+    if go {
+        context.startup_acknowledged.store(true, Ordering::Release);
+    }
+    go
+}
+
+/// The worker side of the commit: wait for the decision; on the deadline
+/// abandon the gate unless the command already committed it, in which case
+/// the decision follows without waiting on this worker.
+fn await_release(gate: &AtomicU8, release: &BatchRelease, timeout: Duration) -> bool {
+    let woke = !matches!(
+        release.wake.recv_timeout(timeout),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+    );
+    if !woke {
+        if abandon_commit(gate) {
+            return false;
+        }
+        let _ = release.wake.recv();
+    }
+    release.decision.load(Ordering::Acquire) == RELEASE_GO
+        && gate.load(Ordering::Acquire) == GATE_COMMITTED
+}
+
+/// Report the startup result, then hold a Ready stream behind the release.
 fn startup_handshake(context: &CaptureThreadContext, report: StartupReport) -> bool {
-    let ready = report.is_ok();
-    // Zero capacity: this returns only once the command consumed the report,
-    // and fails if the command stopped waiting (timeout or cancel).
-    if context.startup_tx.send(report).is_err() || !ready {
-        return false;
-    }
-    if !await_capture_commit(&context.startup_commit_rx, context.commit_timeout) {
-        return false;
-    }
-    context.startup_acknowledged.store(true, Ordering::Release);
-    true
+    report_startup(context, report) && await_capture_release(context)
 }
 
 /// Join a stop-signalled worker by `deadline`, returning it if it is still
@@ -439,15 +528,19 @@ fn join_capture_worker(handle: JoinHandle<()>, deadline: Instant) -> Option<Join
     }
 }
 
-/// Stop every prepared worker: signal all of them and close every commit
-/// gate before joining any, so no worker waits on another's join. Returns
-/// the ones still running at `deadline`.
-fn stop_prepared_workers(captures: Vec<PreparedCapture>, deadline: Instant) -> Vec<JoinHandle<()>> {
+/// Stop every prepared worker: abort the release (waking every parked
+/// worker) and signal all of them before joining any. Returns the ones still
+/// running at `deadline`.
+fn stop_prepared_workers(
+    captures: Vec<PreparedCapture>,
+    mut release: BatchReleaseOwner,
+    deadline: Instant,
+) -> Vec<JoinHandle<()>> {
+    release.decide(false);
     let threads: Vec<JoinHandle<()>> = captures
         .into_iter()
         .map(|capture| {
             capture.stop_signal.store(true, Ordering::Release);
-            // Dropping the rest of `capture` closes its commit gate.
             capture.thread
         })
         .collect();
@@ -463,6 +556,7 @@ fn spawn_capture_worker(
     index: usize,
     request: CaptureSourceStart,
     commit_timeout: Duration,
+    release: &BatchRelease,
     pipeline_tx: Sender<AudioPipelineInput>,
     app_handle: &AppHandle,
     sample_rate: u32,
@@ -475,7 +569,7 @@ fn spawn_capture_worker(
     // its receive loop until this command consumed the result of
     // build -> start -> subscribe, and its report fails once we stop waiting.
     let (startup_tx, startup_rx) = crossbeam_channel::bounded(0);
-    let (startup_commit_tx, startup_commit_rx) = std::sync::mpsc::sync_channel(0);
+    let commit_gate = Arc::new(AtomicU8::new(GATE_WAITING));
     let source_info = source_info_for_capture_start(
         &request.source_id,
         &request.target,
@@ -500,7 +594,8 @@ fn spawn_capture_worker(
         stop_signal: Arc::clone(&stop_signal),
         startup_acknowledged: Arc::clone(&startup_acknowledged),
         startup_tx,
-        startup_commit_rx,
+        commit_gate: Arc::clone(&commit_gate),
+        release: release.clone(),
         commit_timeout,
         pipeline_tx,
         app_handle: app_handle.clone(),
@@ -509,6 +604,7 @@ fn spawn_capture_worker(
         stream_loss: stream_loss.clone(),
     };
     let body = Arc::clone(&hooks.body);
+    let parent_loss = stream_loss.clone();
     let panic_app = app_handle.clone();
     let panic_source = request.source_id.clone();
     let panic_acknowledged = Arc::clone(&startup_acknowledged);
@@ -551,7 +647,8 @@ fn spawn_capture_worker(
             source_id: request.source_id,
             thread,
             stop_signal,
-            startup_commit_tx: Some(startup_commit_tx),
+            commit_gate,
+            stream_loss: parent_loss,
             startup_acknowledged,
             finished,
             source_info,
@@ -575,10 +672,11 @@ pub(crate) fn prepare_capture_sources(
 ) -> Result<PreparedCaptures, CaptureStartRollback> {
     let hooks = &ticket.hooks;
     let count = requests.len();
-    // A Ready worker waits behind its commit gate while later sources start.
+    // A Ready worker waits behind the release while later sources start.
     let commit_timeout = hooks
         .startup_timeout
         .saturating_mul(u32::try_from(count).unwrap_or(u32::MAX).saturating_add(1));
+    let (release_owner, release) = BatchReleaseOwner::new();
     let mut ready = Vec::with_capacity(count);
     for (index, request) in requests.into_iter().enumerate() {
         let label = capture_log_label(&request.target);
@@ -590,6 +688,7 @@ pub(crate) fn prepare_capture_sources(
                 index,
                 request,
                 commit_timeout,
+                &release,
                 pipeline_tx.clone(),
                 &app_handle,
                 sample_rate,
@@ -626,13 +725,17 @@ pub(crate) fn prepare_capture_sources(
             drop(startup_rx);
             ready.push(capture);
         }
-        let unjoined = stop_prepared_workers(ready, Instant::now() + hooks.join_timeout);
+        let unjoined =
+            stop_prepared_workers(ready, release_owner, Instant::now() + hooks.join_timeout);
         return Err(CaptureStartRollback {
             failure: CaptureStartFailure::during_prepare(index, reason, count),
             unjoined,
         });
     }
-    Ok(PreparedCaptures { captures: ready })
+    Ok(PreparedCaptures {
+        captures: ready,
+        release: release_owner,
+    })
 }
 
 /// Log label for a capture target: its kind, never its id.
@@ -718,11 +821,9 @@ impl GenerationTracker {
 enum RecoverySignal {
     /// The system default device changed; the supervisor may reopen.
     DefaultChanged,
-    /// The backend stream died; a replacement is being arranged.
-    DeviceInvalidated {
-        /// Diagnostic description of the invalidation.
-        reason: String,
-    },
+    /// The backend stream died; a replacement is being arranged. rsac's
+    /// description is not kept: it can carry device and driver text.
+    DeviceInvalidated,
     /// Another reopen attempt was scheduled.
     RetryScheduled {
         /// One-based number of the scheduled attempt.
@@ -734,8 +835,6 @@ enum RecoverySignal {
     Exhausted {
         /// Attempts spent before recovery ended.
         attempts: u32,
-        /// Diagnostic description of the terminal failure.
-        reason: String,
     },
     /// A future rsac event variant this build does not know.
     Unknown,
@@ -746,18 +845,13 @@ enum RecoverySignal {
 fn classify_recovery_event(event: &RecoveryEvent) -> RecoverySignal {
     match event {
         RecoveryEvent::DefaultChanged { .. } => RecoverySignal::DefaultChanged,
-        RecoveryEvent::DeviceInvalidated { reason, .. } => RecoverySignal::DeviceInvalidated {
-            reason: reason.clone(),
-        },
+        RecoveryEvent::DeviceInvalidated { .. } => RecoverySignal::DeviceInvalidated,
         RecoveryEvent::RetryScheduled { attempt, .. } => {
             RecoverySignal::RetryScheduled { attempt: *attempt }
         }
         RecoveryEvent::Recovered { .. } => RecoverySignal::Recovered,
-        RecoveryEvent::Exhausted {
-            attempts, reason, ..
-        } => RecoverySignal::Exhausted {
+        RecoveryEvent::Exhausted { attempts, .. } => RecoverySignal::Exhausted {
             attempts: *attempts,
-            reason: reason.clone(),
         },
         // `RecoveryEvent` is `#[non_exhaustive]`: unknown future variants
         // degrade to a benign, logged unknown rather than a build break.
@@ -790,10 +884,10 @@ fn recovery_signal_report(signal: &RecoverySignal) -> RecoverySignalReport {
             "recovery_default_changed",
             "system default capture device changed; supervisor will reopen the stream".to_string(),
         ),
-        RecoverySignal::DeviceInvalidated { reason } => (
+        RecoverySignal::DeviceInvalidated => (
             sentry::Level::Warning,
             "recovery_device_invalidated",
-            format!("capture stream invalidated ({reason}); reopening on the default device"),
+            "capture stream invalidated; reopening on the default device".to_string(),
         ),
         RecoverySignal::RetryScheduled { attempt } => (
             sentry::Level::Warning,
@@ -805,10 +899,10 @@ fn recovery_signal_report(signal: &RecoverySignal) -> RecoverySignalReport {
             "recovery_recovered",
             "replacement stream opened; capture resumed on the current default device".to_string(),
         ),
-        RecoverySignal::Exhausted { attempts, reason } => (
+        RecoverySignal::Exhausted { attempts } => (
             sentry::Level::Error,
             "recovery_exhausted",
-            format!("auto-recovery gave up after {attempts} attempt(s): {reason}"),
+            format!("auto-recovery gave up after {attempts} attempt(s)"),
         ),
         RecoverySignal::Unknown => (
             sentry::Level::Warning,
@@ -988,28 +1082,73 @@ mod rsac_v041_contract_tests {
     }
 
     #[test]
-    fn prepared_capture_cannot_release_audio_before_commit() {
-        let (commit_tx, commit_rx) = std::sync::mpsc::sync_channel(0);
+    fn a_ready_worker_stays_silent_until_the_whole_aggregate_is_released() {
+        let (mut owner, release) = BatchReleaseOwner::new();
+        let gate = Arc::new(AtomicU8::new(GATE_WAITING));
         let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
         let (audio_tx, audio_rx) = std::sync::mpsc::channel();
+        let worker_gate = Arc::clone(&gate);
         let worker = std::thread::spawn(move || {
             waiting_tx.send(()).unwrap();
-            if await_capture_commit(&commit_rx, Duration::from_secs(1)) {
+            if await_release(&worker_gate, &release, Duration::from_secs(10)) {
                 audio_tx.send("released").unwrap();
             }
         });
 
-        waiting_rx.recv().unwrap();
+        waiting_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(
             audio_rx.try_recv().is_err(),
-            "a Ready worker must remain silent before the audit commit"
+            "a Ready worker must remain silent before the commit"
         );
-        commit_tx.send(()).unwrap();
+        assert!(
+            gate.compare_exchange(
+                GATE_WAITING,
+                GATE_COMMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire
+            )
+            .is_ok()
+        );
+        owner.decide(true);
         assert_eq!(
-            audio_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            audio_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
             "released"
         );
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn an_aborted_release_and_an_abandoned_gate_both_keep_the_worker_silent() {
+        // Abort: committed, but another source failed.
+        let (mut owner, release) = BatchReleaseOwner::new();
+        let gate = AtomicU8::new(GATE_COMMITTED);
+        owner.decide(false);
+        assert!(!await_release(&gate, &release, Duration::from_secs(10)));
+
+        // The worker's deadline passes first: it abandons the gate, so the
+        // command's commit fails instead of waiting on it.
+        let (_owner, release) = BatchReleaseOwner::new();
+        let gate = AtomicU8::new(GATE_WAITING);
+        assert!(!await_release(&gate, &release, Duration::ZERO));
+        assert_eq!(gate.load(Ordering::SeqCst), GATE_ABANDONED);
+        assert!(
+            gate.compare_exchange(
+                GATE_WAITING,
+                GATE_COMMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire
+            )
+            .is_err()
+        );
+
+        // Committed before the deadline: the worker waits for the decision.
+        let (mut owner, release) = BatchReleaseOwner::new();
+        let gate = Arc::new(AtomicU8::new(GATE_COMMITTED));
+        let worker_gate = Arc::clone(&gate);
+        let worker =
+            std::thread::spawn(move || await_release(&worker_gate, &release, Duration::ZERO));
+        owner.decide(true);
+        assert!(worker.join().unwrap());
     }
 
     #[test]
@@ -1659,7 +1798,6 @@ pub struct AudioCaptureManager {
 
 struct PendingCaptureStart {
     attempt: u64,
-    source_ids: Vec<String>,
     /// Dropped to cancel, so a cancel is sticky and wakes the waiting start.
     cancel_tx: Option<crossbeam_channel::Sender<()>>,
 }
@@ -1679,22 +1817,30 @@ pub(crate) struct CaptureSourceStart {
     pub(crate) descriptor: Option<AudioSourceInfo>,
 }
 
-/// A worker whose rsac stream is Ready and parked behind its commit gate.
-/// Dropping it closes the gate, which stops the worker.
+/// A worker whose rsac stream is Ready and parked behind the release.
 struct PreparedCapture {
     index: usize,
     source_id: String,
     thread: JoinHandle<()>,
     stop_signal: Arc<AtomicBool>,
-    startup_commit_tx: Option<SyncSender<()>>,
+    commit_gate: Arc<AtomicU8>,
+    stream_loss: StreamLoss,
     startup_acknowledged: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     source_info: AudioSourceInfo,
 }
 
-/// Every requested source, Ready, in request order.
+/// Every requested source, Ready, in request order, and their shared
+/// release. Dropping it unreleased stops every worker.
 pub(crate) struct PreparedCaptures {
     captures: Vec<PreparedCapture>,
+    release: BatchReleaseOwner,
+}
+
+/// Why the commit transition refused, or the caller's record failure.
+pub(crate) enum CaptureCommitError<E> {
+    Refused(CaptureStartFailure),
+    Record(E),
 }
 
 /// A failed prepare: the failure to report, and the stop-signalled workers
@@ -1832,7 +1978,6 @@ impl AudioCaptureManager {
     /// concurrent start.
     pub(crate) fn register_capture_start(
         &mut self,
-        source_ids: Vec<String>,
     ) -> Result<CaptureStartTicket, CaptureFailureReason> {
         if self.shutting_down {
             return Err(CaptureFailureReason::Cancelled);
@@ -1844,7 +1989,6 @@ impl AudioCaptureManager {
         let (cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
         self.pending_start = Some(PendingCaptureStart {
             attempt: self.next_attempt,
-            source_ids,
             cancel_tx: Some(cancel_tx),
         });
         Ok(CaptureStartTicket {
@@ -1865,15 +2009,16 @@ impl AudioCaptureManager {
         }
     }
 
-    /// Cancel a pending start that includes `source_id`. Returns whether it
-    /// did; the start then rolls back every source it prepared.
-    pub(crate) fn cancel_pending_start(&mut self, source_id: &str) -> bool {
+    /// Cancel the pending start, whichever source the Stop names: before the
+    /// acknowledgement the caller may not know the canonical ids. Returns
+    /// whether a start was pending; it then rolls back every source.
+    pub(crate) fn cancel_pending_start(&mut self) -> bool {
         match self.pending_start.as_mut() {
-            Some(pending) if pending.source_ids.iter().any(|id| id == source_id) => {
+            Some(pending) => {
                 pending.cancel_tx = None;
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 
@@ -1907,17 +2052,28 @@ impl AudioCaptureManager {
         self.retired_threads.extend(threads);
     }
 
-    /// The single commit transition for `attempt`: release every prepared
-    /// worker into the pipeline and take ownership of all of them, unless the
-    /// start was cancelled, the app is shutting down, or a worker died. On
-    /// refusal every prepared worker is stopped and joined (or retired).
-    /// The caller has already recorded CaptureStarted.
-    pub(crate) fn commit_prepared_captures(
+    /// The single commit transition for `attempt`, run under the manager lock
+    /// so Stop's cancel, shutdown and listing see it whole:
+    /// 1. refuse if the start was cancelled or the app is shutting down;
+    /// 2. commit every worker's gate, refusing if one stopped waiting or died;
+    /// 3. `record_started` (the CaptureStarted row; on failure
+    ///    `close_uncertain_start` closes a row that may be durable anyway);
+    /// 4. release every worker at once and take ownership.
+    ///
+    /// Nothing is recorded and no worker forwards audio unless all of these
+    /// hold. A refusal stops every worker, joining or retiring it. No step
+    /// waits on a worker.
+    pub(crate) fn commit_prepared_captures<E>(
         &mut self,
         attempt: u64,
         prepared: PreparedCaptures,
-    ) -> Result<u64, CaptureStartFailure> {
-        let mut captures = prepared.captures;
+        record_started: impl FnOnce() -> Result<(), E>,
+        close_uncertain_start: impl FnOnce(),
+    ) -> Result<u64, CaptureCommitError<E>> {
+        let PreparedCaptures {
+            captures,
+            mut release,
+        } = prepared;
         let count = captures.len();
         let cancelled = self.shutting_down
             || !self
@@ -1925,25 +2081,24 @@ impl AudioCaptureManager {
                 .as_ref()
                 .is_some_and(|pending| pending.attempt == attempt && pending.cancel_tx.is_some());
         self.release_capture_start(attempt);
-        let failure = if cancelled {
+        let refusal = if cancelled {
             Some(CaptureStartFailure::during_commit(
                 None,
                 CaptureFailureReason::Cancelled,
                 count,
             ))
         } else {
-            captures.iter_mut().find_map(|capture| {
-                let released = capture
-                    .startup_commit_tx
-                    .take()
-                    .is_some_and(|commit| commit.send(()).is_ok());
-                if released {
-                    // Parent-side publication closes the post-rendezvous
-                    // panic window: a worker that exits after accepting
-                    // commit must reconcile normally.
-                    capture.startup_acknowledged.store(true, Ordering::Release);
-                }
-                (!released || capture.finished.load(Ordering::Acquire)).then(|| {
+            captures.iter().find_map(|capture| {
+                let committed = capture
+                    .commit_gate
+                    .compare_exchange(
+                        GATE_WAITING,
+                        GATE_COMMITTED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok();
+                (!committed || capture.finished.load(Ordering::Acquire)).then(|| {
                     CaptureStartFailure::during_commit(
                         Some(capture.index),
                         CaptureFailureReason::WorkerExited,
@@ -1952,13 +2107,27 @@ impl AudioCaptureManager {
                 })
             })
         };
-        if let Some(failure) = failure {
-            let unjoined =
-                stop_prepared_workers(captures, Instant::now() + self.hooks.join_timeout);
-            self.retire_capture_workers(unjoined);
-            return Err(failure);
+        if let Some(failure) = refusal {
+            self.stop_uncommitted(captures, release);
+            return Err(CaptureCommitError::Refused(failure));
         }
+        if let Err(error) = record_started() {
+            self.stop_uncommitted(captures, release);
+            close_uncertain_start();
+            return Err(CaptureCommitError::Record(error));
+        }
+        // Parent-side publication before the release: a worker lost from
+        // here on is an acknowledged source and reconciles normally.
+        for capture in &captures {
+            capture.startup_acknowledged.store(true, Ordering::Release);
+        }
+        release.decide(true);
         for capture in captures {
+            // Lost between its commit and the release: its own report ran
+            // before it was acknowledged, so request reconciliation here.
+            if capture.finished.load(Ordering::Acquire) {
+                capture.stream_loss.report();
+            }
             self.sources.insert(
                 capture.source_id,
                 CaptureHandle {
@@ -1975,11 +2144,9 @@ impl AudioCaptureManager {
         Ok(attempt)
     }
 
-    /// Stop every prepared worker of a start that cannot commit (its
-    /// CaptureStarted row could not be recorded). Nothing was released.
-    pub(crate) fn abort_prepared_captures(&mut self, prepared: PreparedCaptures) {
+    fn stop_uncommitted(&mut self, captures: Vec<PreparedCapture>, release: BatchReleaseOwner) {
         let unjoined =
-            stop_prepared_workers(prepared.captures, Instant::now() + self.hooks.join_timeout);
+            stop_prepared_workers(captures, release, Instant::now() + self.hooks.join_timeout);
         self.retire_capture_workers(unjoined);
     }
 
@@ -2659,33 +2826,59 @@ pub(crate) mod scripted {
 
     /// How one scripted worker behaves, in spawn order.
     pub(crate) enum ScriptedStart {
-        /// Report Ready, wait for commit, then run until stopped or lost.
+        /// Report Ready, wait for the release, then run until stopped or lost.
         Ready,
         /// Fail build/start/subscribe with this rsac error.
         Fail(AudioError),
         /// Block as in a stuck OS call, ignoring Stop, until released; then
         /// try to report Ready.
         Hang,
-        /// Report Ready, then die on `lose_stream()` without taking the
-        /// commit: the worker gone between Ready and commit.
+        /// Report Ready, then die on `lose_stream()` before the commit.
         ReadyThenExit,
+        /// Report Ready, stop waiting for the commit (as when its deadline
+        /// passes), then wedge in teardown until released.
+        AbandonThenWedge,
+    }
+
+    /// What a scripted worker reached, in order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ScriptedEvent {
+        /// The command consumed its Ready report.
+        Reported,
+        /// It stopped waiting for the commit.
+        Abandoned,
+        /// It is dead (finished) but not yet returned.
+        Lost,
     }
 
     /// Controls for one spawned scripted worker.
     pub(crate) struct ScriptedWorker {
         release: crossbeam_channel::Sender<()>,
         lose: crossbeam_channel::Sender<()>,
+        events: crossbeam_channel::Receiver<ScriptedEvent>,
     }
 
     impl ScriptedWorker {
-        /// Let a `Hang` worker return from its stuck call.
+        /// Let a `Hang` or `AbandonThenWedge` worker return.
         pub(crate) fn release(&self) {
             let _ = self.release.try_send(());
         }
 
-        /// The device disappears: a committed worker's stream ends.
+        /// The device disappears: the worker's stream ends.
         pub(crate) fn lose_stream(&self) {
             let _ = self.lose.try_send(());
+        }
+
+        /// Wait, within `bound`, until the worker reached `event`.
+        pub(crate) fn wait_for(&self, event: ScriptedEvent, bound: Duration) {
+            let deadline = Instant::now() + bound;
+            loop {
+                match self.events.recv_deadline(deadline) {
+                    Ok(reached) if reached == event => return,
+                    Ok(_) => {}
+                    Err(error) => panic!("scripted worker never reached {event:?}: {error}"),
+                }
+            }
         }
     }
 
@@ -2694,6 +2887,15 @@ pub(crate) mod scripted {
         pub(crate) workers: crossbeam_channel::Receiver<ScriptedWorker>,
         /// Reconciliation requests: (source id, the dead handle's identity).
         pub(crate) exit_requests: crossbeam_channel::Receiver<(String, Arc<AtomicBool>)>,
+    }
+
+    impl ScriptedControls {
+        /// The next spawned worker, within `bound`.
+        pub(crate) fn next_worker(&self, bound: Duration) -> ScriptedWorker {
+            self.workers
+                .recv_timeout(bound)
+                .expect("a scripted capture worker spawns")
+        }
     }
 
     pub(crate) fn scripted_hooks(
@@ -2712,10 +2914,21 @@ pub(crate) mod scripted {
                 .expect("a capture worker was spawned beyond its script");
             let (release, release_rx) = crossbeam_channel::bounded(1);
             let (lose, lose_rx) = crossbeam_channel::bounded(1);
-            let _ = workers_tx.send(ScriptedWorker { release, lose });
+            let (events_tx, events) = crossbeam_channel::unbounded();
+            let _ = workers_tx.send(ScriptedWorker {
+                release,
+                lose,
+                events,
+            });
+            let reported = |ok: bool| {
+                if ok {
+                    let _ = events_tx.send(ScriptedEvent::Reported);
+                }
+                ok
+            };
             match script {
                 ScriptedStart::Fail(error) => {
-                    startup_handshake(&context, Err(capture_failure_reason(&error)));
+                    report_startup(&context, Err(capture_failure_reason(&error)));
                     false
                 }
                 ScriptedStart::Hang => {
@@ -2724,15 +2937,27 @@ pub(crate) mod scripted {
                     false
                 }
                 ScriptedStart::ReadyThenExit => {
-                    if context.startup_tx.send(Ok(None)).is_ok() {
+                    if reported(report_startup(&context, Ok(None))) {
                         let _ = lose_rx.recv();
                     }
-                    // Returning drops the commit gate's receiver, so the
-                    // command's commit send fails.
+                    context.stream_loss.report();
+                    let _ = events_tx.send(ScriptedEvent::Lost);
+                    false
+                }
+                ScriptedStart::AbandonThenWedge => {
+                    if reported(report_startup(&context, Ok(None)))
+                        && abandon_commit(&context.commit_gate)
+                    {
+                        let _ = events_tx.send(ScriptedEvent::Abandoned);
+                        // Teardown wedged in an OS call.
+                        let _ = release_rx.recv();
+                    }
                     false
                 }
                 ScriptedStart::Ready => {
-                    if !startup_handshake(&context, Ok(None)) {
+                    if !reported(report_startup(&context, Ok(None)))
+                        || !await_capture_release(&context)
+                    {
                         return false;
                     }
                     while !context.stop_signal.load(Ordering::Acquire) {
@@ -2769,12 +2994,20 @@ pub(crate) mod scripted {
     }
 
     impl AudioCaptureManager {
-        /// Block until every retired worker has exited (after the test
-        /// released it), so the next boundary check is deterministic.
-        pub(crate) fn join_retired_workers(&mut self) {
-            for handle in self.retired_threads.drain(..) {
-                let _ = handle.join();
-            }
+        /// Join every retired worker (after the test released it) within
+        /// `bound`, so the next boundary check is deterministic.
+        pub(crate) fn join_retired_workers(&mut self, bound: Duration) {
+            let deadline = Instant::now() + bound;
+            let still_running: Vec<_> = self
+                .retired_threads
+                .drain(..)
+                .filter_map(|handle| join_capture_worker(handle, deadline))
+                .collect();
+            assert!(
+                still_running.is_empty(),
+                "{} retired worker(s) did not exit",
+                still_running.len()
+            );
         }
 
         pub(crate) fn retired_worker_count(&self) -> usize {
@@ -3396,9 +3629,7 @@ mod hotplug_recovery_tests {
                 "recovery_default_changed",
             ),
             (
-                RecoverySignal::DeviceInvalidated {
-                    reason: "device unplugged".into(),
-                },
+                RecoverySignal::DeviceInvalidated,
                 sentry::Level::Warning,
                 "recovery_device_invalidated",
             ),
@@ -3413,10 +3644,7 @@ mod hotplug_recovery_tests {
                 "recovery_recovered",
             ),
             (
-                RecoverySignal::Exhausted {
-                    attempts: 5,
-                    reason: "no device reappeared".into(),
-                },
+                RecoverySignal::Exhausted { attempts: 5 },
                 sentry::Level::Error,
                 "recovery_exhausted",
             ),
@@ -3435,19 +3663,12 @@ mod hotplug_recovery_tests {
     }
 
     #[test]
-    fn recovery_log_lines_carry_attempt_and_reason_details() {
+    fn recovery_log_lines_carry_the_attempt_count() {
         let retry = recovery_signal_report(&RecoverySignal::RetryScheduled { attempt: 4 });
         assert!(retry.message.contains('4'), "attempt in {retry:?}");
 
-        let exhausted = recovery_signal_report(&RecoverySignal::Exhausted {
-            attempts: 5,
-            reason: "device never reappeared".into(),
-        });
+        let exhausted = recovery_signal_report(&RecoverySignal::Exhausted { attempts: 5 });
         assert!(exhausted.message.contains('5'), "attempts in {exhausted:?}");
-        assert!(
-            exhausted.message.contains("device never reappeared"),
-            "reason in {exhausted:?}"
-        );
     }
 
     #[test]
