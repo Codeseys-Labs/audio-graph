@@ -575,7 +575,6 @@ fn open_session_for_content_with_head<T, E>(
                     pending.take().expect("admission calls its reader once")(floor, head)
                 });
             match result {
-                #[cfg(windows)]
                 Err(GuardedSessionOpenError::ControlPlaneUnreadable(ManifestLoadError::Coordination(
                     super::canonical_durability::CanonicalCoordinationError::QualificationRefused(refusal)
                 ))) => refusal,
@@ -2243,6 +2242,35 @@ mod guarded_admission_tests {
             0,
             "the read created no lock, no manifest, and no temporary"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inconclusive_unix_probe_requires_the_existing_weak_writer_floor_lock() {
+        use crate::persistence::canonical_durability::{
+            CanonicalCoordinationError, CanonicalFilesystemQualificationError,
+        };
+        let root = root("weak-writer-unknown-probe");
+        let store = SessionArtifactManifestStore::after_qualification_refusal(
+            &root,
+            SESSION,
+            CanonicalFilesystemQualificationError::IdentityUnavailable,
+        )
+        .unwrap();
+        assert!(matches!(
+            guarded_session_open(&store, SessionSemanticsVersion::V1, |_| Ok::<_, ()>(())),
+            Err(GuardedSessionOpenError::ControlPlaneUnreadable(
+                super::ManifestLoadError::Coordination(CanonicalCoordinationError::Missing)
+            ))
+        ));
+        write_fixture(&store_coordination_path(&root, SESSION).unwrap(), b"");
+        let floor = guarded_session_open(&store, SessionSemanticsVersion::V1, Ok::<_, ()>).unwrap();
+        assert_eq!(floor.evidence, SessionFloorEvidence::GuardedAbsence);
+        assert!(matches!(
+            store.begin_write(),
+            Err(ManifestStoreError::NamespaceQualificationRequired)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

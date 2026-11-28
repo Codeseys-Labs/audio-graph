@@ -56,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A panic inside one LLM executor job no longer leaves other jobs waiting
+  forever. That job and the jobs queued behind it end at once (notes synthesis
+  and projection with an error, entity extraction with its rule-based
+  fallback), and the next job starts a new worker (#539).
 - ASR sessions that fail soon after readiness now consume the reconnect budget.
   Deepgram preserves an intentional stop during final transcript drain. Soniox
   stops replaced connections and opens a fresh session after a duration limit.

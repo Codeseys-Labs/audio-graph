@@ -29,6 +29,7 @@ pub enum RedactedPanicOp {
     CredentialBoundary,
     LlmClientBuild,
     LlmModelLoad,
+    LlmExecutorJob,
 }
 
 impl RedactedPanicOp {
@@ -43,6 +44,7 @@ impl RedactedPanicOp {
             Self::CredentialBoundary => "credential.boundary",
             Self::LlmClientBuild => "llm.client_build",
             Self::LlmModelLoad => "llm.model_load",
+            Self::LlmExecutorJob => "llm.executor_job",
         }
     }
 }
