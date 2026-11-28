@@ -4647,7 +4647,9 @@ fn approved_agent_projection_patch(
             // Locally generated: no LLM route was dispatched, so there is no route
             // to stamp and the model id is ours, not a served one.
             route_id: None,
+            // Our own rule ran on this machine.
             model_source: crate::llm::route::ModelIdentitySource::Requested,
+            model_placement: Some(audio_graph_ipc_contract::model_id::ModelPlacement::Local),
         },
         route: None,
         queued_at_ms: Some(now_ms),
@@ -5941,6 +5943,7 @@ fn build_assist_answer_started_event(
     .model(crate::persistence::MovementModel {
         provider_id: Some(provider_id.to_string()),
         model_id: None,
+        model_placement: None,
     })
     .source(crate::persistence::DataMovementSource {
         kind: assist_answer_action_id(auto).to_string(),
@@ -5992,6 +5995,7 @@ fn build_assist_answer_terminal_event(
     .model(crate::persistence::MovementModel {
         provider_id: Some(provider_id.to_string()),
         model_id: None,
+        model_placement: None,
     })
     .source(crate::persistence::DataMovementSource {
         kind: assist_answer_action_id(auto).to_string(),
@@ -14787,10 +14791,11 @@ mod tests {
             confidence: 0.9,
             provenance: crate::projections::ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -15869,6 +15874,7 @@ mod tests {
                 prompt_id: "report-notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: Some(1_700_000_050_000 + sequence),
             generation_latency_ms: Some(30 + sequence),
@@ -15902,6 +15908,7 @@ mod tests {
                 prompt_id: "report-graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: Some(1_700_000_150_000 + sequence),
             generation_latency_ms: Some(40 + sequence),
@@ -15940,6 +15947,7 @@ mod tests {
                 prompt_id: "report-invalid-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -15993,6 +16001,7 @@ mod tests {
                 prompt_id: "stale-notes".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             evidence: None,
         });
@@ -16023,6 +16032,7 @@ mod tests {
                 prompt_id: "stale-graph".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             evidence: None,
         });
@@ -16044,6 +16054,7 @@ mod tests {
             prompt_id: "active-before-load".to_string(),
             route_id: None,
             model_source: crate::llm::route::ModelIdentitySource::Requested,
+            model_placement: None,
         };
         let mut state = crate::projections::MaterializedProjectionState::new(session_id);
         state.notes.last_sequence = 99;
@@ -16617,6 +16628,7 @@ mod tests {
         .model(MovementModel {
             provider_id: Some("llm.openrouter".to_string()),
             model_id: Some("openai/gpt-4o-mini".to_string()),
+            model_placement: Some(audio_graph_ipc_contract::model_id::ModelPlacement::Remote),
         })
         .build();
 
@@ -16631,6 +16643,107 @@ mod tests {
         assert!(!serialized.to_lowercase().contains("secret"));
         assert!(!serialized.to_lowercase().contains("api_key"));
         assert!(!serialized.contains("Bearer"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_data_movement_cmd_reads_a_model_id_by_where_its_model_ran() {
+        use crate::llm::route::model_id_fixtures::{PATH_CANARY, SECRET_CANARY, STORED};
+        use crate::persistence::{
+            DataClass, DataMovementActor, DataMovementDestination, DataMovementEventType,
+            DataMovementLedgerBuilder, DestinationBoundary, MovementModel, MovementPolicy,
+            PrivacyMode, RetentionClass,
+        };
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("data-movement-model-id");
+        let _guard = HomeGuard::set(&dir);
+
+        let session_id = "session-with-model-ids";
+        // (boundary, provider, whether the row says its model ran off the
+        // user's network). A generic OpenAI-compatible server can sit on the
+        // user's LAN, which egress still calls a provider.
+        let places = [
+            (DestinationBoundary::Local, "llm.api", false),
+            (DestinationBoundary::Provider, "llm.api", false),
+            (DestinationBoundary::Provider, "llm.openrouter", false),
+            (DestinationBoundary::Provider, "llm.cerebras", true),
+        ];
+        let rows: Vec<_> = places
+            .into_iter()
+            .flat_map(|place| STORED.into_iter().map(move |ids| (place, ids)))
+            .zip(1_000..)
+            .map(
+                |(((boundary, provider, _), (model_id, _, _)), created_at_ms)| {
+                    DataMovementLedgerBuilder::new(
+                        session_id,
+                        DataMovementActor::System,
+                        DataMovementEventType::ProviderCallSucceeded,
+                        MovementPolicy {
+                            privacy_mode: PrivacyMode::ByokCloud,
+                            user_visible: true,
+                            retention_class: RetentionClass::Transient,
+                        },
+                        DataMovementDestination {
+                            boundary,
+                            provider_id: Some(provider.to_string()),
+                            endpoint_class: Some("chat_completions".to_string()),
+                        },
+                    )
+                    .created_at_ms(created_at_ms)
+                    .data_classes([DataClass::Prompts])
+                    .model(MovementModel {
+                        provider_id: Some(provider.to_string()),
+                        model_id: Some(model_id.to_string()),
+                        // Rows as builds before the placement marker wrote them.
+                        model_placement: None,
+                    })
+                    .build()
+                },
+            )
+            .collect();
+        seed_data_movement_ledger(session_id, &rows);
+        let ledger_path =
+            crate::user_data::data_movement_ledger_path(session_id).expect("resolve ledger path");
+        let stored_bytes = std::fs::read(&ledger_path).expect("read the ledger");
+
+        let loaded = load_session_data_movement_impl(session_id.to_string()).expect("ledger loads");
+
+        let model_ids: Vec<_> = loaded
+            .iter()
+            .map(|event| {
+                event
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.model_id.as_deref())
+            })
+            .collect();
+        let expected: Vec<_> = places
+            .iter()
+            .flat_map(|(_, _, remote)| {
+                STORED
+                    .iter()
+                    .map(move |(_, local, hosted)| Some(if *remote { *hosted } else { *local }))
+            })
+            .collect();
+        assert_eq!(model_ids, expected);
+        // The serialized form is what the frontend receives: no row a model
+        // could have run nearby names a directory, and none keeps a secret.
+        for (index, event) in loaded.iter().enumerate() {
+            let reply = serde_json::to_string(event).expect("serialize a loaded row");
+            assert!(!reply.contains(SECRET_CANARY), "{reply}");
+            if !places[index / STORED.len()].2 {
+                assert!(!reply.contains(PATH_CANARY), "{reply}");
+            }
+        }
+        // The stored rows were read, not rewritten.
+        assert_eq!(
+            std::fs::read(&ledger_path).expect("re-read the ledger"),
+            stored_bytes
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -17831,6 +17944,103 @@ mod tests {
     }
 
     #[test]
+    fn export_session_bundle_carries_each_model_id_by_where_its_model_ran() {
+        use crate::llm::route::model_id_fixtures::{PATH_CANARY, SECRET_CANARY, STORED};
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("export-model-id");
+        let _guard = HomeGuard::set(&dir);
+        let repository = FileMemoryRepository::user_data();
+
+        // (provider, route, whether its records say the model ran off the
+        // user's network). OpenRouter can be given a base URL on the user's
+        // machine, and its records do not keep it.
+        let places = [
+            ("llm.api", "route.openai_compatible", false),
+            ("llm.openrouter", "route.openrouter", false),
+            ("llm.cerebras", "route.cerebras_direct", true),
+        ];
+        for (index, (stored, local, hosted)) in STORED.into_iter().enumerate() {
+            for (place, (provider, route_id, remote)) in places.into_iter().enumerate() {
+                let session_id = format!("export-model-id-{index}-{place}");
+                let session_id = session_id.as_str();
+                let stamp = |provenance: &mut crate::projections::ProjectionProvenance| {
+                    provenance.provider = provider.to_string();
+                    provenance.route_id = Some(route_id.to_string());
+                    provenance.model = stored.to_string();
+                };
+
+                let event = projection_status_test_event(&format!("{session_id}-span-1"));
+                let basis = crate::projections::ProjectionBasis::from_transcript_events(
+                    std::slice::from_ref(&event),
+                );
+                repository
+                    .append_transcript_event(session_id, &event)
+                    .expect("append transcript event");
+                let mut notes_patch = report_note_patch(1, basis.clone(), "Exported note body.");
+                stamp(&mut notes_patch.provenance);
+                let mut graph_patch = report_graph_patch(1, basis.clone());
+                stamp(&mut graph_patch.provenance);
+                for patch in [&notes_patch, &graph_patch] {
+                    repository
+                        .append_projection_patch(session_id, patch)
+                        .expect("append projection patch");
+                }
+                let mut notes = stale_materialized_notes(session_id, basis.clone());
+                stamp(&mut notes.notes[0].provenance);
+                repository
+                    .save_materialized_notes(session_id, &notes)
+                    .expect("save materialized notes artifact");
+                let mut graph = stale_materialized_graph(session_id, basis);
+                stamp(&mut graph.nodes[0].provenance);
+                repository
+                    .save_materialized_graph(session_id, &graph)
+                    .expect("save materialized graph artifact");
+
+                let stored_paths = [
+                    crate::user_data::resolve_projection_events_path(session_id)
+                        .expect("projection events path"),
+                    crate::user_data::resolve_notes_path(session_id)
+                        .expect("materialized notes path"),
+                    crate::user_data::resolve_materialized_graph_path(session_id)
+                        .expect("materialized graph path"),
+                ];
+                let stored_bytes: Vec<_> = stored_paths
+                    .iter()
+                    .map(|path| std::fs::read(path).expect("read a stored artifact"))
+                    .collect();
+
+                let bundle = session_export_bundle(session_id).expect("export bundle");
+
+                let expected = if remote { hosted } else { local };
+                assert_eq!(bundle.projection_events.len(), 2);
+                for patch in &bundle.projection_events {
+                    assert_eq!(patch.provenance.model, expected, "{stored} {remote}");
+                }
+                let notes = bundle.notes.as_ref().expect("exported notes");
+                assert_eq!(notes.notes[0].provenance.model, expected);
+                let graph = bundle.materialized_graph.as_ref().expect("exported graph");
+                assert_eq!(graph.nodes[0].provenance.model, expected);
+                let json = serde_json::to_string(&bundle).expect("bundle serializes");
+                assert!(!json.contains(SECRET_CANARY), "{json}");
+                if !remote {
+                    assert!(!json.contains(PATH_CANARY), "{json}");
+                }
+
+                // The stored patches and materialized artifacts were read,
+                // not rewritten.
+                for (path, bytes) in stored_paths.iter().zip(&stored_bytes) {
+                    assert_eq!(&std::fs::read(path).expect("re-read an artifact"), bytes);
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn export_transcript_recovery_carries_evidence_and_keeps_it_out_of_replay() {
         use crate::test_log_capture::{ThreadLogCapture, render};
         use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -18998,6 +19208,7 @@ mod tests {
                 prompt_id: "report-graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -19022,6 +19233,7 @@ mod tests {
                 prompt_id: "report-graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -25700,6 +25912,7 @@ mod tests {
                     prompt_id: "test".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 },
                 evidence: None,
             });

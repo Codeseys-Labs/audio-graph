@@ -393,6 +393,7 @@ fn default_fixture_provenance() -> crate::projections::ProjectionProvenance {
         // Deterministic fixture: no route was dispatched.
         route_id: None,
         model_source: crate::llm::route::ModelIdentitySource::Requested,
+        model_placement: None,
     }
 }
 
@@ -897,6 +898,7 @@ mod tests {
                 prompt_id: "offline-projection-eval-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,

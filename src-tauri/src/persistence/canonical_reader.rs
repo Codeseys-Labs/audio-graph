@@ -329,6 +329,7 @@ mod tests {
                 // defaults when reading a patch written before the route table.
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             route: None,
             queued_at_ms: None,
@@ -632,6 +633,104 @@ mod tests {
         assert_eq!(fs::read(&path).expect("re-read legacy bytes"), bytes);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stored_model_id_is_read_by_where_its_model_ran_and_the_file_is_left_alone() {
+        use crate::llm::route::model_id_fixtures::{PATH_CANARY, SECRET_CANARY, STORED};
+
+        // (provider, route, whether a record from it says the model ran off
+        // the user's network)
+        for (provider, route_id, remote) in [
+            ("llm.api", Some("route.openai_compatible"), false),
+            ("llm.local_llama", Some("route.local_llama"), false),
+            // A record written before ADR-0038 named the provider this way.
+            ("local_llama", None, false),
+            // A custom base URL can put OpenRouter on the user's machine.
+            ("llm.openrouter", Some("route.openrouter"), false),
+            ("openrouter", None, false),
+            ("llm.cerebras", Some("route.cerebras_direct"), true),
+            ("llm.aws_bedrock", None, true),
+        ] {
+            for (stored, local, hosted) in STORED {
+                let expected = if remote { hosted } else { local };
+                let root = unique_tempdir("stored-model-id");
+                let path = root.join("projection.jsonl");
+                let session_id = "session-stored-model-id";
+                let mut legacy = projection_patch(1);
+                legacy.provenance.provider = provider.to_string();
+                legacy.provenance.route_id = route_id.map(str::to_string);
+                legacy.provenance.model = stored.to_string();
+                let mut bytes = serde_json::to_vec(&legacy).expect("serialize legacy patch");
+                bytes.push(b'\n');
+                fs::create_dir_all(&root).expect("create fixture root");
+                fs::write(&path, &bytes).expect("write legacy accepted patch");
+
+                let read = load_projection_patches(&path, session_id).expect("decode the patch");
+                let patch = &present_snapshot(&read).records[0].payload;
+                assert_eq!(patch.provenance.model, expected, "{provider} {stored}");
+
+                // Every item the patch materializes carries the same id, and
+                // so does the patch when it is written again.
+                let replayed = MaterializedProjectionState::replay_accepted_patches(
+                    session_id,
+                    [patch.clone()],
+                )
+                .expect("replay the patch");
+                assert_eq!(replayed.notes.notes[0].provenance.model, expected);
+                let rewritten = serde_json::to_string(patch).expect("serialize the read patch");
+                assert!(!rewritten.contains(SECRET_CANARY), "{rewritten}");
+                if !remote {
+                    assert!(!rewritten.contains(PATH_CANARY), "{rewritten}");
+                }
+
+                assert_eq!(fs::read(&path).expect("re-read legacy bytes"), bytes);
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[test]
+    fn a_marked_model_id_is_read_as_written() {
+        use audio_graph_ipc_contract::model_id::ModelPlacement;
+
+        // (served at, what a build with the rule wrote, what it reads back as)
+        for (placement, written, read_back) in [
+            // OpenRouter's real host: the hosted id, namespace and all.
+            (
+                ModelPlacement::Remote,
+                "anthropic/claude-sonnet-4",
+                "anthropic/claude-sonnet-4",
+            ),
+            // OpenRouter at a loopback base URL: a display name.
+            (ModelPlacement::Local, "private.gguf", "private.gguf"),
+            // The credential screen runs on a marked record too.
+            (
+                ModelPlacement::Remote,
+                "Bearer Ym9i/c2VjcmV0",
+                crate::llm::route::WITHHELD_MODEL_PLACEHOLDER,
+            ),
+        ] {
+            let root = unique_tempdir("marked-model-id");
+            let path = root.join("projection.jsonl");
+            let session_id = "session-marked-model-id";
+            let mut patch = projection_patch(1);
+            patch.provenance.provider = "llm.openrouter".to_string();
+            patch.provenance.route_id = Some("route.openrouter".to_string());
+            patch.provenance.model = written.to_string();
+            patch.provenance.model_placement = Some(placement);
+            let mut bytes = serde_json::to_vec(&patch).expect("serialize patch");
+            bytes.push(b'\n');
+            fs::create_dir_all(&root).expect("create fixture root");
+            fs::write(&path, &bytes).expect("write accepted patch");
+
+            let read = load_projection_patches(&path, session_id).expect("decode the patch");
+            let provenance = &present_snapshot(&read).records[0].payload.provenance;
+            assert_eq!(provenance.model, read_back, "{placement:?} {written}");
+            assert_eq!(provenance.model_placement, Some(placement));
+            assert_eq!(fs::read(&path).expect("re-read bytes"), bytes);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

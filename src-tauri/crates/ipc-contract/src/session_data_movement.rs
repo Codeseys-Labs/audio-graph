@@ -229,6 +229,11 @@ pub struct MovementModel {
     pub provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Where the model ran, written with the model rule applied at the
+    /// endpoint dialled. Absent on rows written before it, which are read by
+    /// what their boundary and provider say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_placement: Option<crate::model_id::ModelPlacement>,
 }
 
 /// Quantitative, non-content measures of the movement.
@@ -350,7 +355,10 @@ impl DataMovementResult {
 /// A single redacted data-movement audit event.
 ///
 /// Append-only. Serialized one-per-line to a session's ledger JSONL file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+// Decoded through `StoredDataMovementEvent`, which is why `Deserialize` is
+// written out below rather than derived. Not a doc comment: the generated
+// schema would carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct DataMovementEvent {
     /// Stable unique id for this event (uuid v4 string).
     pub event_id: String,
@@ -377,6 +385,86 @@ pub struct DataMovementEvent {
     pub counts: Option<MovementCounts>,
     pub policy: MovementPolicy,
     pub result: DataMovementResult,
+}
+
+/// A [`DataMovementEvent`] as a ledger row holds it.
+///
+/// A row's model id is read by where the row says its model ran (see
+/// [`crate::model_id`]): a hosted identifier is kept when the data left the
+/// device for a provider that only dials fixed public hosts, and any other
+/// model shows a display name. Rows written before that rule can hold a local
+/// model's path. The stored row is left as it is.
+#[derive(Deserialize)]
+struct StoredDataMovementEvent {
+    event_id: String,
+    schema_version: u32,
+    session_id: String,
+    created_at_ms: u64,
+    actor: DataMovementActor,
+    event_type: DataMovementEventType,
+    #[serde(default)]
+    data_classes: Vec<DataClass>,
+    #[serde(default)]
+    source: Option<DataMovementSource>,
+    destination: DataMovementDestination,
+    #[serde(default)]
+    artifact_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    basis: Option<MovementBasis>,
+    #[serde(default)]
+    model: Option<MovementModel>,
+    #[serde(default)]
+    counts: Option<MovementCounts>,
+    policy: MovementPolicy,
+    result: DataMovementResult,
+}
+
+impl From<StoredDataMovementEvent> for DataMovementEvent {
+    fn from(stored: StoredDataMovementEvent) -> Self {
+        // An unmarked row is read by its boundary and provider. A provider
+        // boundary is the egress classification, which calls a server on the
+        // user's LAN remote, so only a provider whose every endpoint is a
+        // fixed public host says the model ran off the user's network.
+        let provider_id = stored
+            .destination
+            .provider_id
+            .as_deref()
+            .or_else(|| stored.model.as_ref()?.provider_id.as_deref());
+        let legacy_remote = stored.destination.boundary == DestinationBoundary::Provider
+            && provider_id.is_some_and(crate::model_id::provider_dials_only_public_hosts);
+        Self {
+            event_id: stored.event_id,
+            schema_version: stored.schema_version,
+            session_id: stored.session_id,
+            created_at_ms: stored.created_at_ms,
+            actor: stored.actor,
+            event_type: stored.event_type,
+            data_classes: stored.data_classes,
+            source: stored.source,
+            destination: stored.destination,
+            artifact_refs: stored.artifact_refs,
+            basis: stored.basis,
+            model: stored.model.map(|model| MovementModel {
+                provider_id: model.provider_id,
+                model_id: model.model_id.map(|id| {
+                    crate::model_id::stored_for_place(id, model.model_placement, legacy_remote)
+                }),
+                model_placement: model.model_placement,
+            }),
+            counts: stored.counts,
+            policy: stored.policy,
+            result: stored.result,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DataMovementEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        StoredDataMovementEvent::deserialize(deserializer).map(Self::from)
+    }
 }
 
 /// A crude, dependency-free guard that strips obvious credential-shaped tokens
@@ -550,9 +638,12 @@ export interface MovementBasis {{
   projection_sequence?: number | null;
 }}
 
+export type ModelPlacement = "local" | "remote";
+
 export interface MovementModel {{
   provider_id?: string | null;
   model_id?: string | null;
+  model_placement?: ModelPlacement | null;
 }}
 
 export interface MovementCounts {{
@@ -622,7 +713,7 @@ mod tests {
                 source_id: Some("transcript_events".to_string()),
                 source_label: Some("Transcript revision log".to_string()),
             }),
-            destination: DataMovementDestination::provider("llm.openrouter", "chat_completions"),
+            destination: DataMovementDestination::provider("llm.cerebras", "chat_completions"),
             artifact_refs: vec![ArtifactRef {
                 kind: "materialized_notes".to_string(),
                 storage: ArtifactStorageKind::File,
@@ -633,8 +724,9 @@ mod tests {
                 projection_sequence: Some(4),
             }),
             model: Some(MovementModel {
-                provider_id: Some("llm.openrouter".to_string()),
-                model_id: Some("anthropic/claude-sonnet-4".to_string()),
+                provider_id: Some("llm.cerebras".to_string()),
+                model_id: Some("cerebras/llama-3.3-70b".to_string()),
+                model_placement: Some(crate::model_id::ModelPlacement::Remote),
             }),
             counts: Some(MovementCounts {
                 audio_ms: None,
@@ -659,13 +751,117 @@ mod tests {
         assert_eq!(value["actor"], "system");
         assert_eq!(value["event_type"], "provider_call_succeeded");
         assert_eq!(value["destination"]["boundary"], "provider");
-        assert_eq!(value["destination"]["provider_id"], "llm.openrouter");
+        assert_eq!(value["destination"]["provider_id"], "llm.cerebras");
         assert_eq!(value["policy"]["privacy_mode"], "byok_cloud");
         assert_eq!(value["result"]["status"], "succeeded");
         assert_eq!(value["data_classes"][0], "transcript_text");
 
         let round_trip: DataMovementEvent = serde_json::from_value(value).expect("deserialize");
         assert_eq!(round_trip, event);
+    }
+
+    #[test]
+    fn a_stored_model_id_is_read_by_where_the_row_says_its_model_ran() {
+        // A row as a build before the placement marker wrote it.
+        let stored_row = |boundary: &str, provider: &str, model_id: serde_json::Value| {
+            let mut row = serde_json::to_value(sample_event()).expect("serialize");
+            row["destination"]["boundary"] = boundary.into();
+            row["destination"]["provider_id"] = provider.into();
+            row["model"]["provider_id"] = provider.into();
+            row["model"]["model_id"] = model_id;
+            row["model"]
+                .as_object_mut()
+                .expect("a model")
+                .remove("model_placement");
+            row
+        };
+        let read = |row: serde_json::Value| {
+            serde_json::from_value::<DataMovementEvent>(row)
+                .expect("a stored row")
+                .model
+                .expect("a model")
+                .model_id
+        };
+        for (stored, local) in [
+            ("/home/numbat/models/private.gguf", "private.gguf"),
+            // What older builds stored for a Windows path.
+            (
+                "C:Usersnumbatmodelsprivate.gguf",
+                crate::model_id::LOCAL_MODEL_PLACEHOLDER,
+            ),
+            ("numbat/checkpoint", "checkpoint"),
+            ("numbat/private.gguf/", "private.gguf"),
+            ("C:numbat/checkpoint", "checkpoint"),
+            ("file:///home/numbat/checkpoint", "checkpoint"),
+            ("org/model.gguf", "model.gguf"),
+            ("org/repo/model.safetensors", "model.safetensors"),
+            (
+                "accounts/fireworks/models/llama-v3p1-8b-instruct",
+                "llama-v3p1-8b-instruct",
+            ),
+            ("org/model@rev1", "model@rev1"),
+            ("llama3.2:latest", "llama3.2:latest"),
+        ] {
+            // Data that left the device for a provider that only dials
+            // public hosts: the hosted identifier.
+            assert_eq!(
+                read(stored_row("provider", "llm.cerebras", stored.into())).as_deref(),
+                Some(stored)
+            );
+            // A provider that takes a user-chosen base URL could have run the
+            // model on the user's network, and the row does not say.
+            for provider in ["llm.openrouter", "llm.api", "asr.wombat"] {
+                assert_eq!(
+                    read(stored_row("provider", provider, stored.into())).as_deref(),
+                    Some(local),
+                    "{stored} at {provider}"
+                );
+            }
+            // Every other boundary reads as a local model.
+            for boundary in ["local", "org", "export"] {
+                assert_eq!(
+                    read(stored_row(boundary, "llm.cerebras", stored.into())).as_deref(),
+                    Some(local),
+                    "{stored} at {boundary}"
+                );
+            }
+        }
+        // A row with a null model id still reads as none.
+        assert_eq!(
+            read(stored_row("local", "llm.cerebras", serde_json::Value::Null)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_marked_row_is_read_by_where_it_says_its_model_ran() {
+        let marked = |provider: &str, placement: &str| {
+            let mut row = serde_json::to_value(sample_event()).expect("serialize");
+            row["destination"]["provider_id"] = provider.into();
+            row["model"]["provider_id"] = provider.into();
+            row["model"]["model_id"] = "anthropic/claude-sonnet-4".into();
+            row["model"]["model_placement"] = placement.into();
+            serde_json::from_value::<DataMovementEvent>(row)
+                .expect("a stored row")
+                .model
+                .expect("a model")
+        };
+        // A row written at OpenRouter's real host keeps its namespace.
+        let remote = marked("llm.openrouter", "remote");
+        assert_eq!(
+            remote.model_id.as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+        assert_eq!(
+            remote.model_placement,
+            Some(crate::model_id::ModelPlacement::Remote)
+        );
+        // One written at a loopback base URL is a display name, whatever
+        // its provider.
+        assert_eq!(
+            marked("llm.cerebras", "local").model_id.as_deref(),
+            Some("claude-sonnet-4")
+        );
     }
 
     #[test]
