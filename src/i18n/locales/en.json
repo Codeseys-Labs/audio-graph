@@ -578,6 +578,13 @@
       "recovery": {
         "missingCredentials": "Add the missing key in this provider section, then run checks.",
         "credentialRejected": "The saved credential was rejected — replace it in this provider section, then run checks.",
+        "retryLater": "Run checks again in a few minutes.",
+        "checkNetwork": "Check your network connection, then run checks again.",
+        "reviewConfiguration": "Check this provider's model, region, or endpoint, then run checks again.",
+        "chooseSupportedProvider": "Choose a supported provider for this role.",
+        "reviewPolicy": "Review the privacy setting that blocks this provider.",
+        "restartApplication": "Restart the app, then run checks again.",
+        "runChecksAgain": "Run checks again.",
         "errorWithCredentials": "Replace the saved key or adjust provider settings, then run checks.",
         "errorWithoutCredentials": "Add a saved key or adjust provider settings, then run checks.",
         "uncheckedWithCredentials": "Run checks to validate the saved key before starting a session."

@@ -2181,7 +2181,8 @@ where
     if config_path.exists() {
         match read_settings_file(config_path, parse_settings_yaml) {
             Ok(settings) => {
-                log::info!("Loaded settings from {}", config_path.display());
+                // Closed text: the path names the user's profile directory.
+                log::info!("Loaded settings from config.yaml");
                 return LoadedSettings::new(settings, SettingsLoadStatus::CanonicalOk);
             }
             Err(_e) => {
@@ -2208,13 +2209,10 @@ where
 
     match read_settings_file(legacy_path, parse_settings_json) {
         Ok(settings) => {
-            log::info!(
-                "Imported legacy settings from {}; writing canonical {}",
-                legacy_path.display(),
-                config_path.display()
-            );
-            if let Err(e) = persist_import(&settings) {
-                log::warn!("Failed to write imported config.yaml: {}", e);
+            log::info!("Imported legacy settings.json; writing canonical config.yaml");
+            if persist_import(&settings).is_err() {
+                // The write error can name the path; it is not logged.
+                log::warn!("Failed to write imported config.yaml");
             }
             LoadedSettings::new(settings, SettingsLoadStatus::LegacyImported)
         }
@@ -2237,8 +2235,8 @@ where
 pub fn load_settings_with_status(app: &tauri::AppHandle) -> LoadedSettings {
     let config_path = match get_settings_path(app) {
         Ok(path) => path,
-        Err(e) => {
-            log::warn!("Failed to determine settings path, using defaults: {}", e);
+        Err(_) => {
+            log::warn!("Failed to determine settings path, using defaults");
             return LoadedSettings::new(
                 AppSettings::default(),
                 SettingsLoadStatus::PathErrorDefaulted,
@@ -2252,8 +2250,8 @@ pub fn load_settings_with_status(app: &tauri::AppHandle) -> LoadedSettings {
 
     let legacy_path = match get_legacy_settings_json_path(app) {
         Ok(path) => path,
-        Err(e) => {
-            log::debug!("Failed to determine legacy settings path: {}", e);
+        Err(_) => {
+            log::debug!("Failed to determine legacy settings path");
             return load_settings_from_paths_with_status(&config_path, None, |_| Ok(()));
         }
     };

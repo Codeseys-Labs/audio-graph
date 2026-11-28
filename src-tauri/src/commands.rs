@@ -12727,6 +12727,31 @@ fn store_provider_readiness(cache_key: String, readiness: &ProviderReadiness) {
         .insert(cache_key, readiness.clone());
 }
 
+/// Read the credential epoch, then the store it covers. A save writes the store
+/// before it bumps the epoch, so in this order a save landing between the two
+/// reads can only pair a newer store with an older epoch: a result is never
+/// keyed under an epoch newer than the credential it checked.
+fn readiness_credential_snapshot<E>(
+    load: impl FnOnce() -> Result<crate::credentials::CredentialStore, E>,
+) -> Result<(u64, crate::credentials::CredentialStore), E> {
+    let epoch = PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst);
+    Ok((epoch, load()?))
+}
+
+/// Cache a result only if no save or delete landed while it was being
+/// checked; a result from before a key change is returned but not kept.
+fn store_provider_readiness_for_epoch(
+    cache_key: String,
+    readiness: &ProviderReadiness,
+    started_epoch: u64,
+) -> bool {
+    if PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst) != started_epoch {
+        return false;
+    }
+    store_provider_readiness(cache_key, readiness);
+    true
+}
+
 fn begin_provider_readiness_refresh(
     cache_key: &str,
     now: u64,
@@ -12920,6 +12945,7 @@ fn should_probe_provider(
             | "asr.assemblyai"
             | "asr.soniox"
             | "llm.cerebras"
+            | "llm.sambanova"
             | "llm.openrouter"
             | "tts.deepgram_aura"
             | "realtime_agent.gemini_live"
@@ -13306,13 +13332,13 @@ pub async fn get_provider_readiness_cmd(
     request_id: Option<String>,
 ) -> AppResult<Vec<ProviderReadiness>> {
     let settings = crate::settings::load_settings(&app);
-    let store = crate::credentials::try_load_credentials()?;
+    let (credential_epoch, store) =
+        readiness_credential_snapshot(crate::credentials::try_load_credentials)?;
     let request = register_provider_readiness_request(request_id)?;
     let (_request_guard, cancel) = match &request {
         Some((guard, token)) => (Some(guard), Some(token)),
         None => (None, None),
     };
-    let credential_epoch = PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst);
     let native_realtime_active = native_realtime_readiness_requested(
         conversation_mode.as_deref(),
         converse_engine.as_deref(),
@@ -13382,7 +13408,7 @@ pub async fn get_provider_readiness_cmd(
         let value = apply_local_model_readiness(descriptor, &app, value);
 
         if value.checked_at.is_some() {
-            store_provider_readiness(cache_key, &value);
+            store_provider_readiness_for_epoch(cache_key, &value, credential_epoch);
         }
         readiness.push(value);
     }
@@ -13477,11 +13503,7 @@ pub async fn test_cloud_asr_connection(
     let api_key = endpoint_api_key_from_draft_or_store(&endpoint, api_key)?;
     let model_catalog =
         fetch_openai_compatible_model_catalog(&endpoint, api_key.as_deref()).await?;
-    Ok(format!(
-        "Connected to {} ({} models)",
-        endpoint,
-        model_catalog.len()
-    ))
+    Ok(format!("Connected ({} models)", model_catalog.len()))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -13632,9 +13654,14 @@ fn provider_check_context() -> RuntimeDiagnosticContext {
 
 /// The HTTP client a readiness or connection check sends through. Its build
 /// error is OS or TLS prose, so only the fact of it is kept.
+///
+/// Redirects stay on the configured origin: reqwest drops `Authorization` on a
+/// cross-origin hop, so a 401 from there would say nothing about the saved key.
+/// The stopped 3xx is classified as a rejected request.
 fn provider_check_client() -> AppResult<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .redirect(crate::llm::http_diag::same_origin_redirects())
         .build()
         .map_err(|_| RuntimeDiagnostic::internal(provider_check_context()).into())
 }
@@ -13667,6 +13694,12 @@ fn provider_check_request_error(error: &reqwest::Error) -> AppError {
             RuntimeErrorCode::NetworkUnreachable,
             true,
             RuntimeSafeRecoveryAction::CheckNetwork,
+        )
+    } else if error.is_redirect() {
+        (
+            RuntimeErrorCode::RequestRejected,
+            false,
+            RuntimeSafeRecoveryAction::ReviewConfiguration,
         )
     } else {
         return RuntimeDiagnostic::internal(provider_check_context()).into();
@@ -13739,8 +13772,7 @@ pub async fn test_openai_compatible_llm_connection_cmd(
     let model_catalog =
         fetch_openai_compatible_model_catalog(&endpoint, api_key.as_deref()).await?;
     Ok(format!(
-        "Connected to {} ({} OpenAI-compatible models)",
-        endpoint.trim(),
+        "Connected ({} OpenAI-compatible models)",
         model_catalog.len()
     ))
 }
@@ -14202,10 +14234,14 @@ async fn probe_aws_credentials(
     session_token: Option<String>,
 ) -> AppResult<()> {
     let region = region.trim();
+    // The closed cause only: the form already holds what the user typed.
     if region.is_empty() || !region.contains('-') {
-        return Err(AppError::AwsRegionInvalid {
-            region: region.to_string(),
-        });
+        return Err(
+            RuntimeErrorDiagnostic::invalid_configuration(RuntimeDiagnosticContext::new(
+                RuntimeOperation::ProviderReadiness,
+            ))
+            .into(),
+        );
     }
     let sdk_config = crate::aws_util::build_aws_sdk_config_with_draft_credentials(
         region,
@@ -14277,9 +14313,19 @@ fn sts_service_code_diagnostic(code: Option<&str>) -> RuntimeDiagnostic {
         Some("InvalidClientTokenId" | "SignatureDoesNotMatch" | "IncompleteSignature") => {
             RuntimeErrorDiagnostic::credential_rejected(context).into()
         }
-        Some("ExpiredToken" | "ExpiredTokenException" | "RequestExpired") => {
+        Some("ExpiredToken" | "ExpiredTokenException") => {
             RuntimeErrorDiagnostic::credential_expired(context).into()
         }
+        // The request's timestamp was outside the window STS accepts, usually
+        // the machine's clock; the credential is not at fault. AWS STS common
+        // errors: "Generate a new request with a current timestamp and try again."
+        Some("RequestExpired") => RuntimeErrorDiagnostic::new(
+            RuntimeErrorCode::RequestRejected,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+            context,
+        )
+        .into(),
         Some("AccessDenied" | "AccessDeniedException") => {
             RuntimeErrorDiagnostic::permission_denied(context).into()
         }
@@ -21547,6 +21593,232 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_readiness_probe_does_not_follow_a_redirect_off_the_configured_origin() {
+        // reqwest would drop the key on the cross-origin hop, so this 401
+        // would wrongly read as a rejected key if the probe followed it.
+        let unauthenticated =
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openai_api_key = Some("redirect-key-canary".to_string());
+        store.openrouter_api_key = Some("redirect-key-canary".to_string());
+
+        for provider_id in ["llm.api", "llm.openrouter"] {
+            let (elsewhere, contacted) =
+                spawn_contact_recording_http_mock(unauthenticated.to_string()).await;
+            let configured = spawn_raw_http_mock(format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {elsewhere}/models\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+            let llm_provider = match provider_id {
+                "llm.api" => crate::settings::LlmProvider::Api {
+                    endpoint: format!("{configured}/v1"),
+                    api_key: String::new(),
+                    model: "probe-model".to_string(),
+                },
+                _ => crate::settings::LlmProvider::OpenRouter {
+                    model: String::new(),
+                    base_url: configured,
+                    provider_order: None,
+                    include_usage_in_stream: true,
+                    api_key: String::new(),
+                },
+            };
+            let settings = crate::settings::AppSettings {
+                llm_provider,
+                ..Default::default()
+            };
+
+            let readiness = refresh_provider_readiness(
+                crate::provider_registry::descriptor_by_id(provider_id),
+                &settings,
+                &store,
+                1,
+                None,
+            )
+            .await;
+
+            assert_eq!(
+                readiness.status,
+                ProviderReadinessStatus::Error,
+                "{provider_id}"
+            );
+            let Some(RuntimeDiagnostic::Runtime(detail)) = &readiness.diagnostic else {
+                panic!("{provider_id}: no typed cause");
+            };
+            assert_eq!(
+                detail.code,
+                RuntimeErrorCode::RequestRejected,
+                "{provider_id}"
+            );
+            assert!(
+                !contacted.load(Ordering::SeqCst),
+                "{provider_id} followed the redirect off its origin"
+            );
+        }
+    }
+
+    #[test]
+    fn a_save_during_a_readiness_refresh_never_caches_the_old_key_under_the_new_epoch() {
+        let _lock = CREDENTIAL_EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let descriptor = crate::provider_registry::descriptor_by_id("llm.openrouter");
+        let settings = crate::settings::AppSettings::default();
+        let active: HashSet<&'static str> = ["llm.openrouter"].into_iter().collect();
+        let key_store = |key: &str| {
+            let mut store = crate::credentials::CredentialStore::default();
+            store.openrouter_api_key = Some(key.to_string());
+            store
+        };
+        let checked = |store: &crate::credentials::CredentialStore, epoch| ProviderReadiness {
+            checked_at: Some(unix_millis()),
+            ..base_provider_readiness(descriptor, &settings, store, epoch)
+        };
+        let current_key =
+            |epoch| provider_readiness_cache_key(descriptor, &settings, epoch, &active);
+
+        // A save lands between the two reads: the store is read with key A,
+        // then the save writes key B and bumps the epoch.
+        let (started, store) = readiness_credential_snapshot(|| {
+            let store = key_store("key-a");
+            bump_provider_credential_epoch();
+            Ok::<_, ()>(store)
+        })
+        .expect("snapshot");
+        let now_epoch = PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst);
+        assert_ne!(started, now_epoch, "key A is never paired with B's epoch");
+        assert!(!store_provider_readiness_for_epoch(
+            current_key(started),
+            &checked(&store, started),
+            started,
+        ));
+        assert!(cached_provider_readiness(&current_key(now_epoch), unix_millis()).is_none());
+
+        // A save lands while the probe runs: its result is returned, not kept.
+        let (started, store) =
+            readiness_credential_snapshot(|| Ok::<_, ()>(key_store("key-b"))).expect("snapshot");
+        let result = checked(&store, started);
+        bump_provider_credential_epoch();
+        let now_epoch = PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst);
+        assert!(!store_provider_readiness_for_epoch(
+            current_key(started),
+            &result,
+            started
+        ));
+        assert!(cached_provider_readiness(&current_key(started), unix_millis()).is_none());
+        assert!(cached_provider_readiness(&current_key(now_epoch), unix_millis()).is_none());
+
+        // With no save in between, the result is cached under its own epoch.
+        let (started, store) =
+            readiness_credential_snapshot(|| Ok::<_, ()>(key_store("key-c"))).expect("snapshot");
+        assert!(store_provider_readiness_for_epoch(
+            current_key(started),
+            &checked(&store, started),
+            started,
+        ));
+        assert!(cached_provider_readiness(&current_key(started), unix_millis()).is_some());
+    }
+
+    #[tokio::test]
+    async fn readiness_entries_and_notes_serialize_exactly_their_closed_fields() {
+        fn keys(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+            value
+                .as_object()
+                .expect("an object")
+                .keys()
+                .cloned()
+                .collect()
+        }
+        fn set(names: &[&str]) -> std::collections::BTreeSet<String> {
+            names.iter().map(|name| name.to_string()).collect()
+        }
+
+        let notes = [
+            (ProviderReadinessNote::ReadyToCheck, set(&["kind"])),
+            (
+                ProviderReadinessNote::MissingCredentials {
+                    keys: vec!["openai_api_key".to_string()],
+                },
+                set(&["kind", "keys"]),
+            ),
+            (ProviderReadinessNote::AwsProfileRequired, set(&["kind"])),
+            (ProviderReadinessNote::VertexProjectRequired, set(&["kind"])),
+            (ProviderReadinessNote::VertexNotProbed, set(&["kind"])),
+            (ProviderReadinessNote::NoAutomaticProbe, set(&["kind"])),
+            (ProviderReadinessNote::LocalModelsManaged, set(&["kind"])),
+            (
+                ProviderReadinessNote::LocalModels {
+                    ready: 1,
+                    total: 2,
+                    missing: vec!["model-a".to_string()],
+                    invalid: Vec::new(),
+                    planned: false,
+                },
+                set(&["kind", "ready", "total", "missing", "invalid", "planned"]),
+            ),
+            (ProviderReadinessNote::NotSelected, set(&["kind"])),
+            (ProviderReadinessNote::Cancelled, set(&["kind"])),
+            (ProviderReadinessNote::CheckInProgress, set(&["kind"])),
+            (
+                ProviderReadinessNote::CheckRateLimited {
+                    retry_after_secs: 3,
+                },
+                set(&["kind", "retry_after_secs"]),
+            ),
+            (ProviderReadinessNote::Verified, set(&["kind"])),
+            (ProviderReadinessNote::Failed, set(&["kind"])),
+        ];
+        for (note, expected) in notes {
+            let value = serde_json::to_value(&note).expect("serialize note");
+            assert_eq!(keys(&value), expected, "{note:?}");
+        }
+
+        // A real failed entry: only its closed fields, and a closed credential row.
+        let endpoint = spawn_raw_http_mock(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        )
+        .await;
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openai_api_key = Some("keyset-key-canary".to_string());
+        let settings = crate::settings::AppSettings {
+            llm_provider: crate::settings::LlmProvider::Api {
+                endpoint: format!("{endpoint}/v1"),
+                api_key: String::new(),
+                model: "probe-model".to_string(),
+            },
+            ..Default::default()
+        };
+        let readiness = refresh_provider_readiness(
+            crate::provider_registry::descriptor_by_id("llm.api"),
+            &settings,
+            &store,
+            1,
+            None,
+        )
+        .await;
+        let value = serde_json::to_value(&readiness).expect("serialize readiness");
+        assert_eq!(
+            keys(&value),
+            set(&[
+                "provider_id",
+                "status",
+                "note",
+                "automatic_probe_available",
+                "checked_at",
+                "stale",
+                "credential_epoch",
+                "credentials",
+                "diagnostic",
+            ]),
+            "{value}"
+        );
+        for credential in value["credentials"].as_array().expect("credential rows") {
+            assert_eq!(keys(credential), set(&["key", "present"]), "{credential}");
+        }
+    }
+
     #[test]
     fn an_sts_failure_is_classified_by_kind_and_code_without_its_text() {
         use aws_sdk_sts::error::{ConnectorError, ErrorMetadata, SdkError};
@@ -21578,6 +21850,12 @@ mod tests {
             (
                 service("ExpiredTokenException"),
                 RuntimeErrorCode::CredentialExpired,
+            ),
+            // A clock outside STS's window, not an expired credential.
+            (service("RequestExpired"), RuntimeErrorCode::RequestRejected),
+            (
+                service("IncompleteSignature"),
+                RuntimeErrorCode::CredentialRejected,
             ),
             (service("AccessDenied"), RuntimeErrorCode::PermissionDenied),
             (
@@ -21629,20 +21907,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_aws_check_with_no_valid_region_is_invalid_configuration() {
-        for region in ["", "  ", "useast1"] {
-            let error = probe_aws_credentials(
-                region,
+    async fn an_aws_check_with_no_valid_region_is_invalid_configuration_without_the_region() {
+        for region in ["", "  ", "numbatcanaryregion"] {
+            let error = test_aws_credentials(
+                region.to_string(),
                 crate::settings::AwsCredentialSource::DefaultChain,
                 None,
                 None,
             )
             .await
             .expect_err("no region");
-            assert!(
-                matches!(error, AppError::AwsRegionInvalid { .. }),
-                "{region:?}: {error:?}"
-            );
+            let AppError::RuntimeDiagnostic(RuntimeDiagnostic::Runtime(detail)) = &error else {
+                panic!("{region:?}: {error:?}");
+            };
+            assert_eq!(detail.code, RuntimeErrorCode::InvalidConfiguration);
+            let serialized = serde_json::to_string(&error).expect("serialize error");
+            assert!(!serialized.contains("numbatcanary"), "{serialized}");
         }
     }
 

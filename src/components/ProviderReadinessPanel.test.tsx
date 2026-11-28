@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import i18n from "i18next";
 import { describe, expect, it } from "vitest";
 import { GENERATED_PROVIDER_REGISTRY } from "../generated/providerRegistry";
+import { RUNTIME_DIAGNOSTIC_CONTRACT } from "../generated/runtimeDiagnostic";
 import {
   credentialStoreFailure,
   FAILURE_CASES,
@@ -308,13 +309,24 @@ describe("ProviderReadinessPanel", () => {
     expect(screen.queryByText(/sk-/i)).not.toBeInTheDocument();
   });
 
-  it("guides saved-key errors toward replace or settings repair", () => {
+  it("does not point at the saved key when the provider rejected the request itself", () => {
     const entry = readiness({
-      ...failedReadiness(runtimeFailure("request_rejected")),
+      ...failedReadiness(
+        runtimeFailure("request_rejected", "review_configuration"),
+      ),
       credentials: [{ key: "openrouter_api_key", present: true }],
     });
 
-    expect(providerRecoveryAction(entry, t)).toMatch(/replace the saved key/i);
+    expect(providerRecoveryAction(entry, t)).toBe(
+      t("settings.providerReadiness.recovery.reviewConfiguration"),
+    );
+  });
+
+  it("covers every closed runtime code in the failure table", () => {
+    const covered = new Set(FAILURE_CASES.map((c) => c.name));
+    for (const code of RUNTIME_DIAGNOSTIC_CONTRACT.error_codes) {
+      expect(covered).toContain(`runtime/${code}`);
+    }
   });
 
   it("decides recovery from the typed cause alone, never from message text", () => {
@@ -328,8 +340,8 @@ describe("ProviderReadinessPanel", () => {
       message: "Credential rejected (401): Deepgram returned HTTP 401",
     } as unknown as ProviderReadiness;
 
-    expect(providerRecoveryAction(entry, t)).toMatch(
-      /replace the saved key or adjust provider settings/i,
+    expect(providerRecoveryAction(entry, t)).toBe(
+      t("settings.providerReadiness.recovery.runChecksAgain"),
     );
     expect(providerReadinessMessage(entry, t)).toBe(
       t("runtimeDiagnostics.runtime.request_rejected"),
@@ -348,7 +360,7 @@ describe("ProviderReadinessPanel", () => {
         }),
         t,
       );
-    const generic = /replace the saved key or adjust provider settings/i;
+    const keyAdvice = /saved key|saved credential|replace/i;
 
     expect(
       recovery(runtimeFailure("credential_rejected", "reenter_credential")),
@@ -361,20 +373,33 @@ describe("ProviderReadinessPanel", () => {
     expect(
       recovery(runtimeFailure("permission_denied", "review_configuration")),
     ).toMatch(/account permissions or plan/i);
-    for (const diagnostic of [
-      runtimeFailure("credential_rejected", "reenter_credential"),
-      runtimeFailure("credential_expired", "refresh_credential"),
-      runtimeFailure("permission_denied", "review_configuration"),
-    ]) {
-      expect(recovery(diagnostic)).not.toMatch(generic);
-    }
-    // A generic rejection and a timeout are not evidence that the saved key
-    // itself is wrong.
-    expect(recovery(runtimeFailure("request_rejected"))).toMatch(generic);
-    expect(recovery(runtimeFailure("timeout", "retry", true))).toMatch(generic);
+    // A rejected request, a rate limit, an outage, a timeout and a network
+    // failure are not evidence that the saved key itself is wrong.
     expect(
-      recovery(runtimeFailure("invalid_configuration", "review_configuration")),
-    ).toMatch(generic);
+      recovery(runtimeFailure("request_rejected", "review_configuration")),
+    ).toMatch(/model, region, or endpoint/i);
+    expect(
+      recovery(runtimeFailure("rate_limited", "retry_after_delay", true)),
+    ).toMatch(/in a few minutes/i);
+    expect(
+      recovery(runtimeFailure("provider_unavailable", "retry", true)),
+    ).toMatch(/in a few minutes/i);
+    expect(recovery(runtimeFailure("timeout", "retry", true))).toMatch(
+      /in a few minutes/i,
+    );
+    expect(
+      recovery(runtimeFailure("network_unreachable", "check_network", true)),
+    ).toMatch(/network connection/i);
+    for (const diagnostic of [
+      runtimeFailure("request_rejected", "review_configuration"),
+      runtimeFailure("rate_limited", "retry_after_delay", true),
+      runtimeFailure("provider_unavailable", "retry", true),
+      runtimeFailure("timeout", "retry", true),
+      runtimeFailure("network_unreachable", "check_network", true),
+      runtimeFailure("invalid_configuration", "review_configuration"),
+    ]) {
+      expect(recovery(diagnostic)).not.toMatch(keyAdvice);
+    }
     // A locked store says to unlock it, not to replace the key.
     expect(recovery(credentialStoreFailure("locked", "unlock_store"))).toMatch(
       /unlock the credential store/i,

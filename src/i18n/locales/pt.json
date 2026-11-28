@@ -578,6 +578,13 @@
       "recovery": {
         "missingCredentials": "Adicione a chave ausente nesta seção do provedor e execute as verificações.",
         "credentialRejected": "A credencial salva foi rejeitada — substitua-a nesta seção do provedor e execute as verificações.",
+        "retryLater": "Execute as verificações novamente em alguns minutos.",
+        "checkNetwork": "Verifique sua conexão de rede e execute as verificações novamente.",
+        "reviewConfiguration": "Verifique o modelo, a região ou o endpoint deste provedor e execute as verificações novamente.",
+        "chooseSupportedProvider": "Escolha um provedor compatível para esta função.",
+        "reviewPolicy": "Revise a configuração de privacidade que bloqueia este provedor.",
+        "restartApplication": "Reinicie o aplicativo e execute as verificações novamente.",
+        "runChecksAgain": "Execute as verificações novamente.",
         "errorWithCredentials": "Substitua a chave salva ou ajuste as configurações do provedor e execute as verificações.",
         "errorWithoutCredentials": "Adicione uma chave salva ou ajuste as configurações do provedor e execute as verificações.",
         "uncheckedWithCredentials": "Execute as verificações para validar a chave salva antes de iniciar uma sessão."

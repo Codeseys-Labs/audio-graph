@@ -599,9 +599,13 @@ function providerFailureRecovery(
   if (presentation.diagnostic.kind === "credential") {
     return t(presentation.translationKey);
   }
+  const recovery = (step: string) =>
+    t(`settings.providerReadiness.recovery.${step}`);
+  // Only a rejected or expired credential, or a refused permission, points at
+  // the key; every other cause says what would actually help.
   switch (presentation.recoveryAction) {
     case "reenter_credential":
-      return t("settings.providerReadiness.recovery.credentialRejected");
+      return recovery("credentialRejected");
     // Replacing the key fixes neither an expired credential...
     case "refresh_credential":
       return t("runtimeDiagnostics.runtime.credential_expired");
@@ -611,8 +615,21 @@ function providerFailureRecovery(
       return diagnostic.kind === "runtime" &&
         diagnostic.detail.code === "permission_denied"
         ? t("runtimeDiagnostics.runtime.permission_denied")
-        : null;
+        : recovery("reviewConfiguration");
     }
+    case "retry":
+    case "retry_after_delay":
+      return recovery("retryLater");
+    case "check_network":
+      return recovery("checkNetwork");
+    case "choose_supported_provider":
+      return recovery("chooseSupportedProvider");
+    case "review_policy":
+      return recovery("reviewPolicy");
+    case "restart_application":
+      return recovery("restartApplication");
+    case "none":
+      return recovery("runChecksAgain");
     default:
       return null;
   }
