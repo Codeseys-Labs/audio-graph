@@ -623,6 +623,7 @@ enum DisconnectKind {
     ServerClose(RuntimeDiagnostic),
     NetworkError(RuntimeDiagnostic),
     PolicyBlocked(RuntimeDiagnostic),
+    TerminalError(RuntimeDiagnostic),
     ProtocolError(RuntimeDiagnostic),
     UserRequested,
     WriterEnded,
@@ -756,8 +757,13 @@ async fn session_task(ctx: SonioxSessionCtx) {
             }
             DisconnectKind::PolicyBlocked(message) => {
                 log::warn!("Soniox session: content egress blocked: {message}");
-                let _ = event_tx.send(SonioxEvent::Error { message });
                 emit_disconnected_once(&event_tx, &disconnected_emitted);
+                let _ = event_tx.send(SonioxEvent::Error { message });
+                break;
+            }
+            DisconnectKind::TerminalError(message) => {
+                emit_disconnected_once(&event_tx, &disconnected_emitted);
+                let _ = event_tx.send(SonioxEvent::Error { message });
                 break;
             }
             _ => {
@@ -988,8 +994,10 @@ async fn run_io_with_keepalive_interval(
 
                 match result {
                     Ok(Message::Text(text)) => {
-                        let finished =
-                            handle_server_message(&text, event_tx, parser);
+                        let finished = match handle_server_message(&text, event_tx, parser) {
+                            Ok(finished) => finished,
+                            Err(message) => return DisconnectKind::TerminalError(message),
+                        };
                         if finished && finishing {
                             let _ = writer.close().await;
                             return DisconnectKind::UserRequested;
@@ -1034,18 +1042,21 @@ pub(super) fn handle_server_message(
     text: &str,
     tx: &crossbeam_channel::Sender<SonioxEvent>,
     parser: &mut SonioxRealtimeParser,
-) -> bool {
+) -> Result<bool, RuntimeDiagnostic> {
     let parsed = match parser.parse_message(text, current_unix_millis()) {
         Ok(parsed) => parsed,
         Err(error) => {
             let _ = tx.send(SonioxEvent::Error {
                 message: error.into(),
             });
-            return false;
+            return Ok(false);
         }
     };
 
     if let Some(message) = parsed.error {
+        if is_terminal_reconnect_error(&message) {
+            return Err(message);
+        }
         let _ = tx.send(SonioxEvent::Error { message });
     }
 
@@ -1057,7 +1068,7 @@ pub(super) fn handle_server_message(
         let _ = tx.send(SonioxEvent::Finished);
     }
 
-    parsed.finished
+    Ok(parsed.finished)
 }
 
 fn soniox_session_config_payload(config: &SonioxConfig) -> Value {
@@ -1182,58 +1193,185 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn reconnect_stops_on_terminal_upgrade_error() {
-        use super::super::diagnostic_tests::reject_upgrade;
+    async fn terminal_auth_frame_ends_session_without_another_reconnect() {
         use std::sync::atomic::AtomicUsize;
 
-        let (url, initial) = ws_fixture::spawn_server(|mut websocket| async move {
-            websocket.close(None).await.unwrap();
-        })
-        .await;
-        let (writer, reader) = ws_fixture::connect_client(&url).await.split();
-        let (reconnect_url, upgrade_server) = reject_upgrade(403, false).await;
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let calls = Arc::clone(&attempts);
-        let opener: ReconnectOpener = Arc::new(move |config| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            let url = reconnect_url.clone();
-            Box::pin(async move { open_ws_url(&config, &url).await })
-        });
-
-        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
-        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
-        let task = tokio::spawn(session_task(SonioxSessionCtx {
-            writer,
-            reader,
-            config: test_config(),
-            audio_rx,
-            event_tx,
-            connected: Arc::new(AtomicBool::new(true)),
-            user_disconnected: Arc::new(AtomicBool::new(false)),
-            pending_chunks: Arc::new(AtomicUsize::new(0)),
-            reconnect_opener: Some(opener),
-            run_io_entries: None,
-        }));
-
-        tokio::time::timeout(Duration::from_secs(6), task)
+        for (wire_type, code) in [
+            ("unauthenticated", Code::CredentialRejected),
+            ("permission_denied", Code::PermissionDenied),
+            ("temp_api_key_session_expired", Code::CredentialExpired),
+        ] {
+            let (initial_url, initial_server) =
+                ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
+            let (writer, reader) = ws_fixture::connect_client(&initial_url).await.split();
+            let (reconnect_url, server) = ws_fixture::spawn_server(move |mut socket| async move {
+                assert!(matches!(socket.next().await, Some(Ok(Message::Text(_)))));
+                let frame =
+                    json!({"error_type": wire_type, "error_message": "private provider note"});
+                socket
+                    .send(Message::Text(frame.to_string().into()))
+                    .await
+                    .unwrap();
+                // Keep the socket open. The diagnostic frame must end the session.
+                while let Some(Ok(message)) = socket.next().await {
+                    assert!(!matches!(message, Message::Text(_)));
+                }
+            })
+            .await;
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&attempts);
+            let opener: ReconnectOpener = Arc::new(move |config| {
+                count.fetch_add(1, Ordering::SeqCst);
+                let url = reconnect_url.clone();
+                Box::pin(async move { open_ws_url(&config, &url).await })
+            });
+            let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+            let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                session_task(SonioxSessionCtx {
+                    writer,
+                    reader,
+                    config: test_config(),
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(true)),
+                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    pending_chunks: Arc::new(AtomicUsize::new(0)),
+                    reconnect_opener: Some(opener),
+                    run_io_entries: None,
+                }),
+            )
             .await
-            .expect("reconnect must end on a terminal failure")
-            .unwrap();
-        initial.await.unwrap();
-        upgrade_server.await.unwrap();
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        let events: Vec<_> = event_rx.try_iter().collect();
-        assert!(
-            matches!(
-                events.as_slice(),
-                [
-                    SonioxEvent::Reconnecting { attempt: 1, .. },
-                    SonioxEvent::Disconnected,
-                    SonioxEvent::Error { message: RuntimeDiagnostic::Runtime(error) },
-                ] if error.code == Code::PermissionDenied && !error.retryable
-            ),
-            "unexpected events: {events:?}"
-        );
+            .expect("terminal frame must end the session");
+            initial_server.await.unwrap();
+            server.await.unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            let events: Vec<_> = event_rx.try_iter().collect();
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [
+                        SonioxEvent::Reconnecting { attempt: 1, .. },
+                        SonioxEvent::Reconnected,
+                        SonioxEvent::Disconnected,
+                        SonioxEvent::Error { message },
+                    ] if *message == websocket_diagnostic(code)
+                ),
+                "unexpected events: {events:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_stops_on_terminal_upgrade_error() {
+        use super::super::diagnostic_tests::{assert_outcome, reject_upgrades};
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeSafeRecoveryAction as Action, RuntimeStatusClass::ClientError,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        for statuses in [&[403][..], &[429, 403], &[]] {
+            let (url, initial) = ws_fixture::spawn_server(|mut websocket| async move {
+                websocket.close(None).await.unwrap();
+            })
+            .await;
+            let (writer, reader) = ws_fixture::connect_client(&url).await.split();
+            let (reconnect_url, upgrade_server) = reject_upgrades(
+                statuses.iter().map(|&status| (status, None)).collect(),
+                false,
+            )
+            .await;
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::clone(&attempts);
+            let opener: ReconnectOpener = Arc::new(move |config| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let url = reconnect_url.clone();
+                Box::pin(async move { open_ws_url(&config, &url).await })
+            });
+
+            let mut config = test_config();
+            if statuses.is_empty() {
+                config.api_key.clear();
+            }
+            let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+            let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+            let task = tokio::spawn(session_task(SonioxSessionCtx {
+                writer,
+                reader,
+                config,
+                audio_rx,
+                event_tx,
+                connected: Arc::new(AtomicBool::new(true)),
+                user_disconnected: Arc::new(AtomicBool::new(false)),
+                pending_chunks: Arc::new(AtomicUsize::new(0)),
+                reconnect_opener: Some(opener),
+                run_io_entries: None,
+            }));
+            tokio::time::timeout(Duration::from_secs(8), task)
+                .await
+                .expect("reconnect must end on a terminal failure")
+                .unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), statuses.len());
+            initial.await.unwrap();
+            upgrade_server.await.unwrap();
+            let events: Vec<_> = event_rx.try_iter().collect();
+            assert!(
+                matches!(events.as_slice(), [.., SonioxEvent::Error { .. }]),
+                "unexpected events: {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|event| match event {
+                        SonioxEvent::Reconnecting { attempt, .. } => Some(*attempt),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                (1..=statuses.len() as u32).collect::<Vec<_>>(),
+            );
+            let errors: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    SonioxEvent::Error { message } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            match statuses.len() {
+                0 => {
+                    assert_eq!(
+                        errors,
+                        [&super::super::missing_provider_credential(
+                            BuiltInCredentialSetId::Soniox
+                        )]
+                    );
+                }
+                1 | 2 => {
+                    assert_eq!(errors.len(), statuses.len());
+                    if statuses.len() == 2 {
+                        assert_outcome(
+                            errors[0],
+                            (
+                                Code::RateLimited,
+                                true,
+                                Action::RetryAfterDelay,
+                                Some(ClientError),
+                            ),
+                        );
+                    }
+                    assert_outcome(
+                        errors[statuses.len() - 1],
+                        (
+                            Code::PermissionDenied,
+                            false,
+                            Action::ReviewConfiguration,
+                            Some(ClientError),
+                        ),
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[tokio::test]
@@ -2210,7 +2348,7 @@ mod tests {
             }) {
                 Message::Text(text) => {
                     saw_text_response = true;
-                    if handle_server_message(&text, &event_tx, &mut parser) {
+                    if handle_server_message(&text, &event_tx, &mut parser).unwrap() {
                         saw_finished = true;
                     }
                     while let Ok(event) = event_rx.try_recv() {
@@ -2262,7 +2400,7 @@ mod tests {
             ),
             &tx,
             &mut parser,
-        );
+        ).unwrap();
 
         match rx.recv().expect("error event") {
             SonioxEvent::Error { message } => {
@@ -2288,7 +2426,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(16);
         let mut parser = SonioxRealtimeParser::new("mixed");
 
-        assert!(!handle_server_message("{", &tx, &mut parser));
+        assert!(!handle_server_message("{", &tx, &mut parser).unwrap());
 
         match rx.recv().expect("error event") {
             SonioxEvent::Error { message } => {

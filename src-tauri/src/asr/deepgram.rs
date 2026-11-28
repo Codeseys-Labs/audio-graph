@@ -1176,6 +1176,13 @@ fn spawn_session_task(
 }
 
 async fn session_task(ctx: DeepgramSessionCtx) {
+    session_task_with_backoff(ctx, Duration::from_secs).await;
+}
+
+async fn session_task_with_backoff(
+    ctx: DeepgramSessionCtx,
+    backoff_duration: impl Fn(u64) -> Duration,
+) {
     let DeepgramSessionCtx {
         writer: initial_writer,
         reader: initial_reader,
@@ -1231,8 +1238,8 @@ async fn session_task(ctx: DeepgramSessionCtx) {
             }
             DisconnectKind::PolicyBlocked(message) => {
                 log::warn!("Deepgram session: content egress blocked: {message}");
-                let _ = event_tx.send(DeepgramEvent::Error { message });
                 emit_disconnected_once(&event_tx, &disconnected_emitted);
+                let _ = event_tx.send(DeepgramEvent::Error { message });
                 break;
             }
             _ => {
@@ -1293,7 +1300,7 @@ async fn session_task(ctx: DeepgramSessionCtx) {
 
                     // Sleep for the backoff window, but bail out early if the
                     // user cancels during the wait.
-                    let sleep = tokio::time::sleep(Duration::from_secs(backoff));
+                    let sleep = tokio::time::sleep(backoff_duration(backoff));
                     tokio::pin!(sleep);
                     loop {
                         tokio::select! {
@@ -4263,6 +4270,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_exhaustion_reports_last_open_error_from_the_current_outage() {
+        use super::super::diagnostic_tests::{assert_outcome, reject_upgrades};
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeSafeRecoveryAction as Action;
+        use std::sync::atomic::AtomicUsize;
+
+        let (initial_url, initial) =
+            ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
+        let (recovered_url, recovered) =
+            ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
+        let (writer, reader) = ws_fixture::connect_client(&initial_url).await.split();
+        let budget = crate::reconnect::DEFAULT_BACKOFF_SECONDS.len();
+        let mut statuses = vec![(429, None)];
+        statuses.extend(std::iter::repeat_n((503, None), budget - 1));
+        statuses.push((408, None));
+        let (reject_url, rejecting) = reject_upgrades(statuses, true).await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        let opener: ReconnectOpener = Arc::new(move |config| {
+            let url = if count.fetch_add(1, Ordering::SeqCst) == 1 {
+                recovered_url.clone()
+            } else {
+                reject_url.clone()
+            };
+            Box::pin(async move { open_ws_url(&config, &url).await })
+        });
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            session_task_with_backoff(
+                DeepgramSessionCtx {
+                    writer,
+                    reader,
+                    config: test_config("nova-3"),
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(true)),
+                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    disconnected_emitted: Arc::new(AtomicBool::new(false)),
+                    pending_chunks: Arc::new(AtomicUsize::new(0)),
+                    reconnect_opener: Some(opener),
+                    run_io_entries: None,
+                },
+                |_| Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("second outage must exhaust the budget");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), budget + 2);
+        initial.await.unwrap();
+        recovered.await.unwrap();
+        rejecting.await.unwrap();
+        let events: Vec<_> = event_rx.try_iter().collect();
+        let reset = events
+            .iter()
+            .position(|event| matches!(event, DeepgramEvent::Reconnected))
+            .unwrap();
+        assert_eq!(reset, 4, "the first reconnect must succeed after the 429");
+        let second_outage = &events[reset + 1..];
+        assert!(matches!(
+            second_outage.first(),
+            Some(DeepgramEvent::Disconnected)
+        ));
+        let second_attempts = second_outage.iter().filter_map(|event| match event {
+            DeepgramEvent::Reconnecting { attempt, .. } => Some(*attempt),
+            _ => None,
+        });
+        assert!(
+            second_attempts.eq(1..=budget as u32),
+            "the second outage needs a fresh budget"
+        );
+        let [
+            ..,
+            DeepgramEvent::Error {
+                message: final_open,
+            },
+            DeepgramEvent::Error { message: exhausted },
+        ] = second_outage
+        else {
+            panic!("expected final open and exhaustion errors");
+        };
+        assert_eq!(final_open, exhausted);
+        assert_outcome(
+            exhausted,
+            (
+                Code::Timeout,
+                true,
+                Action::Retry,
+                Some(RuntimeStatusClass::ClientError),
+            ),
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

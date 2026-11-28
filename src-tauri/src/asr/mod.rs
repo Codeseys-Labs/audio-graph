@@ -71,6 +71,7 @@ fn asr_diagnostic(code: RuntimeErrorCode, transport: RuntimeTransport) -> Runtim
         }
         Code::PermissionDenied => return RuntimeErrorDiagnostic::permission_denied(context).into(),
         Code::InvalidConfiguration => {
+            // OpenAI Realtime uses this when session.update itself is rejected.
             return RuntimeErrorDiagnostic::invalid_configuration(context).into();
         }
         Code::RateLimited => (true, Recovery::RetryAfterDelay),
@@ -733,7 +734,7 @@ mod diagnostic_tests {
         let parsed = parser.parse_message(&payload, 0).unwrap();
         assert_safe(&format!("{parsed:?}"));
         assert_diagnostic(&parsed.error.unwrap(), RuntimeErrorCode::Internal);
-        soniox::handle_server_message(&payload, &tx, &mut parser);
+        soniox::handle_server_message(&payload, &tx, &mut parser).unwrap();
         let event = rx.try_recv().unwrap();
         assert_safe(&format!("{event:?}"));
         let soniox::SonioxEvent::Error { message } = event else {
@@ -746,7 +747,7 @@ mod diagnostic_tests {
             (504, RuntimeErrorCode::Timeout),
         ] {
             let payload = json!({"error_code": wire_code, "error_message": wire_prose()});
-            soniox::handle_server_message(&payload.to_string(), &tx, &mut parser);
+            soniox::handle_server_message(&payload.to_string(), &tx, &mut parser).unwrap();
             let soniox::SonioxEvent::Error { message } = rx.try_recv().unwrap() else {
                 panic!("expected Soniox error event");
             };

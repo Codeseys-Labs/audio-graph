@@ -534,9 +534,15 @@ enum DisconnectKind {
     NetworkError(RuntimeDiagnostic),
     ProtocolError(RuntimeDiagnostic),
     PolicyBlocked(RuntimeDiagnostic),
+    TerminalError(RuntimeDiagnostic),
+    SessionExpired,
     UserRequested,
     WriterEnded,
 }
+
+// Each socket sends exactly one update. OpenAI echoes its ID in errors
+// attributed to that update, which lets us identify a rejected configuration.
+const SESSION_UPDATE_EVENT_ID: &str = "transcription-session-update";
 
 /// Build the `session.update` client event that configures a transcription
 /// session per the GA wire protocol (research §4.1).
@@ -559,6 +565,7 @@ fn session_update_payload(config: &OpenAiRealtimeConfig) -> Value {
 
     json!({
         "type": "session.update",
+        "event_id": SESSION_UPDATE_EVENT_ID,
         "session": {
             "type": "transcription",
             "audio": {
@@ -711,6 +718,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
     #[cfg(test)]
     let run_io_entries = ctx.run_io_entries;
     let mut reconnect_attempts: u32 = 0;
+    let mut last_open_error = None;
     // The readiness event `run_io` should emit when the server confirms the
     // session (`session.updated`): `Connected` for the first session, then
     // `Reconnected` after each successful reconnect.
@@ -744,7 +752,12 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
         })
         .await;
 
-        connected.store(false, Ordering::SeqCst);
+        // Only the acknowledgement handled by run_io marks the session ready.
+        // An upgrade followed by an early close remains part of this outage.
+        if connected.swap(false, Ordering::SeqCst) {
+            reconnect_attempts = 0;
+            last_open_error = None;
+        }
 
         match disconnect {
             DisconnectKind::UserRequested | DisconnectKind::WriterEnded => {
@@ -754,8 +767,13 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
             }
             DisconnectKind::PolicyBlocked(message) => {
                 log::warn!("OpenAI Realtime session: content egress blocked: {message}");
-                emit_error(&event_tx, message);
                 emit_disconnected_once(&event_tx, &disconnected_emitted);
+                emit_error(&event_tx, message);
+                break;
+            }
+            DisconnectKind::TerminalError(message) => {
+                emit_disconnected_once(&event_tx, &disconnected_emitted);
+                emit_error(&event_tx, message);
                 break;
             }
             _ => {
@@ -774,7 +792,6 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                     break;
                 }
 
-                let mut last_open_error = None;
                 let reconnected = loop {
                     let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
                         ReconnectStep::Retry {
@@ -789,6 +806,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                                 "OpenAI Realtime session: reconnect budget exhausted after {attempted} attempts"
                             );
                             let message = last_open_error
+                                .take()
                                 .unwrap_or_else(|| websocket_diagnostic(Code::ProviderUnavailable));
                             emit_error(&event_tx, message);
                             break false;
@@ -844,7 +862,6 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                             log::info!(
                                 "OpenAI Realtime session: socket reopened on attempt {attempt}; awaiting session.updated"
                             );
-                            reconnect_attempts = 0;
                             break true;
                         }
                         Err(diag) => {
@@ -1089,20 +1106,21 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
 
                 match result {
                     Ok(Message::Text(text)) => {
-                        if handle_server_message(
-                            &text,
-                            event_tx,
-                            &mut accumulator,
-                        )
-                            && !session_confirmed
-                        {
-                            // The server has applied our `session.update`: the
-                            // session is now configured per the `Connected`
-                            // contract, so raise readiness exactly once.
-                            session_confirmed = true;
-                            connected.store(true, Ordering::SeqCst);
-                            disconnected_emitted.store(false, Ordering::SeqCst);
-                            let _ = event_tx.send(ready_event.clone());
+                        match handle_server_message(&text, event_tx, &mut accumulator) {
+                            ServerMessage::SessionUpdated if !session_confirmed => {
+                                session_confirmed = true;
+                                connected.store(true, Ordering::SeqCst);
+                                disconnected_emitted.store(false, Ordering::SeqCst);
+                                let _ = event_tx.send(ready_event.clone());
+                            }
+                            ServerMessage::TerminalError(message) => {
+                                return DisconnectKind::TerminalError(message);
+                            }
+                            ServerMessage::SessionExpired => {
+                                let _ = tokio::time::timeout(Duration::from_secs(1), writer.close()).await;
+                                return DisconnectKind::SessionExpired;
+                            }
+                            _ => {}
                         }
                     }
                     Ok(Message::Close(frame)) => {
@@ -1157,24 +1175,19 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
 /// `completed` ordering is not guaranteed, so each `item_id` is reconciled
 /// independently.
 ///
-/// Returns `true` iff the message is a session-readiness frame
-/// (`session.updated` / `session.created`), signalling the caller that the
-/// transcription session is now configured and it may emit
-/// `Connected`/`Reconnected`. The readiness *event* is emitted by the caller
-/// (so the once-only gating lives next to the `connected` flag), keeping this
-/// parser free of cross-message state.
+/// The caller emits readiness and handles session-ending errors.
 pub(super) fn handle_server_message(
     text: &str,
     tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>,
     accumulator: &mut HashMap<String, String>,
-) -> bool {
+) -> ServerMessage {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => {
             let message = websocket_diagnostic(Code::InvalidResponse);
             log::warn!("OpenAI Realtime: {message}");
             emit_error(tx, message);
-            return false;
+            return ServerMessage::Continue;
         }
     };
 
@@ -1189,7 +1202,7 @@ pub(super) fn handle_server_message(
                 .to_string();
             let delta = parsed.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             if item_id.is_empty() || delta.is_empty() {
-                return false;
+                return ServerMessage::Continue;
             }
             let acc = accumulator.entry(item_id.clone()).or_default();
             acc.push_str(delta);
@@ -1198,7 +1211,7 @@ pub(super) fn handle_server_message(
                 item_id,
                 is_final: false,
             });
-            false
+            ServerMessage::Continue
         }
         "conversation.item.input_audio_transcription.completed" => {
             let item_id = parsed
@@ -1216,14 +1229,14 @@ pub(super) fn handle_server_message(
                 .unwrap_or_default();
             accumulator.remove(&item_id);
             if transcript.is_empty() {
-                return false;
+                return ServerMessage::Continue;
             }
             let _ = tx.send(OpenAiRealtimeEvent::Transcript {
                 text: transcript,
                 item_id,
                 is_final: true,
             });
-            false
+            ServerMessage::Continue
         }
         "conversation.item.input_audio_transcription.failed" => {
             let item_id = parsed.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -1231,25 +1244,46 @@ pub(super) fn handle_server_message(
                 accumulator.remove(item_id);
             }
             emit_error(tx, openai_realtime_error_diagnostic(parsed.get("error")));
-            false
+            ServerMessage::Continue
         }
         "error" => {
-            let message = openai_realtime_error_diagnostic(parsed.get("error"));
+            let error = parsed.get("error");
+            let message = openai_realtime_error_diagnostic(error);
+            if is_terminal_reconnect_error(&message) {
+                return ServerMessage::TerminalError(message);
+            }
             emit_error(tx, message);
-            false
+            if error
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                == Some("session_expired")
+            {
+                ServerMessage::SessionExpired
+            } else {
+                ServerMessage::Continue
+            }
         }
-        "session.updated" | "session.created" => {
-            log::debug!("OpenAI Realtime: {msg_type} (session configured)");
-            true
+        "session.updated" => {
+            log::debug!("OpenAI Realtime: session configured");
+            ServerMessage::SessionUpdated
         }
+        "session.created" => ServerMessage::Continue,
         _ => {
             // Many informational events (speech_started/stopped, item.added,
             // rate_limits.updated, etc.) are expected and not actionable on the
             // STT-only path.
             log::debug!("OpenAI Realtime: unhandled message type");
-            false
+            ServerMessage::Continue
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ServerMessage {
+    Continue,
+    SessionUpdated,
+    TerminalError(RuntimeDiagnostic),
+    SessionExpired,
 }
 
 fn emit_error(tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>, message: RuntimeDiagnostic) {
@@ -1265,6 +1299,15 @@ fn openai_realtime_error_diagnostic(error: Option<&Value>) -> RuntimeDiagnostic 
         // A Realtime session has its own duration limit.
         // https://developers.openai.com/api/docs/guides/realtime-conversations
         Some("session_expired") => Code::Timeout,
+        // The documented event_id identifies which client event was rejected.
+        // https://developers.openai.com/api/reference/resources/realtime/client-events#session-update
+        _ if error.is_some_and(|error| {
+            error.get("type").and_then(Value::as_str) == Some("invalid_request_error")
+                && error.get("event_id").and_then(Value::as_str) == Some(SESSION_UPDATE_EVENT_ID)
+        }) =>
+        {
+            Code::InvalidConfiguration
+        }
         Some("invalid_value") => Code::RequestRejected,
         _ => Code::Internal,
     })
@@ -1325,59 +1368,245 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn reconnect_stops_on_terminal_upgrade_error() {
-        use super::super::diagnostic_tests::reject_upgrade;
+    async fn session_expiry_reconnects_and_configuration_rejection_stops() {
         use std::sync::atomic::AtomicUsize;
 
-        let (url, initial) = ws_fixture::spawn_server(|mut websocket| async move {
-            websocket.close(None).await.unwrap();
-        })
-        .await;
-        let (writer, reader) = ws_fixture::connect_client(&url).await.split();
-        let (reconnect_url, upgrade_server) = reject_upgrade(401, true).await;
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let calls = Arc::clone(&attempts);
-        let opener: ReconnectOpener = Arc::new(move |config| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            let url = reconnect_url.clone();
-            Box::pin(async move { open_ws_url(&config, &url).await })
-        });
-
-        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
-        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
-        let task = tokio::spawn(session_task(OpenAiRealtimeSessionCtx {
-            writer,
-            reader,
-            config: test_config(),
-            audio_rx,
-            event_tx,
-            connected: Arc::new(AtomicBool::new(true)),
-            user_disconnected: Arc::new(AtomicBool::new(false)),
-            disconnected_emitted: Arc::new(AtomicBool::new(false)),
-            pending_chunks: Arc::new(AtomicUsize::new(0)),
-            reconnect_opener: Some(opener),
-            run_io_entries: None,
-        }));
-
-        tokio::time::timeout(Duration::from_secs(6), task)
+        for expires in [true, false] {
+            let mut initial_steps = vec![ws_fixture::ServerStep::expect_any_text()];
+            if expires {
+                initial_steps.extend([
+                    ws_fixture::ServerStep::send_text(r#"{"type":"session.updated"}"#),
+                    ws_fixture::ServerStep::send_text(
+                        r#"{"type":"error","error":{"code":"session_expired"}}"#,
+                    ),
+                    // The server never initiates a close in this case.
+                    ws_fixture::ServerStep::expect_close(),
+                ]);
+            } else {
+                initial_steps.push(ws_fixture::ServerStep::send_close());
+            }
+            let (initial_url, initial) = ws_fixture::spawn_scripted_server(initial_steps).await;
+            let (url, unconfirmed) = ws_fixture::spawn_scripted_server(vec![
+                ws_fixture::ServerStep::expect_any_text(),
+                ws_fixture::ServerStep::send_text(r#"{"type":"session.created"}"#),
+                ws_fixture::ServerStep::send_close(),
+            ])
+            .await;
+            let (reject_url, rejecting) = ws_fixture::spawn_server(|mut socket| async move {
+                let Some(Ok(Message::Text(update))) = socket.next().await else {
+                    panic!("expected session update");
+                };
+                let update: Value = serde_json::from_str(&update).unwrap();
+                assert_eq!(update["type"], "session.update");
+                assert_eq!(update["event_id"], SESSION_UPDATE_EVENT_ID);
+                socket
+                    .send(Message::Text(r#"{"type":"session.created"}"#.into()))
+                    .await
+                    .unwrap();
+                let frame = json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "invalid_value",
+                        "event_id": update["event_id"],
+                        "message": "private provider note",
+                    },
+                });
+                socket
+                    .send(Message::Text(frame.to_string().into()))
+                    .await
+                    .unwrap();
+                // The server stays open, so the client must act on the rejection.
+                while let Some(Ok(message)) = socket.next().await {
+                    assert!(!matches!(message, Message::Text(_)));
+                }
+            })
+            .await;
+            let config = test_config();
+            let (writer, reader) = open_ws_url(&config, &initial_url).await.unwrap();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&attempts);
+            let opener: ReconnectOpener = Arc::new(move |config| {
+                let attempt = count.fetch_add(1, Ordering::SeqCst);
+                let url = if !expires && attempt == 0 {
+                    url.clone()
+                } else {
+                    reject_url.clone()
+                };
+                Box::pin(async move { open_ws_url(&config, &url).await })
+            });
+            let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+            let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+            tokio::time::timeout(
+                Duration::from_secs(8),
+                session_task(OpenAiRealtimeSessionCtx {
+                    writer,
+                    reader,
+                    config,
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(false)),
+                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    disconnected_emitted: Arc::new(AtomicBool::new(false)),
+                    pending_chunks: Arc::new(AtomicUsize::new(0)),
+                    reconnect_opener: Some(opener),
+                    run_io_entries: None,
+                }),
+            )
             .await
-            .expect("reconnect must end on a terminal failure")
-            .unwrap();
-        initial.await.unwrap();
-        upgrade_server.await.unwrap();
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        let events: Vec<_> = event_rx.try_iter().collect();
-        assert!(
-            matches!(
-                events.as_slice(),
-                [
-                    OpenAiRealtimeEvent::Disconnected,
-                    OpenAiRealtimeEvent::Reconnecting { attempt: 1, .. },
-                    OpenAiRealtimeEvent::Error { message: RuntimeDiagnostic::Runtime(error) },
-                ] if error.code == Code::CredentialRejected && !error.retryable
-            ),
-            "unexpected events: {events:?}"
-        );
+            .expect("terminal setup frame must end the session");
+            initial.await.unwrap();
+            rejecting.await.unwrap();
+            if expires {
+                unconfirmed.abort();
+            } else {
+                unconfirmed.await.unwrap();
+            }
+            let events: Vec<_> = event_rx.try_iter().collect();
+            let terminal = websocket_diagnostic(Code::InvalidConfiguration);
+            if expires {
+                assert_eq!(attempts.load(Ordering::SeqCst), 1);
+                assert!(
+                    matches!(
+                        events.as_slice(),
+                        [
+                            OpenAiRealtimeEvent::Connected,
+                            OpenAiRealtimeEvent::Error { message: expiry },
+                            OpenAiRealtimeEvent::Disconnected,
+                            OpenAiRealtimeEvent::Reconnecting { attempt: 1, .. },
+                            OpenAiRealtimeEvent::Error { message },
+                        ] if *expiry == websocket_diagnostic(Code::Timeout) && *message == terminal
+                    ),
+                    "unexpected events: {events:?}"
+                );
+            } else {
+                assert_eq!(attempts.load(Ordering::SeqCst), 2);
+                assert!(
+                    matches!(
+                        events.as_slice(),
+                        [
+                            OpenAiRealtimeEvent::Disconnected,
+                            OpenAiRealtimeEvent::Reconnecting { attempt: 1, .. },
+                            OpenAiRealtimeEvent::Reconnecting { attempt: 2, .. },
+                            OpenAiRealtimeEvent::Error { message },
+                        ] if *message == terminal
+                    ),
+                    "unexpected events: {events:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_stops_on_terminal_upgrade_error() {
+        use super::super::diagnostic_tests::{assert_outcome, reject_upgrades};
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeSafeRecoveryAction as Action, RuntimeStatusClass::ClientError,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        for statuses in [&[401][..], &[429, 401], &[]] {
+            let (url, initial) = ws_fixture::spawn_server(|mut websocket| async move {
+                websocket.close(None).await.unwrap();
+            })
+            .await;
+            let (writer, reader) = ws_fixture::connect_client(&url).await.split();
+            let (reconnect_url, upgrade_server) = reject_upgrades(
+                statuses.iter().map(|&status| (status, None)).collect(),
+                true,
+            )
+            .await;
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::clone(&attempts);
+            let opener: ReconnectOpener = Arc::new(move |config| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let url = reconnect_url.clone();
+                Box::pin(async move { open_ws_url(&config, &url).await })
+            });
+
+            let mut config = test_config();
+            if statuses.is_empty() {
+                config.api_key.clear();
+            }
+            let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+            let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+            let task = tokio::spawn(session_task(OpenAiRealtimeSessionCtx {
+                writer,
+                reader,
+                config,
+                audio_rx,
+                event_tx,
+                connected: Arc::new(AtomicBool::new(true)),
+                user_disconnected: Arc::new(AtomicBool::new(false)),
+                disconnected_emitted: Arc::new(AtomicBool::new(false)),
+                pending_chunks: Arc::new(AtomicUsize::new(0)),
+                reconnect_opener: Some(opener),
+                run_io_entries: None,
+            }));
+            tokio::time::timeout(Duration::from_secs(8), task)
+                .await
+                .expect("reconnect must end on a terminal failure")
+                .unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), statuses.len());
+            initial.await.unwrap();
+            upgrade_server.await.unwrap();
+            let events: Vec<_> = event_rx.try_iter().collect();
+            assert!(
+                matches!(events.as_slice(), [.., OpenAiRealtimeEvent::Error { .. }]),
+                "unexpected events: {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|event| match event {
+                        OpenAiRealtimeEvent::Reconnecting { attempt, .. } => Some(*attempt),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                (1..=statuses.len() as u32).collect::<Vec<_>>(),
+            );
+            let errors: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    OpenAiRealtimeEvent::Error { message } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            match statuses.len() {
+                0 => {
+                    assert_eq!(
+                        errors,
+                        [&super::super::missing_provider_credential(
+                            BuiltInCredentialSetId::Openai
+                        )]
+                    );
+                }
+                1 | 2 => {
+                    assert_eq!(errors.len(), statuses.len());
+                    if statuses.len() == 2 {
+                        assert_outcome(
+                            errors[0],
+                            (
+                                Code::RateLimited,
+                                true,
+                                Action::RetryAfterDelay,
+                                Some(ClientError),
+                            ),
+                        );
+                    }
+                    assert_outcome(
+                        errors[statuses.len() - 1],
+                        (
+                            Code::CredentialRejected,
+                            false,
+                            Action::ReenterCredential,
+                            Some(ClientError),
+                        ),
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[tokio::test]
@@ -2171,7 +2400,7 @@ mod tests {
         let mut acc = HashMap::new();
         let confirmed =
             handle_server_message(r#"{"type":"session.updated","session":{}}"#, &tx, &mut acc);
-        assert!(confirmed, "session.updated must signal session-confirmed");
+        assert_eq!(confirmed, ServerMessage::SessionUpdated);
         // The parser itself emits no event — the readiness event is the caller's
         // responsibility (so the once-only gating lives next to `connected`).
         assert!(
@@ -2181,12 +2410,12 @@ mod tests {
     }
 
     #[test]
-    fn session_created_signals_readiness() {
+    fn session_created_does_not_signal_readiness() {
         let (tx, _rx) = crossbeam_channel::bounded(16);
         let mut acc = HashMap::new();
         let confirmed =
             handle_server_message(r#"{"type":"session.created","session":{}}"#, &tx, &mut acc);
-        assert!(confirmed, "session.created must signal session-confirmed");
+        assert_eq!(confirmed, ServerMessage::Continue);
     }
 
     #[test]
@@ -2194,24 +2423,32 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::bounded(16);
         let mut acc = HashMap::new();
         // Transcript delta, error, informational, and unknown frames must all
-        // report `false` so the caller never raises Connected prematurely.
-        assert!(!handle_server_message(
-            r#"{"type":"conversation.item.input_audio_transcription.delta",
+        // leave the connection unchanged.
+        assert_eq!(
+            handle_server_message(
+                r#"{"type":"conversation.item.input_audio_transcription.delta",
                 "item_id":"i","delta":"hi"}"#,
-            &tx,
-            &mut acc,
-        ));
-        assert!(!handle_server_message(
-            r#"{"type":"error","error":{"message":"boom"}}"#,
-            &tx,
-            &mut acc,
-        ));
-        assert!(!handle_server_message(
-            r#"{"type":"rate_limits.updated"}"#,
-            &tx,
-            &mut acc,
-        ));
-        assert!(!handle_server_message("not json", &tx, &mut acc));
+                &tx,
+                &mut acc,
+            ),
+            ServerMessage::Continue
+        );
+        assert_eq!(
+            handle_server_message(
+                r#"{"type":"error","error":{"message":"boom"}}"#,
+                &tx,
+                &mut acc,
+            ),
+            ServerMessage::Continue
+        );
+        assert_eq!(
+            handle_server_message(r#"{"type":"rate_limits.updated"}"#, &tx, &mut acc,),
+            ServerMessage::Continue
+        );
+        assert_eq!(
+            handle_server_message("not json", &tx, &mut acc),
+            ServerMessage::Continue
+        );
     }
 
     /// Reproduces the `run_io` readiness gating in isolation: the readiness
@@ -2227,7 +2464,9 @@ mod tests {
 
         // Mirror the run_io reader-arm gating logic.
         let mut feed = |text: &str| {
-            if handle_server_message(text, &tx, &mut acc) && !session_confirmed {
+            if handle_server_message(text, &tx, &mut acc) == ServerMessage::SessionUpdated
+                && !session_confirmed
+            {
                 session_confirmed = true;
                 connected.store(true, Ordering::SeqCst);
                 let _ = tx.send(ready_event.clone());

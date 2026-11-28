@@ -642,7 +642,6 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::projections::{TranscriptEvent, TranscriptLedger};
     use std::collections::HashMap;
 
