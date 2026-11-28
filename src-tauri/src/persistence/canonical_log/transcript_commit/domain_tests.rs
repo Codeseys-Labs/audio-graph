@@ -189,6 +189,7 @@ fn restart_refuses_a_matching_complete_frame_that_cannot_replay() {
         base_len: cache.byte_len,
         frame_len: frame.frame.len() as u64,
         frame_hash: digest(&frame.frame),
+        members: Vec::new(),
     };
     let descriptor = session.log.with_added_extension("attempt");
     fs::write(&descriptor, serde_json::to_vec(&intent).unwrap()).unwrap();

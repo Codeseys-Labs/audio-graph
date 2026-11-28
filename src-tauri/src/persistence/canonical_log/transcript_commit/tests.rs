@@ -203,6 +203,9 @@ fn interrupted_writer_child() {
         return;
     };
     let cut = match std::env::var(CHILD_CUT).unwrap().as_str() {
+        "group-torn" => Cut::KillGroupTorn,
+        "group-member" => Cut::KillGroupMember,
+        "group-complete" => Cut::KillComplete,
         "torn" => Cut::KillPartial,
         "complete" => Cut::KillComplete,
         "idle" => Cut::Short,
@@ -214,6 +217,13 @@ fn interrupted_writer_child() {
         "recover-retire" => Cut::KillRetired,
         _ => panic!("unknown writer checkpoint"),
     };
+    if std::env::var(CHILD_CUT).unwrap().starts_with("group-") {
+        let prepared = PreparedTranscriptStorage::open(Path::new(&path), SESSION).unwrap();
+        prepared.ready().unwrap();
+        CUT.set(Some(cut));
+        let outcome = prepared.commit_group_after(&group_events(), 1);
+        panic!("group returned before the process cut: {outcome:?}");
+    }
     CUT.set(Some(cut));
     if matches!(cut, Cut::KillTruncated | Cut::KillGap | Cut::KillRetired) {
         let outcome = ready(Path::new(&path), SESSION);
@@ -308,6 +318,197 @@ fn kill_at_writer_checkpoint(path: &Path, checkpoint: &str, while_alive: impl Fn
     );
     if let Err(payload) = observation {
         std::panic::resume_unwind(payload);
+    }
+}
+
+fn group_events() -> [TranscriptEvent; 3] {
+    [
+        transcript_event("willow", "second"),
+        transcript_event("birch", "third"),
+        transcript_event("ash", "fourth"),
+    ]
+}
+
+#[test]
+fn group_preflight_is_nonmutating_and_the_complete_group_shares_one_file_write() {
+    let fixture = Fixture::new();
+    let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+    let events = group_events();
+    assert_eq!(storage.commit_group_after(&events, 0).unwrap(), None);
+    assert!(!fixture.path.exists());
+    storage
+        .commit_after(&transcript_event("leaf", "first"), Some(0))
+        .unwrap();
+    let original = fs::read(&fixture.path).unwrap();
+    let retained = transcript_recovery_artifacts(&fixture.path).unwrap();
+    assert_eq!(storage.commit_group_after(&events, 0).unwrap(), None);
+    assert_eq!(
+        storage
+            .commit_group_after(&[events[0].clone(), events[0].clone()], 1)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        storage
+            .commit_group_after(&[events[0].clone(), transcript_event("leaf", "first")], 1)
+            .unwrap(),
+        None
+    );
+    let mut invalid = events.clone();
+    invalid[1].confidence = f32::NAN;
+    assert_eq!(storage.commit_group_after(&invalid, 1).unwrap(), None);
+    assert_eq!(
+        transcript_recovery_artifacts(&fixture.path).unwrap(),
+        retained
+    );
+    assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    let before = group::GROUP_WRITES.get();
+    let receipts = storage.commit_group_after(&events, 1).unwrap().unwrap();
+    assert!(
+        receipts
+            .iter()
+            .all(|r| !r.already_accepted && r.barrier == receipts[0].barrier)
+    );
+    assert_eq!(
+        receipts.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+        [2, 3, 4]
+    );
+    assert_eq!(group::GROUP_WRITES.get() - before, 1);
+    assert_eq!(fixture.replay().head.unwrap().sequence, 4);
+    assert!(transcript_gaps(&fixture.path).unwrap().is_empty());
+}
+
+#[test]
+fn a_failed_group_barrier_withholds_all_receipts_and_exact_retry_rewrites_the_group() {
+    let fixture = Fixture::new();
+    let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+    storage
+        .commit_after(&transcript_event("leaf", "first"), Some(0))
+        .unwrap();
+    let events = group_events();
+    CUT.set(Some(Cut::Sync));
+    assert!(matches!(
+        storage.commit_group_after(&events, 1),
+        Err(TranscriptCommitError::Io {
+            phase: CanonicalAppendPhase::Sync,
+            ..
+        })
+    ));
+    fixture.assert_only_first_is_visible();
+    let bytes = fs::read(&fixture.path).unwrap();
+    CUT.set(Some(Cut::Short));
+    assert!(matches!(
+        storage.commit_group_after(&events, 1),
+        Err(TranscriptCommitError::Io {
+            kind: io::ErrorKind::WriteZero,
+            ..
+        })
+    ));
+    fixture.assert_only_first_is_visible();
+    assert_eq!(fs::read(&fixture.path).unwrap(), bytes);
+    let receipts = storage.commit_group_after(&events, 1).unwrap().unwrap();
+    assert_eq!(
+        receipts.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+        [2, 3, 4]
+    );
+    assert_eq!(fs::read(&fixture.path).unwrap(), bytes);
+    for event in &events {
+        assert!(storage.commit_after(event, None).unwrap().already_accepted);
+    }
+    assert_eq!(fixture.replay().records.len(), 4);
+    assert!(transcript_gaps(&fixture.path).unwrap().is_empty());
+}
+
+#[test]
+fn an_individual_group_member_retry_cannot_duplicate_or_change_the_live_owners_frames() {
+    let fixture = Fixture::new();
+    let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+    storage
+        .commit_after(&transcript_event("leaf", "first"), Some(0))
+        .unwrap();
+    let events = group_events();
+    CUT.set(Some(Cut::Short));
+    assert!(matches!(
+        storage.commit_group_after(&events, 1),
+        Err(TranscriptCommitError::Io {
+            kind: io::ErrorKind::WriteZero,
+            ..
+        })
+    ));
+    let before = fs::read(&fixture.path).unwrap();
+    let mut changed = events[1].clone();
+    changed.text = "changed".into();
+    assert_eq!(
+        storage.commit_after(&changed, None),
+        Err(TranscriptCommitError::ConflictingAttempt)
+    );
+    assert_eq!(fs::read(&fixture.path).unwrap(), before);
+    fixture.assert_only_first_is_visible();
+    let member = storage.commit_after(&events[1], None).unwrap();
+    assert_eq!(member.sequence, 3);
+    assert!(member.already_accepted);
+    assert_eq!(fixture.replay().records.len(), 4);
+    assert!(transcript_gaps(&fixture.path).unwrap().is_empty());
+}
+
+#[test]
+fn a_killed_group_replays_its_complete_members_and_quarantines_only_the_torn_remainder() {
+    for (checkpoint, complete) in [
+        ("group-torn", 1),
+        ("group-member", 1),
+        ("group-complete", 3),
+    ] {
+        let fixture = Fixture::new();
+        commit_transcript(&fixture.path, SESSION, &transcript_event("leaf", "first")).unwrap();
+        kill_at_writer_checkpoint(&fixture.path, checkpoint, || {});
+        fixture.assert_only_first_is_visible();
+        let before = fs::read(&fixture.path).unwrap();
+        let end = before.iter().rposition(|&b| b == b'\n').unwrap() + 1;
+        if checkpoint == "group-torn" {
+            // Crash a second time after quarantine publication and truncation,
+            // before the gap has become durable.
+            kill_at_writer_checkpoint(&fixture.path, "recover-truncate", || {});
+            fixture.assert_only_first_is_visible();
+        }
+        let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+        // A different next request drives reconciliation. Its stale live head
+        // cannot advance past recovered members until they have been replayed.
+        let next = transcript_event("elm", "next");
+        assert_eq!(
+            storage.commit_after(&next, Some(1)),
+            Err(TranscriptCommitError::LiveHeadChanged)
+        );
+        let snapshot = fixture.replay();
+        assert_eq!(snapshot.records.len(), 1 + complete);
+        assert_eq!(fs::read(&fixture.path).unwrap(), before[..end]);
+        let gaps = transcript_gaps(&fixture.path).unwrap();
+        if complete == 1 {
+            assert_eq!(gaps.len(), 1);
+            assert_eq!(
+                gaps[0].after.as_ref().unwrap().record_hash,
+                snapshot.records[1].record_hash
+            );
+            assert_eq!(gaps[0].suffix_quarantined, end != before.len());
+            let quarantine = transcript_recovery_artifacts(&fixture.path)
+                .unwrap()
+                .into_iter()
+                .find(|p| p.extension().is_some_and(|x| x == "quarantine"));
+            assert_eq!(quarantine.is_some(), end != before.len());
+            if let Some(quarantine) = quarantine {
+                assert_eq!(fs::read(quarantine).unwrap(), before[end..]);
+            }
+        } else {
+            assert!(gaps.is_empty());
+        }
+        for event in group_events().iter().take(complete) {
+            assert!(storage.commit_after(event, None).unwrap().already_accepted);
+        }
+        let head = 1 + complete as u64;
+        assert_eq!(
+            storage.commit_after(&next, Some(head)).unwrap().sequence,
+            head + 1
+        );
+        assert_eq!(fixture.replay().records.len(), 2 + complete);
     }
 }
 
@@ -694,16 +895,27 @@ fn release_transcript_receipt_latency() {
     use std::io::BufWriter;
     use std::sync::Mutex;
     use std::time::Instant;
+    let event = |sequence: u64| {
+        let mut row = transcript_event(&format!("span-{sequence}"), "reed");
+        row.start_time = sequence as f64;
+        row.end_time = row.start_time + 0.5;
+        row
+    };
+    struct Probe {
+        _fixture: Fixture,
+        writer: TranscriptEventWriter,
+        ledger: Arc<Mutex<TranscriptLedger>>,
+        depth: u64,
+        next: u64,
+        solo: Vec<Duration>,
+        burst: Vec<Duration>,
+        burst_elapsed: Duration,
+    }
+    let mut probes = Vec::new();
     for depth in [100_u64, 10_000, 50_000] {
         let fixture = Fixture::new();
         let mut source = BufWriter::new(File::create(&fixture.path).unwrap());
         let mut ledger = TranscriptLedger::new(SESSION);
-        let event = |sequence: u64| {
-            let mut row = transcript_event(&format!("span-{sequence}"), "reed");
-            row.start_time = sequence as f64;
-            row.end_time = row.start_time + 0.5;
-            row
-        };
         for sequence in 1..=depth {
             let revision = event(sequence);
             serde_json::to_writer(&mut source, &revision).unwrap();
@@ -717,26 +929,123 @@ fn release_transcript_receipt_latency() {
         let ledger = Arc::new(Mutex::new(ledger));
         let writer = fixture.writer();
         let client = writer.client();
-        let mut timings = Vec::with_capacity(256);
-        for sequence in depth + 1..=depth + 272 {
-            let revision = event(sequence);
-            let start = Instant::now();
-            let (_, receipt) = client.append_live(&revision, ledger.clone()).unwrap();
-            let elapsed = start.elapsed();
+        for sequence in depth + 1..=depth + 16 {
+            let (_, receipt) = client
+                .append_live(&event(sequence), ledger.clone())
+                .unwrap();
             assert_eq!(receipt.sequence, sequence);
-            if sequence > depth + 16 {
-                timings.push(elapsed);
-            }
         }
-        timings.sort_unstable();
-        println!(
-            "receipt_latency depth={depth} samples={} p50_us={} p95_us={}",
-            timings.len(),
-            timings[127].as_micros(),
-            timings[243].as_micros()
-        );
-        assert!(writer.shutdown_with_timeout(HANG_LIMIT));
+        probes.push(Probe {
+            _fixture: fixture,
+            writer,
+            ledger,
+            depth,
+            next: depth + 17,
+            solo: Vec::with_capacity(256),
+            burst: Vec::with_capacity(256),
+            burst_elapsed: Duration::ZERO,
+        });
     }
+    // Rotate between depths in each round so that competing disk activity is
+    // sampled by all three sessions instead of falling into one depth bucket.
+    for round in 0..16 {
+        for offset in 0..3 {
+            let probe = &mut probes[(round + offset) % 3];
+            let client = probe.writer.client();
+            for _ in 0..16 {
+                let revision = event(probe.next);
+                let started = Instant::now();
+                let (_, receipt) = client.append_live(&revision, probe.ledger.clone()).unwrap();
+                probe.solo.push(started.elapsed());
+                assert_eq!(receipt.sequence, probe.next);
+                probe.next += 1;
+            }
+            let burst_start = Instant::now();
+            let pending: Vec<_> = (probe.next..probe.next + 16)
+                .map(|sequence| {
+                    let revision = event(sequence);
+                    let started = Instant::now();
+                    let pending = client.submit_live(&revision, probe.ledger.clone()).unwrap();
+                    (sequence, started, pending)
+                })
+                .collect();
+            for (sequence, started, pending) in pending {
+                assert_eq!(pending.wait().unwrap().1.sequence, sequence);
+                probe.burst.push(started.elapsed());
+            }
+            probe.burst_elapsed += burst_start.elapsed();
+            probe.next += 16;
+        }
+    }
+    for mut probe in probes {
+        probe.solo.sort_unstable();
+        probe.burst.sort_unstable();
+        let (groups, members) = probe.writer.group_counts();
+        println!(
+            "receipt_latency depth={} samples={} p50_us={} p95_us={}",
+            probe.depth,
+            probe.solo.len(),
+            probe.solo[127].as_micros(),
+            probe.solo[243].as_micros()
+        );
+        println!(
+            "burst_latency depth={} samples={} p50_us={} p95_us={} elapsed_ms={} groups={} grouped_members={}",
+            probe.depth,
+            probe.burst.len(),
+            probe.burst[127].as_micros(),
+            probe.burst[243].as_micros(),
+            probe.burst_elapsed.as_millis(),
+            groups,
+            members
+        );
+        assert!(probe.writer.shutdown_with_timeout(HANG_LIMIT));
+    }
+}
+
+#[test]
+fn queued_live_revisions_share_a_receipt_barrier_and_publish_in_order() {
+    use crate::projections::TranscriptLedger;
+    let fixture = Fixture::new();
+    let writer = fixture.writer();
+    let client = writer.client();
+    let ledger = Arc::new(std::sync::Mutex::new(TranscriptLedger::new(SESSION)));
+    client
+        .append_live(&transcript_event("seed", CONTENT), ledger.clone())
+        .unwrap();
+    let held = ledger.lock().unwrap();
+    let pending: Vec<_> = (1..=8)
+        .map(|n| {
+            client
+                .submit_live(
+                    &transcript_event(&format!("leaf-{n}"), CONTENT),
+                    ledger.clone(),
+                )
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(held.accepted_event_count, 1);
+    assert_eq!(
+        read_committed::<TranscriptEvent>(&fixture.path, SESSION)
+            .unwrap()
+            .records
+            .len(),
+        1
+    );
+    drop(held);
+    for (i, ticket) in pending.into_iter().enumerate() {
+        let (published, receipt) = ticket.wait().unwrap();
+        assert!(published);
+        assert_eq!(receipt.sequence, 2 + i as u64);
+    }
+    let snapshot = read_committed::<TranscriptEvent>(&fixture.path, SESSION).unwrap();
+    assert_eq!(snapshot.records.len(), 9);
+    assert_eq!(ledger.lock().unwrap().accepted_event_count, 9);
+    let (groups, members) = writer.group_counts();
+    assert!(
+        groups >= 1 && members >= 2,
+        "the burst shared a storage transaction"
+    );
+    assert!(writer.shutdown_with_timeout(HANG_LIMIT));
 }
 
 #[test]
@@ -879,4 +1188,29 @@ fn writable_tmpfs_records_on_the_unqualified_tier() {
         CanonicalDurabilityBarrier::SyncedUnqualified
     );
     assert_eq!(f.replay().head.unwrap().sequence, 1);
+}
+
+#[test]
+fn exact_first_create_retry_keeps_its_namespace_receipt() {
+    let f = Fixture::new();
+    let prepared = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    let event = transcript_event("leaf", "first");
+    CUT.set(Some(Cut::Full));
+    assert!(
+        prepared
+            .commit_after(&event, Some(0))
+            .unwrap_err()
+            .is_storage_full()
+    );
+    assert!(f.path.exists());
+    let receipt = prepared.commit_after(&event, Some(0)).unwrap();
+    assert_eq!(receipt.sequence, 1);
+    let expected = if prepared.is_unqualified() {
+        CanonicalDurabilityBarrier::SyncedUnqualified
+    } else if cfg!(windows) {
+        CanonicalDurabilityBarrier::FileAndWindowsNtfsParentFlush
+    } else {
+        CanonicalDurabilityBarrier::FileAndParentNamespace
+    };
+    assert_eq!(receipt.barrier, expected);
 }

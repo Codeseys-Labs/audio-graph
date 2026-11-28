@@ -44,6 +44,7 @@ pub mod session_artifact_manifest;
 pub mod session_semantics;
 #[cfg(feature = "surrealdb-embedded")]
 pub mod surreal;
+mod transcript_batch;
 pub use data_movement::{DataMovementLedgerBuilder, hash_artifact_path};
 pub use io::write_or_emit_storage_full;
 
@@ -1904,6 +1905,10 @@ pub enum TranscriptWriteMsg {
 // through every send and match site for negligible benefit.
 #[allow(clippy::large_enum_variant)]
 pub enum TranscriptEventWriteMsg {
+    #[cfg(test)]
+    SimulateDiskFull,
+    #[cfg(test)]
+    GroupCounts(mpsc::Sender<Result<(usize, usize), canonical_log::TranscriptCommitError>>),
     Live(
         TranscriptEvent,
         Arc<Mutex<TranscriptLedger>>,
@@ -2319,8 +2324,34 @@ impl TranscriptWriter {
     }
 }
 
-type LiveTranscriptResult =
+pub(crate) type LiveTranscriptResult =
     Result<(bool, canonical_log::TranscriptReceipt), canonical_log::TranscriptCommitError>;
+
+pub(crate) const MAX_TRANSCRIPT_GROUP: usize = 16;
+const TRANSCRIPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub(crate) struct PendingTranscriptReceipt<T> {
+    reply: mpsc::Receiver<Result<T, canonical_log::TranscriptCommitError>>,
+    deadline: std::time::Instant,
+}
+
+impl<T> PendingTranscriptReceipt<T> {
+    pub(crate) fn wait(self) -> Result<T, canonical_log::TranscriptCommitError> {
+        use canonical_log::TranscriptCommitError as Error;
+        self.reply
+            .recv_timeout(
+                self.deadline
+                    .saturating_duration_since(std::time::Instant::now()),
+            )
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => Error::AckTimeout,
+                mpsc::RecvTimeoutError::Disconnected => Error::ReplyLost,
+            })?
+    }
+}
+
+pub(crate) type PendingLiveTranscript =
+    PendingTranscriptReceipt<(bool, canonical_log::TranscriptReceipt)>;
 
 #[derive(Clone)]
 pub(crate) struct TranscriptCommitClient {
@@ -2335,7 +2366,17 @@ impl TranscriptCommitClient {
         event: &TranscriptEvent,
         ledger: Arc<Mutex<TranscriptLedger>>,
     ) -> LiveTranscriptResult {
-        self.request(|reply| TranscriptEventWriteMsg::Live(event.clone(), ledger, reply))
+        self.submit_live(event, ledger)?.wait()
+    }
+
+    pub(crate) fn submit_live(
+        &self,
+        event: &TranscriptEvent,
+        ledger: Arc<Mutex<TranscriptLedger>>,
+    ) -> Result<PendingLiveTranscript, canonical_log::TranscriptCommitError> {
+        self.enqueue(TRANSCRIPT_ACK_TIMEOUT, |reply| {
+            TranscriptEventWriteMsg::Live(event.clone(), ledger, reply)
+        })
     }
 
     fn request<T>(
@@ -2344,7 +2385,7 @@ impl TranscriptCommitClient {
             mpsc::Sender<Result<T, canonical_log::TranscriptCommitError>>,
         ) -> TranscriptEventWriteMsg,
     ) -> Result<T, canonical_log::TranscriptCommitError> {
-        self.request_with_timeout(std::time::Duration::from_secs(5), message)
+        self.request_with_timeout(TRANSCRIPT_ACK_TIMEOUT, message)
     }
 
     fn request_with_timeout<T>(
@@ -2354,6 +2395,16 @@ impl TranscriptCommitClient {
             mpsc::Sender<Result<T, canonical_log::TranscriptCommitError>>,
         ) -> TranscriptEventWriteMsg,
     ) -> Result<T, canonical_log::TranscriptCommitError> {
+        self.enqueue(timeout, message)?.wait()
+    }
+
+    fn enqueue<T>(
+        &self,
+        timeout: std::time::Duration,
+        message: impl FnOnce(
+            mpsc::Sender<Result<T, canonical_log::TranscriptCommitError>>,
+        ) -> TranscriptEventWriteMsg,
+    ) -> Result<PendingTranscriptReceipt<T>, canonical_log::TranscriptCommitError> {
         use canonical_log::TranscriptCommitError as Error;
         let (reply, ack) = mpsc::channel();
         match self.tx.try_send(message(reply)) {
@@ -2364,10 +2415,10 @@ impl TranscriptCommitClient {
                     &self.dropped_event_count,
                     &self.queue_full_active,
                 );
-                ack.recv_timeout(timeout).map_err(|e| match e {
-                    mpsc::RecvTimeoutError::Timeout => Error::AckTimeout,
-                    mpsc::RecvTimeoutError::Disconnected => Error::ReplyLost,
-                })?
+                Ok(PendingTranscriptReceipt {
+                    reply: ack,
+                    deadline: std::time::Instant::now() + timeout,
+                })
             }
             Err(mpsc::TrySendError::Full(_)) => {
                 note_event_writer_queue_full(
@@ -2479,8 +2530,8 @@ impl TranscriptEventWriter {
 
     /// Build a repository-backed transcript event writer.
     ///
-    /// This keeps the runtime writer contract available for DB-backed adapters
-    /// without changing the default file-backed writer path.
+    /// The repository must expose a session-scoped canonical file. Capture
+    /// preflight probes its selected receipt tier before starting the worker.
     pub fn repository(
         session_id: impl Into<String>,
         repository: Arc<dyn LocalMemoryRepository>,
@@ -2498,40 +2549,7 @@ impl TranscriptEventWriter {
         let flag = shutdown_requested.clone();
         let handle = std::thread::Builder::new()
             .name("transcript-commit".into())
-            .spawn(move || {
-                let mut live_index = crate::projections::TranscriptLiveIndex::default();
-                loop {
-                    match rx.recv_timeout(POLL_INTERVAL) {
-                        Ok(TranscriptEventWriteMsg::Append(event, expected_head, reply)) => {
-                            let result = storage.commit_after(&event, expected_head);
-                            if result.as_ref().is_err_and(|e| e.is_storage_full()) {
-                                io::notify_transcript_storage_full(app_handle());
-                            }
-                            let _ = reply.send(result);
-                        }
-                        Ok(TranscriptEventWriteMsg::Live(event, ledger, reply)) => {
-                            let result = commit_to_live_ledger(
-                                &mut live_index,
-                                &storage,
-                                &path,
-                                &session_id,
-                                event,
-                                &ledger,
-                            );
-                            if result.as_ref().is_err_and(|e| e.is_storage_full()) {
-                                io::notify_transcript_storage_full(app_handle());
-                            }
-                            let _ = reply.send(result);
-                        }
-                        Ok(TranscriptEventWriteMsg::Shutdown)
-                        | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) if flag.load(Ordering::SeqCst) => {
-                            break;
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                }
-            })
+            .spawn(move || transcript_batch::run(rx, &storage, &path, &session_id, &flag))
             .ok()?;
         Some(Self {
             unqualified,
@@ -2543,12 +2561,26 @@ impl TranscriptEventWriter {
         })
     }
 
-    /// Queue admission is pending. Only the worker can issue the durable receipt.
+    /// Queue admission is pending until the worker confirms the selected storage tier.
     pub fn append(
         &self,
         event: &TranscriptEvent,
     ) -> Result<canonical_log::TranscriptReceipt, canonical_log::TranscriptCommitError> {
         self.append_after(event, None)
+    }
+
+    #[cfg(test)]
+    fn group_counts(&self) -> (usize, usize) {
+        self.client()
+            .request(TranscriptEventWriteMsg::GroupCounts)
+            .unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulate_disk_full_on_next_append(&self) {
+        self.tx
+            .send(TranscriptEventWriteMsg::SimulateDiskFull)
+            .expect("test writer is available");
     }
 
     pub(crate) fn client(&self) -> TranscriptCommitClient {

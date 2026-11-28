@@ -1848,6 +1848,8 @@ struct PendingAppend {
 mod transcript_commit;
 pub(crate) mod transcript_export;
 pub(super) use transcript_commit::read_committed;
+#[cfg(test)]
+pub(super) use transcript_commit::simulate_disk_full;
 pub(crate) use transcript_commit::{
     PreparedTranscriptStorage, commit_transcript, recover_previous_sessions,
     transcript_recovery_artifacts,

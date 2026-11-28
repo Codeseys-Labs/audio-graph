@@ -88,7 +88,7 @@ pub struct TranscriptGap {
     pub suffix_quarantined: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Intent {
     attempt: String,
@@ -98,6 +98,8 @@ struct Intent {
     source_was_absent: bool,
     frame_len: u64,
     frame_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    members: Vec<group::Member>,
 }
 
 fn process_owner() -> &'static str {
@@ -160,6 +162,7 @@ struct RetainedFrame {
     bytes: Vec<u8>,
     payload: String,
     revision_id: String,
+    group_members: Vec<(String, String)>,
     synced: bool,
 }
 type Attempts = std::sync::Mutex<HashMap<PathBuf, LiveAttempt>>;
@@ -212,7 +215,7 @@ struct VerifiedPrefix {
 }
 enum TranscriptGuard<'a> {
     Qualified(
-        CanonicalExclusiveGuard,
+        Box<CanonicalExclusiveGuard>,
         &'a CanonicalFilesystemQualification,
     ),
     Unqualified(File),
@@ -280,6 +283,7 @@ impl<'a> Commit<'a> {
             Some((qualification, durability)) => TranscriptGuard::Qualified(
                 durability
                     .transcript_guard(qualification, lock)
+                    .map(Box::new)
                     .map_err(TranscriptCommitError::Rejected)?,
                 qualification,
             ),
@@ -427,13 +431,7 @@ impl<'a> Commit<'a> {
         }
         Ok((cache, revisions))
     }
-    fn run(
-        &self,
-        event: Option<&TranscriptEvent>,
-        expected_head: Option<u64>,
-        owner: &str,
-        verified: &std::cell::RefCell<Option<VerifiedPrefix>>,
-    ) -> Result<Option<TranscriptReceipt>, TranscriptCommitError> {
+    fn acquire_lease(&self) -> Result<Lease, TranscriptCommitError> {
         let lock = self.path.with_added_extension("attempt-lock");
         let lock_key =
             fs::canonicalize(lock.parent().ok_or(TranscriptCommitError::InvalidAddress)?)
@@ -446,7 +444,7 @@ impl<'a> Commit<'a> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&lock_key);
-        let mut lease = if let Some(attempt) = retained {
+        let lease = if let Some(attempt) = retained {
             Lease {
                 path: lock_key,
                 file: Some(attempt.file),
@@ -473,16 +471,32 @@ impl<'a> Commit<'a> {
                 pending: None,
             }
         };
+        Ok(lease)
+    }
+    fn run(
+        &self,
+        event: Option<&TranscriptEvent>,
+        expected_head: Option<u64>,
+        owner: &str,
+        verified: &std::cell::RefCell<Option<VerifiedPrefix>>,
+    ) -> Result<Option<TranscriptReceipt>, TranscriptCommitError> {
+        let mut lease = self.acquire_lease()?;
         let payload_digest = event
             .map(serde_json::to_vec)
             .transpose()
             .map_err(|_| TranscriptCommitError::InvalidHistory)?
             .map(|bytes| digest(&bytes));
         let intent_path = self.path.with_added_extension("attempt");
-        let intent: Option<Intent> = checked_bytes_bounded(&intent_path, 4096)?
+        let mut intent: Option<Intent> = checked_bytes_bounded(&intent_path, 4096)?
             .map(|bytes| serde_json::from_slice(&bytes))
             .transpose()
             .map_err(|_| TranscriptCommitError::InvalidHistory)?;
+        if let Some(group) = intent.as_ref().filter(|intent| !intent.members.is_empty()) {
+            self.resolve_group_for_request(group, &mut lease, event, payload_digest.as_deref())?;
+            *verified.borrow_mut() = None;
+            lease.pending = None;
+            intent = None;
+        }
         if intent.is_none()
             && let Some(retained) = &lease.pending
         {
@@ -693,6 +707,12 @@ impl<'a> Commit<'a> {
             self.abandon_attempt(&intent, &bytes[base_len..], &mut source)?;
             lease.pending = None;
         }
+        // A failed first append may have installed an empty source. Its retry
+        // still owns the first-create namespace obligation recorded in the intent.
+        let first_create = source.is_none()
+            || live_attempt
+                .as_ref()
+                .is_some_and(|intent| intent.source_was_absent);
         if let Some(intent) = live_attempt {
             if intent.frame_hash != frame_hash
                 || lease
@@ -711,6 +731,7 @@ impl<'a> Commit<'a> {
                 base_len: cache.byte_len,
                 frame_len: frame.frame.len() as u64,
                 frame_hash,
+                members: Vec::new(),
             };
             let descriptor =
                 serde_json::to_vec(&intent).map_err(|_| TranscriptCommitError::InvalidHistory)?;
@@ -718,13 +739,13 @@ impl<'a> Commit<'a> {
                 bytes: frame.frame.clone(),
                 payload: payload_digest.ok_or(TranscriptCommitError::InvalidHistory)?,
                 revision_id: metadata.event_id.clone(),
+                group_members: Vec::new(),
                 synced: false,
             });
             self.publish(&intent_path, &descriptor)?;
             #[cfg(test)]
             kill_at(Cut::KillIntent);
         }
-        let first_create = source.is_none();
         let mut file = match source {
             Some(file) => file,
             None => {
@@ -935,6 +956,8 @@ enum Cut {
     RecoverySync,
     KillPartial,
     KillComplete,
+    KillGroupTorn,
+    KillGroupMember,
     KillIntent,
     KillQuarantine,
     KillTruncated,
@@ -945,6 +968,11 @@ enum Cut {
 }
 #[cfg(test)]
 thread_local! { static CUT: std::cell::Cell<Option<Cut>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(in crate::persistence) fn simulate_disk_full() {
+    CUT.set(Some(Cut::Full));
+}
+
 #[cfg(test)]
 fn wait_for_kill() -> ! {
     println!("TRANSCRIPT_WRITER_CUT");
@@ -1426,3 +1454,5 @@ mod tests;
 
 #[cfg(test)]
 mod domain_tests;
+
+mod group;

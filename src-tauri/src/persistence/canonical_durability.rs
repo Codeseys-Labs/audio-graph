@@ -755,11 +755,18 @@ impl ManagedNamespace {
         platform: CanonicalPlatform,
         allow_descendant: bool,
     ) -> Result<BoundParent, CanonicalDurabilityRejection> {
-        self.validate_current()?;
         if target.file_name().is_none() {
             return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
         }
         let parent = parent_directory(target);
+        // For a direct child of the exact Windows root, its flush handle below
+        // also proves the qualified root identity. An alias or a descendant
+        // must independently validate both the root and the target parent.
+        let direct_windows_root =
+            cfg!(windows) && parent.as_os_str() == self.canonical_root.as_os_str();
+        if !direct_windows_root {
+            self.validate_current()?;
+        }
         #[cfg(windows)]
         windows_ntfs::check_directory_chain(&parent).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -768,26 +775,34 @@ impl ManagedNamespace {
                 durability_io(CanonicalDurabilityStage::OpenParent, &error)
             }
         })?;
-        let canonical_parent = std::fs::canonicalize(&parent).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                CanonicalDurabilityRejection::ParentProvisioningRequired
-            } else {
-                durability_io(CanonicalDurabilityStage::OpenParent, &error)
-            }
-        })?;
+        let canonical_parent = if direct_windows_root {
+            parent
+        } else {
+            std::fs::canonicalize(&parent).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    CanonicalDurabilityRejection::ParentProvisioningRequired
+                } else {
+                    durability_io(CanonicalDurabilityStage::OpenParent, &error)
+                }
+            })?
+        };
         let is_root = canonical_parent == self.canonical_root;
         if !(is_root || allow_descendant && canonical_parent.starts_with(&self.canonical_root)) {
             return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
         }
-        let metadata = std::fs::metadata(&canonical_parent)
-            .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
-        if !metadata.is_dir() {
-            return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
-        }
-        let identity = self.observed_identity(
-            path_identity(&canonical_parent, &metadata)
-                .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?,
-        );
+        let identity = if direct_windows_root {
+            self.identity.clone()
+        } else {
+            let metadata = std::fs::metadata(&canonical_parent)
+                .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
+            if !metadata.is_dir() {
+                return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+            }
+            self.observed_identity(
+                path_identity(&canonical_parent, &metadata)
+                    .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?,
+            )
+        };
         if is_root && identity_is_available(&self.identity) && identity != self.identity {
             return Err(CanonicalDurabilityRejection::IdentityChanged);
         }
@@ -796,6 +811,9 @@ impl ManagedNamespace {
             let opened_metadata = directory
                 .metadata()
                 .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))?;
+            if !opened_metadata.is_dir() {
+                return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
+            }
             if identity_is_available(&identity)
                 && self.observed_identity(
                     handle_identity(directory, &opened_metadata).map_err(|error| {
@@ -2624,14 +2642,20 @@ impl CanonicalExclusiveGuard {
             Ok(parent) => parent,
             Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
         };
-        let destination_parent = match self.namespace.bind_parent(destination, self.platform) {
-            Ok(parent) => parent,
-            Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
-        };
-        if temporary_parent.canonical_path != destination_parent.canonical_path {
-            return CanonicalDurabilityOutcome::Rejected(
-                CanonicalDurabilityRejection::TargetOutsideManagedNamespace,
-            );
+        // Two direct sibling names share the same held parent barrier. Resolve
+        // distinct parent spellings independently before accepting an alias.
+        if destination.file_name().is_none()
+            || temporary.parent().map(Path::as_os_str) != destination.parent().map(Path::as_os_str)
+        {
+            let destination_parent = match self.namespace.bind_parent(destination, self.platform) {
+                Ok(parent) => parent,
+                Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
+            };
+            if temporary_parent.canonical_path != destination_parent.canonical_path {
+                return CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::TargetOutsideManagedNamespace,
+                );
+            }
         }
         if snapshot_basenames_overlap(temporary, destination) {
             return CanonicalDurabilityOutcome::Rejected(
@@ -4321,6 +4345,7 @@ mod windows_ntfs {
     }
 
     pub(super) fn check_directory_chain(path: &Path) -> io::Result<()> {
+        use windows::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
         let absolute = std::path::absolute(path)?;
         match absolute.components().next() {
             Some(Component::Prefix(prefix))
@@ -4328,8 +4353,24 @@ mod windows_ntfs {
             _ => return Err(io::ErrorKind::Unsupported.into()),
         }
         // canonicalize follows junctions, so inspect the caller's chain first.
+        let mut wide = Vec::new();
         for ancestor in absolute.ancestors() {
-            require_plain(&std::fs::symlink_metadata(ancestor)?)?;
+            // Query the attributes of the named entry itself, including on
+            // symlinks and mounted folders. No handle or full metadata is needed.
+            wide.clear();
+            wide.extend(ancestor.as_os_str().encode_wide());
+            if wide.contains(&0) {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            wide.push(0);
+            // SAFETY: the path is NUL-terminated and live through the call.
+            let attributes = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
+            if attributes == INVALID_FILE_ATTRIBUTES {
+                // The std path also supports long non-verbatim caller spellings.
+                require_plain(&std::fs::symlink_metadata(ancestor)?)?;
+            } else if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
         }
         Ok(())
     }
@@ -7053,9 +7094,10 @@ mod tests {
         fs::create_dir_all(&parent).unwrap();
         let (proof, _) =
             CanonicalFilesystemQualification::for_existing_managed_root(&parent).unwrap();
+        let target = proof.namespace.canonical_root.join("entry");
         let bound = proof
             .namespace
-            .bind_parent(&parent.join("entry"), CanonicalPlatform::Windows)
+            .bind_parent(&target, CanonicalPlatform::Windows)
             .unwrap();
         fs::rename(&parent, root.join("original")).unwrap();
         fs::create_dir(&parent).unwrap();
@@ -7063,6 +7105,12 @@ mod tests {
             bound.barrier.sync_all().unwrap_err().kind(),
             io::ErrorKind::Other
         );
+        assert!(matches!(
+            proof
+                .namespace
+                .bind_parent(&target, CanonicalPlatform::Windows),
+            Err(CanonicalDurabilityRejection::IdentityChanged)
+        ));
         drop(bound);
         fs::remove_dir_all(root).unwrap();
     }

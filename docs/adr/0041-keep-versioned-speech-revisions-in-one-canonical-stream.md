@@ -348,3 +348,20 @@ visible for this tier. Qualified local filesystems retain their existing
 first-create namespace barriers. Recording still requires a writable source,
 a usable lock, successful synchronization and admission at the v1 floor.
 A v2 floor continues to require the qualified transition protocol.
+
+### Receipt timing for v1 transcript revisions
+
+Each revision owns its own frame, sequence and payload commitment. An idle
+writer begins the next append immediately. Under load, the writer can collect
+up to 16 queued revisions for the same live ledger within an eight-millisecond
+window. The attempt descriptor identifies each member in order. One file
+synchronization covers the contiguous frames. The writer publishes receipts
+and advances the live ledger after the storage tier's barriers complete and
+the attempt descriptor is retired. Acknowledged loss remains zero within the
+qualified tier's guarantees. The unqualified tier retains its disk warning.
+
+On interruption, recovery starts at the descriptor's verified preceding head.
+It rewrites and synchronizes complete matching members, preserves an
+uncommitted suffix as evidence, and records its gap after the last verified
+member. Consumers can replay the recovered prefix exactly once. An expired
+caller wait cannot revoke a frame whose commit completes later.
