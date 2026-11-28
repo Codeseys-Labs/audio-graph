@@ -168,6 +168,12 @@ pub enum CaptureFailureReason {
     StartupTimeout,
     WorkerExited,
     Cancelled,
+    /// The start's renderer was superseded: another renderer attached since
+    /// it was issued its epoch. Distinct from `Cancelled`, which acknowledges
+    /// a deliberate Stop.
+    StaleAttachment,
+    /// A repeated delivery of a start whose outcome is not known yet.
+    StillPreparing,
     AlreadyRunning,
     PreviousCaptureStopping,
     PreviousCaptureReconciling,
@@ -184,6 +190,8 @@ impl CaptureFailureReason {
             Self::StartupTimeout => "startup_timeout",
             Self::WorkerExited => "worker_exited",
             Self::Cancelled => "cancelled",
+            Self::StaleAttachment => "stale_attachment",
+            Self::StillPreparing => "still_preparing",
             Self::AlreadyRunning => "already_running",
             Self::PreviousCaptureStopping => "previous_capture_stopping",
             Self::PreviousCaptureReconciling => "previous_capture_reconciling",
@@ -1840,9 +1848,18 @@ struct PendingCaptureStart {
     id: CaptureId,
     /// Dropped to cancel, so a cancel is sticky and wakes the waiting start.
     cancel_tx: Option<crossbeam_channel::Sender<()>>,
-    /// Dropped with the registration, which tells a repeated delivery of
-    /// this start that its outcome is known.
-    settled: tokio::sync::watch::Sender<()>,
+    /// Where the first delivery publishes its outcome for repeated
+    /// deliveries; its ticket holds the same sender past the commit.
+    settled: Arc<tokio::sync::watch::Sender<Option<CaptureSettlement>>>,
+}
+
+/// The outcome of a start, as a repeated delivery of it learns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CaptureSettlement {
+    Committed,
+    Refused(CaptureStartFailure),
+    /// It failed without a closed refusal (or its command panicked).
+    Failed,
 }
 
 /// How [`AudioCaptureManager::register_capture_start`] admitted a start.
@@ -1851,9 +1868,9 @@ pub(crate) enum CaptureRegistration {
     Registered(CaptureStartTicket),
     /// A repeated delivery of the live capture's start.
     Live,
-    /// A repeated delivery of the start still preparing: its outcome is known
-    /// once this receiver reports the registration gone.
-    Preparing(tokio::sync::watch::Receiver<()>),
+    /// A repeated delivery of the start still preparing: its outcome is
+    /// published on this receiver.
+    Preparing(tokio::sync::watch::Receiver<Option<CaptureSettlement>>),
 }
 
 /// A registered start. Its owner must call
@@ -1862,6 +1879,8 @@ pub(crate) struct CaptureStartTicket {
     pub(crate) id: CaptureId,
     cancel_rx: crossbeam_channel::Receiver<()>,
     hooks: CaptureWorkerHooks,
+    /// Publishes this start's outcome to its repeated deliveries.
+    pub(crate) settled: Arc<tokio::sync::watch::Sender<Option<CaptureSettlement>>>,
 }
 
 /// One requested source, resolved by the command layer.
@@ -2049,12 +2068,15 @@ impl AudioCaptureManager {
     }
 
     /// Register start `id` before it waits for the session lifecycle, so a
-    /// Stop, attach or shutdown from then on cancels it. A start registers
-    /// only if `id` is above both watermarks: newer than every cancelled id
-    /// and every start already registered. Commands are delivered at least
-    /// once, so a repeated delivery of the live capture's start, or of the
-    /// start still preparing, is recognised rather than refused. Refuses a
-    /// second concurrent start, and retires its id so it never runs.
+    /// Stop, attach or shutdown from then on cancels it. Commands are
+    /// delivered at least once, so identity comes first: a repeated delivery
+    /// of the live capture's start, or of the start still preparing, is
+    /// recognised whatever its other arguments. Otherwise a start of an
+    /// earlier renderer's epoch is refused as `stale_attachment`, and one at
+    /// or below either watermark (newer than every cancelled id and every
+    /// start already registered) as `cancelled`. A start that passes those
+    /// is retired (it can never run later) and refused as `already_running`
+    /// while another start is preparing.
     pub(crate) fn register_capture_start(
         &mut self,
         id: CaptureId,
@@ -2067,7 +2089,13 @@ impl AudioCaptureManager {
         {
             return Ok(CaptureRegistration::Preparing(pending.settled.subscribe()));
         }
-        if self.shutting_down || id <= self.cancelled_through || id <= self.last_registered {
+        if self.shutting_down {
+            return Err(CaptureFailureReason::Cancelled);
+        }
+        if id.epoch != self.epoch {
+            return Err(CaptureFailureReason::StaleAttachment);
+        }
+        if id <= self.cancelled_through || id <= self.last_registered {
             return Err(CaptureFailureReason::Cancelled);
         }
         self.last_registered = id;
@@ -2075,15 +2103,17 @@ impl AudioCaptureManager {
             return Err(CaptureFailureReason::AlreadyRunning);
         }
         let (cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
+        let settled = Arc::new(tokio::sync::watch::Sender::new(None));
         self.pending_start = Some(PendingCaptureStart {
             id,
             cancel_tx: Some(cancel_tx),
-            settled: tokio::sync::watch::Sender::new(()),
+            settled: Arc::clone(&settled),
         });
         Ok(CaptureRegistration::Registered(CaptureStartTicket {
             id,
             cancel_rx,
             hooks: self.hooks.clone(),
+            settled,
         }))
     }
 
@@ -3513,12 +3543,21 @@ mod handle_lifecycle_tests {
         assert_eq!(mgr.attach("realm-b"), 2);
         assert!(cancelled(&pending));
         mgr.release_capture_start(pending.id);
-        // The old renderer's later starts, sent before it went away.
+        // The old renderer's later starts, sent before it went away: refused
+        // as superseded, not as a deliberate Stop's cancellation.
         assert_eq!(
             refusal(&mut mgr, id(1, 7)),
-            Some(CaptureFailureReason::Cancelled)
+            Some(CaptureFailureReason::StaleAttachment)
         );
-        let fresh = registered(&mut mgr, id(2, 1));
+        // So is a start of this renderer after a stale attach overtook it.
+        assert_eq!(mgr.attach("realm-a"), 3);
+        assert_eq!(
+            refusal(&mut mgr, id(2, 1)),
+            Some(CaptureFailureReason::StaleAttachment)
+        );
+        // Re-attaching issues a current epoch whose starts register.
+        assert_eq!(mgr.attach("realm-b"), 4);
+        let fresh = registered(&mut mgr, id(4, 1));
         assert!(!cancelled(&fresh));
         mgr.release_capture_start(fresh.id);
     }
@@ -3538,19 +3577,25 @@ mod handle_lifecycle_tests {
         let mut mgr = AudioCaptureManager::new();
         mgr.attach("realm-a");
         let first = registered(&mut mgr, id(1, 1));
-        let Ok(CaptureRegistration::Preparing(settled)) = mgr.register_capture_start(id(1, 1))
+        let Ok(CaptureRegistration::Preparing(mut settled)) = mgr.register_capture_start(id(1, 1))
         else {
             panic!("a repeated delivery of the preparing start waits for it");
         };
-        assert!(
-            settled.has_changed().is_ok(),
+        assert_eq!(
+            *settled.borrow_and_update(),
+            None,
             "unsettled while the first delivery prepares"
         );
+        // The first delivery publishes its outcome, then its registration
+        // goes; a Stop or a newer owner afterwards does not change it.
+        let refused = CaptureStartFailure::refused(CaptureFailureReason::StartupTimeout, 1);
+        first
+            .settled
+            .send_replace(Some(CaptureSettlement::Refused(refused.clone())));
         mgr.release_capture_start(first.id);
-        assert!(
-            settled.has_changed().is_err(),
-            "settled once the first delivery's registration is gone"
-        );
+        mgr.cancel_through(id(1, 1));
+        assert!(settled.has_changed().unwrap());
+        assert_eq!(*settled.borrow(), Some(CaptureSettlement::Refused(refused)));
         // Never run, so a later delivery is refused.
         assert_eq!(
             refusal(&mut mgr, id(1, 1)),

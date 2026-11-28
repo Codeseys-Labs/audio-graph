@@ -134,6 +134,30 @@ struct ShutdownHandles {
     is_gemini_active: Arc<RwLock<bool>>,
     is_converse_active: Arc<RwLock<bool>>,
     is_openai_realtime_active: Arc<RwLock<bool>>,
+    projection_schedulers: Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
+}
+
+impl ShutdownHandles {
+    fn new(state: &AppState) -> Self {
+        Self {
+            session_id: state.session_id.clone(),
+            autosave_stop: state.autosave_stop.clone(),
+            graph_autosave_thread: state.graph_autosave_thread.clone(),
+            knowledge_graph: state.knowledge_graph.clone(),
+            transcript_buffer: state.transcript_buffer.clone(),
+            transcript_writer: state.transcript_writer.clone(),
+            transcript_event_writer: state.transcript_event_writer.clone(),
+            projection_event_writer: state.projection_event_writer.clone(),
+            capture_manager: state.capture_manager.clone(),
+            app_settings: state.app_settings.clone(),
+            is_capturing: state.is_capturing.clone(),
+            is_transcribing: state.is_transcribing.clone(),
+            is_gemini_active: state.is_gemini_active.clone(),
+            is_converse_active: state.is_converse_active.clone(),
+            is_openai_realtime_active: state.is_openai_realtime_active.clone(),
+            projection_schedulers: state.projection_schedulers.clone(),
+        }
+    }
 }
 
 /// Bounded, best-effort graceful teardown run once from `RunEvent::Exit`.
@@ -153,6 +177,13 @@ struct ShutdownHandles {
 /// Every step is individually timeout-bounded; the function NEVER blocks the
 /// exit indefinitely, even on a wedged disk or network.
 fn stop_captures_and_close_movement(h: &ShutdownHandles) {
+    // Capture ends here, so, as on every other end, the projection coverage
+    // check is cancelled first: verification installs and dispatches nothing
+    // from now on.
+    h.projection_schedulers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .cancel_coverage_check();
     let (stopped_sources, uncertain_start) = match h.capture_manager.lock() {
         Ok(mut manager) => (manager.stop_all(), manager.take_uncertain_capture_start()),
         Err(poisoned) => {
@@ -442,23 +473,7 @@ pub fn run() {
     // `app_state` is moved into `.manage(...)`. The `RunEvent::Exit` closure is
     // `move`, so it owns these clones. All are cheap `Arc` clones of the shared
     // state (see [`crate::state::AppState`]).
-    let shutdown = ShutdownHandles {
-        session_id: app_state.session_id.clone(),
-        autosave_stop: app_state.autosave_stop.clone(),
-        graph_autosave_thread: app_state.graph_autosave_thread.clone(),
-        knowledge_graph: app_state.knowledge_graph.clone(),
-        transcript_buffer: app_state.transcript_buffer.clone(),
-        transcript_writer: app_state.transcript_writer.clone(),
-        transcript_event_writer: app_state.transcript_event_writer.clone(),
-        projection_event_writer: app_state.projection_event_writer.clone(),
-        capture_manager: app_state.capture_manager.clone(),
-        app_settings: app_state.app_settings.clone(),
-        is_capturing: app_state.is_capturing.clone(),
-        is_transcribing: app_state.is_transcribing.clone(),
-        is_gemini_active: app_state.is_gemini_active.clone(),
-        is_converse_active: app_state.is_converse_active.clone(),
-        is_openai_realtime_active: app_state.is_openai_realtime_active.clone(),
-    };
+    let shutdown = ShutdownHandles::new(&app_state);
 
     let builder = tauri::Builder::default()
         // BUG-3: single-instance guard MUST be the first plugin registered
@@ -852,26 +867,26 @@ mod shutdown_tests {
             .unwrap()
             .insert_synthetic_handle("shutdown-source", false);
         *app.is_capturing.write().unwrap() = true;
+        let check = crate::persistence::begin_projection_capture(&app);
+        let schedulers = app.projection_schedulers.clone();
+        assert!(
+            schedulers
+                .lock()
+                .unwrap()
+                .owns_coverage_check(&session_id, &check)
+        );
 
-        let handles = ShutdownHandles {
-            session_id: app.session_id.clone(),
-            autosave_stop: app.autosave_stop.clone(),
-            graph_autosave_thread: app.graph_autosave_thread.clone(),
-            knowledge_graph: app.knowledge_graph.clone(),
-            transcript_buffer: app.transcript_buffer.clone(),
-            transcript_writer: app.transcript_writer.clone(),
-            transcript_event_writer: app.transcript_event_writer.clone(),
-            projection_event_writer: app.projection_event_writer.clone(),
-            capture_manager: app.capture_manager.clone(),
-            app_settings: app.app_settings.clone(),
-            is_capturing: app.is_capturing.clone(),
-            is_transcribing: app.is_transcribing.clone(),
-            is_gemini_active: app.is_gemini_active.clone(),
-            is_converse_active: app.is_converse_active.clone(),
-            is_openai_realtime_active: app.is_openai_realtime_active.clone(),
-        };
-
+        let handles = ShutdownHandles::new(&app);
         stop_captures_and_close_movement(&handles);
+
+        // Shutdown ends the capture, so the coverage check is cancelled:
+        // verification installs and dispatches nothing during the quit.
+        assert!(
+            !schedulers
+                .lock()
+                .unwrap()
+                .owns_coverage_check(&session_id, &check)
+        );
 
         assert!(
             app.capture_manager
@@ -936,24 +951,7 @@ mod shutdown_tests {
             .unwrap()
             .mark_capture_start_uncertain(session_id.clone());
 
-        let handles = ShutdownHandles {
-            session_id: app.session_id.clone(),
-            autosave_stop: app.autosave_stop.clone(),
-            graph_autosave_thread: app.graph_autosave_thread.clone(),
-            knowledge_graph: app.knowledge_graph.clone(),
-            transcript_buffer: app.transcript_buffer.clone(),
-            transcript_writer: app.transcript_writer.clone(),
-            transcript_event_writer: app.transcript_event_writer.clone(),
-            projection_event_writer: app.projection_event_writer.clone(),
-            capture_manager: app.capture_manager.clone(),
-            app_settings: app.app_settings.clone(),
-            is_capturing: app.is_capturing.clone(),
-            is_transcribing: app.is_transcribing.clone(),
-            is_gemini_active: app.is_gemini_active.clone(),
-            is_converse_active: app.is_converse_active.clone(),
-            is_openai_realtime_active: app.is_openai_realtime_active.clone(),
-        };
-
+        let handles = ShutdownHandles::new(&app);
         stop_captures_and_close_movement(&handles);
 
         let kinds: Vec<_> = crate::persistence::load_data_movement_events(&session_id)

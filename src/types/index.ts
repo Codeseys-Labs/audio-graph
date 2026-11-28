@@ -3002,6 +3002,8 @@ export const CAPTURE_FAILURE_REASONS = [
   "startup_timeout",
   "worker_exited",
   "cancelled",
+  "stale_attachment",
+  "still_preparing",
   "already_running",
   "previous_capture_stopping",
   "previous_capture_reconciling",

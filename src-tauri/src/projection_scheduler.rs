@@ -1141,6 +1141,12 @@ impl ProjectionSchedulers {
         }
     }
 
+    /// Whether a capture's coverage check is outstanding.
+    #[cfg(test)]
+    pub(crate) fn coverage_check_pending(&self) -> bool {
+        self.coverage_check.is_some()
+    }
+
     pub fn reset(&mut self, session_id: impl Into<String>) {
         // Preserve launch counters across in-process reset. A same-session
         // historical reload can replace an active worker; restarting at 1

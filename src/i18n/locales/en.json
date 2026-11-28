@@ -1664,6 +1664,8 @@
       "startup_timeout": "The audio device didn't respond in time. Try again, or choose another source.",
       "worker_exited": "Audio capture stopped while it was starting. Try again.",
       "cancelled": "Capture start was cancelled.",
+      "stale_attachment": "This window lost its connection to audio capture. Press Start to try again.",
+      "still_preparing": "Capture is still starting. Wait a moment for it to finish.",
       "already_running": "Capture is already running.",
       "previous_capture_stopping": "The previous capture is still stopping. Try again in a moment.",
       "previous_capture_reconciling": "The previous capture ended unexpectedly and is still closing. Try again in a moment."

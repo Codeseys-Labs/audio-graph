@@ -264,10 +264,7 @@ impl AudioPipeline {
     /// Process a single audio chunk: mixdown → resample → accumulate → emit.
     fn process_chunk(&mut self, chunk: AudioChunk) {
         if chunk.sample_rate == 0 {
-            log::warn!(
-                "AudioPipeline: ignoring zero sample rate for {}",
-                chunk.source_id
-            );
+            log::warn!("AudioPipeline: ignoring a chunk with a zero sample rate");
             return;
         }
         // Step 1: Stereo (or multi-channel) → mono mixdown
@@ -293,9 +290,10 @@ impl AudioPipeline {
                     Ok(r) => {
                         state.resampler_delay = r.output_delay();
                         state.resampler = Some(r);
+                        // Closed fields only: the source id is the user's
+                        // selection (an application or device name).
                         log::info!(
-                            "AudioPipeline: created resampler for {}: {}Hz → {}Hz",
-                            source_id,
+                            "AudioPipeline: created a resampler: {}Hz → {}Hz",
                             chunk.sample_rate,
                             TARGET_SAMPLE_RATE
                         );
@@ -1008,6 +1006,45 @@ mod tests {
             "Failed to create 44.1kHz resampler: {:?}",
             r.err()
         );
+    }
+
+    /// An application source's id is the user's selection; the pipeline's
+    /// logs never carry it, at 48 kHz (resampled) or at a zero rate.
+    #[test]
+    fn pipeline_logs_never_carry_an_application_source_id() {
+        const APPLICATION_CANARY: &str = "Lighthouse";
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let (in_tx, in_rx) = crossbeam_channel::unbounded();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        let mut pipeline = AudioPipeline::new(in_rx, out_tx);
+        let source_id = format!("app:{APPLICATION_CANARY}");
+        for sample_rate in [48_000, 0] {
+            in_tx
+                .send(AudioPipelineInput::Chunk(timed_input(
+                    &source_id,
+                    sample_rate,
+                    4_800,
+                    Duration::from_millis(10),
+                    0.25,
+                )))
+                .unwrap();
+        }
+        drop(in_tx);
+        pipeline.run();
+        assert!(
+            !collect_chunks(&out_rx).is_empty(),
+            "the 48 kHz chunk was resampled"
+        );
+
+        let records = capture.finish();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.message.contains("created a resampler")),
+            "the resampler line was captured"
+        );
+        let logs = crate::test_log_capture::render(&records);
+        assert!(!logs.contains(APPLICATION_CANARY), "{logs}");
     }
 
     #[test]
