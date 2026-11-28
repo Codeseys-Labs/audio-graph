@@ -28436,12 +28436,21 @@ mod tests {
     }
 
     /// Arm a settings save that switches provider, to land after the next
-    /// stream request is admitted and before its HTTP body is built.
-    fn save_a_provider_switch_before_the_body_is_built(state: &AppState) {
+    /// stream request is admitted and before its HTTP body is built. The save
+    /// sets the returned flag if the slot it empties still held the restricted
+    /// client that admission synced.
+    fn save_a_provider_switch_before_the_body_is_built(
+        state: &AppState,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let saved_over_the_admitted_client = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = saved_over_the_admitted_client.clone();
         let settings = state.app_settings.clone();
         let api_client = state.api_client.clone();
         let openrouter_client = state.openrouter_client.clone();
         crate::llm::streaming::before_next_request_build(move || {
+            let admitted_client_was_live = lock_client_cache(&openrouter_client)
+                .as_ref()
+                .is_some_and(|client| client.config().routing_policy.is_some());
             {
                 let mut saved = settings.write().unwrap_or_else(|e| e.into_inner());
                 saved.llm_provider = crate::settings::LlmProvider::LocalLlama;
@@ -28449,7 +28458,12 @@ mod tests {
             }
             sync_llm_clients_from_settings_cache(&settings, &api_client, &openrouter_client)
                 .expect("sync the client caches after the save");
+            flag.store(
+                admitted_client_was_live,
+                std::sync::atomic::Ordering::SeqCst,
+            );
         });
+        saved_over_the_admitted_client
     }
 
     fn current_thread_runtime() -> tokio::runtime::Runtime {
@@ -28459,16 +28473,21 @@ mod tests {
             .expect("build a current-thread runtime")
     }
 
-    /// The request reached the original endpoint, after the save, still
-    /// carrying the restrictions it was admitted under.
+    /// The save ran after admission, and the request still reached the
+    /// original endpoint carrying the restrictions it was admitted under.
     async fn assert_restrictions_reached_the_endpoint(
         state: &AppState,
+        saved_over_the_admitted_client: &std::sync::atomic::AtomicBool,
         request_body: tokio::sync::oneshot::Receiver<serde_json::Value>,
     ) {
         let body = tokio::time::timeout(std::time::Duration::from_secs(10), request_body)
             .await
             .expect("the request must reach the endpoint")
             .expect("the endpoint captured the request body");
+        assert!(
+            saved_over_the_admitted_client.load(std::sync::atomic::Ordering::SeqCst),
+            "the save must land after admission synced the restricted client"
+        );
         assert!(
             lock_client_cache(&state.openrouter_client).is_none(),
             "the save must have emptied the shared OpenRouter slot"
@@ -28499,7 +28518,7 @@ mod tests {
             let (base_url, request_body) =
                 crate::llm::streaming::spawn_capturing_sse_mock(OPENROUTER_ANSWER).await;
             select_restricted_openrouter(&state, base_url);
-            save_a_provider_switch_before_the_body_is_built(&state);
+            let saved = save_a_provider_switch_before_the_body_is_built(&state);
 
             start_streaming_chat(
                 "What changed in the roadmap?".to_string(),
@@ -28510,7 +28529,7 @@ mod tests {
             .await
             .expect("the chat is admitted");
 
-            assert_restrictions_reached_the_endpoint(&state, request_body).await;
+            assert_restrictions_reached_the_endpoint(&state, &saved, request_body).await;
         });
     }
 
@@ -28534,7 +28553,7 @@ mod tests {
             let (base_url, request_body) =
                 crate::llm::streaming::spawn_capturing_sse_mock(OPENROUTER_ANSWER).await;
             select_restricted_openrouter(&state, base_url);
-            save_a_provider_switch_before_the_body_is_built(&state);
+            let saved = save_a_provider_switch_before_the_body_is_built(&state);
 
             let reply = send_chat_message(
                 "What changed in the roadmap?".to_string(),
@@ -28545,7 +28564,7 @@ mod tests {
             .expect("the chat completes");
             assert_eq!(reply.message.content, "ok");
 
-            assert_restrictions_reached_the_endpoint(&state, request_body).await;
+            assert_restrictions_reached_the_endpoint(&state, &saved, request_body).await;
         });
     }
 
@@ -28567,7 +28586,7 @@ mod tests {
             let (base_url, request_body) =
                 crate::llm::streaming::spawn_capturing_sse_mock(OPENROUTER_ANSWER).await;
             select_restricted_openrouter(&state, base_url);
-            save_a_provider_switch_before_the_body_is_built(&state);
+            let saved = save_a_provider_switch_before_the_body_is_built(&state);
 
             dispatch_ask_question_card(
                 "What changed in the roadmap?".to_string(),
@@ -28578,7 +28597,7 @@ mod tests {
             .await
             .expect("the question card is minted and its answer dispatched");
 
-            assert_restrictions_reached_the_endpoint(&state, request_body).await;
+            assert_restrictions_reached_the_endpoint(&state, &saved, request_body).await;
         });
     }
 }
