@@ -16636,7 +16636,8 @@ mod tests {
     }
 
     #[test]
-    fn load_session_data_movement_cmd_cuts_a_stored_model_path() {
+    fn load_session_data_movement_cmd_reads_a_model_id_by_where_its_data_went() {
+        use crate::llm::route::model_id_fixtures::{PATH_CANARY, STORED};
         use crate::persistence::{
             DataClass, DataMovementActor, DataMovementDestination, DataMovementEventType,
             DataMovementLedgerBuilder, DestinationBoundary, MovementModel, MovementPolicy,
@@ -16646,52 +16647,45 @@ mod tests {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("data-movement-model-path");
+        let dir = unique_tempdir("data-movement-model-id");
         let _guard = HomeGuard::set(&dir);
 
-        let session_id = "session-with-model-path";
-        // What rows written before the cut hold for a self-hosted server: the
-        // path of its model file. The third is an ordinary id.
-        let stored: Vec<_> = [
-            "/home/numbat-user/models/private.gguf",
-            "C:\\Users\\numbat-user\\models\\private.gguf",
-            "numbat-org/probe-model",
-        ]
-        .into_iter()
-        .zip(1_000..)
-        .map(|(model_id, created_at_ms)| {
-            DataMovementLedgerBuilder::new(
-                session_id,
-                DataMovementActor::System,
-                DataMovementEventType::ProviderCallSucceeded,
-                MovementPolicy {
-                    privacy_mode: PrivacyMode::ByokCloud,
-                    user_visible: true,
-                    retention_class: RetentionClass::Transient,
-                },
-                DataMovementDestination {
-                    boundary: DestinationBoundary::Provider,
+        let session_id = "session-with-model-ids";
+        // Every id once as a local movement and once as one that left the
+        // device for a provider.
+        let rows: Vec<_> = [DestinationBoundary::Local, DestinationBoundary::Provider]
+            .into_iter()
+            .flat_map(|boundary| STORED.into_iter().map(move |ids| (boundary, ids)))
+            .zip(1_000..)
+            .map(|((boundary, (model_id, _)), created_at_ms)| {
+                DataMovementLedgerBuilder::new(
+                    session_id,
+                    DataMovementActor::System,
+                    DataMovementEventType::ProviderCallSucceeded,
+                    MovementPolicy {
+                        privacy_mode: PrivacyMode::ByokCloud,
+                        user_visible: true,
+                        retention_class: RetentionClass::Transient,
+                    },
+                    DataMovementDestination {
+                        boundary,
+                        provider_id: Some("llm.api".to_string()),
+                        endpoint_class: Some("chat_completions".to_string()),
+                    },
+                )
+                .created_at_ms(created_at_ms)
+                .data_classes([DataClass::Prompts])
+                .model(MovementModel {
                     provider_id: Some("llm.api".to_string()),
-                    endpoint_class: Some("chat_completions".to_string()),
-                },
-            )
-            .created_at_ms(created_at_ms)
-            .data_classes([DataClass::Prompts])
-            .model(MovementModel {
-                provider_id: Some("llm.api".to_string()),
-                model_id: Some(model_id.to_string()),
+                    model_id: Some(model_id.to_string()),
+                })
+                .build()
             })
-            .build()
-        })
-        .collect();
-        seed_data_movement_ledger(session_id, &stored);
+            .collect();
+        seed_data_movement_ledger(session_id, &rows);
         let ledger_path =
             crate::user_data::data_movement_ledger_path(session_id).expect("resolve ledger path");
         let stored_bytes = std::fs::read(&ledger_path).expect("read the ledger");
-        assert!(
-            String::from_utf8_lossy(&stored_bytes).contains("numbat-user"),
-            "the fixture must store the path"
-        );
 
         let loaded = load_session_data_movement_impl(session_id.to_string()).expect("ledger loads");
 
@@ -16704,17 +16698,18 @@ mod tests {
                     .and_then(|model| model.model_id.as_deref())
             })
             .collect();
-        assert_eq!(
-            model_ids,
-            [
-                Some("private.gguf"),
-                Some("private.gguf"),
-                Some("numbat-org/probe-model")
-            ]
-        );
-        // The serialized form is what the frontend receives.
-        let reply = serde_json::to_string(&loaded).expect("serialize loaded ledger");
-        assert!(!reply.contains("numbat-user"), "{reply}");
+        let expected: Vec<_> = STORED
+            .iter()
+            .map(|(_, local)| Some(*local))
+            .chain(STORED.iter().map(|(hosted, _)| Some(*hosted)))
+            .collect();
+        assert_eq!(model_ids, expected);
+        // The serialized form is what the frontend receives: no local row
+        // names a directory.
+        for event in &loaded[..STORED.len()] {
+            let reply = serde_json::to_string(event).expect("serialize a loaded row");
+            assert!(!reply.contains(PATH_CANARY), "{reply}");
+        }
         // The stored rows were read, not rewritten.
         assert_eq!(
             std::fs::read(&ledger_path).expect("re-read the ledger"),
@@ -17920,70 +17915,86 @@ mod tests {
     }
 
     #[test]
-    fn export_session_bundle_carries_no_stored_model_path() {
+    fn export_session_bundle_carries_each_model_id_by_where_its_model_ran() {
+        use crate::llm::route::model_id_fixtures::{PATH_CANARY, STORED};
+
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("export-model-path");
+        let dir = unique_tempdir("export-model-id");
         let _guard = HomeGuard::set(&dir);
-
-        let session_id = "export-model-path";
-        // What records written before the cut hold for a local server: the
-        // path of its model file.
-        let stored = "/home/numbat-user/models/private.gguf";
-
         let repository = FileMemoryRepository::user_data();
-        let event = projection_status_test_event(&format!("{session_id}-span-1"));
-        let basis = crate::projections::ProjectionBasis::from_transcript_events(
-            std::slice::from_ref(&event),
-        );
-        repository
-            .append_transcript_event(session_id, &event)
-            .expect("append transcript event");
-        let mut notes_patch = report_note_patch(1, basis.clone(), "Exported note body.");
-        notes_patch.provenance.model = stored.to_string();
-        let mut graph_patch = report_graph_patch(1, basis.clone());
-        graph_patch.provenance.model = stored.to_string();
-        for patch in [&notes_patch, &graph_patch] {
-            repository
-                .append_projection_patch(session_id, patch)
-                .expect("append projection patch");
+
+        // (provider, route, whether its records say the model ran remotely)
+        let places = [
+            ("llm.api", "route.openai_compatible", false),
+            ("llm.openrouter", "route.openrouter", true),
+        ];
+        for (index, (stored, local)) in STORED.into_iter().enumerate() {
+            for (provider, route_id, remote) in places {
+                let session_id = format!("export-model-id-{index}-{remote}");
+                let session_id = session_id.as_str();
+                let stamp = |provenance: &mut crate::projections::ProjectionProvenance| {
+                    provenance.provider = provider.to_string();
+                    provenance.route_id = Some(route_id.to_string());
+                    provenance.model = stored.to_string();
+                };
+
+                let event = projection_status_test_event(&format!("{session_id}-span-1"));
+                let basis = crate::projections::ProjectionBasis::from_transcript_events(
+                    std::slice::from_ref(&event),
+                );
+                repository
+                    .append_transcript_event(session_id, &event)
+                    .expect("append transcript event");
+                let mut notes_patch = report_note_patch(1, basis.clone(), "Exported note body.");
+                stamp(&mut notes_patch.provenance);
+                let mut graph_patch = report_graph_patch(1, basis.clone());
+                stamp(&mut graph_patch.provenance);
+                for patch in [&notes_patch, &graph_patch] {
+                    repository
+                        .append_projection_patch(session_id, patch)
+                        .expect("append projection patch");
+                }
+                let mut notes = stale_materialized_notes(session_id, basis.clone());
+                stamp(&mut notes.notes[0].provenance);
+                repository
+                    .save_materialized_notes(session_id, &notes)
+                    .expect("save materialized notes artifact");
+                let mut graph = stale_materialized_graph(session_id, basis);
+                stamp(&mut graph.nodes[0].provenance);
+                repository
+                    .save_materialized_graph(session_id, &graph)
+                    .expect("save materialized graph artifact");
+
+                let events_path = crate::user_data::resolve_projection_events_path(session_id)
+                    .expect("projection events path");
+                let stored_events =
+                    std::fs::read(&events_path).expect("read the projection events");
+
+                let bundle = session_export_bundle(session_id).expect("export bundle");
+
+                let expected = if remote { stored } else { local };
+                assert_eq!(bundle.projection_events.len(), 2);
+                for patch in &bundle.projection_events {
+                    assert_eq!(patch.provenance.model, expected, "{stored} {remote}");
+                }
+                let notes = bundle.notes.as_ref().expect("exported notes");
+                assert_eq!(notes.notes[0].provenance.model, expected);
+                let graph = bundle.materialized_graph.as_ref().expect("exported graph");
+                assert_eq!(graph.nodes[0].provenance.model, expected);
+                if !remote {
+                    let json = serde_json::to_string(&bundle).expect("bundle serializes");
+                    assert!(!json.contains(PATH_CANARY), "{json}");
+                }
+
+                // The stored patches were read, not rewritten.
+                assert_eq!(
+                    std::fs::read(&events_path).expect("re-read the projection events"),
+                    stored_events
+                );
+            }
         }
-        let mut notes = stale_materialized_notes(session_id, basis.clone());
-        notes.notes[0].provenance.model = stored.to_string();
-        repository
-            .save_materialized_notes(session_id, &notes)
-            .expect("save materialized notes artifact");
-        let mut graph = stale_materialized_graph(session_id, basis);
-        graph.nodes[0].provenance.model = stored.to_string();
-        repository
-            .save_materialized_graph(session_id, &graph)
-            .expect("save materialized graph artifact");
-
-        let events_path = crate::user_data::resolve_projection_events_path(session_id)
-            .expect("projection events path");
-        let stored_events = std::fs::read(&events_path).expect("read the projection events");
-        assert!(
-            String::from_utf8_lossy(&stored_events).contains("numbat-user"),
-            "the fixture must store the path"
-        );
-
-        let bundle = session_export_bundle(session_id).expect("export bundle");
-
-        assert_eq!(bundle.projection_events.len(), 2);
-        for patch in &bundle.projection_events {
-            assert_eq!(patch.provenance.model, "private.gguf");
-        }
-        assert!(bundle.notes.is_some() && bundle.materialized_graph.is_some());
-        let json = serde_json::to_string(&bundle).expect("bundle serializes to JSON");
-        assert!(json.contains("private.gguf"), "{json}");
-        assert!(!json.contains("numbat-user"), "{json}");
-
-        // The stored patches were read, not rewritten.
-        assert_eq!(
-            std::fs::read(&events_path).expect("re-read the projection events"),
-            stored_events
-        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

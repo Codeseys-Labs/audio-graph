@@ -1,6 +1,8 @@
 //! Named, sealed, single-attempt decision dispatch (ADR-0049). No route walker.
 use super::{CloudflareModel, EndpointKind, SystemOneHttpEngine};
-use crate::llm::route::{ModelIdentitySource, sanitize_route_metadata};
+use crate::llm::route::{
+    ModelIdentitySource, owned_model_id_for_place, sanitize_model_id, sanitize_route_metadata,
+};
 use crate::persistence::{self, LocalMemoryRepository};
 use crate::settings::{DecisionRouteSettings, PrivacyMode};
 use audio_graph_decision_contract::{
@@ -274,6 +276,27 @@ impl DecisionRoute {
         }
         pin
     }
+    /// `pin` as a record stores it. The pin's digest and the calibrations are
+    /// keyed on the pin as configured. A record shows a local model by a
+    /// display name (see `ipc_contract::model_id`), never by the path a user
+    /// configured for a local server.
+    fn stored_pin(&self, mut pin: ModelPin, settings: &DecisionRouteSettings) -> ModelPin {
+        if self.engine.egress() == Egress::Cloud {
+            return pin;
+        }
+        pin.requested = if self.engine == EngineKind::LocalHttp {
+            // From the setting itself: the filter in `pin` has already dropped
+            // the separators of a Windows path.
+            settings
+                .local_http_model
+                .as_deref()
+                .and_then(|model| sanitize_model_id(model, false))
+                .unwrap_or_default()
+        } else {
+            owned_model_id_for_place(pin.requested, false)
+        };
+        pin
+    }
     fn endpoint(&self, settings: &DecisionRouteSettings) -> Result<EndpointKind, &'static str> {
         Ok(match self.engine {
             EngineKind::HostedJev => EndpointKind::TypeSafe,
@@ -366,7 +389,10 @@ pub struct DecisionBasis {
     pub span_id: String,
     pub revision: u64,
 }
+/// Decoded through [`StoredDecisionRecord`], so a stored model id is read by
+/// where the record says the model ran.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "StoredDecisionRecord")]
 pub struct DecisionRecord {
     pub id: String,
     pub call_id: String,
@@ -394,6 +420,81 @@ pub struct DecisionRecord {
     pub latency_ms: u64,
     pub usage: Usage,
     pub error_class: Option<String>,
+}
+
+/// A [`DecisionRecord`] as a card or a relabel run stores it.
+///
+/// Records written before the model rule can hold the path a local server
+/// loaded or a user configured. Building the typed value from this one applies
+/// the rule on every read: a record that does not say `cloud` is a local
+/// model's, and shows a display name. The stored record is not rewritten.
+#[derive(Deserialize)]
+struct StoredDecisionRecord {
+    id: String,
+    call_id: String,
+    route_id: Option<String>,
+    provider_id: Option<String>,
+    engine: Option<EngineKind>,
+    egress: String,
+    model_pin: Option<ModelPin>,
+    model_pin_digest: Option<String>,
+    served_model: Option<String>,
+    model_identity_source: ModelIdentitySource,
+    question_id: String,
+    schema_version: u32,
+    state_sha256: String,
+    basis: Vec<DecisionBasis>,
+    raw: Option<Answer>,
+    calibrated: Option<Answer>,
+    calibration: CalibrationSnapshot,
+    outcome: DecisionOutcome,
+    authority: DecisionAuthority,
+    source: DecisionSource,
+    heuristic_answer: String,
+    route_answer: Option<String>,
+    bf16_near_tie: bool,
+    latency_ms: u64,
+    usage: Usage,
+    error_class: Option<String>,
+}
+
+impl From<StoredDecisionRecord> for DecisionRecord {
+    fn from(stored: StoredDecisionRecord) -> Self {
+        let ran_remotely = stored.egress == "cloud";
+        Self {
+            id: stored.id,
+            call_id: stored.call_id,
+            route_id: stored.route_id,
+            provider_id: stored.provider_id,
+            engine: stored.engine,
+            egress: stored.egress,
+            model_pin: stored.model_pin.map(|pin| ModelPin {
+                requested: owned_model_id_for_place(pin.requested, ran_remotely),
+                ..pin
+            }),
+            model_pin_digest: stored.model_pin_digest,
+            served_model: stored
+                .served_model
+                .map(|served| owned_model_id_for_place(served, ran_remotely)),
+            model_identity_source: stored.model_identity_source,
+            question_id: stored.question_id,
+            schema_version: stored.schema_version,
+            state_sha256: stored.state_sha256,
+            basis: stored.basis,
+            raw: stored.raw,
+            calibrated: stored.calibrated,
+            calibration: stored.calibration,
+            outcome: stored.outcome,
+            authority: stored.authority,
+            source: stored.source,
+            heuristic_answer: stored.heuristic_answer,
+            route_answer: stored.route_answer,
+            bf16_near_tie: stored.bf16_near_tie,
+            latency_ms: stored.latency_ms,
+            usage: stored.usage,
+            error_class: stored.error_class,
+        }
+    }
 }
 
 struct CachedNativeEngine {
@@ -522,8 +623,13 @@ fn records(
 ) -> Vec<DecisionRecord> {
     let digest = state_digest(&request.state);
     let call_id = uuid::Uuid::new_v4().to_string();
+    // The digest is of the pin as configured, which calibrations are keyed
+    // on. The records store it as `stored_pin` gives it.
     let pin = route.map(|route| route.pin(context.settings));
     let pin_digest = pin.as_ref().map(digest_pin);
+    let pin = route
+        .zip(pin)
+        .map(|(route, pin)| route.stored_pin(pin, context.settings));
     request
         .questions
         .keys()
@@ -797,7 +903,15 @@ fn apply_response(
         let Some(raw) = response.answers.get(&record.question_id) else {
             continue;
         };
-        let served = sanitize_route_metadata(&response.model);
+        // Calibrations are keyed on the id as the engine reported it, so the
+        // fit is matched on that. The record stores the id by where the model
+        // ran: a display name for a local engine.
+        let reported = sanitize_route_metadata(&response.model);
+        let served = if route.engine.egress() == Egress::Cloud {
+            reported.clone()
+        } else {
+            sanitize_model_id(&response.model, false)
+        };
         record.model_identity_source = if served.is_some() {
             ModelIdentitySource::Served
         } else {
@@ -808,7 +922,7 @@ fn apply_response(
         let calibration = route.calibrations.iter().find(|fit| {
             record.model_identity_source == ModelIdentitySource::Served
                 && fit.route_id == route.id
-                && Some(fit.served_model) == record.served_model.as_deref()
+                && Some(fit.served_model) == reported.as_deref()
                 && Some(fit.model_pin_digest) == record.model_pin_digest.as_deref()
                 && record
                     .model_pin

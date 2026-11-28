@@ -31,7 +31,7 @@ use super::http_diag::{SchemaRejection, diagnostic};
 use super::route::{
     AttemptedRouteIdentity, AuthorizedRoute, BlockingBackend, ConstrainedDecodingGrade,
     ModelIdentitySource, RequestOutputForm, RouteRecord, TerminalStatus, WireOutcome,
-    authorize_route_dispatch, model_id_without_path, retry_class_for_terminal_status,
+    authorize_route_dispatch, owned_model_id_for_place, retry_class_for_terminal_status,
     route_for_api_endpoint, route_for_openrouter_policy,
 };
 
@@ -1156,10 +1156,8 @@ fn projection_api(
     // from (seeds audio-graph-862c / audio-graph-7da4). Folded, not
     // overwritten, so a repair dial that lands on a re-pointed client cannot
     // erase the draft dial's egress (see `stamp_attempted_route`).
-    stamp_attempted_route(
-        attempted_route,
-        AttemptedRouteIdentity::for_route(live, Some(&client.config().endpoint)),
-    );
+    let identity = AttemptedRouteIdentity::for_route(live, Some(&client.config().endpoint));
+    stamp_attempted_route(attempted_route, identity);
     let requested_model = client.config().model.clone();
 
     // Route-driven, not host-substring-driven: an endpoint whose row declares
@@ -1217,6 +1215,7 @@ fn projection_api(
         requested_model,
         tokens_used,
         wire,
+        identity.requires_cloud_transfer,
     ))
 }
 
@@ -1279,6 +1278,7 @@ fn projection_openrouter(
                     requested_model,
                     tokens_used,
                     wire,
+                    true,
                 ));
             }
             Err(e) if e.schema_rejection.is_some() => {
@@ -1313,6 +1313,7 @@ fn projection_openrouter(
         requested_model,
         tokens_used,
         wire,
+        true,
     ))
 }
 
@@ -1321,10 +1322,12 @@ fn projection_openrouter(
 /// `model_source` records which it is so no reader can mistake a config echo for
 /// served identity (ADR-0038 defect 3).
 ///
-/// This is the one place a model id enters provenance, so it is where a path
-/// is cut away. A served id was already cut where it was read. The requested
-/// id is the user's own configuration, which for a local server is often the
-/// path of the model file.
+/// This is the one place a model id enters provenance, so it is where the rule
+/// in `ipc_contract::model_id` is applied: a model that ran at a remote
+/// endpoint keeps its hosted identifier, and a local one shows a display name.
+/// A served id was already handled where it was read. The requested id is the
+/// user's own configuration, which for a local server is often the path of
+/// the model file.
 fn projection_output_from_wire(
     route: &AuthorizedRoute,
     live: &'static crate::llm::route::RouteDescriptor,
@@ -1332,12 +1335,13 @@ fn projection_output_from_wire(
     requested_model: String,
     tokens_used: u32,
     wire: WireOutcome,
+    ran_remotely: bool,
 ) -> ProjectionBackendOutput {
-    let (model, model_source) = match wire.served_model.as_deref() {
+    let (model, model_source) = match wire.served_model.clone() {
         Some(served) => (served, ModelIdentitySource::Served),
-        None => (requested_model.as_str(), ModelIdentitySource::Requested),
+        None => (requested_model, ModelIdentitySource::Requested),
     };
-    let model = model_id_without_path(model).to_string();
+    let model = owned_model_id_for_place(model, ran_remotely);
     ProjectionBackendOutput {
         raw_json,
         route_id: live.id,
@@ -3012,51 +3016,13 @@ mod tests {
     }
 
     #[test]
-    fn a_model_path_never_reaches_projection_provenance() {
+    fn a_model_id_enters_provenance_by_where_its_model_ran() {
+        use crate::llm::route::LOCAL_MODEL_PLACEHOLDER;
+        use crate::llm::route::model_id_fixtures::{PATH_CANARY, STORED};
         use ModelIdentitySource::{Requested, Served};
 
         let rt = tokio::runtime::Runtime::new().expect("rt");
-        for (served, configured, recorded, source) in [
-            // A local server reports the file it loaded.
-            (
-                Some("/home/numbat-user/models/private.gguf"),
-                "probe-model",
-                "private.gguf",
-                Served,
-            ),
-            (
-                Some("C:\\Users\\numbat-user\\models\\private.gguf"),
-                "probe-model",
-                "private.gguf",
-                Served,
-            ),
-            (
-                Some("numbat-org/probe-model-turbo"),
-                "probe-model",
-                "numbat-org/probe-model-turbo",
-                Served,
-            ),
-            // It reports nothing, so the configured id is recorded: often the
-            // same path, because that is what such a server is asked for.
-            (
-                None,
-                "/home/numbat-user/models/private.gguf",
-                "private.gguf",
-                Requested,
-            ),
-            (
-                None,
-                "C:\\Users\\numbat-user\\models\\private.gguf",
-                "private.gguf",
-                Requested,
-            ),
-            (
-                None,
-                "numbat-org/probe-model",
-                "numbat-org/probe-model",
-                Requested,
-            ),
-        ] {
+        let reply = |served: Option<&str>| {
             let mut body = serde_json::json!({
                 "choices": [{
                     "message": { "content": "{\"operations\":[{\"type\":\"upsert_note\",\
@@ -3069,29 +3035,85 @@ mod tests {
             if let Some(served) = served {
                 body["model"] = served.into();
             }
-            let (base, _count) = rt.block_on(spawn_counting_mock(vec![body.to_string()]));
-
-            let (job, ledger) = projection_test_job(ProjectionKind::Notes);
-            let handles = handles_with_api_model(&base, configured);
-            let provider = LlmProvider::Api {
-                endpoint: base.clone(),
-                api_key: "sk-route-removal-probe".to_string(),
-                model: configured.to_string(),
+            body.to_string()
+        };
+        // A loopback OpenAI-compatible server is a local endpoint. OpenRouter
+        // has no local deployment, so the same loopback server behind it is
+        // a remote endpoint.
+        let provenance = |remote: bool, served: Option<&str>, configured: &str| {
+            let (base, _count) = rt.block_on(spawn_counting_mock(vec![reply(served)]));
+            let (handles, provider) = if remote {
+                let client = OpenRouterClient::new(crate::llm::openrouter::OpenRouterConfig {
+                    base_url: base.clone(),
+                    ..crate::llm::openrouter::OpenRouterConfig::with_defaults(
+                        "probe-key".to_string(),
+                        configured.to_string(),
+                    )
+                })
+                .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+                let handles = BackendHandles {
+                    llm_engine: Arc::new(Mutex::new(None)),
+                    api_client: Arc::new(Mutex::new(None)),
+                    openrouter_client: Arc::new(Mutex::new(Some(client))),
+                    mistralrs_engine: Arc::new(Mutex::new(None)),
+                };
+                let provider = LlmProvider::OpenRouter {
+                    model: configured.to_string(),
+                    base_url: base,
+                    provider_order: None,
+                    include_usage_in_stream: true,
+                    api_key: "probe-key".to_string(),
+                };
+                (handles, provider)
+            } else {
+                let handles = handles_with_api_model(&base, configured);
+                let provider = LlmProvider::Api {
+                    endpoint: base,
+                    api_key: "probe-key".to_string(),
+                    model: configured.to_string(),
+                };
+                (handles, provider)
             };
-            let patch = std::thread::spawn(move || {
+            let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+            std::thread::spawn(move || {
                 run_projection_patch(&handles, &provider, &job, &ledger, None.into(), 1, 100)
             })
             .join()
             .expect("worker thread panic")
             .outcome
             .expect("a valid notes draft")
-            .patch;
+            .patch
+        };
 
-            assert_eq!(patch.provenance.model, recorded, "{served:?} {configured}");
-            assert_eq!(patch.provenance.model_source, source);
-            // Nothing in the patch as persisted names the directory.
-            let persisted = serde_json::to_string(&patch).expect("serialize the patch");
-            assert!(!persisted.contains("numbat-user"), "{persisted}");
+        for (id, local) in STORED {
+            for remote in [false, true] {
+                // The server reports `id` as the model it served. A served id
+                // goes through the metadata filter, which has never kept `@`.
+                let shown = if remote { id } else { local };
+                let (served_model, served_source) = if shown == LOCAL_MODEL_PLACEHOLDER {
+                    // No name is left, so the requested id is recorded.
+                    ("probe-model".to_string(), Requested)
+                } else {
+                    (
+                        crate::llm::route::sanitize_route_metadata(shown).expect("a name"),
+                        Served,
+                    )
+                };
+                let patch = provenance(remote, Some(id), "probe-model");
+                assert_eq!(patch.provenance.model, served_model, "served {id} {remote}");
+                assert_eq!(patch.provenance.model_source, served_source);
+
+                // The server reports nothing, so the configured id is
+                // recorded: for a local server, often its model's path.
+                let patch = provenance(remote, None, id);
+                assert_eq!(patch.provenance.model, shown, "configured {id} {remote}");
+                assert_eq!(patch.provenance.model_source, Requested);
+
+                if !remote {
+                    let persisted = serde_json::to_string(&patch).expect("serialize the patch");
+                    assert!(!persisted.contains(PATH_CANARY), "{persisted}");
+                }
+            }
         }
     }
 

@@ -1,110 +1,146 @@
-//! The one definition of which part of a model id may be stored or shown.
+//! What may be stored or shown for a model. Where the model ran decides, not
+//! what its identifier looks like.
+//!
+//! - A model at a remote endpoint keeps the provider's hosted identifier.
+//! - A model that ran on this machine, or at an endpoint the app classes as
+//!   local, gets a display name and never its identifier. A local server
+//!   reports the path it loaded as its model id, and the same path is what
+//!   the user configures as the model to request. A path names a user and a
+//!   directory layout.
+//! - A stored record that cannot say where its model ran is read by the
+//!   local rule. A hosted id that loses its namespace is cosmetic; a path
+//!   that survives is a leak.
+//!
+//! No rule here looks at the shape of the identifier to guess whether it is a
+//! path: `numbat/checkpoint` and `org/model` are the same shape.
 
-/// Weight-file extensions: what a local server's model id ends in when the id
-/// is the path of the file it loaded.
-const MODEL_FILE_EXTENSIONS: [&str; 8] = [
-    "gguf",
-    "ggml",
-    "bin",
-    "safetensors",
-    "onnx",
-    "pt",
-    "pth",
-    "ckpt",
-];
-
-/// The part of a model id that may be persisted: never a location on someone's
-/// machine.
+/// What stands in for a local model whose identifier leaves no name to show:
+/// a bare root, a home marker, or anything that still begins with a drive.
 ///
-/// A local or self-hosted server (llama.cpp server, vLLM) reports the path it
-/// loaded as its model id, and that same path is what the user configures as
-/// the model to request. A path names a user and a directory layout; a record
-/// needs the model only. The test is on shape, never on meaning: a leading
-/// `/`, `~` or `.` segment, a drive prefix, a backslash, or a directory in
-/// front of a weight file. Such a value is cut down to its final component. An
-/// `org/model` id has none of those marks and comes back whole.
-pub fn without_path(raw: &str) -> &str {
-    let id = raw.trim();
-    if !is_path_shaped(id) {
+/// The last case covers what older builds stored for a Windows path. They
+/// dropped its backslashes before persisting it, so `C:\Users\name\m.gguf`
+/// was stored as `C:Usersnamem.gguf`, which cannot be cut back to a file name.
+pub const LOCAL_MODEL_PLACEHOLDER: &str = "local-model";
+
+/// What to store or show for a model, given where it ran.
+pub fn for_place(id: &str, ran_remotely: bool) -> &str {
+    if ran_remotely {
+        id
+    } else {
+        local_display_name(id)
+    }
+}
+
+/// The display name of a local model: what follows the last separator of its
+/// identifier, with a `file:` scheme and trailing separators removed first.
+///
+/// The result is a part of `id`, never trimmed or otherwise altered, or
+/// [`LOCAL_MODEL_PLACEHOLDER`]. An empty id stays empty. Applying it again
+/// changes nothing.
+pub fn local_display_name(id: &str) -> &str {
+    if id.is_empty() {
         return id;
     }
-    let name = id
-        .trim_end_matches(['/', '\\'])
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or_default();
-    // A home marker, a dot segment or a bare drive names no model.
-    let bare_drive = name.len() == 2 && name.ends_with(':');
-    if bare_drive || matches!(name, "~" | "." | "..") {
-        ""
+    let mut name = id;
+    loop {
+        let unschemed = match name.get(..5) {
+            Some(scheme) if scheme.eq_ignore_ascii_case("file:") => &name[5..],
+            _ => name,
+        };
+        let last = unschemed
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default();
+        if last.len() == name.len() {
+            break;
+        }
+        name = last;
+    }
+    let drive_prefixed =
+        matches!(name.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic());
+    if drive_prefixed || matches!(name, "" | "~" | "." | "..") {
+        LOCAL_MODEL_PLACEHOLDER
     } else {
         name
     }
 }
 
-fn is_path_shaped(id: &str) -> bool {
-    let drive_prefix = matches!(
-        id.as_bytes(),
-        [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic()
-    );
-    let names_a_weight_file = id.rsplit_once('.').is_some_and(|(_, extension)| {
-        MODEL_FILE_EXTENSIONS
-            .iter()
-            .any(|known| extension.eq_ignore_ascii_case(known))
-    });
-    id.starts_with(['/', '~'])
-        || id.starts_with("./")
-        || id.starts_with("../")
-        || id.contains('\\')
-        || drive_prefix
-        || (id.contains('/') && names_a_weight_file)
+/// [`for_place`] over an owned identifier, reusing it when nothing is cut.
+pub fn owned_for_place(id: String, ran_remotely: bool) -> String {
+    let kept = for_place(&id, ran_remotely);
+    if kept.len() == id.len() && kept.as_ptr() == id.as_ptr() {
+        id
+    } else {
+        kept.to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::without_path;
+    use super::{LOCAL_MODEL_PLACEHOLDER, for_place, local_display_name};
+
+    /// (identifier, what a local model shows). A remote model keeps every one
+    /// of these whole.
+    const CASES: [(&str, &str); 22] = [
+        // Paths a local server reports or a user configures.
+        ("/home/numbat/models/private.gguf", "private.gguf"),
+        ("/models/mistral-7b/", "mistral-7b"),
+        ("~/models/private.gguf", "private.gguf"),
+        ("./numbat/private", "private"),
+        ("C:\\Users\\numbat\\models\\private.gguf", "private.gguf"),
+        ("C:/Users/numbat/models/private.gguf", "private.gguf"),
+        (
+            "\\\\numbat-host\\share\\private.safetensors",
+            "private.safetensors",
+        ),
+        // The four that survived a shape test.
+        ("numbat/checkpoint", "checkpoint"),
+        ("numbat/private.gguf/", "private.gguf"),
+        ("C:numbat/checkpoint", "checkpoint"),
+        ("file:///home/numbat/checkpoint", "checkpoint"),
+        // A name is not trimmed.
+        ("/models/ private.gguf", " private.gguf"),
+        // What older builds stored for a Windows path, and other values that
+        // leave no name.
+        ("C:Usersnumbatmodelsprivate.gguf", LOCAL_MODEL_PLACEHOLDER),
+        ("C:private.gguf", LOCAL_MODEL_PLACEHOLDER),
+        ("C:\\", LOCAL_MODEL_PLACEHOLDER),
+        ("/", LOCAL_MODEL_PLACEHOLDER),
+        ("~", LOCAL_MODEL_PLACEHOLDER),
+        // Hosted identifiers, which a local endpoint can serve too.
+        ("org/model.gguf", "model.gguf"),
+        ("org/repo/model.safetensors", "model.safetensors"),
+        (
+            "accounts/fireworks/models/llama-v3p1-8b-instruct",
+            "llama-v3p1-8b-instruct",
+        ),
+        ("org/model@rev1", "model@rev1"),
+        ("llama3.2:latest", "llama3.2:latest"),
+    ];
 
     #[test]
-    fn a_model_id_keeps_no_path() {
-        for (raw, kept) in [
-            // Ordinary ids come back whole.
-            ("anthropic/claude-sonnet-4.5", "anthropic/claude-sonnet-4.5"),
-            (
-                "accounts/fireworks/models/llama-v3p1-8b-instruct",
-                "accounts/fireworks/models/llama-v3p1-8b-instruct",
-            ),
-            ("llama3.2:latest", "llama3.2:latest"),
-            (
-                "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M",
-                "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M",
-            ),
-            ("private.gguf", "private.gguf"),
-            // POSIX paths.
-            ("/home/numbat-user/models/private.gguf", "private.gguf"),
-            ("/models/mistral-7b/", "mistral-7b"),
-            ("~/models/private.gguf", "private.gguf"),
-            ("./numbat-user/private", "private"),
-            ("../numbat-user/private", "private"),
-            ("numbat-user/private.GGUF", "private.GGUF"),
-            // Windows paths.
-            (
-                "C:\\Users\\numbat-user\\models\\private.gguf",
-                "private.gguf",
-            ),
-            ("C:/Users/numbat-user/models/private.gguf", "private.gguf"),
-            (
-                "\\\\numbat-host\\share\\private.safetensors",
-                "private.safetensors",
-            ),
-            ("numbat-user\\private", "private"),
-            // Nothing that names a model is left.
-            ("/", ""),
-            ("~", ""),
-            ("C:\\", ""),
-            ("../", ""),
-        ] {
-            assert_eq!(without_path(raw), kept, "{raw}");
-            assert_eq!(without_path(kept), kept, "{kept} is already cut");
+    fn a_local_model_shows_a_name_and_a_remote_one_keeps_its_identifier() {
+        for (id, shown) in CASES {
+            assert_eq!(local_display_name(id), shown, "{id}");
+            assert_eq!(for_place(id, false), shown, "{id}");
+            assert_eq!(for_place(id, true), id, "{id}");
+            assert_eq!(
+                local_display_name(shown),
+                shown,
+                "{shown} is already a display name"
+            );
+            assert!(!shown.contains(['/', '\\']), "{shown}");
+            assert!(!shown.contains("numbat"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn a_display_name_is_a_fixed_point_even_through_a_nested_scheme() {
+        for id in ["numbat/file:private.gguf", "file:file:/numbat/private.gguf"] {
+            let shown = local_display_name(id);
+            assert_eq!(shown, "private.gguf", "{id}");
+            assert_eq!(local_display_name(shown), shown);
         }
     }
 }

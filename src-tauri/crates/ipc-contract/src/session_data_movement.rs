@@ -227,31 +227,8 @@ pub struct MovementBasis {
 pub struct MovementModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
-    // Never a filesystem path. A row stored before `model_id::without_path`
-    // existed can hold a local model's path, so it is cut as the row is read
-    // and the stored row is left as it is. Not a doc comment: the generated
-    // schema would carry it.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "stored_model_id"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
-}
-
-fn stored_model_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let stored = Option::<String>::deserialize(deserializer)?;
-    Ok(stored.map(|stored| {
-        let kept = crate::model_id::without_path(&stored);
-        if kept.len() == stored.len() {
-            stored
-        } else {
-            kept.to_string()
-        }
-    }))
 }
 
 /// Quantitative, non-content measures of the movement.
@@ -373,7 +350,10 @@ impl DataMovementResult {
 /// A single redacted data-movement audit event.
 ///
 /// Append-only. Serialized one-per-line to a session's ledger JSONL file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+// Decoded through `StoredDataMovementEvent`, which is why `Deserialize` is
+// written out below rather than derived. Not a doc comment: the generated
+// schema would carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct DataMovementEvent {
     /// Stable unique id for this event (uuid v4 string).
     pub event_id: String,
@@ -400,6 +380,75 @@ pub struct DataMovementEvent {
     pub counts: Option<MovementCounts>,
     pub policy: MovementPolicy,
     pub result: DataMovementResult,
+}
+
+/// A [`DataMovementEvent`] as a ledger row holds it.
+///
+/// A row's model id is read by where the row says its data went (see
+/// [`crate::model_id`]): a hosted identifier is kept when the data left the
+/// device for a provider, and a local model shows a display name. Rows written
+/// before that rule can hold a local model's path. The stored row is left as
+/// it is.
+#[derive(Deserialize)]
+struct StoredDataMovementEvent {
+    event_id: String,
+    schema_version: u32,
+    session_id: String,
+    created_at_ms: u64,
+    actor: DataMovementActor,
+    event_type: DataMovementEventType,
+    #[serde(default)]
+    data_classes: Vec<DataClass>,
+    #[serde(default)]
+    source: Option<DataMovementSource>,
+    destination: DataMovementDestination,
+    #[serde(default)]
+    artifact_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    basis: Option<MovementBasis>,
+    #[serde(default)]
+    model: Option<MovementModel>,
+    #[serde(default)]
+    counts: Option<MovementCounts>,
+    policy: MovementPolicy,
+    result: DataMovementResult,
+}
+
+impl From<StoredDataMovementEvent> for DataMovementEvent {
+    fn from(stored: StoredDataMovementEvent) -> Self {
+        let ran_remotely = stored.destination.boundary == DestinationBoundary::Provider;
+        Self {
+            event_id: stored.event_id,
+            schema_version: stored.schema_version,
+            session_id: stored.session_id,
+            created_at_ms: stored.created_at_ms,
+            actor: stored.actor,
+            event_type: stored.event_type,
+            data_classes: stored.data_classes,
+            source: stored.source,
+            destination: stored.destination,
+            artifact_refs: stored.artifact_refs,
+            basis: stored.basis,
+            model: stored.model.map(|model| MovementModel {
+                provider_id: model.provider_id,
+                model_id: model
+                    .model_id
+                    .map(|id| crate::model_id::owned_for_place(id, ran_remotely)),
+            }),
+            counts: stored.counts,
+            policy: stored.policy,
+            result: stored.result,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DataMovementEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        StoredDataMovementEvent::deserialize(deserializer).map(Self::from)
+    }
 }
 
 /// A crude, dependency-free guard that strips obvious credential-shaped tokens
@@ -692,28 +741,56 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_model_path_is_cut_when_a_row_is_read() {
-        for (stored, read_back) in [
-            ("/home/numbat-user/models/private.gguf", "private.gguf"),
+    fn a_stored_model_id_is_read_by_where_the_row_says_its_data_went() {
+        let stored_row = |boundary: &str, model_id: serde_json::Value| {
+            let mut row = serde_json::to_value(sample_event()).expect("serialize");
+            row["destination"]["boundary"] = boundary.into();
+            row["model"]["model_id"] = model_id;
+            row
+        };
+        let read = |row: serde_json::Value| {
+            serde_json::from_value::<DataMovementEvent>(row)
+                .expect("a stored row")
+                .model
+                .expect("a model")
+                .model_id
+        };
+        for (stored, local) in [
+            ("/home/numbat/models/private.gguf", "private.gguf"),
+            // What older builds stored for a Windows path.
             (
-                "C:\\Users\\numbat-user\\models\\private.gguf",
-                "private.gguf",
+                "C:Usersnumbatmodelsprivate.gguf",
+                crate::model_id::LOCAL_MODEL_PLACEHOLDER,
             ),
-            ("numbat-org/probe-model", "numbat-org/probe-model"),
+            ("numbat/checkpoint", "checkpoint"),
+            ("numbat/private.gguf/", "private.gguf"),
+            ("C:numbat/checkpoint", "checkpoint"),
+            ("file:///home/numbat/checkpoint", "checkpoint"),
+            ("org/model.gguf", "model.gguf"),
+            ("org/repo/model.safetensors", "model.safetensors"),
+            (
+                "accounts/fireworks/models/llama-v3p1-8b-instruct",
+                "llama-v3p1-8b-instruct",
+            ),
+            ("org/model@rev1", "model@rev1"),
+            ("llama3.2:latest", "llama3.2:latest"),
         ] {
-            let model: MovementModel =
-                serde_json::from_value(serde_json::json!({ "model_id": stored }))
-                    .expect("a stored model row");
-            assert_eq!(model.model_id.as_deref(), Some(read_back), "{stored}");
+            // Data that left the device for a provider: the hosted identifier.
+            assert_eq!(
+                read(stored_row("provider", stored.into())).as_deref(),
+                Some(stored)
+            );
+            // Every other boundary reads as a local model.
+            for boundary in ["local", "org", "export"] {
+                assert_eq!(
+                    read(stored_row(boundary, stored.into())).as_deref(),
+                    Some(local),
+                    "{stored} at {boundary}"
+                );
+            }
         }
-        // A row with no model id, or a null one, still reads as none.
-        for row in [
-            serde_json::json!({}),
-            serde_json::json!({ "model_id": null }),
-        ] {
-            let model: MovementModel = serde_json::from_value(row).expect("a stored model row");
-            assert_eq!(model.model_id, None);
-        }
+        // A row with a null model id still reads as none.
+        assert_eq!(read(stored_row("local", serde_json::Value::Null)), None);
     }
 
     #[test]

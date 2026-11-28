@@ -2068,7 +2068,11 @@ impl fmt::Debug for DebugGraphNodeDraft<'_> {
 
 /// Per-item LLM provenance, cloned into every materialized note / node / edge and
 /// persisted, so per-item byte cost governs what may live here (ADR-0038).
+///
+/// Decoded through [`StoredProjectionProvenance`], so a stored model id is read
+/// by where the record says the model ran.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(from = "StoredProjectionProvenance")]
 pub struct ProjectionProvenance {
     /// The REGISTRY provider id the route was authorized against (`llm.openrouter`,
     /// `llm.cerebras`, …). Before ADR-0038 this carried a fourth ad-hoc naming
@@ -2078,11 +2082,9 @@ pub struct ProjectionProvenance {
     /// [`model_source`](Self::model_source), which says which it is rather than
     /// leaving a reader to assume.
     ///
-    /// Never a filesystem path. New records are cut where they are stamped. A
-    /// record stored before that can hold a local model's path, so it is cut
-    /// again here as it is read: nothing loaded, exported or written again
-    /// carries the path, and the stored record is not rewritten.
-    #[serde(deserialize_with = "crate::llm::route::deserialize_model_id")]
+    /// A hosted identifier for a model that ran at a remote endpoint, and a
+    /// display name for a local one: never a filesystem path (see
+    /// `ipc_contract::model_id`).
     pub model: String,
     pub prompt_id: String,
     /// The stamped route id (`route.cerebras_via_openrouter`, …). `None` on records
@@ -2094,6 +2096,38 @@ pub struct ProjectionProvenance {
     /// mistaken for served identity.
     #[serde(default)]
     pub model_source: crate::llm::route::ModelIdentitySource,
+}
+
+/// A [`ProjectionProvenance`] as a patch, note or graph item stores it.
+///
+/// Records written before the model rule can hold a local model's path, or
+/// what the old character filter left of a Windows path. Building the typed
+/// value from this one applies the rule on every read: nothing loaded,
+/// exported or written again carries the path, and the stored record is not
+/// rewritten.
+#[derive(serde::Deserialize)]
+struct StoredProjectionProvenance {
+    provider: String,
+    model: String,
+    prompt_id: String,
+    #[serde(default)]
+    route_id: Option<String>,
+    #[serde(default)]
+    model_source: crate::llm::route::ModelIdentitySource,
+}
+
+impl From<StoredProjectionProvenance> for ProjectionProvenance {
+    fn from(stored: StoredProjectionProvenance) -> Self {
+        let ran_remotely =
+            crate::llm::route::recorded_as_remote(&stored.provider, stored.route_id.as_deref());
+        Self {
+            model: crate::llm::route::owned_model_id_for_place(stored.model, ran_remotely),
+            provider: stored.provider,
+            prompt_id: stored.prompt_id,
+            route_id: stored.route_id,
+            model_source: stored.model_source,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema, PartialEq)]

@@ -250,7 +250,15 @@ async fn dispatch_outcomes_stamp_raw_calibrated_identity_usage_and_redacted_ledg
         assert_eq!(record.provider_id.as_deref(), Some("decision.d3_edge"));
         assert_eq!(record.state_sha256, state_digest(&request().state));
         if !failure {
-            assert_eq!(record.served_model.as_deref(), Some("vllm-sr/d3-edge"));
+            // The engine runs on this machine, so the record shows its model
+            // by a display name. The calibration still matched on the id the
+            // engine reported.
+            assert_eq!(record.served_model.as_deref(), Some("d3-edge"));
+            let ledger = repo.load_data_movement_events(context.session_id).unwrap();
+            assert_eq!(
+                ledger[1].model.as_ref().unwrap().model_id.as_deref(),
+                Some("d3-edge")
+            );
             assert_eq!(record.model_identity_source, ModelIdentitySource::Served);
             assert_eq!(record.route_answer.as_deref(), Some("note"));
             assert_eq!(
@@ -644,4 +652,75 @@ async fn non_live_assist_question_family_preserves_parameterized_schema_version(
     assert_eq!(mismatched[0].outcome, DecisionOutcome::Abstained);
 
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_stored_decision_record_is_read_by_where_its_model_ran() {
+    use crate::llm::route::model_id_fixtures::{PATH_CANARY, STORED};
+
+    let dir = std::env::temp_dir().join(format!("decision-record-{}", uuid::Uuid::new_v4()));
+    let repo = FileMemoryRepository::with_data_root(&dir);
+    let settings = DecisionRouteSettings::default();
+    let context = DispatchContext {
+        session_id: "session-stored-record",
+        settings: &settings,
+        privacy: PrivacyMode::LocalOnly,
+        models_dir: &dir,
+        schema_version: crate::decision::shadow::LIVE_ASSIST_SCHEMA_VERSION,
+        basis: &[],
+        repository: &repo,
+        engines: &EngineCache::default(),
+    };
+    let record = records(
+        route_by_id("route.decision.d3_edge"),
+        &request(),
+        &context,
+        &[],
+    )
+    .remove(0);
+    let template = serde_json::to_value(&record).unwrap();
+
+    for (stored, local) in STORED {
+        for (egress, expected) in [("local", local), ("cloud", stored)] {
+            let mut row = template.clone();
+            row["egress"] = egress.into();
+            row["served_model"] = stored.into();
+            row["model_pin"]["requested"] = stored.into();
+            let read: DecisionRecord = serde_json::from_value(row).unwrap();
+
+            assert_eq!(read.served_model.as_deref(), Some(expected), "{stored}");
+            assert_eq!(read.model_pin.as_ref().unwrap().requested, expected);
+            // The digest is kept as stored.
+            assert_eq!(read.model_pin_digest, record.model_pin_digest);
+            if egress == "local" {
+                let shown = serde_json::to_string(&read).unwrap();
+                assert!(!shown.contains(PATH_CANARY), "{shown}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_local_http_model_is_recorded_by_its_display_name() {
+    let route = route_by_id("route.decision.ollama_loopback").unwrap();
+    for (configured, recorded) in [
+        ("C:\\Users\\numbat\\models\\private.gguf", "private.gguf"),
+        ("/home/numbat/models/private.gguf", "private.gguf"),
+        ("numbat/checkpoint", "checkpoint"),
+        ("file:///home/numbat/checkpoint", "checkpoint"),
+        ("org/repo/model.safetensors", "model.safetensors"),
+        ("llama3.2:latest", "llama3.2:latest"),
+    ] {
+        let settings = DecisionRouteSettings {
+            local_http_model: Some(configured.into()),
+            ..Default::default()
+        };
+        let pin = route.pin(&settings);
+        let digest = digest_pin(&pin);
+        let stored = route.stored_pin(pin, &settings);
+
+        assert_eq!(stored.requested, recorded, "{configured}");
+        // The digest calibrations are keyed on is of the pin as configured.
+        assert_eq!(digest, digest_pin(&route.pin(&settings)));
+    }
 }

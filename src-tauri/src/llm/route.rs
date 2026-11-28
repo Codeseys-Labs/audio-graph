@@ -892,33 +892,80 @@ pub(crate) fn looks_credential_shaped(value: &str) -> bool {
         || lower.contains("apikey")
 }
 
-/// The part of a model id that may be persisted. Defined once, in the contract
-/// crate, so the data-movement ledger cuts a stored id the same way.
-pub(crate) use audio_graph_ipc_contract::model_id::without_path as model_id_without_path;
+/// What may be stored or shown for a model, decided by where it ran. Defined
+/// once, in the contract crate, so provenance, the data-movement ledger and
+/// decision records follow one rule.
+pub(crate) use audio_graph_ipc_contract::model_id::{
+    LOCAL_MODEL_PLACEHOLDER, for_place as model_id_for_place,
+    owned_for_place as owned_model_id_for_place,
+};
 
-/// [`sanitize_route_metadata`] for a model id a response reported, with any
-/// path cut away first. The order matters: the character filter drops the
-/// backslashes that mark a Windows path and would keep its directory names.
-pub(crate) fn sanitize_served_model(raw: &str) -> Option<String> {
-    sanitize_route_metadata(model_id_without_path(raw))
+/// [`sanitize_route_metadata`] for a model id a response reported or a user
+/// configured.
+///
+/// A model that ran locally is cut to its display name first. The order
+/// matters: the character filter drops the backslashes that mark a Windows
+/// path and would keep its directory names. A local id that leaves no name is
+/// no id at all: for a served id, the caller records the requested one.
+pub(crate) fn sanitize_model_id(raw: &str, ran_remotely: bool) -> Option<String> {
+    let shown = model_id_for_place(raw, ran_remotely);
+    if !ran_remotely && shown == LOCAL_MODEL_PLACEHOLDER {
+        return None;
+    }
+    sanitize_route_metadata(shown)
 }
 
-/// Read a persisted model id through [`model_id_without_path`].
+/// Whether a stored record says its model ran at a remote endpoint.
 ///
-/// A record written before that cut existed can hold a local server's model
-/// path. Cutting it as it is read means nothing loaded, exported or written
-/// again carries the path, and the stored record is left as it is.
-pub(crate) fn deserialize_model_id<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let stored = <String as serde::Deserialize>::deserialize(deserializer)?;
-    let kept = model_id_without_path(&stored);
-    Ok(if kept.len() == stored.len() {
-        stored
-    } else {
-        kept.to_string()
-    })
+/// Only a provider whose every route is remote says so, as in
+/// [`AttemptedRouteIdentity::for_route`]. The generic OpenAI-compatible
+/// provider serves loopback and remote endpoints under one id and its records
+/// keep no endpoint class, so they cannot say; neither can an id this build
+/// does not know. Those are read by the local rule.
+pub(crate) fn recorded_as_remote(provider: &str, route_id: Option<&str>) -> bool {
+    let provider_id = route_id
+        .and_then(|id| LLM_ROUTES.iter().find(|route| route.id == id))
+        .map_or(provider, |route| route.provider_id);
+    match provider_id {
+        "llm.local_llama" | "llm.mistralrs" | "llm.api" => false,
+        // What records carried before ADR-0038 for the one provider that was
+        // always remote. The other three old names are local or generic.
+        "openrouter" => true,
+        known => LLM_ROUTES.iter().any(|route| route.provider_id == known),
+    }
+}
+
+/// Model ids every layer that stores one is tested with.
+#[cfg(test)]
+pub(crate) mod model_id_fixtures {
+    /// (identifier, what a local model shows). A model at a remote endpoint
+    /// keeps each identifier whole.
+    pub(crate) const STORED: [(&str, &str); 11] = [
+        ("/home/numbat/models/private.gguf", "private.gguf"),
+        // What older builds stored for `C:\Users\numbat\models\private.gguf`:
+        // their filter dropped the backslashes.
+        (
+            "C:Usersnumbatmodelsprivate.gguf",
+            super::LOCAL_MODEL_PLACEHOLDER,
+        ),
+        // Paths a shape test let through.
+        ("numbat/checkpoint", "checkpoint"),
+        ("numbat/private.gguf/", "private.gguf"),
+        ("C:numbat/checkpoint", "checkpoint"),
+        ("file:///home/numbat/checkpoint", "checkpoint"),
+        // Hosted identifiers.
+        ("org/model.gguf", "model.gguf"),
+        ("org/repo/model.safetensors", "model.safetensors"),
+        (
+            "accounts/fireworks/models/llama-v3p1-8b-instruct",
+            "llama-v3p1-8b-instruct",
+        ),
+        ("org/model@rev1", "model@rev1"),
+        ("llama3.2:latest", "llama3.2:latest"),
+    ];
+
+    /// The directory name every local path above carries.
+    pub(crate) const PATH_CANARY: &str = "numbat";
 }
 
 // ---------------------------------------------------------------------------
@@ -1542,29 +1589,84 @@ mod tests {
     }
 
     #[test]
-    fn a_served_model_path_is_cut_before_it_is_sanitized() {
-        assert_eq!(
-            sanitize_served_model("C:\\Users\\numbat-user\\models\\private.gguf").as_deref(),
-            Some("private.gguf")
-        );
-        assert_eq!(
-            sanitize_served_model("/home/numbat-user/models/private.gguf").as_deref(),
-            Some("private.gguf")
-        );
-        // A path longer than the metadata cap still yields its short name.
+    fn a_served_model_id_is_cut_only_where_the_model_ran_locally() {
+        for (served, local) in [
+            (
+                "C:\\Users\\numbat\\models\\private.gguf",
+                Some("private.gguf"),
+            ),
+            ("/home/numbat/models/private.gguf", Some("private.gguf")),
+            ("numbat/checkpoint", Some("checkpoint")),
+            ("org/repo/model.safetensors", Some("model.safetensors")),
+            ("llama3.2:latest", Some("llama3.2:latest")),
+            // No name is left, so there is no served id.
+            ("/", None),
+            ("C:private.gguf", None),
+        ] {
+            assert_eq!(
+                sanitize_model_id(served, false).as_deref(),
+                local,
+                "{served}"
+            );
+        }
+        // A local path longer than the metadata cap still yields its name.
         let deep = format!("/home/{}private.gguf", "numbat-dir/".repeat(12));
         assert!(deep.len() > MAX_METADATA_LEN);
         assert_eq!(
-            sanitize_served_model(&deep).as_deref(),
+            sanitize_model_id(&deep, false).as_deref(),
             Some("private.gguf")
         );
-        assert_eq!(
-            sanitize_served_model("anthropic/claude-sonnet-4.5").as_deref(),
-            Some("anthropic/claude-sonnet-4.5")
-        );
-        assert_eq!(sanitize_served_model("/"), None);
         // The other guards still apply to what is left.
-        assert_eq!(sanitize_served_model("/models/sk-live-abc.gguf"), None);
+        assert_eq!(sanitize_model_id("/models/flask-app.gguf", false), None);
+
+        // A remote model keeps its hosted identifier: only the filter runs.
+        for hosted in [
+            "org/model.gguf",
+            "org/repo/model.safetensors",
+            "accounts/fireworks/models/llama-v3p1-8b-instruct",
+            "llama3.2:latest",
+        ] {
+            assert_eq!(sanitize_model_id(hosted, true).as_deref(), Some(hosted));
+        }
+        // The filter has never kept `@`.
+        assert_eq!(
+            sanitize_model_id("org/model@rev1", true).as_deref(),
+            Some("org/modelrev1")
+        );
+    }
+
+    #[test]
+    fn only_a_provider_with_no_local_deployment_is_recorded_as_remote() {
+        for (provider, route_id, remote) in [
+            ("llm.openrouter", Some("route.openrouter"), true),
+            (
+                "llm.openrouter",
+                Some("route.cerebras_via_openrouter"),
+                true,
+            ),
+            ("llm.cerebras", Some("route.cerebras_direct"), true),
+            ("llm.sambanova", None, true),
+            ("llm.aws_bedrock", None, true),
+            // The name old records carry.
+            ("openrouter", None, true),
+            ("llm.local_llama", Some("route.local_llama"), false),
+            ("llm.mistralrs", None, false),
+            ("local_llama", None, false),
+            ("mistralrs", None, false),
+            // One id for loopback and remote endpoints: the record cannot say.
+            ("llm.api", Some("route.openai_compatible"), false),
+            ("api", None, false),
+            // An id this build does not know.
+            ("llm.wombat", None, false),
+            // The route decides when both are present.
+            ("llm.openrouter", Some("route.local_llama"), false),
+        ] {
+            assert_eq!(
+                recorded_as_remote(provider, route_id),
+                remote,
+                "{provider} {route_id:?}"
+            );
+        }
     }
 
     #[test]
