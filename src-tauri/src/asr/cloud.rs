@@ -208,11 +208,7 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
         .content_egress_policy()
         .check_audio("asr.cloud")
         .map_err(|_| {
-            super::asr_diagnostic(
-                RuntimeErrorCode::PolicyBlocked,
-                RuntimeTransport::Http,
-                None,
-            )
+            super::asr_diagnostic(RuntimeErrorCode::PolicyBlocked, RuntimeTransport::Http)
         })?;
     let call_start = std::time::Instant::now();
     log::info!("Cloud ASR: starting transcription request");
@@ -268,7 +264,7 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
             } else {
                 RuntimeErrorCode::NetworkUnreachable
             };
-            super::asr_diagnostic(code, RuntimeTransport::Http, None)
+            super::asr_diagnostic(code, RuntimeTransport::Http)
         }
     })?;
     let status = response.status();
@@ -291,7 +287,7 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
     }
     let whisper_resp: WhisperResponse = response.json().map_err(|error| {
         if error.is_timeout() {
-            super::asr_diagnostic(RuntimeErrorCode::Timeout, RuntimeTransport::Http, None)
+            super::asr_diagnostic(RuntimeErrorCode::Timeout, RuntimeTransport::Http)
         } else {
             RuntimeErrorDiagnostic::new(
                 RuntimeErrorCode::InvalidResponse,
@@ -626,11 +622,7 @@ mod tests {
 
         assert_eq!(
             error,
-            super::super::asr_diagnostic(
-                RuntimeErrorCode::PolicyBlocked,
-                RuntimeTransport::Http,
-                None
-            )
+            super::super::asr_diagnostic(RuntimeErrorCode::PolicyBlocked, RuntimeTransport::Http)
         );
     }
 
@@ -644,11 +636,7 @@ mod tests {
 
         assert_eq!(
             error,
-            super::super::asr_diagnostic(
-                RuntimeErrorCode::PolicyBlocked,
-                RuntimeTransport::Http,
-                None
-            )
+            super::super::asr_diagnostic(RuntimeErrorCode::PolicyBlocked, RuntimeTransport::Http)
         );
     }
 
