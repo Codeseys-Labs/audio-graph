@@ -101,6 +101,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Clearing the chat now cancels chat requests still in flight, so a cleared
+  question is never sent and its reply never shown; card answers run on. A
+  chat whose stream goes quiet for 10 minutes ends with a timeout, and a card
+  answer whose save stalls frees its slot and fails after 15 seconds. Notes
+  synthesis no longer holds up capture stop, New Session or chat while the
+  model runs, drops notes made for a session that rotated meanwhile, and at
+  most two blocking model calls may be outstanding at once (#550).
 - Notes and Graph now publish changes after their projection log confirms the
   write. Historical Review shows when an existing projection trails its
   transcript or needs repair after an interrupted write. Export includes

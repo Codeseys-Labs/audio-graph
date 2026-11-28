@@ -3688,42 +3688,91 @@ impl Drop for StreamRegistration {
     }
 }
 
+/// Register a chat request's cancel token where clearing the chat finds it,
+/// for as long as the returned guard lives. A clear that landed since the
+/// request read `history_generation` cancels it here: Clear bumps the
+/// generation before it cancels the registered requests, so one of the two
+/// sees the other.
+fn register_chat_request(
+    state: &AppState,
+    cancel: &tokio_util::sync::CancellationToken,
+    history_generation: u64,
+) -> StreamRegistration {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    state
+        .chat_requests
+        .register(request_id.clone(), cancel.clone());
+    if chat_history_generation(state) != history_generation {
+        cancel.cancel();
+    }
+    StreamRegistration {
+        registry: state.chat_requests.clone(),
+        request_id,
+    }
+}
+
+/// Clear the chat: bump the history generation, then cancel every chat
+/// request in flight. A request not sent yet is never sent, and the reply of
+/// one already sent is discarded (best effort: a request the provider has
+/// already answered completes, and records nothing). Card answers are not
+/// chat requests and run on.
+fn clear_chat(
+    history: &std::sync::RwLock<crate::state::ChatHistory>,
+    chat_requests: &crate::llm::streaming::StreamRegistry,
+) {
+    history
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    let cancelled = chat_requests.cancel_all();
+    if cancelled > 0 {
+        log::info!("Clearing the chat cancelled {cancelled} chat request(s) in flight");
+    }
+}
+
 /// Record a finished request's turns, unless the chat was cleared or the
 /// session rotated (which clears it) since the request read its history at
 /// `generation`. A stale write is dropped, so a cleared message never comes
-/// back. A failed call records nothing, neither its user message nor any
-/// partial reply, so the next request replays exactly the history that
-/// preceded it.
+/// back, and the request is reported as cancelled. A failed call records
+/// nothing, neither its user message nor any partial reply, so the next
+/// request replays exactly the history that preceded it. Returns whether the
+/// turns were recorded.
 fn record_chat_turns(
     history: &std::sync::RwLock<crate::state::ChatHistory>,
     generation: u64,
     turns: impl IntoIterator<Item = ChatMessage>,
-) {
+) -> bool {
     let mut history = history
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !history.append_if_current(generation, turns) {
+    let recorded = history.append_if_current(generation, turns);
+    if !recorded {
         log::info!("Chat history was cleared during the request; its turn is not recorded");
     }
+    recorded
 }
 
-/// Record a finished turn and return its assistant message.
+/// Record a finished turn and return its assistant message; a reply to a
+/// cleared chat is not returned, and the request is `cancelled`.
 fn record_chat_turn(
     state: &AppState,
     generation: u64,
     user_turn: ChatMessage,
     reply: String,
-) -> ChatMessage {
+) -> Result<ChatMessage, RuntimeDiagnostic> {
     let assistant_turn = ChatMessage {
         role: "assistant".to_string(),
         content: reply,
     };
-    record_chat_turns(
+    if record_chat_turns(
         &state.chat_history,
         generation,
         [user_turn, assistant_turn.clone()],
-    );
-    assistant_turn
+    ) {
+        Ok(assistant_turn)
+    } else {
+        Err(llm_cancelled_diagnostic())
+    }
 }
 
 fn llm_internal_diagnostic() -> RuntimeDiagnostic {
@@ -3752,21 +3801,64 @@ fn llm_timeout_diagnostic() -> RuntimeDiagnostic {
     .into()
 }
 
+fn llm_capacity_diagnostic() -> RuntimeDiagnostic {
+    RuntimeErrorDiagnostic::new(
+        RuntimeErrorCode::CapacityExhausted,
+        true,
+        RuntimeSafeRecoveryAction::RetryAfterDelay,
+        RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
+    )
+    .into()
+}
+
 /// Longest a blocking LLM executor call may run. The executor has one worker
 /// thread; if that thread panics mid-job, every later job waits in its queue
 /// forever, so no caller may wait unbounded. Long enough for a slow
 /// local-model generation.
 const BLOCKING_LLM_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Most blocking LLM executor calls outstanding at once, counting timed-out
+/// calls whose threads are still parked: one running behind the executor's
+/// single worker, and one waiting.
+const MAX_OUTSTANDING_BLOCKING_LLM_CALLS: usize = 2;
+
+/// Frees an outstanding blocking LLM call's slot when the call returns, which
+/// for a timed-out call is whenever its parked thread finally does.
+struct OutstandingBlockingLlmCall(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for OutstandingBlockingLlmCall {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Run a blocking LLM executor call off the async runtime, bounded by
 /// `limit`. A call that panics is `internal`, and one that outlives `limit` is
 /// `timeout`. Nothing can cancel a timed-out call, so its thread stays
-/// blocked.
+/// blocked and keeps its slot in `outstanding`; once
+/// [`MAX_OUTSTANDING_BLOCKING_LLM_CALLS`] are outstanding a call is refused
+/// at once as `capacity_exhausted`, so repeated timeouts cannot pile up work
+/// behind the executor.
 async fn bounded_blocking_llm_call<T: Send + 'static>(
+    outstanding: &Arc<std::sync::atomic::AtomicUsize>,
     limit: std::time::Duration,
     call: impl FnOnce() -> Result<T, RuntimeDiagnostic> + Send + 'static,
 ) -> Result<T, RuntimeDiagnostic> {
-    match tokio::time::timeout(limit, tokio::task::spawn_blocking(call)).await {
+    if outstanding
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |calls| {
+            (calls < MAX_OUTSTANDING_BLOCKING_LLM_CALLS).then_some(calls + 1)
+        })
+        .is_err()
+    {
+        log::warn!("A blocking LLM call was refused: too many are still outstanding");
+        return Err(llm_capacity_diagnostic());
+    }
+    let slot = OutstandingBlockingLlmCall(Arc::clone(outstanding));
+    let job = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        call()
+    });
+    match tokio::time::timeout(limit, job).await {
         Ok(Ok(result)) => result,
         Ok(Err(_panicked)) => Err(llm_internal_diagnostic()),
         Err(_elapsed) => Err(llm_timeout_diagnostic()),
@@ -3805,16 +3897,27 @@ impl LlmStreamFrames {
     }
 }
 
+/// Longest the accumulating chat command waits for the next frame of its
+/// stream. Long enough for a local model, which emits its whole reply as one
+/// delta.
+const CHAT_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Drain a stream into one whole reply and its token count. Only an explicit
 /// `Done` is a reply: a failure, a cancellation, or a stream that ends without
-/// a terminal frame is an error, and its partial text is discarded.
+/// a terminal frame is an error, and its partial text is discarded. A stream
+/// that sends nothing for `idle_limit` is a `timeout`; the caller's
+/// cancellation guard then stops its producer.
 async fn collect_chat_reply(
     mut frames: LlmStreamFrames,
+    idle_limit: std::time::Duration,
 ) -> Result<(String, u32), RuntimeDiagnostic> {
     use crate::llm::streaming::TokenDelta;
     let mut reply = String::new();
     loop {
-        match frames.next().await {
+        let Ok(frame) = tokio::time::timeout(idle_limit, frames.next()).await else {
+            return Err(llm_timeout_diagnostic());
+        };
+        match frame {
             TokenDelta::Delta { content, .. } => reply.push_str(&content),
             TokenDelta::Done {
                 full_text, usage, ..
@@ -3986,6 +4089,9 @@ fn spawn_stream_task(
         request_id: Some(request_id.clone()),
     });
     let (rx, cancel) = stream_chat_with_request(request);
+    // Clearing the chat cancels it too, unless the chat was already cleared
+    // since this request read its history.
+    let chat_request = register_chat_request(state, &cancel, history_generation);
     state.stream_registry.register(request_id.clone(), cancel);
 
     let registration = StreamRegistration {
@@ -4014,6 +4120,7 @@ fn spawn_stream_task(
 
     tokio::spawn(async move {
         let _registration = registration;
+        let _chat_request = chat_request;
         let mut pipe: Option<crate::speak_aloud::SpeakAloudPipe> =
             match crate::speak_aloud::SpeakAloudPipe::maybe_new(
                 settings_snapshot.0,
@@ -4073,7 +4180,9 @@ fn spawn_stream_task(
                     usage,
                     finish_reason,
                 } => {
-                    record_chat_turns(
+                    // A reply to a cleared chat is not recorded and is not
+                    // presented as one: the stream ends as cancelled.
+                    let recorded = record_chat_turns(
                         &chat_history,
                         history_generation,
                         [
@@ -4084,13 +4193,20 @@ fn spawn_stream_task(
                             },
                         ],
                     );
-                    if let Some(p) = pipe.take()
-                        && let Err(e) = p.finish()
-                    {
-                        log::warn!("speak-aloud finish failed: {}", e);
+                    if let Some(p) = pipe.take() {
+                        if !recorded {
+                            let _ = p.cancel();
+                        } else if let Err(e) = p.finish() {
+                            log::warn!("speak-aloud finish failed: {}", e);
+                        }
                     }
                     let tokens_used = tokens_used_from_stream_usage(usage.clone());
                     persist_llm_usage_for_session(&app, &session_id_for_usage, tokens_used);
+                    let (full_text, finish_reason) = if recorded {
+                        (full_text, finish_reason)
+                    } else {
+                        (String::new(), "cancelled".to_string())
+                    };
                     if let Err(e) = channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Done {
                         request_id: request_id_for_task.clone(),
                         full_text,
@@ -4344,23 +4460,27 @@ pub async fn send_chat_message(
             source_id: None,
             request_id: None,
         });
-        // This blocking shim drains the stream to completion and does not expose
-        // cancellation. Dropping a CancellationToken does not fire it; this
-        // binding only keeps the stream infrastructure intact.
-        let (rx, _no_cancel) = stream_chat_with_request(request);
+        let (rx, cancel) = stream_chat_with_request(request);
+        // Clearing the chat cancels this request; so does this command ending
+        // any other way (its reply, an error, a timeout, or the caller going
+        // away), so no producer outlives it.
+        let _chat_request = register_chat_request(state.inner(), &cancel, history_generation);
+        let _cancel_on_exit = cancel.drop_guard();
         // Chat history keeps neither turn of a call that did not complete.
         // This command returns only a whole reply, so partial text from a
         // failed or cancelled call is discarded rather than presented as an
         // answer.
+        let fail = |diagnostic: RuntimeDiagnostic| {
+            log::warn!("send_chat_message failed: {diagnostic}");
+            AppError::from(diagnostic)
+        };
         let (reply, tokens_used) =
-            collect_chat_reply(LlmStreamFrames::new(rx))
+            collect_chat_reply(LlmStreamFrames::new(rx), CHAT_STREAM_IDLE_TIMEOUT)
                 .await
-                .map_err(|diagnostic| {
-                    log::warn!("send_chat_message failed: {diagnostic}");
-                    AppError::from(diagnostic)
-                })?;
-        let assistant_msg = record_chat_turn(state.inner(), history_generation, user_turn, reply);
+                .map_err(fail)?;
         persist_llm_usage_for_session(&app, &state.current_session_id(), tokens_used);
+        let assistant_msg =
+            record_chat_turn(state.inner(), history_generation, user_turn, reply).map_err(fail)?;
         return Ok(ChatResponse {
             message: assistant_msg,
             tokens_used,
@@ -4378,17 +4498,24 @@ pub async fn send_chat_message(
     // above. It is told the client that gate approved, and refuses any other.
     let executor = state.llm_executor.clone();
     let admitted = LlmClientTargets::from_settings(&settings).admitted();
-    let outcome = bounded_blocking_llm_call(BLOCKING_LLM_CALL_TIMEOUT, move || {
-        executor.chat_with_history(messages, graph_context, llm_provider, admitted)
-    })
+    let outcome = bounded_blocking_llm_call(
+        &state.blocking_llm_calls,
+        BLOCKING_LLM_CALL_TIMEOUT,
+        move || executor.chat_with_history(messages, graph_context, llm_provider, admitted),
+    )
     .await
     .map_err(|diagnostic| {
         log::warn!("send_chat_message failed: {diagnostic}");
         AppError::from(diagnostic)
     })?;
-    let assistant_msg =
-        record_chat_turn(state.inner(), history_generation, user_turn, outcome.text);
     persist_llm_usage_for_session(&app, &state.current_session_id(), outcome.tokens_used);
+    let assistant_msg =
+        record_chat_turn(state.inner(), history_generation, user_turn, outcome.text).map_err(
+            |diagnostic| {
+                log::warn!("send_chat_message failed: {diagnostic}");
+                AppError::from(diagnostic)
+            },
+        )?;
     Ok(ChatResponse {
         message: assistant_msg,
         tokens_used: outcome.tokens_used,
@@ -4405,7 +4532,7 @@ pub async fn synthesize_notes(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
-    let _session_lifecycle = state.session_lifecycle.lock().await;
+    let session_lifecycle = state.session_lifecycle.lock().await;
     // Notes synthesis sends the transcript and graph to the selected LLM. Keep
     // the product gate ahead of client synchronization or context reads just
     // like the interactive chat entry points (ADR-0033).
@@ -4423,21 +4550,30 @@ pub async fn synthesize_notes(
         &["transcript", "graph_context", "prompt"],
         llm_provider.requires_cloud_content_transfer(),
     )?;
-    synthesize_notes_admitted(state.inner(), &settings).await
+    synthesize_notes_admitted(state.inner(), &settings, session_lifecycle).await
 }
 
-/// [`synthesize_notes`] once its gate has passed for `settings`.
+/// [`synthesize_notes`] once its gate has passed for `settings`, holding the
+/// session lifecycle.
 ///
 /// The executor takes its client inside this call, later than that gate, and a
 /// settings save in between can have replaced it with one for another
 /// destination, model or policy. `settings` is the gate's own snapshot. The
 /// client the cache would hold for it is what the executor is told to expect,
 /// and the executor refuses the chat for any other.
+///
+/// Everything the model needs is captured under `session_lifecycle`, which is
+/// then released before the model runs, so capture stop, session rotation,
+/// chat starts and card answers do not queue behind it (#550). The notes
+/// belong to the session they were made from: if it rotated meanwhile they
+/// are refused as `cancelled`.
 async fn synthesize_notes_admitted(
     state: &AppState,
     settings: &crate::settings::AppSettings,
+    session_lifecycle: tokio::sync::MutexGuard<'_, ()>,
 ) -> AppResult<String> {
     sync_llm_clients(state).await?;
+    let session_id = state.current_session_id();
 
     let snapshot = {
         let kg = state
@@ -4483,17 +4619,25 @@ async fn synthesize_notes_admitted(
         content: prompt,
     }];
 
+    drop(session_lifecycle);
+
     let executor = state.llm_executor.clone();
     let llm_provider = settings.llm_provider.clone();
     let admitted = LlmClientTargets::from_settings(settings).admitted();
-    let outcome = bounded_blocking_llm_call(BLOCKING_LLM_CALL_TIMEOUT, move || {
-        executor.chat_with_history(messages, graph_context, llm_provider, admitted)
-    })
+    let outcome = bounded_blocking_llm_call(
+        &state.blocking_llm_calls,
+        BLOCKING_LLM_CALL_TIMEOUT,
+        move || executor.chat_with_history(messages, graph_context, llm_provider, admitted),
+    )
     .await
     .map_err(|diagnostic| {
         log::warn!("synthesize_notes failed: {diagnostic}");
         AppError::from(diagnostic)
     })?;
+    if state.current_session_id() != session_id {
+        log::info!("The session rotated while notes were synthesized; they are not returned");
+        return Err(llm_cancelled_diagnostic().into());
+    }
 
     // Notes synthesis only needs the generated Markdown; the token usage on the
     // outcome is reported through the chat path, not here.
@@ -4510,14 +4654,11 @@ pub async fn get_chat_history(state: State<'_, AppState>) -> AppResult<Vec<ChatM
     Ok(history.messages().to_vec())
 }
 
-/// Clear the chat message history.
+/// Clear the chat message history, and cancel every chat request in flight
+/// (see [`clear_chat`]).
 #[tauri::command]
 pub async fn clear_chat_history(state: State<'_, AppState>) -> AppResult<()> {
-    let mut history = state
-        .chat_history
-        .write()
-        .map_err(|e| format!("Lock error: {}", e))?;
-    history.clear();
+    clear_chat(&state.chat_history, &state.chat_requests);
     Ok(())
 }
 
@@ -6167,7 +6308,8 @@ impl Drop for CardAnswerSlot {
 /// Returns a closed `internal` diagnostic when the card could not be
 /// written, so the caller reports a failure rather than a normal terminal
 /// frame. The card is announced only once written, and only while its
-/// session is still the live one.
+/// session is still the live one. Once `abandoned` is set (the caller
+/// stopped waiting, see [`finish_card_answer`]) it writes no answer.
 #[allow(clippy::too_many_arguments)]
 fn finalize_card_answer(
     app: &tauri::AppHandle,
@@ -6177,6 +6319,7 @@ fn finalize_card_answer(
     finish_reason: Option<String>,
     diagnostic: Option<RuntimeDiagnostic>,
     total_tokens: Option<u64>,
+    abandoned: &std::sync::atomic::AtomicBool,
 ) -> Result<(), RuntimeDiagnostic> {
     let mut answer = events::CardAnswer {
         status,
@@ -6211,6 +6354,13 @@ fn finalize_card_answer(
         status,
     );
     append_assist_answer_ledger_event(&ctx.session_id, &terminal_event);
+
+    #[cfg(test)]
+    let _finished = card_finalize_test::stall(&ctx.card_id);
+    // The caller gave up on this write: a retry may already own the card.
+    if abandoned.load(Ordering::SeqCst) {
+        return Err(llm_internal_diagnostic());
+    }
 
     // A card that cannot be read is a failure; one that is gone is not.
     let card = FileMemoryRepository::user_data()
@@ -6277,6 +6427,116 @@ fn finalize_card_answer(
         telemetry_event,
     );
     persisted
+}
+
+/// Longest a card answer's finalization (its terminal ledger row and card
+/// write) may take before the attempt gives up on it.
+const CARD_ANSWER_FINALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Finalize `terminal` off the async runtime, bounded by `limit`, then free
+/// `release` (the attempt's registration and slot) and return the terminal
+/// frame to send. A persistence call that outlives `limit`, as on a stalled
+/// filesystem, is abandoned: it writes no answer if it has not begun to, the
+/// slot is freed so rotation and a retry can proceed, and the attempt ends
+/// as a closed `internal` failure. Nothing can cancel a stalled write, so one
+/// already under way may still land.
+async fn finish_card_answer(
+    app: tauri::AppHandle,
+    ctx: CardAnswerContext,
+    terminal: CardAnswerTerminal,
+    request_id: String,
+    limit: std::time::Duration,
+    release: (StreamRegistration, CardAnswerSlot),
+) -> events::ChatStreamFrame {
+    use crate::events::ChatStreamFrame;
+    use crate::llm::streaming::ChatStreamEvent;
+    let CardAnswerTerminal {
+        status,
+        full_text,
+        finish_reason,
+        diagnostic,
+        total_tokens,
+        frame,
+    } = terminal;
+    let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let abandoned_by_caller = Arc::clone(&abandoned);
+    let write = tokio::task::spawn_blocking(move || {
+        finalize_card_answer(
+            &app,
+            &ctx,
+            status,
+            full_text,
+            finish_reason,
+            diagnostic,
+            total_tokens,
+            &abandoned,
+        )
+    });
+    let persisted = match tokio::time::timeout(limit, write).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_panicked)) => Err(llm_internal_diagnostic()),
+        Err(_elapsed) => {
+            abandoned_by_caller.store(true, Ordering::SeqCst);
+            log::warn!("A card answer's persistence did not finish in time; the attempt failed");
+            Err(llm_internal_diagnostic())
+        }
+    };
+    drop(release);
+    match persisted {
+        Ok(()) => frame,
+        // The answer the model produced is still shown, as the failed
+        // attempt's display-only partial text.
+        Err(diagnostic) => ChatStreamFrame::Failed {
+            request_id,
+            full_text: match frame {
+                ChatStreamFrame::Stream(ChatStreamEvent::Done { full_text, .. })
+                | ChatStreamFrame::Failed { full_text, .. } => full_text,
+                ChatStreamFrame::Stream(ChatStreamEvent::Delta { .. }) => String::new(),
+            },
+            diagnostic,
+        },
+    }
+}
+
+/// Test-only: hold one card's finalization at the point where it reads and
+/// writes the card, as a stalled filesystem would.
+#[cfg(test)]
+mod card_finalize_test {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// Per card: the stall's release, and a sender dropped when the
+    /// finalization returns.
+    type Stall = (
+        crossbeam_channel::Receiver<()>,
+        crossbeam_channel::Sender<()>,
+    );
+
+    static STALLS: Mutex<Option<HashMap<String, Stall>>> = Mutex::new(None);
+
+    /// Stall `card_id`'s next finalization until `release` is sent to (or
+    /// dropped); `finished` disconnects once that finalization returned.
+    pub(super) fn arm(
+        card_id: &str,
+        release: crossbeam_channel::Receiver<()>,
+        finished: crossbeam_channel::Sender<()>,
+    ) {
+        STALLS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(card_id.to_string(), (release, finished));
+    }
+
+    pub(super) fn stall(card_id: &str) -> Option<crossbeam_channel::Sender<()>> {
+        let (release, finished) = STALLS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()?
+            .remove(card_id)?;
+        let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+        Some(finished)
+    }
 }
 
 /// Spawn the answer stream task. Deliberately NOT a call to
@@ -6492,32 +6752,16 @@ fn spawn_card_answer_stream_task(
             }
         };
 
-        // Persist, then free the slot, then tell the frontend.
-        let persisted = finalize_card_answer(
-            &app,
-            &ctx,
-            terminal.status,
-            terminal.full_text,
-            terminal.finish_reason,
-            terminal.diagnostic,
-            terminal.total_tokens,
-        );
-        drop(registration);
-        drop(slot);
-        let frame = match persisted {
-            Ok(()) => terminal.frame,
-            // The answer the model produced is still shown, as the failed
-            // attempt's display-only partial text.
-            Err(diagnostic) => ChatStreamFrame::Failed {
-                request_id: request_id_for_task.clone(),
-                full_text: match terminal.frame {
-                    ChatStreamFrame::Stream(ChatStreamEvent::Done { full_text, .. })
-                    | ChatStreamFrame::Failed { full_text, .. } => full_text,
-                    ChatStreamFrame::Stream(ChatStreamEvent::Delta { .. }) => String::new(),
-                },
-                diagnostic,
-            },
-        };
+        // Persist (bounded), then free the slot, then tell the frontend.
+        let frame = finish_card_answer(
+            app,
+            ctx,
+            terminal,
+            request_id_for_task.clone(),
+            CARD_ANSWER_FINALIZE_TIMEOUT,
+            (registration, slot),
+        )
+        .await;
         if channel_alive && let Err(e) = channel.send(frame) {
             log::warn!(
                 "card answer stream {}: terminal channel send failed: {}",
@@ -27716,6 +27960,7 @@ mod tests {
             Some("stop".to_string()),
             None,
             Some(42),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("the answer is written");
 
@@ -27805,6 +28050,7 @@ mod tests {
             Some("length".to_string()),
             None,
             Some(9000),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .expect("the capped answer is written");
 
@@ -29004,7 +29250,10 @@ mod tests {
         sync_with_watchdog(&state).expect("the save publishes its client");
 
         let refused = rt
-            .block_on(synthesize_notes_admitted(&state, &gated))
+            .block_on(async {
+                let lifecycle = state.session_lifecycle.lock().await;
+                synthesize_notes_admitted(&state, &gated, lifecycle).await
+            })
             .expect_err("the saved endpoint was never gated");
         assert_eq!(refused.to_string(), "runtime/policy_blocked");
         assert!(!contacted(&saved_contacted) && !contacted(&gated_contacted));
@@ -29013,11 +29262,102 @@ mod tests {
         let gated =
             read_settings_for_session_content(&state, "notes_synthesis").expect("gated settings");
         assert_eq!(
-            rt.block_on(synthesize_notes_admitted(&state, &gated))
-                .expect("the gated endpoint answers"),
+            rt.block_on(async {
+                let lifecycle = state.session_lifecycle.lock().await;
+                synthesize_notes_admitted(&state, &gated, lifecycle).await
+            })
+            .expect("the gated endpoint answers"),
             "notes"
         );
         assert!(contacted(&saved_contacted) && !contacted(&gated_contacted));
+    }
+
+    /// A loopback provider that answers `response` once released, after
+    /// telling the test it was contacted.
+    async fn spawn_held_http_mock(
+        response: String,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        let (contacted_tx, contacted) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = contacted_tx.send(());
+                let _ = released.await;
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), contacted, release)
+    }
+
+    /// Notes synthesis captures what it needs under the session lifecycle and
+    /// releases it while the model runs; notes made for a session that has
+    /// since rotated are not returned (#550).
+    #[test]
+    fn notes_synthesis_frees_the_session_lifecycle_while_the_model_runs() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("notes-synthesis-lock-scope");
+        let _guard = HomeGuard::set(&dir);
+        let reply = {
+            let body = r#"{"choices":[{"message":{"content":"notes"},"finish_reason":"stop"}]}"#;
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let state = Arc::new(AppState::new());
+        for rotate in [false, true] {
+            let (endpoint, contacted, release) = rt.block_on(spawn_held_http_mock(reply.clone()));
+            *state.app_settings.write().unwrap() = loopback_llm_settings(&endpoint);
+            let gated = read_settings_for_session_content(&state, "notes_synthesis")
+                .expect("gated settings");
+            let synthesizing = Arc::clone(&state);
+            let synthesis = rt.spawn(async move {
+                let lifecycle = synthesizing.session_lifecycle.lock().await;
+                synthesize_notes_admitted(&synthesizing, &gated, lifecycle).await
+            });
+            rt.block_on(async { tokio::time::timeout(Duration::from_secs(20), contacted).await })
+                .expect("the provider is contacted in time")
+                .expect("the mock reports its contact");
+            assert!(
+                state.session_lifecycle.try_lock().is_ok(),
+                "the lifecycle is free while the model runs"
+            );
+            if rotate {
+                assert!(matches!(
+                    state.rotate_session("rotated-during-notes"),
+                    crate::state::RotateOutcome::Rotated(_)
+                ));
+            }
+            release.send(()).expect("release the reply");
+            let notes = rt.block_on(synthesis).expect("join the synthesis");
+            if rotate {
+                assert_eq!(notes.unwrap_err().to_string(), "runtime/cancelled");
+            } else {
+                assert_eq!(notes.expect("the notes"), "notes");
+            }
+        }
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The provider fails before sending a single token.
@@ -29327,7 +29667,7 @@ mod tests {
     fn chat_with_mid_stream_step(
         step: MidStream,
         dir_name: &str,
-    ) -> (serde_json::Value, serde_json::Value, Vec<ChatMessage>) {
+    ) -> (serde_json::Value, serde_json::Value, Vec<ChatMessage>, bool) {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -29343,11 +29683,11 @@ mod tests {
             .enable_all()
             .build()
             .expect("build a current-thread runtime");
-        let frame = rt.block_on(async {
-            point_state_at_mock_llm_provider(
-                &state,
-                spawn_raw_http_mock(complete_sse_response("the private answer")).await,
-            );
+        let (frame, contacted) = rt.block_on(async {
+            let (url, contacted) =
+                spawn_contact_recording_http_mock(complete_sse_response("the private answer"))
+                    .await;
+            point_state_at_mock_llm_provider(&state, url);
             let (channel, mut frames) = recording_chat_channel();
             let request_id = start_streaming_chat(
                 CLEARED_QUESTION.to_string(),
@@ -29378,10 +29718,11 @@ mod tests {
                     ));
                 }
             }
-            chat_frames_through_terminal(&mut frames)
+            let frame = chat_frames_through_terminal(&mut frames)
                 .await
                 .pop()
-                .expect("a terminal frame")
+                .expect("a terminal frame");
+            (frame, contacted.load(Ordering::SeqCst))
         });
         let history = chat_history_json(&state);
         let next = prepare_next_chat_request(&state);
@@ -29393,7 +29734,7 @@ mod tests {
             .take();
         drain_test_writers(&state);
         let _ = std::fs::remove_dir_all(dir);
-        (frame, history, next)
+        (frame, history, next, contacted)
     }
 
     fn assert_cleared_question_stays_gone(history: &serde_json::Value, next: &[ChatMessage]) {
@@ -29410,11 +29751,18 @@ mod tests {
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
-    fn a_chat_that_completes_after_a_clear_records_nothing() {
-        let (frame, history, next) =
+    fn a_streaming_chat_cleared_before_it_is_sent_never_reaches_the_provider() {
+        // Clearing cancels the request the command already prepared and
+        // handed to its stream task (#550).
+        let (frame, history, next, contacted) =
             chat_with_mid_stream_step(MidStream::Clear, "chat-clear-then-complete");
         assert_eq!(frame["event"], "done", "{frame}");
-        assert_eq!(frame["data"]["finish_reason"], "stop", "{frame}");
+        assert_eq!(frame["data"]["finish_reason"], "cancelled", "{frame}");
+        assert_eq!(frame["data"]["full_text"], "", "{frame}");
+        assert!(
+            !contacted,
+            "the cleared question never reaches the provider"
+        );
         assert_cleared_question_stays_gone(&history, &next);
     }
 
@@ -29424,7 +29772,7 @@ mod tests {
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
     fn a_chat_cancelled_after_a_clear_records_nothing() {
-        let (frame, history, next) =
+        let (frame, history, next, _) =
             chat_with_mid_stream_step(MidStream::ClearThenCancel, "chat-clear-then-cancel");
         assert_eq!(frame["data"]["finish_reason"], "cancelled", "{frame}");
         assert_cleared_question_stays_gone(&history, &next);
@@ -29436,7 +29784,7 @@ mod tests {
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
     fn a_cancelled_chat_records_nothing_into_a_session_that_rotated_first() {
-        let (frame, history, next) =
+        let (frame, history, next, _) =
             chat_with_mid_stream_step(MidStream::CancelThenRotate, "chat-rotate-during-cancel");
         assert_eq!(frame["data"]["finish_reason"], "cancelled", "{frame}");
         assert_cleared_question_stays_gone(&history, &next);
@@ -29579,6 +29927,188 @@ mod tests {
         assert_cleared_request_was_never_sent(&error, contacted, &history, &next);
     }
 
+    /// `send_chat_message` prepared and registered its request; the chat is
+    /// cleared on its stream task, before the HTTP request is built. The
+    /// request is never sent and no reply is returned (#550).
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_blocking_chat_cleared_after_it_was_prepared_is_never_sent_or_answered() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("chat-clear-after-blocking-prep");
+        let _guard = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        seed_chat_session(&state);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let (error, contacted) = rt.block_on(async {
+            let (url, contacted) =
+                spawn_contact_recording_http_mock(complete_sse_response("the private answer"))
+                    .await;
+            point_state_at_mock_llm_provider(&state, url);
+            let history = state.chat_history.clone();
+            let requests = state.chat_requests.clone();
+            crate::llm::streaming::before_next_request_build(move || {
+                clear_chat(&history, &requests);
+            });
+            let error =
+                send_chat_message(CLEARED_QUESTION.to_string(), app.clone(), manager.state())
+                    .await
+                    .expect_err("a cleared request is refused");
+            (
+                serde_json::to_value(error).expect("serialize the IPC error"),
+                contacted.load(Ordering::SeqCst),
+            )
+        });
+        let history = chat_history_json(&state);
+        let next = prepare_next_chat_request(&state);
+        assert_cleared_request_was_never_sent(&error, contacted, &history, &next);
+        assert!(state.chat_requests.is_empty(), "the registration is gone");
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A card answer is not a chat request: clearing the chat while one is
+    /// about to be sent leaves it running to its answer (#550).
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn clearing_the_chat_leaves_a_card_answer_running() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("chat-clear-keeps-card-answer");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        let card_id = "answered-through-a-clear";
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_id, &seed)
+            .expect("seed the card");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let snapshot = rt.block_on(async {
+            let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Still answered.\"},\"finish_reason\":\"stop\"}]}\n\n\
+                            data: [DONE]\n\n";
+            point_state_at_mock_llm_provider(&state, spawn_answer_engine_sse_mock(sse_body).await);
+            let history = state.chat_history.clone();
+            let requests = state.chat_requests.clone();
+            crate::llm::streaming::before_next_request_build(move || {
+                clear_chat(&history, &requests);
+            });
+            let (channel, terminal) = snapshotting_answer_channel(&state, &session_id, card_id);
+            let dispatch = answer_question_card_impl(
+                card_id.to_string(),
+                false,
+                channel,
+                app_handle.clone(),
+                &state,
+            )
+            .await
+            .expect("the dispatch call itself must not error");
+            assert!(matches!(dispatch, AnswerDispatch::Dispatched { .. }));
+            tokio::task::spawn_blocking(move || {
+                terminal
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("terminal frame in time")
+            })
+            .await
+            .expect("join the frame wait")
+        });
+        assert_eq!(snapshot.event, "done");
+        assert_eq!(
+            snapshot.answer_status,
+            Some(events::CardAnswerStatus::Answered)
+        );
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The accumulating chat command gives up on a stream that goes quiet,
+    /// however long the call has run as a whole (#550).
+    #[test]
+    fn a_chat_stream_that_goes_quiet_times_out_and_one_that_keeps_talking_does_not() {
+        use crate::llm::streaming::TokenDelta;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("build a paused current-thread runtime");
+        rt.block_on(async {
+            let idle = Duration::from_secs(600);
+            let delta = || TokenDelta::Delta {
+                content: PARTIAL_REPLY.to_string(),
+                finish_reason: None,
+            };
+
+            // Silent after one delta, with the producer still holding its end.
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tx.send(delta()).await.unwrap();
+            assert_eq!(
+                collect_chat_reply(LlmStreamFrames::new(rx), idle).await,
+                Err(llm_timeout_diagnostic())
+            );
+            drop(tx);
+
+            // A delta every 400 s for 1200 s, then Done: never idle for 600 s.
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            let producer = tokio::spawn(async move {
+                for _ in 0..3 {
+                    tokio::time::sleep(Duration::from_secs(400)).await;
+                    tx.send(delta()).await.unwrap();
+                }
+                tx.send(TokenDelta::Done {
+                    full_text: String::new(),
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                })
+                .await
+                .unwrap();
+            });
+            assert_eq!(
+                collect_chat_reply(LlmStreamFrames::new(rx), idle).await,
+                Ok((PARTIAL_REPLY.repeat(3), 0))
+            );
+            producer.await.unwrap();
+        });
+    }
+
     /// A stream whose producer queues `frames` and then drops its sender.
     fn frames_then_dropped_sender(
         frames: Vec<crate::llm::streaming::TokenDelta>,
@@ -29620,28 +30150,38 @@ mod tests {
             // The accumulating command reports it, and a cancellation, as an
             // error; only an explicit `Done` is a reply.
             assert_eq!(
-                collect_chat_reply(frames_then_dropped_sender(vec![delta()])).await,
+                collect_chat_reply(
+                    frames_then_dropped_sender(vec![delta()]),
+                    CHAT_STREAM_IDLE_TIMEOUT
+                )
+                .await,
                 Err(llm_internal_diagnostic())
             );
             assert_eq!(
-                collect_chat_reply(frames_then_dropped_sender(vec![
-                    delta(),
-                    TokenDelta::Cancelled {
-                        full_text: PARTIAL_REPLY.to_string(),
-                    },
-                ]))
+                collect_chat_reply(
+                    frames_then_dropped_sender(vec![
+                        delta(),
+                        TokenDelta::Cancelled {
+                            full_text: PARTIAL_REPLY.to_string(),
+                        },
+                    ]),
+                    CHAT_STREAM_IDLE_TIMEOUT
+                )
                 .await,
                 Err(llm_cancelled_diagnostic())
             );
             assert_eq!(
-                collect_chat_reply(frames_then_dropped_sender(vec![
-                    delta(),
-                    TokenDelta::Done {
-                        full_text: PARTIAL_REPLY.to_string(),
-                        usage: None,
-                        finish_reason: "stop".to_string(),
-                    },
-                ]))
+                collect_chat_reply(
+                    frames_then_dropped_sender(vec![
+                        delta(),
+                        TokenDelta::Done {
+                            full_text: PARTIAL_REPLY.to_string(),
+                            usage: None,
+                            finish_reason: "stop".to_string(),
+                        },
+                    ]),
+                    CHAT_STREAM_IDLE_TIMEOUT
+                )
                 .await,
                 Ok((PARTIAL_REPLY.to_string(), 0))
             );
@@ -29652,22 +30192,168 @@ mod tests {
     fn a_blocking_llm_call_that_never_returns_times_out_and_a_panic_is_internal() {
         let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
         rt.block_on(async {
+            let outstanding = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             // A job left in a dead worker's queue: nothing ever answers it.
             let (keep_unanswered, unanswered) = std::sync::mpsc::channel::<()>();
-            let hung = bounded_blocking_llm_call(Duration::from_millis(50), move || {
-                let _ = unanswered.recv();
-                Ok(())
-            })
-            .await;
+            let hung =
+                bounded_blocking_llm_call(&outstanding, Duration::from_millis(50), move || {
+                    let _ = unanswered.recv();
+                    Ok(())
+                })
+                .await;
             assert_eq!(hung, Err(llm_timeout_diagnostic()));
             drop(keep_unanswered);
 
-            let panicked = bounded_blocking_llm_call::<()>(Duration::from_secs(20), || {
-                panic!("the executor call panicked")
-            })
-            .await;
+            let panicked =
+                bounded_blocking_llm_call::<()>(&outstanding, Duration::from_secs(20), || {
+                    panic!("the executor call panicked")
+                })
+                .await;
             assert_eq!(panicked, Err(llm_internal_diagnostic()));
         });
+    }
+
+    /// Timed-out calls keep their slots until their parked threads return;
+    /// past the cap a call is refused at once and never runs (#550).
+    #[test]
+    fn blocking_llm_calls_past_the_cap_are_refused_until_parked_ones_return() {
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        rt.block_on(async {
+            let outstanding = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (release, parked) = crossbeam_channel::unbounded::<()>();
+            for _ in 0..MAX_OUTSTANDING_BLOCKING_LLM_CALLS {
+                let parked = parked.clone();
+                let hung =
+                    bounded_blocking_llm_call(&outstanding, Duration::from_millis(50), move || {
+                        let _ = parked.recv_timeout(Duration::from_secs(30));
+                        Ok(())
+                    })
+                    .await;
+                assert_eq!(hung, Err(llm_timeout_diagnostic()));
+            }
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ran_flag = Arc::clone(&ran);
+            let refused =
+                bounded_blocking_llm_call(&outstanding, Duration::from_secs(20), move || {
+                    ran_flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+            assert_eq!(refused, Err(llm_capacity_diagnostic()));
+            assert!(!ran.load(Ordering::SeqCst), "a refused call never runs");
+
+            drop(release);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while outstanding.load(Ordering::SeqCst) != 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the parked calls return"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                bounded_blocking_llm_call(&outstanding, Duration::from_secs(20), || Ok(7)).await,
+                Ok(7)
+            );
+        });
+    }
+
+    /// A card answer's write that stalls past its bound frees the slot and
+    /// registration, ends the attempt as a closed `internal` failure, and
+    /// writes no answer once it resumes (#550).
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_card_answer_whose_write_stalls_frees_its_slot_and_fails_closed() {
+        use crate::events::ChatStreamFrame;
+        use crate::llm::streaming::ChatStreamEvent;
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("card-answer-stalled-write");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        let card_id = "stalled-write-card";
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_id, &seed)
+            .expect("seed the card");
+
+        let request_id = "stalled-write-request".to_string();
+        state.card_answer_in_flight.store(true, Ordering::SeqCst);
+        let slot = CardAnswerSlot(state.card_answer_in_flight.clone());
+        state
+            .stream_registry
+            .register(request_id.clone(), CancellationToken::new());
+        let registration = StreamRegistration {
+            registry: state.stream_registry.clone(),
+            request_id: request_id.clone(),
+        };
+        let (release, stalled) = crossbeam_channel::bounded::<()>(1);
+        let (finished_tx, finished) = crossbeam_channel::bounded::<()>(0);
+        card_finalize_test::arm(card_id, stalled, finished_tx);
+        let terminal = CardAnswerTerminal {
+            status: events::CardAnswerStatus::Answered,
+            full_text: "the answer".to_string(),
+            finish_reason: Some("stop".to_string()),
+            diagnostic: None,
+            total_tokens: None,
+            frame: ChatStreamFrame::Stream(ChatStreamEvent::Done {
+                request_id: request_id.clone(),
+                full_text: "the answer".to_string(),
+                finish_reason: "stop".to_string(),
+                usage: None,
+            }),
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let frame = rt.block_on(finish_card_answer(
+            app_handle,
+            answer_engine_context(&session_id, card_id, false),
+            terminal,
+            request_id,
+            Duration::from_millis(100),
+            (registration, slot),
+        ));
+        match frame {
+            ChatStreamFrame::Failed {
+                full_text,
+                diagnostic,
+                ..
+            } => {
+                assert_eq!(diagnostic, llm_internal_diagnostic());
+                assert_eq!(full_text, "the answer");
+            }
+            other => panic!("expected a closed failure, got {other:?}"),
+        }
+        assert!(!state.card_answer_in_flight.load(Ordering::SeqCst));
+        assert!(state.stream_registry.is_empty());
+
+        release.send(()).expect("resume the stalled write");
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(20)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected),
+            "the resumed write returns"
+        );
+        let card = existing_live_assist_card(&session_id, card_id).expect("the card");
+        assert!(card.answer.is_none(), "the abandoned write wrote no answer");
+
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
