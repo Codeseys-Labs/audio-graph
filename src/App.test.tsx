@@ -924,7 +924,19 @@ describe("App — post-Express hand-off nudge (B20)", () => {
           // `DiarizationDegradationNotice.tsx`'s doc comment), not English
           // prose; the component translates it via
           // `pipeline.diarizationDegradedReason.<code>`.
-          diarization: { type: "Degraded", reason: "engine_not_compiled" },
+          diarization: {
+            type: "Degraded",
+            reason: "engine_not_compiled",
+            diagnostic: {
+              kind: "runtime",
+              detail: {
+                code: "unsupported",
+                retryable: false,
+                recovery_action: "review_configuration",
+                context: { operation: "transcription", transport: "native" },
+              },
+            },
+          },
         },
       });
     });

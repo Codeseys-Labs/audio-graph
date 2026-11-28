@@ -3,6 +3,8 @@
 //! These constants define the event names emitted from the Rust backend
 //! to the frontend. The frontend subscribes using `listen()` from `@tauri-apps/api`.
 
+use audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic;
+
 /// Event emitted when a new transcript segment is available.
 pub const TRANSCRIPT_UPDATE: &str = "transcript-update";
 
@@ -203,7 +205,7 @@ pub enum StageStatus {
         processed_count: u64,
     },
     Error {
-        message: String,
+        diagnostic: RuntimeDiagnostic,
     },
     /// The stage is running, but not with the backend/fidelity the user's
     /// configuration asked for — e.g. diarization silently fell back from a
@@ -224,7 +226,8 @@ pub enum StageStatus {
     /// non-English UI gets a real translation instead of an English
     /// sentence bolted onto a translated title.
     Degraded {
-        reason: String,
+        reason: crate::speech::DiarizationDegradationReason,
+        diagnostic: RuntimeDiagnostic,
     },
 }
 
@@ -866,13 +869,34 @@ pub struct CaptureBackpressurePayload {
 /// Payload for `AWS_ERROR` events (ag#13).
 ///
 /// `error` carries the structured classification (a [`crate::aws_util::UiAwsError`]
-/// serialized with `category` / payload fields). `raw_message` is the original aws-sdk
-/// error string, kept so the frontend can log or disclose details when the
-/// category alone isn't enough (e.g. unexpected `Unknown` bucket).
+/// serialized with `category` / payload fields). The Transcribe streaming path
+/// populates the legacy `raw_message` field with the closed diagnostic display.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AwsErrorPayload {
     pub error: crate::aws_util::UiAwsError,
     pub raw_message: String,
+}
+
+impl AwsErrorPayload {
+    pub(crate) fn from_transcribe_diagnostic(diagnostic: &RuntimeDiagnostic) -> Self {
+        use crate::aws_util::UiAwsError;
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode;
+        let raw_message = diagnostic.to_string();
+        let error = match diagnostic {
+            RuntimeDiagnostic::Runtime(detail)
+                if matches!(
+                    detail.code,
+                    RuntimeErrorCode::NetworkUnreachable | RuntimeErrorCode::Timeout
+                ) =>
+            {
+                UiAwsError::NetworkUnreachable
+            }
+            _ => UiAwsError::Unknown {
+                message: raw_message.clone(),
+            },
+        };
+        Self { error, raw_message }
+    }
 }
 
 /// Emit a Tauri event and log any emission failure at `error` level.
@@ -939,6 +963,83 @@ pub fn is_storage_full(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_runtime_diagnostic() -> audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic
+    {
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
+            RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeTransport,
+        };
+
+        RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::new(
+            RuntimeErrorCode::NetworkUnreachable,
+            true,
+            RuntimeSafeRecoveryAction::CheckNetwork,
+            RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                .with_transport(RuntimeTransport::Sdk),
+        ))
+    }
+
+    #[test]
+    fn stage_status_degraded_serializes_a_closed_reason_and_diagnostic() {
+        let diagnostic = test_runtime_diagnostic();
+        let status = StageStatus::Degraded {
+            reason: crate::speech::DiarizationDegradationReason::EngineNotCompiled,
+            diagnostic: diagnostic.clone(),
+        };
+        let mut wire = serde_json::to_value(status).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "type": "Degraded", "reason": "engine_not_compiled", "diagnostic": diagnostic
+            })
+        );
+        wire["reason"] =
+            serde_json::json!("provider prose /private/session/path request-id-canary");
+        assert!(serde_json::from_value::<StageStatus>(wire).is_err());
+    }
+
+    #[test]
+    fn stage_status_error_serializes_only_the_closed_runtime_diagnostic() {
+        let status = StageStatus::Error {
+            diagnostic: test_runtime_diagnostic(),
+        };
+
+        let json = serde_json::to_value(status).expect("serialize stage status");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "Error",
+                "diagnostic": {
+                    "kind": "runtime",
+                    "detail": {
+                        "code": "network_unreachable",
+                        "retryable": true,
+                        "recovery_action": "check_network",
+                        "context": {
+                            "operation": "transcription",
+                            "transport": "sdk"
+                        }
+                    }
+                }
+            })
+        );
+
+        let serialized = json.to_string();
+        for forbidden in [
+            "message",
+            "provider native prose",
+            "response body canary",
+            "/private/session/path",
+            "request-id-canary",
+            "exact_length",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "stage status leaked forbidden field/value {forbidden}: {serialized}"
+            );
+        }
+    }
 
     #[test]
     fn is_storage_full_detects_enospc() {
