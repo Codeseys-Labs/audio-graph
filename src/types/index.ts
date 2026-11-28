@@ -41,6 +41,7 @@ import type {
   AudioSourceInfo,
   SourceId,
 } from "../generated/audioSource";
+import type { RuntimeDiagnostic } from "../generated/runtimeDiagnostic";
 // AnswerDrafts (audio-graph-83cc T4): per-card transient answer-stream
 // progress state. Defined in `store/` (not here) for the same reason
 // `ShellNav` is — it ships with the slice creator `store/index.ts` spreads
@@ -632,7 +633,7 @@ export interface GraphSnapshot {
 export type StageStatus =
   | { type: "Idle" }
   | { type: "Running"; processed_count: number }
-  | { type: "Error"; message: string }
+  | { type: "Error"; diagnostic: RuntimeDiagnostic }
   /**
    * The stage is running, but not with the backend/fidelity the user's
    * configuration asked for (audio-graph-586b) — e.g. diarization silently
@@ -644,7 +645,15 @@ export type StageStatus =
    * `pipeline.diarizationDegradedReason.<code>`, matching this app's
    * existing typed + translated `SttFidelityDegradation` vocabulary.
    */
-  | { type: "Degraded"; reason: string };
+  | {
+      type: "Degraded";
+      diagnostic: RuntimeDiagnostic;
+      reason:
+        | "engine_not_compiled"
+        | "clustering_assets_not_downloaded"
+        | "asset_not_downloaded"
+        | "asset_invalid";
+    };
 
 export interface PipelineStatus {
   capture: StageStatus;

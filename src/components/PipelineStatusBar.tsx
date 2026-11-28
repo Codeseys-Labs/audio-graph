@@ -45,6 +45,7 @@ import type {
   StageStatus,
 } from "../types";
 import { computeCompositeHealth } from "../utils/pipelineHealth";
+import { runtimeDiagnosticPresentation } from "../utils/runtimeDiagnostic";
 import Icon, { type IconName } from "./Icon";
 import Tooltip from "./Tooltip";
 
@@ -100,6 +101,21 @@ const PIPELINE_STAGES = [
   },
 ] as const;
 
+function degradedReason(
+  status: Extract<StageStatus, { type: "Degraded" }>,
+  t: TFunction,
+): string {
+  switch (status.reason) {
+    case "engine_not_compiled":
+    case "clustering_assets_not_downloaded":
+    case "asset_not_downloaded":
+    case "asset_invalid":
+      return t(`pipeline.diarizationDegradedReason.${status.reason}`);
+    default:
+      return t(runtimeDiagnosticPresentation(status.diagnostic).translationKey);
+  }
+}
+
 /** Map StageStatus to a CSS modifier and tooltip. */
 function stageStatusInfo(
   status: StageStatus,
@@ -121,7 +137,9 @@ function stageStatusInfo(
     case "Error":
       return {
         modifier: "error",
-        tooltip: t("pipeline.statusError", { message: status.message }),
+        tooltip: t(
+          runtimeDiagnosticPresentation(status.diagnostic).translationKey,
+        ),
       };
     case "Degraded":
       // audio-graph-586b: reuses the already-provisioned `warning` dot
@@ -137,7 +155,7 @@ function stageStatusInfo(
       return {
         modifier: "warning",
         tooltip: t("pipeline.statusDegraded", {
-          reason: t(`pipeline.diarizationDegradedReason.${status.reason}`),
+          reason: degradedReason(status, t),
         }),
       };
   }

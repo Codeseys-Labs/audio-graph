@@ -11,6 +11,16 @@ import type {
 } from "../types";
 import PipelineStatusBar from "./PipelineStatusBar";
 
+const diagnostic = {
+  kind: "runtime",
+  detail: {
+    code: "unsupported",
+    retryable: false,
+    recovery_action: "review_configuration",
+    context: { operation: "transcription", transport: "native" },
+  },
+} as const;
+
 const idle: StageStatus = { type: "Idle" };
 
 function allIdle(): PipelineStatus {
@@ -41,7 +51,7 @@ function forceExpanded(
 ): PipelineStatus {
   return {
     ...allIdle(),
-    pipeline: { type: "Error", message: "forced-expansion-for-test" },
+    pipeline: { type: "Error", diagnostic },
     ...overrides,
   };
 }
@@ -134,7 +144,7 @@ describe("PipelineStatusBar", () => {
     resetStore({
       pipelineStatus: {
         ...allIdle(),
-        graph: { type: "Error", message: "boom" },
+        graph: { type: "Error", diagnostic },
       },
     });
     render(<PipelineStatusBar />);
@@ -196,16 +206,46 @@ describe("PipelineStatusBar", () => {
     ).toBeInTheDocument();
   });
 
-  it("surfaces the error message in an Error stage's accessible label", () => {
+  it("localizes an Error diagnostic without rendering untrusted compatibility data", () => {
+    const canaries = [
+      "provider native prose canary",
+      "response body canary",
+      "/private/session/path",
+      "request-id-canary",
+      "exact-sensitive-length-7919977",
+    ];
     resetStore({
-      pipelineStatus: forceExpanded({
-        graph: { type: "Error", message: "boom" },
-      }),
+      pipelineStatus: {
+        ...allIdle(),
+        graph: {
+          type: "Error",
+          diagnostic: {
+            kind: "runtime",
+            detail: {
+              code: "request_rejected",
+              retryable: false,
+              recovery_action: "review_configuration",
+              context: { operation: "transcription", transport: "sdk" },
+              provider_message: canaries[0],
+              response_body: canaries[1],
+              private_path: canaries[2],
+              request_id: canaries[3],
+              audio_length: canaries[4],
+            },
+          },
+          message: canaries.join(" "),
+        } as unknown as StageStatus,
+      },
     });
     render(<PipelineStatusBar />);
     expect(
-      screen.getByRole("img", { name: /Graph: Error: boom/i }),
+      screen.getByRole("img", {
+        name: /Graph: The provider rejected the request\./i,
+      }),
     ).toBeInTheDocument();
+    for (const canary of canaries) {
+      expect(document.body.textContent).not.toContain(canary);
+    }
   });
 
   it("appends a formatted latency to the tooltip and renders a latency badge", () => {
@@ -404,7 +444,11 @@ describe("PipelineStatusBar", () => {
         // `reason` is the backend's stable snake_case code (review
         // follow-up, audio-graph-586b), not English prose — the tooltip
         // translates it via `pipeline.diarizationDegradedReason.<code>`.
-        diarization: { type: "Degraded", reason: "engine_not_compiled" },
+        diarization: {
+          type: "Degraded",
+          diagnostic,
+          reason: "engine_not_compiled",
+        },
       },
     });
     render(<PipelineStatusBar />);
@@ -423,6 +467,27 @@ describe("PipelineStatusBar", () => {
     // must fail this assertion.
     expect(diarizationDot).toHaveClass("bg-accent-yellow");
     expect(diarizationDot).not.toHaveClass("bg-accent-green");
+  });
+
+  it("falls back to the localized diagnostic for an unknown degradation reason", () => {
+    const reason = "private-provider-message-canary";
+    resetStore({
+      pipelineStatus: {
+        ...allIdle(),
+        diarization: {
+          type: "Degraded",
+          diagnostic,
+          reason,
+        } as unknown as StageStatus,
+      },
+    });
+    render(<PipelineStatusBar />);
+    expect(
+      screen.getByRole("img", {
+        name: /Diarization: Degraded: The provider does not support this operation/i,
+      }),
+    ).toBeInTheDocument();
+    expect(document.body.innerHTML).not.toContain(reason);
   });
 
   it("surfaces persistence queue pressure distinctly from storage-full (and this alone triggers expansion)", () => {
