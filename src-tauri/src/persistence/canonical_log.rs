@@ -2902,25 +2902,21 @@ fn parse_framed_v1(
     }
     wire.payload = canonicalize_json_value(wire.payload);
     validate_stored_metadata(&wire.event_id, &wire.causal_event_ids, &wire.basis_heads)?;
-    let payload_hash =
-        payload_digest(&wire.payload).map_err(|_| CanonicalCorruptionReason::InvalidJson)?;
-    if payload_hash != wire.payload_hash {
-        // serde_json's default decimal parser can miss the writer's finite
-        // binary64 value by one ULP. Preserve every already-valid commitment;
-        // retry the payload's numeric conversion only on a digest mismatch.
-        #[derive(serde::Deserialize)]
-        struct RawPayload<'a> {
-            #[serde(borrow)]
-            payload: &'a serde_json::value::RawValue,
-        }
-        let raw: RawPayload<'_> =
-            serde_json::from_slice(json).map_err(|_| CanonicalCorruptionReason::InvalidJson)?;
-        restore_float_values(&mut wire.payload, raw.payload)?;
-        if payload_digest(&wire.payload).map_err(|_| CanonicalCorruptionReason::InvalidJson)?
-            != wire.payload_hash
-        {
-            return Err(CanonicalCorruptionReason::PayloadHashMismatch);
-        }
+    // Verify the IEEE values spelled in the frame. The legacy visitor can map
+    // adjacent decimals to the same float, so its digest cannot authenticate
+    // a framed payload even when it happens to match the stored digest.
+    #[derive(serde::Deserialize)]
+    struct RawPayload<'a> {
+        #[serde(borrow)]
+        payload: &'a serde_json::value::RawValue,
+    }
+    let raw: RawPayload<'_> =
+        serde_json::from_slice(json).map_err(|_| CanonicalCorruptionReason::InvalidJson)?;
+    restore_float_values(&mut wire.payload, raw.payload)?;
+    if payload_digest(&wire.payload).map_err(|_| CanonicalCorruptionReason::InvalidJson)?
+        != wire.payload_hash
+    {
+        return Err(CanonicalCorruptionReason::PayloadHashMismatch);
     }
     let record_hash = framed_record_hash(
         session_id,
@@ -4316,7 +4312,14 @@ mod tests {
         let path = temp_log("roundtrip-floats");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let exact = line(2, "float", LEGACY_HEAD, EXACT_HASH, EXACT_HEAD, EXACT);
-        let old = line(3, "old", EXACT_HEAD, OLD_HASH, OLD_HEAD, LEGACY);
+        let old_payload = r#"{"confidence":0.9200000166893004}"#;
+        let old = line(3, "old", EXACT_HEAD, OLD_HASH, OLD_HEAD, old_payload);
+        let aliased = line(3, "old", EXACT_HEAD, OLD_HASH, OLD_HEAD, LEGACY);
+        assert_eq!(
+            parse_framed_v1(aliased.as_bytes(), SESSION, STREAM, SCHEMA, 3, EXACT_HEAD).err(),
+            Some(CanonicalCorruptionReason::PayloadHashMismatch),
+            "the legacy parser maps this different decimal to the hashed value"
+        );
         fs::write(&path, format!("{LEGACY}\n{exact}\n{old}\n")).unwrap();
         let replay = load_canonical_stream::<Value>(
             &path,
