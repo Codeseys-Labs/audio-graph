@@ -229,16 +229,146 @@ fn a_queued_projection_rechecks_cited_revisions_before_any_append() {
 }
 
 #[cfg(not(debug_assertions))]
+fn seed_projection_history(f: &ReceiptFixture, depth: usize) {
+    use crate::persistence::canonical_log::PreparedProjectionStorage;
+    let session = ReceiptFixture::SESSION;
+    let writer = f
+        .runtime
+        .projection_event_writer
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap();
+    assert!(writer.shutdown_with_timeout(Duration::from_secs(30)));
+    if depth == 0 {
+        return;
+    }
+    let path = f.repo.projection_commit_path(session).unwrap();
+    let storage = PreparedProjectionStorage::open(&path, session).unwrap();
+    let source_count = f
+        .runtime
+        .transcript_ledger
+        .lock()
+        .unwrap()
+        .accepted_event_count;
+    let mut state = f.runtime.materialized_projection_state.lock().unwrap();
+    for index in 0..depth {
+        let sequence = (index / 2 + 1) as u64;
+        let patch = if index % 2 == 0 {
+            runtime_note_patch(sequence, f.basis.clone(), "leaf", "green")
+        } else {
+            runtime_graph_patch(sequence, f.basis.clone())
+        };
+        let receipt = storage.commit_after(&patch, Some(source_count)).unwrap();
+        assert_eq!(receipt.head.sequence, index as u64 + 1);
+        state.apply_replayed_patch(&patch, None).unwrap();
+        state.bind_projection_head(&patch.kind, receipt.head);
+    }
+    assert_eq!(state.notes.notes.len(), 1);
+    assert_eq!(state.graph.nodes.len(), 1);
+    f.repo
+        .save_materialized_notes(session, &state.notes)
+        .unwrap();
+    f.repo
+        .save_materialized_graph(session, &state.graph)
+        .unwrap();
+}
+
+// A fresh process isolates allocation and residency from fixture construction
+// and the simultaneous reader. Its RSS includes allocator-retained scratch
+// space and page residency; the deltas are approximate, not live-heap sizes.
+#[cfg(not(debug_assertions))]
+fn measure_projection_cache_memory(root: std::path::PathBuf, source_depth: u64) {
+    use crate::persistence::canonical_log::{CanonicalRecord, PreparedProjectionStorage};
+    use crate::projections::TranscriptEvent;
+    let session = ReceiptFixture::SESSION;
+    let repo = FileMemoryRepository::with_data_root(root);
+    let storage =
+        PreparedProjectionStorage::open(&repo.projection_commit_path(session).unwrap(), session)
+            .unwrap();
+    let mut system = sysinfo::System::new();
+    let pid = sysinfo::get_current_pid().unwrap();
+    let mut rss = || {
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            false,
+            sysinfo::ProcessRefreshKind::nothing().with_memory(),
+        );
+        system.process(pid).unwrap().memory()
+    };
+    let before = rss();
+    storage.ready().unwrap();
+    let after_stream = rss();
+    let patch = runtime_note_patch(
+        1,
+        ProjectionBasis::from_transcript_events(&[]),
+        "leaf",
+        "green",
+    );
+    let proof = storage.live_basis(&patch, source_depth).unwrap();
+    assert_eq!(proof.heads()["transcript_revisions"].sequence, source_depth);
+    let after_sources = rss();
+    println!(
+        "projection_cache_memory before_bytes={before} stream_ready_bytes={after_stream} source_ready_bytes={after_sources} record_inline_bytes={} event_inline_bytes={}",
+        std::mem::size_of::<CanonicalRecord<TranscriptEvent>>(),
+        std::mem::size_of::<TranscriptEvent>()
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn observe_projection_cache_memory(
+    f: &ReceiptFixture,
+    source_depth: usize,
+    projection_depth: usize,
+) {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "state::rotation_tests::release_projection_receipt_latency",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("AUDIOGRAPH_PROJECTION_MEMORY_FIXTURE", &f.dir)
+        .env(
+            "AUDIOGRAPH_PROJECTION_MEMORY_SOURCE_DEPTH",
+            source_depth.to_string(),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cache measurement child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (_, measurement) = stdout.split_once("projection_cache_memory ").unwrap();
+    println!(
+        "projection_cache_memory source_depth={source_depth} projection_depth={projection_depth} {}",
+        measurement.lines().next().unwrap()
+    );
+}
+
+#[cfg(not(debug_assertions))]
 #[test]
 #[ignore = "explicit release measurement of projection apply and cache save"]
 fn release_projection_receipt_latency() {
-    let depths: &[usize] =
-        if std::env::var("AUDIOGRAPH_PROJECTION_LATENCY_10K_ONLY").as_deref() == Ok("1") {
-            &[10_000]
-        } else {
-            &[1_000, 10_000, 50_000]
-        };
-    for &depth in depths {
+    if let Some(root) = std::env::var_os("AUDIOGRAPH_PROJECTION_MEMORY_FIXTURE") {
+        let depth = std::env::var("AUDIOGRAPH_PROJECTION_MEMORY_SOURCE_DEPTH")
+            .unwrap()
+            .parse()
+            .unwrap();
+        measure_projection_cache_memory(root.into(), depth);
+        return;
+    }
+    let vary_history = std::env::var("AUDIOGRAPH_PROJECTION_HISTORY_MATRIX").as_deref() == Ok("1");
+    let cells: &[(usize, usize)] = if vary_history {
+        &[(10_000, 0), (10_000, 1_000), (10_000, 10_000)]
+    } else if std::env::var("AUDIOGRAPH_PROJECTION_LATENCY_10K_ONLY").as_deref() == Ok("1") {
+        &[(10_000, 0)]
+    } else {
+        &[(1_000, 0), (10_000, 0), (50_000, 0)]
+    };
+    for &(depth, projection_depth) in cells {
         let prepared = std::time::Instant::now();
         let mut f = ReceiptFixture::new();
         let path = f
@@ -292,41 +422,74 @@ fn release_projection_receipt_latency() {
         }
         f.basis = ledger.current_basis();
         drop(ledger);
+        if vary_history {
+            seed_projection_history(&f, projection_depth);
+            observe_projection_cache_memory(&f, depth, projection_depth);
+            let open = std::time::Instant::now();
+            let writer =
+                ProjectionEventWriter::repository(ReceiptFixture::SESSION, f.repo.clone()).unwrap();
+            *f.runtime.projection_event_writer.lock().unwrap() = Some(writer);
+            println!(
+                "projection_cold_open source_depth={depth} projection_depth={projection_depth} time_us={}",
+                open.elapsed().as_micros()
+            );
+        }
         let preparation = prepared.elapsed().as_millis();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_reader = stop.clone();
         let reader_repo = f.repo.clone();
         let (ready, started) = std::sync::mpsc::channel();
+        let reads: Arc<[AtomicU64; 4]> = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
+        let counters = reads.clone();
+        let snapshot = || -> [u64; 4] { std::array::from_fn(|i| reads[i].load(Ordering::Relaxed)) };
         let reader = std::thread::spawn(move || {
-            let mut completed = 0;
-            let mut refused = 0;
-            let mut projection_completed = 0;
-            let mut projection_refused = 0;
+            let mut first = true;
             loop {
                 match reader_repo.load_transcript_events(ReceiptFixture::SESSION) {
                     Ok(s) => {
                         assert!(!s.is_empty());
-                        completed += 1;
+                        counters[0].fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(_) => refused += 1,
+                    Err(_) => {
+                        counters[1].fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 match reader_repo.load_projection_patches(ReceiptFixture::SESSION) {
-                    Ok(_) => projection_completed += 1,
-                    Err(_) => projection_refused += 1,
+                    Ok(_) => {
+                        counters[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        counters[3].fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-                if completed + refused == 1 {
+                if first {
+                    first = false;
                     ready.send(()).unwrap();
                 }
                 if stop_reader.load(Ordering::Acquire) {
-                    return (completed, refused, projection_completed, projection_refused);
+                    return;
                 }
             }
         });
         started.recv_timeout(Duration::from_secs(120)).unwrap();
+        let mut first_sequence = (projection_depth / 2) as u64;
+        if vary_history {
+            first_sequence += 1;
+            let cold = std::time::Instant::now();
+            assert!(f.apply(first_sequence).unwrap().materialized_snapshot_saved);
+            println!(
+                "projection_cold_apply source_depth={depth} projection_depth={projection_depth} kind=Notes time_us={}",
+                cold.elapsed().as_micros()
+            );
+            // Both cold-empty and seeded cells now maintain one note and one node.
+            f.apply_patch(runtime_graph_patch(first_sequence, f.basis.clone()))
+                .unwrap();
+        }
         for kind in [ProjectionKind::Notes, ProjectionKind::Graph] {
-            let mut sequence = 0;
+            let mut sequence = first_sequence;
             for changing in [false, true] {
                 let mut samples = Vec::new();
+                let mut starts = snapshot();
                 for i in 0..52 {
                     if changing {
                         let mut row =
@@ -346,6 +509,9 @@ fn release_projection_receipt_latency() {
                         }
                         ProjectionKind::Graph => runtime_graph_patch(sequence, f.basis.clone()),
                     };
+                    if i == 2 {
+                        starts = snapshot();
+                    }
                     let start = std::time::Instant::now();
                     let result = f.apply_patch(patch).unwrap();
                     let elapsed = start.elapsed().as_micros();
@@ -354,17 +520,25 @@ fn release_projection_receipt_latency() {
                         samples.push(elapsed);
                     }
                 }
+                let ends = snapshot();
+                let [
+                    transcripts,
+                    transcript_refused,
+                    projections,
+                    projection_refused,
+                ] = std::array::from_fn(|i| ends[i] - starts[i]);
                 samples.sort_unstable();
                 println!(
-                    "projection_latency kind={kind:?} starting_revisions={depth} changing_basis={changing} prep_ms={preparation} samples=50 p50_us={} p95_us={}",
+                    "projection_latency kind={kind:?} starting_revisions={depth} projection_depth={projection_depth} changing_basis={changing} prep_ms={preparation} samples=50 p50_us={} p95_us={} transcript_completed={transcripts} transcript_refused={transcript_refused} projection_completed={projections} projection_refused={projection_refused}",
                     samples[24], samples[47]
                 );
             }
         }
         stop.store(true, Ordering::Release);
-        let (completed, refused, projection_completed, projection_refused) = reader.join().unwrap();
+        reader.join().unwrap();
+        let [completed, refused, projection_completed, projection_refused] = snapshot();
         println!(
-            "projection_reader starting_revisions={depth} transcript_completed={completed} transcript_refused={refused} projection_completed={projection_completed} projection_refused={projection_refused}"
+            "projection_reader starting_revisions={depth} projection_depth={projection_depth} transcript_completed={completed} transcript_refused={refused} projection_completed={projection_completed} projection_refused={projection_refused}"
         );
     }
 }

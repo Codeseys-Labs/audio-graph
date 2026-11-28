@@ -1847,8 +1847,8 @@ struct PendingAppend {
 
 mod transcript_commit;
 
-pub(super) fn remember_speaker_head(path: &Path, file: &File, head: Option<&CanonicalStreamHead>) {
-    transcript_commit::remember_speaker_head(path, file, head);
+pub(super) fn remember_speaker_head(path: &Path, file: &File, offset:u64, head: Option<&CanonicalStreamHead>) {
+    transcript_commit::remember_speaker_head(path, file, offset, head);
 }
 
 #[cfg(test)]
@@ -2196,6 +2196,12 @@ where
 
     pub fn head(&self) -> Option<&CanonicalStreamHead> {
         self.head.as_ref()
+    }
+
+    /// The frame prefix starts after the separator when extending an
+    /// unterminated legacy row. Valid only for a newly accepted append.
+    pub(super) fn next_frame_offset(&self) -> u64 {
+        self.byte_len + u64::from(self.byte_len > 0 && !self.ends_with_newline)
     }
 
     pub fn cached_event_count(&self) -> usize {
@@ -2912,6 +2918,23 @@ fn parse_framed_v1(
     expected_sequence: u64,
     expected_previous_hash: &str,
 ) -> Result<RawCanonicalRecord, CanonicalCorruptionReason> {
+    parse_anchored_frame(line, session_id, stream_id, domain_schema_version, expected_sequence,
+        FrameAnchor::Previous(expected_previous_hash))
+}
+
+enum FrameAnchor<'a> {
+    Previous(&'a str),
+    VerifiedHead(&'a str),
+}
+
+fn parse_anchored_frame(
+    line: &[u8],
+    session_id: &str,
+    stream_id: &str,
+    domain_schema_version: u32,
+    expected_sequence: u64,
+    anchor: FrameAnchor<'_>,
+) -> Result<RawCanonicalRecord, CanonicalCorruptionReason> {
     let length_start = FRAME_PREFIX_V1.len();
     let length_end = length_start + FRAME_LENGTH_HEX_BYTES;
     if line.len() <= length_end || line.get(length_end) != Some(&b' ') {
@@ -2968,7 +2991,7 @@ fn parse_framed_v1(
     if wire.sequence != expected_sequence {
         return Err(CanonicalCorruptionReason::SequenceMismatch);
     }
-    if wire.previous_hash != expected_previous_hash {
+    if matches!(anchor, FrameAnchor::Previous(hash) if wire.previous_hash != hash) {
         return Err(CanonicalCorruptionReason::PreviousHashMismatch);
     }
     wire.payload = canonicalize_json_value(wire.payload);
@@ -3001,7 +3024,7 @@ fn parse_framed_v1(
         &wire.payload_hash,
     )
     .map_err(|_| CanonicalCorruptionReason::InvalidJson)?;
-    if record_hash != wire.record_hash {
+    if record_hash != wire.record_hash || matches!(anchor, FrameAnchor::VerifiedHead(hash) if record_hash != hash) {
         return Err(CanonicalCorruptionReason::RecordHashMismatch);
     }
     let commitment_hash = event_commitment_hash(

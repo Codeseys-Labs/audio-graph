@@ -7,11 +7,11 @@ use crate::persistence::canonical_durability::{
 };
 use crate::projections::{ProjectionPatch, TranscriptEvent};
 mod domain;
-pub(super) fn remember_speaker_head(path: &Path, file: &File, head: Option<&CanonicalStreamHead>) {
+pub(super) fn remember_speaker_head(path: &Path, file: &File, offset:u64, head: Option<&CanonicalStreamHead>) {
     if let Ok(stamp) = SourceStamp::read(file)
         && let Ok(canonical) = fs::canonicalize(path)
     {
-        domain::remember_head(&canonical, Some(&stamp), head);
+        domain::remember_head(&canonical, Some(&stamp), Some(offset), head);
     }
 }
 
@@ -287,24 +287,19 @@ struct VerifiedPrefix {
     projection_predecessors: HashMap<u64, u64>,
 }
 
-/// Fingerprint the physical head line, including its terminator and any
-/// trailing blank lines. A timestamp collision cannot certify these bytes.
+/// Location of a fully verified, newline-terminated frame at the physical end.
 struct HeadFrame {
     offset: u64,
     length: usize,
-    hash: [u8; 32],
 }
 
 impl HeadFrame {
     fn from_verified(bytes: &[u8], base: u64) -> Option<Self> {
-        let start = bytes
-            .iter()
-            .rposition(|b| !b.is_ascii_whitespace())
-            .and_then(|end| bytes[..end].iter().rposition(|&b| b == b'\n'))
-            .map_or(0, |newline| newline + 1);
+        let line = bytes.strip_suffix(b"\n")?;
+        let start = line.iter().rposition(|&b| b == b'\n').map_or(0, |newline| newline + 1);
         let tail = &bytes[start..];
         // A legacy JSONL head does not carry the hash of its preceding record.
-        if !tail.is_empty() && !tail.starts_with(FRAME_PREFIX_V1) {
+        if !tail.starts_with(FRAME_PREFIX_V1) {
             return None;
         }
         // Oversized legacy rows or trailing padding remain readable via full verification.
@@ -312,17 +307,21 @@ impl HeadFrame {
         (tail.len() <= limit).then(|| Self {
             offset: base + start as u64,
             length: tail.len(),
-            hash: Sha256::digest(tail).into(),
         })
     }
 
-    fn matches(&self, file: &mut File) -> io::Result<bool> {
+    fn matches(&self, file: &mut File, session: &str, stream: &str, version:u32, head:Option<&CanonicalStreamHead>) -> io::Result<bool> {
+        let Some(head) = head else {return Ok(false)};
         let delimiter = usize::from(self.offset != 0);
         file.seek(SeekFrom::Start(self.offset - delimiter as u64))?;
         let mut bytes = vec![0; self.length + delimiter];
         match file.read_exact(&mut bytes) {
-            Ok(()) => Ok((delimiter == 0 || bytes[0] == b'\n')
-                && <[u8; 32]>::from(Sha256::digest(&bytes[delimiter..])) == self.hash),
+            Ok(()) => {
+                let Some(line) = bytes[delimiter..].strip_suffix(b"\n") else {return Ok(false)};
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                Ok((delimiter == 0 || bytes[0] == b'\n') && line.starts_with(FRAME_PREFIX_V1)
+                    && parse_anchored_frame(line, session, stream, version, head.sequence, FrameAnchor::VerifiedHead(&head.record_hash)).is_ok())
+            }
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
             Err(e) => Err(e),
         }
@@ -330,9 +329,10 @@ impl HeadFrame {
 }
 
 impl VerifiedPrefix {
-    fn matches(&self, file: &mut File, stamp: Option<&SourceStamp>) -> io::Result<bool> {
+    fn matches(&self, file: &mut File, stamp: Option<&SourceStamp>, session:&str, stream:&str) -> io::Result<bool> {
         match (&self.stamp, &self.head_frame) {
-            (Some(cached), Some(frame)) if Some(cached) == stamp => frame.matches(file),
+            (Some(cached), Some(frame)) if Some(cached) == stamp && cached.length == self.stream.byte_len && frame.offset + frame.length as u64 == cached.length =>
+                frame.matches(file, session, stream, 1, self.stream.head.as_ref()),
             _ => Ok(false),
         }
     }
@@ -706,7 +706,7 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
             .and_then(|file| SourceStamp::read(file).ok());
         let reusable = match (verified.as_ref(), source.as_mut()) {
             (Some(cached), Some(file)) => cached
-                .matches(file, stamp.as_ref())
+                .matches(file, stamp.as_ref(), self.session, E::STREAM.id())
                 .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?,
             _ => false,
         };
@@ -933,7 +933,7 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
             .ok()
             .and_then(|file| SourceStamp::read(&file).ok());
         if E::STREAM == GapStream::TranscriptRevisions {
-            domain::remember_head(self.path, prefix.stamp.as_ref(), cache.head.as_ref());
+            domain::remember_head(self.path, prefix.stamp.as_ref(), prefix.head_frame.as_ref().map(|frame|frame.offset), cache.head.as_ref());
         }
         Ok(Some(TranscriptReceipt {
             sequence: frame.sequence,

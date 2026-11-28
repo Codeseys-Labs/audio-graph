@@ -14,7 +14,13 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 type Error = TranscriptCommitError;
-type RecentHeads = VecDeque<(PathBuf, SourceStamp, CanonicalStreamHead)>;
+struct PublishedHead {
+    path: PathBuf,
+    identity: crate::persistence::canonical_durability::FilesystemIdentity,
+    offset: u64,
+    head: CanonicalStreamHead,
+}
+type RecentHeads = VecDeque<PublishedHead>;
 fn published() -> &'static Mutex<RecentHeads> {
     static HEADS: OnceLock<Mutex<RecentHeads>> = OnceLock::new();
     HEADS.get_or_init(Default::default)
@@ -23,25 +29,32 @@ fn published() -> &'static Mutex<RecentHeads> {
 pub(in super::super) fn remember_head(
     path: &Path,
     stamp: Option<&SourceStamp>,
+    offset: Option<u64>,
     head: Option<&CanonicalStreamHead>,
 ) {
-    let (Some(stamp), Some(head)) = (stamp, head) else {
+    let mut heads = published().lock().unwrap_or_else(|p| p.into_inner());
+    heads.retain(|entry| entry.path != path);
+    let (Some(stamp), Some(offset), Some(head)) = (stamp, offset, head) else {
         return;
     };
-    let mut heads = published().lock().unwrap_or_else(|p| p.into_inner());
-    heads.retain(|(p, _, _)| p != path);
     if heads.len() >= 64 {
         heads.pop_front();
     }
-    heads.push_back((path.to_owned(), stamp.clone(), head.clone()));
+    heads.push_back(PublishedHead {
+        path: path.to_owned(),
+        identity: stamp.identity.clone(),
+        offset,
+        head: head.clone(),
+    });
 }
-fn published_head(path: &Path, stamp: &SourceStamp) -> Option<CanonicalStreamHead> {
-    published()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .find(|(p, s, _)| p == path && s == stamp)
-        .map(|(_, _, h)| h.clone())
+enum SourceRead {
+    Unchanged,
+    Full,
+    Append {
+        start: u64,
+        head_offset: u64,
+        head: CanonicalStreamHead,
+    },
 }
 
 struct SourceRows<T> {
@@ -88,43 +101,78 @@ impl<T: DeserializeOwned> SourceRows<T> {
         self.head_frame = None;
     }
 
-    /// The caller took a shared lock and ruled out an attempt. Read through
-    /// this open handle after releasing that lock; a changed stamp requests
-    /// a fresh coordinated snapshot. Return whether the prefix was replaced.
+    /// Called under the source's shared lock. Identity and length locate a
+    /// candidate. Only the physical framed record can verify the cached head.
+    fn plan_read(
+        &self,
+        path: &Path,
+        session: &str,
+        stream: &str,
+        version: u32,
+        file: &mut File,
+        stamp: &SourceStamp,
+    ) -> Result<SourceRead, Error> {
+        let (Some(previous), Some(frame)) = (&self.stamp, &self.head_frame) else {
+            return Ok(SourceRead::Full);
+        };
+        if !cfg!(any(unix, windows))
+            || previous.identity != stamp.identity
+            || previous.length > stamp.length
+            || frame.offset + frame.length as u64 != previous.length
+            || (previous.length == stamp.length && previous != stamp)
+        {
+            return Ok(SourceRead::Full);
+        }
+        let cached = self.rows.last().map(|r| CanonicalStreamHead {
+            sequence: r.sequence,
+            event_id: r.event_id.clone(),
+            record_hash: r.record_hash.clone(),
+        });
+        if !frame
+            .matches(file, session, stream, version, cached.as_ref())
+            .map_err(|_| Error::InvalidHistory)?
+        {
+            return Ok(SourceRead::Full);
+        }
+        if previous.length == stamp.length {
+            return Ok(SourceRead::Unchanged);
+        }
+        let heads = published().lock().unwrap_or_else(|p| p.into_inner());
+        let candidate = heads.iter().find(|entry| {
+            entry.path == path
+                && entry.identity == stamp.identity
+                && (previous.length..stamp.length).contains(&entry.offset)
+        });
+        Ok(
+            candidate.map_or(SourceRead::Full, |entry| SourceRead::Append {
+                start: previous.length,
+                head_offset: entry.offset,
+                head: entry.head.clone(),
+            }),
+        )
+    }
+
+    /// The shared lock has been released. Copy through the pinned handle,
+    /// validate the suffix and compare its final frame with the writer receipt.
     fn read(
         &mut self,
-        path: &Path,
         session: &str,
         stream: &str,
         version: u32,
         mut file: File,
         stamp: SourceStamp,
+        plan: SourceRead,
     ) -> Result<Option<bool>, Error> {
-        let unchanged = stamp.change_time.is_some() && self.stamp.as_ref() == Some(&stamp);
-        let mut append = self
-            .stamp
-            .as_ref()
-            .filter(|prev| {
-                stamp.change_time.is_some()
-                    && prev.identity == stamp.identity
-                    && prev.length < stamp.length
-            })
-            .and_then(|prev| Some((prev.length, published_head(path, &stamp)?)));
-        if unchanged || append.is_some() {
-            let matches = match &self.head_frame {
-                Some(frame) => frame
-                    .matches(&mut file)
-                    .map_err(|_| Error::InvalidHistory)?,
-                None => false,
-            };
-            if matches && unchanged {
-                return Ok(Some(false));
-            }
-            if !matches {
-                append = None;
-            }
-        }
-        let start = append.as_ref().map_or(0, |(offset, _)| *offset);
+        let append = match plan {
+            SourceRead::Unchanged => return Ok(Some(false)),
+            SourceRead::Full => None,
+            SourceRead::Append {
+                start,
+                head_offset,
+                head,
+            } => Some((start, head_offset, head)),
+        };
+        let start = append.as_ref().map_or(0, |(start, _, _)| *start);
         file.seek(SeekFrom::Start(start))
             .map_err(|_| Error::InvalidHistory)?;
         let mut bytes = Vec::new();
@@ -160,8 +208,14 @@ impl<T: DeserializeOwned> SourceRows<T> {
         let parsed = parse_structural_suffix(&bytes, session, stream, version, anchor)
             .ok()
             .and_then(|raw| raw_to_typed::<T>(raw).ok());
-        if let Some((_, head)) = append {
-            let Some(parsed) = parsed.filter(|s| s.head.as_ref() == Some(&head)) else {
+        let verified_frame = HeadFrame::from_verified(&bytes, start);
+        if let Some((_, offset, head)) = append {
+            let Some(parsed) = parsed.filter(|s| {
+                s.head.as_ref() == Some(&head)
+                    && verified_frame
+                        .as_ref()
+                        .is_some_and(|frame| frame.offset == offset)
+            }) else {
                 // A valid replacement followed by a legitimate append may
                 // have the same file identity. Rebuild from the physical bytes.
                 return Ok(None);
@@ -181,14 +235,14 @@ impl<T: DeserializeOwned> SourceRows<T> {
             }
             self.rows.extend(parsed.records);
             self.stamp = Some(stamp);
-            self.head_frame = HeadFrame::from_verified(&bytes, start);
+            self.head_frame = verified_frame;
             Ok(Some(false))
         } else {
             self.replace(
                 parsed.ok_or(Error::InvalidHistory)?.records,
                 (!has_speaker_tail).then_some(stamp),
             );
-            self.head_frame = HeadFrame::from_verified(&bytes, start);
+            self.head_frame = verified_frame;
             Ok(Some(true))
         }
     }
@@ -391,13 +445,16 @@ impl BasisCache {
         };
         if let Ok(guard) = guard
             && !has_attempt()?
-            && let Ok(file) = File::open(path)
+            && let Ok(mut file) = File::open(path)
             && let Ok(stamp) = SourceStamp::read(&file)
         {
+            let plan = self
+                .transcript
+                .plan_read(path, session, STREAM, 1, &mut file, &stamp)?;
             drop(guard);
             if let Some(reset) = self
                 .transcript
-                .read(path, session, STREAM, 1, file, stamp)?
+                .read(session, STREAM, 1, file, stamp, plan)?
             {
                 if reset {
                     self.ledger = None;
@@ -442,10 +499,18 @@ impl BasisCache {
                 std::fs::TryLockError::Error(_) => Error::InvalidHistory,
             })?;
             if let Ok(stamp) = SourceStamp::read(&file) {
+                let plan = self.speaker.plan_read(
+                    path,
+                    session,
+                    "speaker_revisions",
+                    2,
+                    &mut file,
+                    &stamp,
+                )?;
                 file.unlock().map_err(|_| Error::InvalidHistory)?;
                 if let Some(reset) =
                     self.speaker
-                        .read(path, session, "speaker_revisions", 2, file, stamp)?
+                        .read(session, "speaker_revisions", 2, file, stamp, plan)?
                 {
                     if reset {
                         self.timeline = None;
@@ -456,10 +521,15 @@ impl BasisCache {
                 // or the verified writer head no longer extends our prefix.
                 self.speaker.stamp = None;
             } else {
+                let length = file.metadata().map_err(|_| Error::InvalidHistory)?.len();
+                file.unlock().map_err(|_| Error::InvalidHistory)?;
                 let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)
+                file.take(length)
+                    .read_to_end(&mut bytes)
                     .map_err(|_| Error::InvalidHistory)?;
-                drop(file);
+                if bytes.len() as u64 != length {
+                    continue;
+                }
                 let end = bytes
                     .iter()
                     .rposition(|&byte| byte == b'\n')

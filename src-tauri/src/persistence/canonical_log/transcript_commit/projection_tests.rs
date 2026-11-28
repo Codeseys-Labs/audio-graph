@@ -104,6 +104,42 @@ impl Drop for Fixture {
     }
 }
 #[test]
+fn append_registry_requires_the_physical_offset_and_verified_final_record() {
+    for wrong_offset in [false, true] {
+        let fixture = Fixture::new();
+        let patch = fixture.seeded_patch();
+        fixture.projection.live_basis(&patch, 1).unwrap();
+        let before = fixture.projection.source_basis.borrow().source_work()[0];
+        fixture
+            .transcript
+            .commit_after(&transcript_event("twig", "leaf"), Some(1))
+            .unwrap();
+        let path = &fixture.transcript.path;
+        let file = File::open(path).unwrap();
+        let stamp = SourceStamp::read(&file).unwrap();
+        let verified = read_committed::<TranscriptEvent>(path, SESSION)
+            .unwrap()
+            .head
+            .unwrap();
+        let mut offset = HeadFrame::from_verified(&fs::read(path).unwrap(), 0)
+            .unwrap()
+            .offset;
+        let mut candidate = verified.clone();
+        if wrong_offset {
+            offset += 1;
+        } else {
+            candidate.record_hash = "0".repeat(64);
+        }
+        domain::remember_head(path, Some(&stamp), Some(offset), Some(&candidate));
+        let actual = fixture.projection.live_basis(&patch, 2).unwrap();
+        assert_eq!(actual.heads()[STREAM].record_hash, verified.record_hash);
+        let after = fixture.projection.source_basis.borrow().source_work()[0];
+        assert!(after.0 > before.0);
+        assert_eq!(before.1, after.1);
+    }
+}
+
+#[test]
 fn moving_transcript_and_speaker_bases_verify_only_new_frames() {
     use crate::{
         identity::tests::span,
@@ -130,12 +166,16 @@ fn moving_transcript_and_speaker_bases_verify_only_new_frames() {
     let next = transcript_event("twig", "leaf");
     fixture.transcript.commit_after(&next, None).unwrap();
     let speaker = span("fern", "mic");
-    append(
-        &path,
-        SESSION,
-        SpeakerWrite::SpanRevision { revision: &speaker },
-    )
-    .unwrap();
+    // Exact redelivery writes no frame and must leave the first append's
+    // published offset intact. The following proof still parses one new row.
+    for _ in 0..2 {
+        append(
+            &path,
+            SESSION,
+            SpeakerWrite::SpanRevision { revision: &speaker },
+        )
+        .unwrap();
+    }
     timeline.apply_event(speaker).unwrap();
     patch.sequence = 2;
     patch.basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
@@ -320,7 +360,7 @@ fn warmed_group_planner_never_appends_to_a_superseded_prefix() {
 }
 
 #[test]
-fn head_frame_tracks_the_last_nonblank_record_and_its_preceding_delimiter() {
+fn head_frame_requires_a_terminal_frame_and_its_preceding_delimiter() {
     let f = Fixture::new();
     let path = f.root.join("anchor");
     let first = serde_json::to_vec(&transcript_event("reed", "wood")).unwrap();
@@ -331,18 +371,27 @@ fn head_frame_tracks_the_last_nonblank_record_and_its_preceding_delimiter() {
         .unwrap();
     let verified = fs::read(&f.transcript.path).unwrap();
     assert_eq!(verified[first.len()], b'\n');
-    assert_eq!(
-        read_committed::<TranscriptEvent>(&f.transcript.path, SESSION)
-            .unwrap()
-            .records
-            .len(),
-        2
-    );
+    let source = read_committed::<TranscriptEvent>(&f.transcript.path, SESSION).unwrap();
+    assert_eq!(source.records.len(), 2);
     for suffix in [b"".as_slice(), b"\n \t\r\n\n"] {
         let mut content = verified.clone();
         content.extend_from_slice(suffix);
         fs::write(&path, &content).unwrap();
-        let check = |frame: &HeadFrame| frame.matches(&mut File::open(&path).unwrap()).unwrap();
+        if !suffix.is_empty() {
+            assert!(HeadFrame::from_verified(&content, 0).is_none());
+            continue;
+        }
+        let check = |frame: &HeadFrame| {
+            frame
+                .matches(
+                    &mut File::open(&path).unwrap(),
+                    SESSION,
+                    STREAM,
+                    1,
+                    source.head.as_ref(),
+                )
+                .unwrap()
+        };
         let from_full_file = HeadFrame::from_verified(&content, 0).unwrap();
         // The appended bytes carry the missing separator for an earlier
         // unterminated legacy row. Both origins must bind the same head.

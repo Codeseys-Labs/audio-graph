@@ -200,6 +200,8 @@ storage uses its platform barrier. Other writable storage can issue
 
 Live writers and projection readers check the physical head frame before reusing a verified prefix. An in-place edit to earlier records that preserves the head frame can go undetected until the next full verification, an accepted limit because cooperating live writers append under the session lock and never edit a committed prefix in place.
 
+The live projection writer retains decoded transcript revisions, their event IDs, prefix hashes and the latest spans for the session. It also retains speaker records once a patch needs them. These caches grow with the retained history and have no fixed memory cap. Separately, preparing a materialization clones the current Notes and Graph state, installing it copies the affected lane, and saving its snapshot serializes that lane. Those costs grow with the materialized content even when physical source verification reads only new records.
+
 Only a receipt permits the live lane to advance. The resulting cache includes
 the projection frame sequence and record hash. A cache write failure leaves
 a committed patch available for local replay. Opening Notes or Graph checks

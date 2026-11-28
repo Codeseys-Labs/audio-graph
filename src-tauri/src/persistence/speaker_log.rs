@@ -143,6 +143,7 @@ fn open_writer(
 }
 pub(super) fn append(path: &Path, session_id: &str, row: SpeakerWrite<'_>) -> Result<(), String> {
     let mut writer = open_writer(path, session_id, &row)?;
+    let offset = writer.next_frame_offset();
     let outcome = match row {
         SpeakerWrite::SpanRevision { revision } => {
             let id = CanonicalEventMetadata::new(format!(
@@ -166,17 +167,18 @@ pub(super) fn append(path: &Path, session_id: &str, row: SpeakerWrite<'_>) -> Re
         }
     };
     match outcome {
-        CanonicalAppendOutcome::Accepted(_) | CanonicalAppendOutcome::AlreadyAccepted(_) => {
+        CanonicalAppendOutcome::Accepted(_) => {
             // Pin this file while the appender still owns its lock. NTFS can
             // finalize write/change times only when the write handle closes.
             let pinned = std::fs::File::open(path).ok();
             let head = writer.head().cloned();
             drop(writer);
             if let Some(file) = pinned {
-                super::canonical_log::remember_speaker_head(path, &file, head.as_ref());
+                super::canonical_log::remember_speaker_head(path, &file, offset, head.as_ref());
             }
             Ok(())
         }
+        CanonicalAppendOutcome::AlreadyAccepted(_) => Ok(()),
         other => Err(format!("speaker append: {other:?}")),
     }
 }

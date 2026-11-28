@@ -173,7 +173,7 @@ impl Commit<'_> {
         };
         let stamp = SourceStamp::read(&file).ok();
         if !prefix
-            .matches(&mut file, stamp.as_ref())
+            .matches(&mut file, stamp.as_ref(), self.session, STREAM)
             .map_err(|e| io_failure(CanonicalAppendPhase::RecoveryRead, e))?
         {
             return Ok(None);
@@ -247,6 +247,7 @@ impl Commit<'_> {
         domain::remember_head(
             self.path,
             prefix.stamp.as_ref(),
+            prefix.head_frame.as_ref().map(|frame| frame.offset),
             prefix.stream.head.as_ref(),
         );
         Ok(Some(receipts))
