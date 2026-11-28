@@ -7,9 +7,19 @@ const WINDOWS_TEST_MANIFEST: &str = "windows-app-manifest.xml";
 /// See [`warn_windows_debug_crt_skew`] and docs/ops/windows-debug-crt-fix.md.
 const CMAKE_MSVC_RUNTIME_LIBRARY: &str = "CMAKE_MSVC_RUNTIME_LIBRARY";
 
+/// Set by GitHub Actions. Its Windows runners are elevated, so tests that
+/// need an elevated run are compiled as ignored everywhere else: a local run
+/// reports them as ignored rather than passing without exercising anything.
+const GITHUB_ACTIONS: &str = "GITHUB_ACTIONS";
+
 fn main() {
     println!("cargo::rerun-if-env-changed={EMBED_WINDOWS_TEST_MANIFEST}");
     println!("cargo::rerun-if-env-changed={CMAKE_MSVC_RUNTIME_LIBRARY}");
+    println!("cargo::rerun-if-env-changed={GITHUB_ACTIONS}");
+    println!("cargo::rustc-check-cfg=cfg(audiograph_github_actions)");
+    if env::var_os(GITHUB_ACTIONS).is_some() {
+        println!("cargo::rustc-cfg=audiograph_github_actions");
+    }
     embed_windows_test_manifest();
     warn_windows_debug_crt_skew();
     tauri_build::build();

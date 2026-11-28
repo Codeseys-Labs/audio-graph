@@ -29,6 +29,10 @@ struct VolumeSample {
 enum RemoteProtocolCall {
     Remote,
     NoRemoteProtocol,
+    /// The file system answered that it does not support the remote-protocol
+    /// information class. That is no evidence of locality either way; the
+    /// drive-type probe decides it.
+    NotSupportedByFileSystem,
 }
 
 fn remote_protocol_call_from_protocol(protocol: u32) -> RemoteProtocolCall {
@@ -36,6 +40,27 @@ fn remote_protocol_call_from_protocol(protocol: u32) -> RemoteProtocolCall {
         RemoteProtocolCall::NoRemoteProtocol
     } else {
         RemoteProtocolCall::Remote
+    }
+}
+
+/// `HRESULT_FROM_WIN32(ERROR_INVALID_PARAMETER)`.
+const INVALID_PARAMETER_HRESULT: i32 = 0x8007_0057_u32 as i32;
+
+/// Win32 documents `FileRemoteProtocolInfo` as usable "for any handles", yet
+/// local NTFS on Windows 11 answers it with `ERROR_INVALID_PARAMETER`
+/// (measured for #521). [MS-FSCC] §2.4, "File Information Classes", gives that
+/// status its meaning: "If a file system does not support a specific file
+/// information class, STATUS_INVALID_PARAMETER MUST be returned." So only that
+/// exact code reads as "class unsupported", and it is not treated as favorable:
+/// `local == Yes` still needs the drive-type probe to report a fixed or
+/// removable drive, and `DRIVE_REMOTE` still makes it `No`. Every other
+/// failure stays a refusal.
+/// <https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/4718fc40-e539-4014-8e33-b675af74e3e1>
+fn remote_protocol_call_from_failure(hresult: i32) -> Result<RemoteProtocolCall, ApiFault> {
+    if hresult == INVALID_PARAMETER_HRESULT {
+        Ok(RemoteProtocolCall::NotSupportedByFileSystem)
+    } else {
+        Err(ApiFault::Unavailable)
     }
 }
 
@@ -163,34 +188,72 @@ trait WindowsMetadataApi {
     fn cloud_files(&self, target: &Self::HeldDirectory) -> CloudFilesCall;
 }
 
-fn inspection_unavailable(_: ApiFault) -> DetectorFault {
-    DetectorFault::InspectionUnavailable
+/// The probe that refused an inspection. Closed: it carries no OS error text,
+/// code or path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowsInspectionStage {
+    DirectoryKind,
+    InitialIdentity,
+    InitialVolume,
+    RemoteProtocol,
+    VolumeHandle,
+    DriveType,
+    Hotplug,
+    FinalIdentity,
+    FinalVolume,
+}
+
+/// A detector refusal that names the failing probe. The cross-platform
+/// [`DetectorFault`] seam keeps only the refusal kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowsInspectionRefusal {
+    TargetUnavailable,
+    InspectionUnavailable(WindowsInspectionStage),
+}
+
+impl From<WindowsInspectionRefusal> for DetectorFault {
+    fn from(refusal: WindowsInspectionRefusal) -> Self {
+        match refusal {
+            WindowsInspectionRefusal::TargetUnavailable => DetectorFault::TargetUnavailable,
+            WindowsInspectionRefusal::InspectionUnavailable(_) => {
+                DetectorFault::InspectionUnavailable
+            }
+        }
+    }
+}
+
+fn at(stage: WindowsInspectionStage) -> impl Fn(ApiFault) -> WindowsInspectionRefusal {
+    move |_| WindowsInspectionRefusal::InspectionUnavailable(stage)
 }
 
 fn inspect_with_api<A: WindowsMetadataApi>(
     api: &A,
     target: &A::HeldDirectory,
     platform_release: PlatformRelease,
-) -> Result<FilesystemObservation, DetectorFault> {
-    if !api.is_directory(target).map_err(inspection_unavailable)? {
-        return Err(DetectorFault::TargetUnavailable);
+) -> Result<FilesystemObservation, WindowsInspectionRefusal> {
+    use WindowsInspectionStage as Stage;
+
+    if !api.is_directory(target).map_err(at(Stage::DirectoryKind))? {
+        return Err(WindowsInspectionRefusal::TargetUnavailable);
     }
 
     let initial_identity = api
         .directory_identity(target)
-        .map_err(inspection_unavailable)?;
-    let initial_volume = api.volume_sample(target).map_err(inspection_unavailable)?;
+        .map_err(at(Stage::InitialIdentity))?;
+    let initial_volume = api
+        .volume_sample(target)
+        .map_err(at(Stage::InitialVolume))?;
     let remote = api
         .remote_protocol(target)
-        .map_err(inspection_unavailable)?;
-    let volume = api.open_volume(target).map_err(inspection_unavailable)?;
-    let drive = api.drive_type(&volume).map_err(inspection_unavailable)?;
-    let hotplug = api.hotplug(&volume).map_err(inspection_unavailable)?;
+        .map_err(at(Stage::RemoteProtocol))?;
+    let volume = api.open_volume(target).map_err(at(Stage::VolumeHandle))?;
+    let drive = api.drive_type(&volume).map_err(at(Stage::DriveType))?;
+    let hotplug = api.hotplug(&volume).map_err(at(Stage::Hotplug))?;
     let cloud = api.cloud_files(target);
     let final_identity = api
         .directory_identity(target)
-        .map_err(inspection_unavailable)?;
-    let final_volume = api.volume_sample(target).map_err(inspection_unavailable)?;
+        .map_err(at(Stage::FinalIdentity))?;
+    let final_volume = api.volume_sample(target).map_err(at(Stage::FinalVolume))?;
 
     let family = match initial_volume.filesystem {
         WindowsFilesystem::Ntfs => FilesystemFamily::WindowsNtfs,
@@ -203,10 +266,14 @@ fn inspect_with_api<A: WindowsMetadataApi>(
     };
     let local = match (remote, drive) {
         (RemoteProtocolCall::Remote, _) | (_, DriveTypeCall::Remote) => Ternary::No,
-        (RemoteProtocolCall::NoRemoteProtocol, DriveTypeCall::Fixed | DriveTypeCall::Removable) => {
-            Ternary::Yes
-        }
-        (RemoteProtocolCall::NoRemoteProtocol, DriveTypeCall::Other) => Ternary::Unknown,
+        (
+            RemoteProtocolCall::NoRemoteProtocol | RemoteProtocolCall::NotSupportedByFileSystem,
+            DriveTypeCall::Fixed | DriveTypeCall::Removable,
+        ) => Ternary::Yes,
+        (
+            RemoteProtocolCall::NoRemoteProtocol | RemoteProtocolCall::NotSupportedByFileSystem,
+            DriveTypeCall::Other,
+        ) => Ternary::Unknown,
     };
     let internal_fixed = match drive {
         DriveTypeCall::Fixed => {
@@ -352,6 +419,14 @@ mod native {
                 handle: OwnedHandle(handle),
             })
         }
+
+        /// Inspects `target` and, on refusal, names the probe that failed.
+        pub(crate) fn inspect_staged(
+            &self,
+            target: &WindowsHeldDirectory,
+        ) -> Result<FilesystemObservation, WindowsInspectionRefusal> {
+            inspect_with_api(&NativeWindowsMetadataApi, target, self.platform_release)
+        }
     }
 
     impl FilesystemDetector for WindowsFilesystemDetector {
@@ -361,7 +436,7 @@ mod native {
             &self,
             target: &Self::HeldTarget,
         ) -> Result<FilesystemObservation, DetectorFault> {
-            inspect_with_api(&NativeWindowsMetadataApi, target, self.platform_release)
+            self.inspect_staged(target).map_err(DetectorFault::from)
         }
     }
 
@@ -459,16 +534,17 @@ mod native {
             };
             // SAFETY: `info` is the exact output structure required by
             // FileRemoteProtocolInfo and remains valid through the call.
-            unsafe {
+            match unsafe {
                 GetFileInformationByHandleEx(
                     target.handle.0,
                     FileRemoteProtocolInfo,
                     std::ptr::addr_of_mut!(info).cast::<c_void>(),
                     size_of_val(&info) as u32,
                 )
+            } {
+                Ok(()) => Ok(remote_protocol_call_from_protocol(info.Protocol)),
+                Err(error) => remote_protocol_call_from_failure(error.code().0),
             }
-            .map_err(|_| ApiFault::Unavailable)?;
-            Ok(remote_protocol_call_from_protocol(info.Protocol))
         }
 
         fn open_volume(&self, target: &Self::HeldDirectory) -> Result<Self::HeldVolume, ApiFault> {
@@ -602,7 +678,7 @@ mod native {
                 .open_target(&path)
                 .expect("open the configured metadata-only smoke target");
             let observation = detector
-                .inspect(&target)
+                .inspect_staged(&target)
                 .expect("inspect the metadata-only smoke target");
 
             assert_eq!(
@@ -789,6 +865,37 @@ mod tests {
         );
     }
 
+    /// A local file system answers the remote-protocol class with
+    /// `ERROR_INVALID_PARAMETER`; only that exact code reads as "not
+    /// redirected", and it still needs a fixed or removable drive to be local.
+    #[test]
+    fn only_invalid_parameter_reads_as_an_unsupported_remote_protocol_class() {
+        assert_eq!(
+            remote_protocol_call_from_failure(0x8007_0057_u32 as i32),
+            Ok(RemoteProtocolCall::NotSupportedByFileSystem)
+        );
+        for other in [0x8007_0005_u32, 0x8007_0001, 0x8000_4005, 0x8007_0032] {
+            assert_eq!(
+                remote_protocol_call_from_failure(other as i32),
+                Err(ApiFault::Unavailable)
+            );
+        }
+
+        let mut local = ScriptedApi::positive();
+        local.remote = Ok(RemoteProtocolCall::NotSupportedByFileSystem);
+        let observation = inspect_with_api(&local, &(), PlatformRelease::new(10, 0, 22_631))
+            .expect("unsupported class on a fixed drive");
+        assert_eq!(observation.local, Ternary::Yes);
+
+        let mut unknown_drive = ScriptedApi::positive();
+        unknown_drive.remote = Ok(RemoteProtocolCall::NotSupportedByFileSystem);
+        unknown_drive.drive = Ok(DriveTypeCall::Other);
+        let observation =
+            inspect_with_api(&unknown_drive, &(), PlatformRelease::new(10, 0, 22_631))
+                .expect("unsupported class on an unknown drive");
+        assert_eq!(observation.local, Ternary::Unknown);
+    }
+
     #[test]
     fn one_held_target_with_every_positive_ntfs_observation_becomes_a_candidate() {
         let api = ScriptedApi::positive();
@@ -835,7 +942,9 @@ mod tests {
 
         assert_eq!(
             inspect_with_api(&api, &(), PlatformRelease::new(10, 0, 22_631)),
-            Err(DetectorFault::InspectionUnavailable)
+            Err(WindowsInspectionRefusal::InspectionUnavailable(
+                WindowsInspectionStage::RemoteProtocol
+            ))
         );
     }
 
@@ -911,7 +1020,8 @@ mod tests {
             let mut api = ScriptedApi::positive();
             inject(&mut api);
             assert_eq!(
-                inspect_with_api(&api, &(), PlatformRelease::new(10, 0, 22_631)),
+                inspect_with_api(&api, &(), PlatformRelease::new(10, 0, 22_631))
+                    .map_err(DetectorFault::from),
                 Err(DetectorFault::InspectionUnavailable),
                 "{name} failure must stay closed"
             );
@@ -921,7 +1031,7 @@ mod tests {
         not_directory.directory = Ok(false);
         assert_eq!(
             inspect_with_api(&not_directory, &(), PlatformRelease::new(10, 0, 22_631)),
-            Err(DetectorFault::TargetUnavailable)
+            Err(WindowsInspectionRefusal::TargetUnavailable)
         );
     }
 
@@ -1011,7 +1121,8 @@ mod tests {
         for (name, mutate, expected) in cases {
             let mut api = ScriptedApi::positive();
             mutate(&mut api);
-            let inspection = inspect_with_api(&api, &(), PlatformRelease::new(10, 0, 22_631));
+            let inspection = inspect_with_api(&api, &(), PlatformRelease::new(10, 0, 22_631))
+                .map_err(DetectorFault::from);
             assert_eq!(
                 evaluate_filesystem(PersistenceTarget::Journal, inspection).code,
                 *expected,
@@ -1042,7 +1153,8 @@ mod tests {
         for (name, race) in races {
             let mut api = ScriptedApi::positive();
             race(&mut api);
-            let inspection = inspect_with_api(&api, &(), PlatformRelease::new(10, 0, 22_631));
+            let inspection = inspect_with_api(&api, &(), PlatformRelease::new(10, 0, 22_631))
+                .map_err(DetectorFault::from);
             assert_eq!(
                 evaluate_filesystem(PersistenceTarget::Journal, inspection).code,
                 FilesystemStatusCode::TargetChanged,
