@@ -136,7 +136,7 @@ impl From<HttpFailure> for String {
     }
 }
 
-/// Canary checks for what crosses a returned error or terminal frame.
+/// Canary check for what crosses a returned error, terminal frame, or log.
 #[cfg(test)]
 pub(super) mod canary {
     pub(crate) fn assert_absent(output: &str, canaries: &[&str]) {

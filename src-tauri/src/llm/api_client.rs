@@ -1120,6 +1120,7 @@ mod tests {
     #[test]
     fn chat_completion_non_2xx_returns_only_the_diagnostic_token() {
         use crate::llm::http_diag::canary::assert_absent;
+        use crate::test_log_capture::{ThreadLogCapture, render};
 
         let rt = tokio::runtime::Runtime::new().expect("rt");
         let key = "api-credential-canary";
@@ -1130,15 +1131,19 @@ mod tests {
         let lengths = [prompt.len(), body.len()].map(|len| len.to_string());
         let (base, _) = rt.block_on(spawn_mock(429, "Too Many Requests", body));
         let endpoint = format!("{base}/{path}?private=query-canary");
-        let err = run_blocking(move || {
-            ApiClient::new(config(&endpoint, Some(key)))
+        let (result, logs) = run_blocking(move || {
+            let capture = ThreadLogCapture::start();
+            let result = ApiClient::new(config(&endpoint, Some(key)))
                 .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
-                .chat_completion(vec![("user".into(), prompt)], false)
-        })
-        .expect_err("provider rejected the request");
+                .chat_completion(vec![("user".into(), prompt)], false);
+            (result, render(&capture.finish()))
+        });
+        let err = result.expect_err("provider rejected the request");
         assert_eq!(err, "runtime/rate_limited");
+        // Nothing on this path logs today; the capture is for the day something does.
+        let observed = format!("{err}\n{logs}");
         assert_absent(
-            &err,
+            &observed,
             &[
                 key,
                 "provider-private-body-canary",
@@ -1148,7 +1153,7 @@ mod tests {
                 "api-prompt-canary",
             ],
         );
-        assert_absent(&err, &lengths.each_ref().map(String::as_str));
+        assert_absent(&observed, &lengths.each_ref().map(String::as_str));
     }
 
     #[test]

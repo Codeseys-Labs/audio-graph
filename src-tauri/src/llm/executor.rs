@@ -1517,10 +1517,12 @@ fn chat_mistralrs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::http_diag::canary::assert_absent;
     use crate::projections::{
         ProjectionKind, ProjectionOperation, ProjectionPriority, TranscriptEvent,
         TranscriptEventStability,
     };
+    use crate::test_log_capture::{ThreadLogCapture, render};
     use std::sync::Mutex as StdMutex;
 
     /// Serialize the cooldown tests: they read/mutate the process-wide
@@ -1825,6 +1827,7 @@ mod tests {
             "the validator error must carry the value for this to be a canary: {private_detail}"
         );
 
+        let capture = ThreadLogCapture::start();
         let err = run_projection_patch_on_route(
             {
                 let call_count = call_count.clone();
@@ -1843,11 +1846,18 @@ mod tests {
             123,
         )
         .expect_err("repair remains invalid");
+        let logs = render(&capture.finish());
 
         assert_eq!(*call_count.lock().unwrap_or_else(|e| e.into_inner()), 2);
         assert_eq!(err, "runtime/invalid_response");
-        crate::llm::http_diag::canary::assert_absent(
-            &err,
+        // The draft and the repair were each logged, by route identity only.
+        assert_eq!(
+            logs.matches("Projection patch route output").count(),
+            2,
+            "{logs}"
+        );
+        assert_absent(
+            &format!("{err}\n{logs}"),
             &[
                 "validation-value-canary",
                 "repair-value-canary",
@@ -2427,6 +2437,27 @@ mod tests {
         );
     }
 
+    // The cloud build's engine stub fails every call, which is enough to reach
+    // the log site; a real engine needs a model file.
+    #[cfg(not(feature = "llm-llama"))]
+    #[test]
+    fn native_extraction_failure_logs_only_the_diagnostic() {
+        let handles = BackendHandles {
+            llm_engine: Arc::new(Mutex::new(Some(LlmEngine))),
+            ..empty_handles()
+        };
+        let capture = ThreadLogCapture::start();
+        let result = extract_native(&handles, "heron transcript", "osprey");
+        let logs = render(&capture.finish());
+
+        assert!(result.is_none());
+        assert!(
+            logs.contains("Native LLM extraction failed: runtime/unsupported"),
+            "{logs}"
+        );
+        assert_absent(&logs, &["heron", "osprey"]);
+    }
+
     // ----- ADR-0038: the removal, proven against a real wire ----------------
 
     /// Serve `responses` (one per incoming connection, in order) and report how
@@ -2571,6 +2602,49 @@ mod tests {
             openrouter_client: Arc::new(Mutex::new(None)),
             mistralrs_engine: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[test]
+    fn api_extraction_failure_logs_only_the_diagnostic() {
+        let _guard = COOLDOWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        EXTRACTION_COOLDOWN_UNTIL_MS.store(0, Ordering::Relaxed);
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        // A 200 whose body is not a chat completion.
+        let body = format!("walrus reply {}", "w".repeat(4000));
+        let body_length = body.len().to_string();
+        let (base, request_count) = rt.block_on(spawn_counting_mock(vec![body]));
+        let handles = handles_with_only_api_client(&base);
+        let provider = LlmProvider::Api {
+            endpoint: base,
+            api_key: "sk-route-removal-probe".to_string(),
+            model: "probe-model".to_string(),
+        };
+
+        let (result, logs) = std::thread::spawn(move || {
+            let capture = ThreadLogCapture::start();
+            let result = run_extraction(&handles, &provider, "heron transcript", "osprey", "");
+            (result, render(&capture.finish()))
+        })
+        .join()
+        .expect("worker thread panic");
+
+        assert!(result.is_none());
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(
+            logs.contains("API extraction failed: runtime/invalid_response"),
+            "{logs}"
+        );
+        assert_absent(
+            &logs,
+            &[
+                "walrus",
+                "heron",
+                "osprey",
+                "sk-route-removal-probe",
+                "127.0.0.1",
+                &body_length,
+            ],
+        );
     }
 
     #[test]
@@ -3066,6 +3140,68 @@ mod tests {
             "job 2's ACTUAL WIRE REQUEST must carry job 1's applied note id — got: {}",
             requests_two[0]
         );
+    }
+
+    #[test]
+    fn executor_thread_logs_no_reply_content_when_draft_and_repair_both_fail() {
+        use crate::test_log_capture::{assert_process_logs_exclude, install, process_logs_contain};
+
+        install();
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        // Two completed replies that are not valid patches: each carries an
+        // unknown operation type and a model-chosen operation id.
+        let reply = |value: &str| {
+            let patch = serde_json::json!({
+                "operations": [{ "type": value, "id": "quokka-operation" }]
+            });
+            serde_json::json!({
+                "choices": [{
+                    "message": { "content": patch.to_string() },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string()
+        };
+        let (base, requests) = rt.block_on(spawn_capturing_mock(vec![
+            reply("numbat-draft"),
+            reply("bilby-repair"),
+        ]));
+        let BackendHandles {
+            llm_engine,
+            api_client,
+            openrouter_client,
+            mistralrs_engine,
+        } = handles_with_only_api_client(&base);
+        let executor =
+            LlmExecutor::new(llm_engine, api_client, openrouter_client, mistralrs_engine);
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+
+        let attempt = executor.generate_projection_patch(
+            job,
+            ledger,
+            None::<crate::projections::MaterializedNotes>,
+            LlmProvider::Api {
+                endpoint: base,
+                api_key: "sk-route-removal-probe".to_string(),
+                model: "probe-model".to_string(),
+            },
+            1,
+            100,
+        );
+
+        assert_eq!(
+            requests.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            2,
+            "the draft and the repair must both reach the wire"
+        );
+        assert_eq!(
+            attempt.outcome.expect_err("the repair is still invalid"),
+            "runtime/invalid_response"
+        );
+        // The worker thread is not this one, so its records are only in the
+        // process log. The fixed label shows the path logged at all.
+        assert!(process_logs_contain("Projection patch route output"));
+        assert_process_logs_exclude(&["numbat-draft", "bilby-repair", "quokka-operation"]);
     }
 
     #[test]

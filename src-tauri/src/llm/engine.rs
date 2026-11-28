@@ -1034,10 +1034,15 @@ mod tests {
 
     #[test]
     fn malformed_extraction_output_never_leaves_the_engine() {
+        use crate::test_log_capture::{ThreadLogCapture, render};
+
+        let capture = ThreadLogCapture::start();
         let output = r#"engine-output-canary {"entities": engine-value-canary"#;
         let error = parse_extraction(output).expect_err("malformed extraction output");
         assert_eq!(error.to_string(), "runtime/invalid_response");
-        assert!(!format!("{error:?}").contains("canary"));
+        // Parsing logs nothing today; the capture is for the day something does.
+        let observed = format!("{error:?}\n{}", render(&capture.finish()));
+        assert!(!observed.contains("canary"), "{observed}");
     }
 
     #[test]

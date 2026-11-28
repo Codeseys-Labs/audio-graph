@@ -3592,6 +3592,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_returns_only_the_diagnostic_token() {
         use crate::llm::http_diag::canary::assert_absent;
+        use crate::test_log_capture::{ThreadLogCapture, render};
 
         let key = "catalog-credential-canary";
         let body = format!("catalog-provider-body-canary{}", "b".repeat(6000));
@@ -3603,6 +3604,7 @@ mod tests {
             body,
         )])
         .await;
+        let capture = ThreadLogCapture::start();
         let err = list_models(
             key,
             &format!("{base}/catalog-path-canary?private=query-canary"),
@@ -3610,8 +3612,10 @@ mod tests {
         .await
         .expect_err("catalog HTTP error");
         assert_eq!(err, "runtime/rate_limited");
+        // Nothing on this path logs today; the capture is for the day something does.
+        let observed = format!("{err}\n{}", render(&capture.finish()));
         assert_absent(
-            &err,
+            &observed,
             &[
                 key,
                 "catalog-provider-body-canary",
@@ -4289,8 +4293,9 @@ mod tests {
     }
 
     #[test]
-    fn chat_completion_http_diagnostic_is_content_free_after_retries() {
+    fn chat_completion_http_diagnostic_and_retry_logs_are_content_free() {
         use crate::llm::http_diag::canary::assert_absent;
+        use crate::test_log_capture::{ThreadLogCapture, render};
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let key = "openrouter-credential-canary";
@@ -4307,19 +4312,29 @@ mod tests {
             );
             3
         ]));
-        let err = std::thread::spawn(move || {
+        let (result, logs) = std::thread::spawn(move || {
+            let capture = ThreadLogCapture::start();
             let mut config = retry_test_config(format!("{base}/path-canary?private=query-canary"));
             config.api_key = key.to_owned();
-            OpenRouterClient::new(config)
+            let result = OpenRouterClient::new(config)
                 .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
-                .chat_completion(vec![("user".into(), prompt)], false)
+                .chat_completion(vec![("user".into(), prompt)], false);
+            (result, render(&capture.finish()))
         })
         .join()
-        .unwrap()
-        .expect_err("502 after exhausting retries");
+        .unwrap();
+        let err = result.expect_err("502 after exhausting retries");
         assert_eq!(err, "runtime/provider_unavailable");
+        // Both retries were logged, by diagnostic token only.
+        assert_eq!(
+            logs.matches("retrying: runtime/provider_unavailable")
+                .count(),
+            2,
+            "{logs}"
+        );
+        let observed = format!("{err}\n{logs}");
         assert_absent(
-            &err,
+            &observed,
             &[
                 key,
                 "private-body-canary",
@@ -4329,7 +4344,7 @@ mod tests {
                 "query-canary",
             ],
         );
-        assert_absent(&err, &lengths.each_ref().map(String::as_str));
+        assert_absent(&observed, &lengths.each_ref().map(String::as_str));
         assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 

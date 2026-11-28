@@ -1331,6 +1331,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_chunk_and_provider_error_do_not_leak_content() {
         use crate::llm::http_diag::canary::assert_absent;
+        use crate::test_log_capture::{ThreadLogCapture, render};
 
         let key = "sse-credential-canary";
         let prompt = format!("sse-prompt-canary{}", "x".repeat(2048));
@@ -1338,60 +1339,87 @@ mod tests {
             "{{\"choices\":\"sse-malformed-chunk-canary{}\"}}",
             "y".repeat(3000)
         );
-        let body = format!(
-            "data: {malformed}\n\n\
-             event: error\ndata: {{\"error\":\"sse-provider-body-canary {key} {prompt}\"}}\n\n"
-        );
-        // Exact sizes of the prompt, the malformed chunk, and the whole body.
-        let lengths = [prompt.len(), malformed.len(), body.len()].map(|len| len.to_string());
-        let base = spawn_sse_mock_owned(body).await;
-        let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
-            LlmProvider::Api {
-                endpoint: format!("{base}/sse-path-canary?private=sse-query-canary"),
-                api_key: key.to_owned(),
-                model: "test-model".to_owned(),
-            },
-            vec![ChatMessage {
-                role: "user".to_owned(),
-                content: prompt,
-            }],
-            String::new(),
-            StreamParams::default(),
-        ));
-        let terminal = rx.recv().await.expect("terminal frame");
-        assert!(rx.recv().await.is_none());
-        // An unclassified provider fault is not evidence of an outage.
-        assert!(matches!(&terminal, TokenDelta::Error { message, full_text }
-            if message == "runtime/internal" && full_text.is_empty()));
-        let observed = format!("{terminal:?}");
-        assert_absent(
-            &observed,
-            &[
-                key,
-                "sse-prompt-canary",
-                "sse-malformed-chunk-canary",
-                "sse-provider-body-canary",
-                "sse-request-canary",
-                "sse-path-canary",
-                "sse-query-canary",
-            ],
-        );
-        assert_absent(&observed, &lengths.each_ref().map(String::as_str));
+        let provider_message = format!("sse-provider-body-canary {key} {prompt}");
+        // A named error event with no code, then an error envelope on a plain
+        // data frame whose code classifies it. Neither message goes anywhere.
+        for (fault, expected) in [
+            (
+                format!("event: error\ndata: {{\"error\":\"{provider_message}\"}}\n\n"),
+                "runtime/internal",
+            ),
+            (
+                format!(
+                    "data: {{\"error\":{{\"code\":\"rate_limit_exceeded\",\
+                     \"message\":\"{provider_message}\"}}}}\n\n"
+                ),
+                "runtime/rate_limited",
+            ),
+        ] {
+            let body = format!("data: {malformed}\n\n{fault}");
+            // Exact sizes of the prompt, the malformed chunk, and the whole body.
+            let lengths = [prompt.len(), malformed.len(), body.len()].map(|len| len.to_string());
+            let base = spawn_sse_mock_owned(body).await;
+            let capture = ThreadLogCapture::start();
+            let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
+                LlmProvider::Api {
+                    endpoint: format!("{base}/sse-path-canary?private=sse-query-canary"),
+                    api_key: key.to_owned(),
+                    model: "test-model".to_owned(),
+                },
+                vec![ChatMessage {
+                    role: "user".to_owned(),
+                    content: prompt.clone(),
+                }],
+                String::new(),
+                StreamParams::default(),
+            ));
+            let terminal = rx.recv().await.expect("terminal frame");
+            assert!(rx.recv().await.is_none());
+            let logs = render(&capture.finish());
+            assert!(
+                matches!(&terminal, TokenDelta::Error { message, full_text }
+                    if message == expected && full_text.is_empty()),
+                "{terminal:?}"
+            );
+            // The malformed chunk was logged, by diagnostic token only.
+            assert!(
+                logs.contains("Ignoring malformed SSE chunk: runtime/invalid_response"),
+                "{logs}"
+            );
+            let observed = format!("{terminal:?}\n{logs}");
+            assert_absent(
+                &observed,
+                &[
+                    key,
+                    "sse-prompt-canary",
+                    "sse-malformed-chunk-canary",
+                    "sse-provider-body-canary",
+                    "sse-request-canary",
+                    "sse-path-canary",
+                    "sse-query-canary",
+                ],
+            );
+            assert_absent(&observed, &lengths.each_ref().map(String::as_str));
+        }
     }
 
     #[tokio::test]
-    async fn provider_finish_reason_never_reaches_a_frame() {
+    async fn provider_finish_reason_never_reaches_a_frame_or_a_log() {
         use crate::llm::http_diag::canary::assert_absent;
+        use crate::test_log_capture::{ThreadLogCapture, render};
 
-        // A hostile value shaped like the consumer's own failure marker, a
-        // recognized value, then the hostile value again on the trailer.
+        // A chunk that does not parse, so the stream is known to log. Then a
+        // hostile value shaped like the consumer's own failure marker, a
+        // recognized value, and the hostile value again on the trailer.
         let base = spawn_sse_mock(concat!(
+            "data: {\"choices\":\"unparsed\"}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"kept \"},\"finish_reason\":\"error: finish-reason-canary\"}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"reply\"},\"finish_reason\":\"length\"}]}\n\n",
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error: finish-reason-canary\"}]}\n\n",
             "data: [DONE]\n\n",
         ))
         .await;
+        let capture = ThreadLogCapture::start();
         let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
             LlmProvider::Api {
                 endpoint: base,
@@ -1406,6 +1434,7 @@ mod tests {
         while let Some(frame) = rx.recv().await {
             frames.push(frame);
         }
+        let logs = render(&capture.finish());
 
         assert!(
             matches!(&frames[..], [
@@ -1417,7 +1446,12 @@ mod tests {
                 && full_text == "kept reply" && finish_reason == "unknown"),
             "{frames:?}"
         );
+        assert!(
+            logs.contains("Ignoring malformed SSE chunk: runtime/invalid_response"),
+            "{logs}"
+        );
         assert_absent(&format!("{frames:?}"), &["finish-reason-canary", "error:"]);
+        assert_absent(&logs, &["finish-reason-canary"]);
     }
 
     #[tokio::test]

@@ -856,7 +856,9 @@ mod tests {
     #[test]
     fn classify_construction_timeout_and_response_errors_without_formatting_sources() {
         use crate::llm::http_diag::canary::assert_absent;
+        use crate::test_log_capture::{ThreadLogCapture, render};
 
+        let capture = ThreadLogCapture::start();
         let source = || std::io::Error::other("sdk-source-canary prompt_bytes=7907");
         let cases = [
             (SdkError::construction_failure(source()), Code::Internal),
@@ -872,6 +874,8 @@ mod tests {
             assert_eq!(actual, diagnostic(code, INFERENCE));
             observed.push_str(&format!("{actual} {actual:?}\n"));
         }
+        // Nothing on this path logs today; the capture is for the day something does.
+        observed.push_str(&render(&capture.finish()));
         assert_absent(
             &observed,
             &["sdk-source-canary", "sdk-response-body-canary", "7907"],
@@ -879,11 +883,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdk_service_error_messages_and_metadata_never_reach_terminals() {
+    async fn sdk_service_error_messages_and_metadata_never_reach_terminals_or_logs() {
         use crate::llm::http_diag::canary::assert_absent;
+        use crate::test_log_capture::{ThreadLogCapture, render};
         use aws_sdk_bedrockruntime::error::ErrorMetadata;
         use aws_sdk_bedrockruntime::types::error::ThrottlingException;
 
+        let capture = ThreadLogCapture::start();
         let request_id = "bedrock-request-canary";
         let message = "sdk-message-canary aws-key-canary private-prompt-canary prompt_bytes=7919";
         let meta = ErrorMetadata::builder()
@@ -921,6 +927,8 @@ mod tests {
             assert_eq!(actual.to_string(), token, "status {status}");
             observed.push_str(&format!("{actual} {actual:?}\n"));
         }
+        // Nothing on this path logs today; the capture is for the day something does.
+        observed.push_str(&render(&capture.finish()));
         assert_absent(
             &observed,
             &[
