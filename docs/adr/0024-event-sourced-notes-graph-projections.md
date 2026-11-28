@@ -198,9 +198,25 @@ append, synchronization and descriptor retirement from ADR-0041. Qualified
 storage uses its platform barrier. Other writable storage can issue
 `SyncedUnqualified` after synchronization succeeds.
 
-Live writers and projection readers check the physical head frame before reusing a verified prefix. An in-place edit to earlier records that preserves the head frame can go undetected until the next full verification, an accepted limit because cooperating live writers append under the session lock and never edit a committed prefix in place.
+Live writers and projection readers verify the physical head frame at its
+recorded offset before reusing a prefix. An in-place edit to earlier bytes
+that leaves the head frame identical can escape detection until the next full
+verification, an accepted limit because cooperating writers only append
+under the session lock.
 
-The live projection writer retains decoded transcript revisions, their event IDs, prefix hashes and the latest spans for the session. It also retains speaker records once a patch needs them. These caches grow with the retained history and have no fixed memory cap. Separately, preparing a materialization clones the current Notes and Graph state, installing it copies the affected lane, and saving its snapshot serializes that lane. Those costs grow with the materialized content even when physical source verification reads only new records.
+The live projection writer retains decoded transcript revisions, event IDs,
+prefix hashes and the latest spans. It retains speaker records once a patch
+needs them. These caches grow with session history and have no fixed memory
+cap. In the Windows release fixture with 10,000 short transcript revisions and
+an empty projection log, loading the source proof grew the process working set
+by about 2.2 KiB per revision. The 568-byte inline record accounts for only
+part of that figure, which includes heap allocations and allocator residency.
+Real sessions vary with the length of their text, IDs and evidence.
+
+Preparing a materialization clones the current Notes and Graph state.
+Installation copies the affected lane and the snapshot writer serializes it.
+These costs grow with materialized content even when source verification
+reads only the previous head frame and newly appended records.
 
 Only a receipt permits the live lane to advance. The resulting cache includes
 the projection frame sequence and record hash. A cache write failure leaves
