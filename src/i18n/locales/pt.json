@@ -835,6 +835,7 @@
       "stale": "Esta transcrição pode estar desatualizada: a última atualização falhou. Mostrando a última cópia carregada.",
       "needsLoad": "Esta visualização precisa que a sessão seja carregada primeiro.",
       "loadSession": "Carregar sessão",
+      "staleView": "Esta visualização pode estar desatualizada: a última atualização falhou. Mostrando a última cópia carregada.",
       "viewUnavailable": "Não foi possível carregar esta sessão.",
       "emptyTranscript": "Esta sessão não tem transcrição."
     },

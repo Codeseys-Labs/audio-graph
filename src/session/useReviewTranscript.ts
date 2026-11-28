@@ -11,7 +11,7 @@
  *
  * It only ever reads `reviewStore`; nothing here touches the Live store.
  */
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useLayoutEffect, useMemo } from "react";
 import {
   type ReviewErrorCode,
   type ReviewSnapshot,
@@ -47,7 +47,10 @@ export function useReviewTranscript(
   const stale = useReviewStore((s) => s.stale);
   const error = useReviewStore((s) => s.error);
 
-  useEffect(() => {
+  // A layout effect, not a passive one: lens components below call
+  // `useReviewArtifact` in their own passive effects, and those must see the
+  // selection this effect makes (children's effects otherwise run first).
+  useLayoutEffect(() => {
     if (sessionId === null) return;
     void select(sessionId);
     const onFocus = () => void refresh();

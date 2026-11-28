@@ -20,7 +20,10 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
-import { useSessionView } from "../session/SessionViewProvider";
+import {
+  useReviewSessionId,
+  useSessionView,
+} from "../session/SessionViewProvider";
 import { useActiveGraphSnapshot } from "../session/useActiveGraphSnapshot";
 import { deferredProviderForLlmStart, useAudioGraphStore } from "../store";
 import type { GraphNode, MaterializedNote, ProjectionPatch } from "../types";
@@ -165,7 +168,12 @@ export default function NotesPanel({
   // Topics) and the Person-node participant fallback below must read the
   // same graph the Graph lens shows, once it's loaded one.
   const { snapshot: graph } = useActiveGraphSnapshot();
-  const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
+  // Synthesis reads the backend's current buffers, so it is blocked while a
+  // historical session is loaded into the global store. A Review pane shows
+  // its own session and offers no synthesis, so the note does not apply.
+  const globalLoadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
+  const loadedSessionId =
+    useReviewSessionId() === null ? globalLoadedSessionId : null;
   const loadSampleSessionPreview = useAudioGraphStore(
     (s) => s.loadSampleSessionPreview,
   );

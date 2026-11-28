@@ -30,7 +30,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
-import { useTranscriptView } from "../session/SessionViewProvider";
+import {
+  useSessionInteractions,
+  useTranscriptView,
+} from "../session/SessionViewProvider";
 import { useAudioGraphStore } from "../store";
 import {
   downloadAsFile,
@@ -92,10 +95,9 @@ function LiveTranscript() {
 
   // Cross-component seek request from the After seek-timeline
   // (audio-graph-3b3f): a bumped `nonce` re-fires the scroll even when the same
-  // segment is re-selected.
-  const transcriptSeekTarget = useAudioGraphStore(
-    (s) => s.transcriptSeekTarget,
-  );
+  // segment is re-selected. A Review pane reads the Review store's own
+  // target (written by its own Timeline lens) and holds no Live subscription.
+  const { transcriptSeekTarget } = useSessionInteractions();
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const wasNearBottomRef = useRef(true);

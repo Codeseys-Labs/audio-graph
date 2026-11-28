@@ -40,8 +40,10 @@
 import { Fragment, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
-import { useSessionView } from "../session/SessionViewProvider";
-import { useAudioGraphStore } from "../store";
+import {
+  useSessionInteractions,
+  useTimelineView,
+} from "../session/SessionViewProvider";
 import type { TimelineEntry } from "../types";
 import { formatTime } from "../utils/format";
 import Icon from "./Icon";
@@ -84,26 +86,19 @@ interface Lane {
 
 function SeekTimeline() {
   const { t } = useTranslation();
-  const { sessionTimeline: timeline } = useSessionView();
-  // Fold total BEFORE the backend's `limit` tail-cap (fix-round finding for
-  // seed audio-graph-4fa5 deliverable e): `timeline.length` alone can never
-  // again exceed `MAX_BLOCKS` once the backend tail-caps to that exact
-  // limit, so the "showing the last N of TOTAL" notice below needs this
-  // separate field to ever fire again. Falls back to `timeline.length` for
-  // the sample-preview's synthesized timeline (never truncated, so the two
-  // always agree there anyway).
-  const sessionTimelineTotalCount = useAudioGraphStore(
-    (s) => s.sessionTimelineTotalCount,
-  );
-  const loading = useAudioGraphStore((s) => s.sessionTimelineLoading);
-  const sessionTranscriptEvents = useAudioGraphStore(
-    (s) => s.sessionTranscriptEvents,
-  );
-  const speakers = useAudioGraphStore((s) => s.speakers);
-  const seekTranscriptToSegment = useAudioGraphStore(
-    (s) => s.seekTranscriptToSegment,
-  );
-  const focusGraphEdges = useAudioGraphStore((s) => s.focusGraphEdges);
+  // Timeline, fold total (BEFORE the backend's `limit` tail-cap, fix-round
+  // finding for seed audio-graph-4fa5 deliverable e: `timeline.length` alone
+  // can never again exceed `MAX_BLOCKS`, so the "showing the last N of TOTAL"
+  // notice needs it), loading flag, transcript events and speakers: Live from
+  // the global store, or a Review subtree's own query-backed data.
+  const {
+    timeline,
+    totalCount: sessionTimelineTotalCount,
+    loading,
+    transcriptEvents: sessionTranscriptEvents,
+    speakers,
+  } = useTimelineView();
+  const { seekTranscriptToSegment, focusGraphEdges } = useSessionInteractions();
 
   // Bridge the timeline's ASR `span_id` to the segment id the transcript list
   // renders (`transcript_segment_id` when present, else `span_id`).
