@@ -6160,11 +6160,12 @@ fn spawn_card_answer_stream_task(
                         log::warn!("speak-aloud append_delta failed: {}", e);
                     }
                     if channel_alive
-                        && let Err(e) = channel.send(events::ChatStreamFrame::Delta {
-                            request_id: request_id_for_task.clone(),
-                            delta: content,
-                            finish_reason,
-                        })
+                        && let Err(e) =
+                            channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Delta {
+                                request_id: request_id_for_task.clone(),
+                                delta: content,
+                                finish_reason,
+                            }))
                     {
                         log::warn!(
                             "card answer stream {}: delta channel send failed ({}); the frontend can no longer see this answer, but it will still be finalized and persisted when the terminal frame arrives",
@@ -6191,12 +6192,13 @@ fn spawn_card_answer_stream_task(
                     persist_llm_usage_for_session(&app, &ctx.session_id, tokens_used);
                     let total_tokens = (tokens_used > 0).then(|| u64::from(tokens_used));
                     if channel_alive
-                        && let Err(e) = channel.send(events::ChatStreamFrame::Done {
-                            request_id: request_id_for_task.clone(),
-                            full_text: full_text.clone(),
-                            finish_reason: finish_reason.clone(),
-                            usage,
-                        })
+                        && let Err(e) =
+                            channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Done {
+                                request_id: request_id_for_task.clone(),
+                                full_text: full_text.clone(),
+                                finish_reason: finish_reason.clone(),
+                                usage,
+                            }))
                     {
                         log::warn!(
                             "card answer stream {}: done channel send failed: {}",
@@ -6254,12 +6256,13 @@ fn spawn_card_answer_stream_task(
                         let _ = p.cancel();
                     }
                     if channel_alive
-                        && let Err(e) = channel.send(events::ChatStreamFrame::Done {
-                            request_id: request_id_for_task.clone(),
-                            full_text: full_text.clone(),
-                            finish_reason: "cancelled".to_string(),
-                            usage: None,
-                        })
+                        && let Err(e) =
+                            channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Done {
+                                request_id: request_id_for_task.clone(),
+                                full_text: full_text.clone(),
+                                finish_reason: "cancelled".to_string(),
+                                usage: None,
+                            }))
                     {
                         log::warn!(
                             "card answer stream {}: cancelled-done channel send failed: {}",
