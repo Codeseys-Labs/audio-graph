@@ -34,9 +34,11 @@
 //!   the whole frame as UTF-8. JSON token deltas are always whole UTF-8
 //!   strings so we don't split graphemes.
 
-use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeErrorCode as Code, RuntimeErrorDiagnostic,
+};
 
-use crate::llm::http_diag::{INFERENCE, diagnostic, status_code};
+use crate::llm::http_diag::{INFERENCE, diagnostic};
 pub use crate::llm::stream_contract::StreamUsage;
 
 /// Default maximum size for one buffered SSE frame before the decoder reports
@@ -232,11 +234,11 @@ fn fault_code(frame: &serde_json::Value) -> Code {
 /// An HTTP status (number or numeric string) or an allowlisted provider token.
 fn structured_code(value: &serde_json::Value) -> Option<Code> {
     if let Some(status) = value.as_u64() {
-        return u16::try_from(status).ok().and_then(status_code);
+        return u16::try_from(status).ok().and_then(status_category);
     }
     let token = value.as_str()?;
     if let Ok(status) = token.parse() {
-        return status_code(status);
+        return status_category(status);
     }
     Some(match token.to_ascii_lowercase().as_str() {
         "rate_limit"
@@ -260,6 +262,15 @@ fn structured_code(value: &serde_json::Value) -> Option<Code> {
         | "request_too_large" => Code::RequestRejected,
         _ => return None,
     })
+}
+
+/// The contract's category for an HTTP failure status a provider reported in a
+/// structured field. Nothing here says a credential was sent, so a 401 is an
+/// ordinary rejection.
+fn status_category(status: u16) -> Option<Code> {
+    (400..=599)
+        .contains(&status)
+        .then(|| RuntimeErrorDiagnostic::from_http_status(status, false, INFERENCE).code)
 }
 
 /// Find the first occurrence of `needle` in `haystack`. Linear scan; for the
@@ -459,6 +470,14 @@ mod tests {
             (
                 r#"{"error":{"code":429,"message":"server exploded"}}"#,
                 Code::RateLimited,
+            ),
+            (
+                r#"{"error":{"code":403,"message":"rate limit"}}"#,
+                Code::PermissionDenied,
+            ),
+            (
+                r#"{"error":{"code":401,"message":"rate limit"}}"#,
+                Code::RequestRejected,
             ),
             (
                 r#"{"error":{"code":"429","message":"timed out"}}"#,

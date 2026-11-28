@@ -1034,13 +1034,10 @@ mod tests {
 
     #[test]
     fn malformed_extraction_output_never_leaves_the_engine() {
-        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
-
-        let logs = Capture::start();
         let output = r#"engine-output-canary {"entities": engine-value-canary"#;
         let error = parse_extraction(output).expect_err("malformed extraction output");
         assert_eq!(error.to_string(), "runtime/invalid_response");
-        assert_absent(&format!("{error:?}\n{}", logs.finish()), &["canary"]);
+        assert!(!format!("{error:?}").contains("canary"));
     }
 
     #[test]

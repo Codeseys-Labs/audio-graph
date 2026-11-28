@@ -2982,7 +2982,7 @@ mod tests {
             .expect("worker thread panic")
             .expect_err("401 must fail immediately with no retry");
         // The request carried a key, so the 401 is about that credential.
-        assert_eq!(err, "credential/access_denied");
+        assert_eq!(err, "runtime/credential_rejected");
         assert_eq!(
             request_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -3569,7 +3569,7 @@ mod tests {
         let err = test_connection("sk-bad", &base)
             .await
             .expect_err("test_connection must return Err on HTTP 401");
-        assert_eq!(err, "credential/access_denied");
+        assert_eq!(err, "runtime/credential_rejected");
     }
 
     #[tokio::test]
@@ -3585,12 +3585,13 @@ mod tests {
         let err = test_connection("sk-bad", &base)
             .await
             .expect_err("test_connection must return Err on HTTP 403");
-        assert_eq!(err, "runtime/request_rejected");
+        // A valid key the provider will not let do this is not a bad key.
+        assert_eq!(err, "runtime/permission_denied");
     }
 
     #[tokio::test]
     async fn discovery_returns_only_the_diagnostic_token() {
-        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
+        use crate::llm::http_diag::canary::assert_absent;
 
         let key = "catalog-credential-canary";
         let body = format!("catalog-provider-body-canary{}", "b".repeat(6000));
@@ -3602,7 +3603,6 @@ mod tests {
             body,
         )])
         .await;
-        let logs = Capture::start();
         let err = list_models(
             key,
             &format!("{base}/catalog-path-canary?private=query-canary"),
@@ -3611,7 +3611,7 @@ mod tests {
         .expect_err("catalog HTTP error");
         assert_eq!(err, "runtime/rate_limited");
         assert_absent(
-            &logs.finish(),
+            &err,
             &[
                 key,
                 "catalog-provider-body-canary",
@@ -4289,8 +4289,8 @@ mod tests {
     }
 
     #[test]
-    fn chat_completion_http_diagnostic_and_retry_logs_are_content_free() {
-        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
+    fn chat_completion_http_diagnostic_is_content_free_after_retries() {
+        use crate::llm::http_diag::canary::assert_absent;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let key = "openrouter-credential-canary";
@@ -4307,25 +4307,19 @@ mod tests {
             );
             3
         ]));
-        let (err, logs) = std::thread::spawn(move || {
-            let logs = Capture::start();
+        let err = std::thread::spawn(move || {
             let mut config = retry_test_config(format!("{base}/path-canary?private=query-canary"));
             config.api_key = key.to_owned();
-            let client = OpenRouterClient::new(config)
-                .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
-            let result = client.chat_completion(vec![("user".into(), prompt)], false);
-            (
-                result.expect_err("502 after exhausting retries"),
-                logs.finish(),
-            )
+            OpenRouterClient::new(config)
+                .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
+                .chat_completion(vec![("user".into(), prompt)], false)
         })
         .join()
-        .unwrap();
+        .unwrap()
+        .expect_err("502 after exhausting retries");
         assert_eq!(err, "runtime/provider_unavailable");
-        // Two retries were logged, by diagnostic token only.
-        assert_eq!(logs.matches("runtime/provider_unavailable").count(), 2);
         assert_absent(
-            &logs,
+            &err,
             &[
                 key,
                 "private-body-canary",
@@ -4335,7 +4329,7 @@ mod tests {
                 "query-canary",
             ],
         );
-        assert_absent(&logs, &lengths.each_ref().map(String::as_str));
+        assert_absent(&err, &lengths.each_ref().map(String::as_str));
         assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 

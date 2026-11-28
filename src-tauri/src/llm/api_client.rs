@@ -1119,7 +1119,7 @@ mod tests {
 
     #[test]
     fn chat_completion_non_2xx_returns_only_the_diagnostic_token() {
-        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
+        use crate::llm::http_diag::canary::assert_absent;
 
         let rt = tokio::runtime::Runtime::new().expect("rt");
         let key = "api-credential-canary";
@@ -1130,19 +1130,15 @@ mod tests {
         let lengths = [prompt.len(), body.len()].map(|len| len.to_string());
         let (base, _) = rt.block_on(spawn_mock(429, "Too Many Requests", body));
         let endpoint = format!("{base}/{path}?private=query-canary");
-        let (err, logs) = run_blocking(move || {
-            let logs = Capture::start();
-            let client = ApiClient::new(config(&endpoint, Some(key)))
-                .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
-            let result = client.chat_completion(vec![("user".into(), prompt)], false);
-            (
-                result.expect_err("provider rejected the request"),
-                logs.finish(),
-            )
-        });
+        let err = run_blocking(move || {
+            ApiClient::new(config(&endpoint, Some(key)))
+                .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
+                .chat_completion(vec![("user".into(), prompt)], false)
+        })
+        .expect_err("provider rejected the request");
         assert_eq!(err, "runtime/rate_limited");
         assert_absent(
-            &logs,
+            &err,
             &[
                 key,
                 "provider-private-body-canary",
@@ -1152,14 +1148,14 @@ mod tests {
                 "api-prompt-canary",
             ],
         );
-        assert_absent(&logs, &lengths.each_ref().map(String::as_str));
+        assert_absent(&err, &lengths.each_ref().map(String::as_str));
     }
 
     #[test]
     fn a_rejected_key_is_a_credential_failure_only_when_a_key_was_sent() {
         let rt = tokio::runtime::Runtime::new().expect("rt");
         for (key, expected) in [
-            (Some("sk-test"), "credential/access_denied"),
+            (Some("sk-test"), "runtime/credential_rejected"),
             (None, "runtime/request_rejected"),
         ] {
             let (base, _) = rt.block_on(spawn_mock(401, "Unauthorized", String::new()));

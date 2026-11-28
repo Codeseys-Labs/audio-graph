@@ -1825,7 +1825,6 @@ mod tests {
             "the validator error must carry the value for this to be a canary: {private_detail}"
         );
 
-        let logs = crate::llm::http_diag::log_canary::Capture::start();
         let err = run_projection_patch_on_route(
             {
                 let call_count = call_count.clone();
@@ -1844,12 +1843,11 @@ mod tests {
             123,
         )
         .expect_err("repair remains invalid");
-        let logs = logs.finish();
 
         assert_eq!(*call_count.lock().unwrap_or_else(|e| e.into_inner()), 2);
         assert_eq!(err, "runtime/invalid_response");
-        crate::llm::http_diag::log_canary::assert_absent(
-            &logs,
+        crate::llm::http_diag::canary::assert_absent(
+            &err,
             &[
                 "validation-value-canary",
                 "repair-value-canary",

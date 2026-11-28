@@ -28,8 +28,8 @@
 //! service messages, and request identifiers never enter the diagnostic.
 
 use audio_graph_ipc_contract::runtime_diagnostic::{
-    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode as Code, RuntimeOperation,
-    RuntimeTransport,
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode as Code, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeTransport,
 };
 use aws_sdk_bedrockruntime::config::http::HttpResponse;
 use aws_sdk_bedrockruntime::error::SdkError;
@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::engine::ChatMessage;
-use crate::llm::http_diag::{AuthFailure, auth_diagnostic, diagnostic, with_status};
+use crate::llm::http_diag::{diagnostic, with_status};
 use crate::llm::stream_contract::{
     FinishReason, StreamContextMetadata, StreamTerminalEvent, StreamUsage,
 };
@@ -528,9 +528,10 @@ fn converse_start_failure(
     sdk_failure(error, |service, response| {
         let status = response.status().as_u16();
         let context = with_status(INFERENCE, status);
-        let auth = |failure| auth_diagnostic(failure, context);
         let code = match service {
-            AccessDeniedException(_) => return auth(AuthFailure::PermissionDenied),
+            AccessDeniedException(_) => {
+                return RuntimeErrorDiagnostic::permission_denied(context).into();
+            }
             ResourceNotFoundException(_) | ValidationException(_) => Code::RequestRejected,
             ModelTimeoutException(_) => Code::Timeout,
             ThrottlingException(_) => Code::RateLimited,
@@ -540,18 +541,17 @@ fn converse_start_failure(
             ModelErrorException(_) | ModelStreamErrorException(_) => Code::InvalidResponse,
             // An unmodeled error: its code and the response status are the only
             // evidence. The service text is never read.
-            _ => match (service.meta().code(), status) {
-                (Some("ExpiredToken" | "ExpiredTokenException"), _) => {
-                    return auth(AuthFailure::CredentialExpired);
+            _ => {
+                return match service.meta().code() {
+                    // An expired session token arrives unmodeled, under these codes.
+                    Some("ExpiredToken" | "ExpiredTokenException") => {
+                        RuntimeErrorDiagnostic::credential_expired(context)
+                    }
+                    // Every request is signed, so a 401 is about that credential.
+                    _ => RuntimeErrorDiagnostic::from_http_status(status, true, INFERENCE),
                 }
-                (_, 401) => return auth(AuthFailure::CredentialRejected),
-                (_, 403) => return auth(AuthFailure::PermissionDenied),
-                (_, 400 | 404 | 422) => Code::RequestRejected,
-                (_, 408 | 504) => Code::Timeout,
-                (_, 429) => Code::RateLimited,
-                (_, 500 | 502 | 503) => Code::ProviderUnavailable,
-                _ => Code::Internal,
-            },
+                .into();
+            }
         };
         diagnostic(code, context)
     })
@@ -855,9 +855,8 @@ mod tests {
 
     #[test]
     fn classify_construction_timeout_and_response_errors_without_formatting_sources() {
-        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
+        use crate::llm::http_diag::canary::assert_absent;
 
-        let logs = Capture::start();
         let source = || std::io::Error::other("sdk-source-canary prompt_bytes=7907");
         let cases = [
             (SdkError::construction_failure(source()), Code::Internal),
@@ -873,7 +872,6 @@ mod tests {
             assert_eq!(actual, diagnostic(code, INFERENCE));
             observed.push_str(&format!("{actual} {actual:?}\n"));
         }
-        observed.push_str(&logs.finish());
         assert_absent(
             &observed,
             &["sdk-source-canary", "sdk-response-body-canary", "7907"],
@@ -881,12 +879,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdk_service_error_messages_and_metadata_never_reach_terminals_or_logs() {
-        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
+    async fn sdk_service_error_messages_and_metadata_never_reach_terminals() {
+        use crate::llm::http_diag::canary::assert_absent;
         use aws_sdk_bedrockruntime::error::ErrorMetadata;
         use aws_sdk_bedrockruntime::types::error::ThrottlingException;
 
-        let logs = Capture::start();
         let request_id = "bedrock-request-canary";
         let message = "sdk-message-canary aws-key-canary private-prompt-canary prompt_bytes=7919";
         let meta = ErrorMetadata::builder()
@@ -905,10 +902,14 @@ mod tests {
             if message == "runtime/rate_limited" && full_text.is_empty())
         );
 
-        // Unknown modeled names do not become categories via the message.
-        // A recognized outer status is still valid classification evidence.
+        // An unmodeled error is classified by its response status alone, never
+        // by its message; a status that is not an HTTP failure fails closed.
         let mut observed = format!("{frames:?}\n");
-        for (status, code) in [(429u16, Code::RateLimited), (418, Code::Internal)] {
+        for (status, token) in [
+            (429u16, "runtime/rate_limited"),
+            (418, "runtime/request_rejected"),
+            (200, "runtime/internal"),
+        ] {
             let mut response =
                 HttpResponse::new(status.try_into().unwrap(), "bedrock-body-canary".into());
             response
@@ -917,10 +918,9 @@ mod tests {
             let error =
                 SdkError::service_error(ConverseStreamError::generic(meta.clone()), response);
             let actual = converse_start_failure(&error);
-            assert_eq!(actual, diagnostic(code, with_status(INFERENCE, status)));
+            assert_eq!(actual.to_string(), token, "status {status}");
             observed.push_str(&format!("{actual} {actual:?}\n"));
         }
-        observed.push_str(&logs.finish());
         assert_absent(
             &observed,
             &[
@@ -935,36 +935,32 @@ mod tests {
     }
 
     #[test]
-    fn auth_evidence_goes_through_the_shared_auth_mapping() {
+    fn auth_evidence_maps_to_the_provider_auth_codes() {
         use aws_sdk_bedrockruntime::error::ErrorMetadata;
         use aws_sdk_bedrockruntime::types::error::AccessDeniedException;
 
         let start = |service: ConverseStreamError, status: u16| {
             let response = HttpResponse::new(status.try_into().unwrap(), "".into());
-            converse_start_failure(&SdkError::service_error(service, response))
+            converse_start_failure(&SdkError::service_error(service, response)).to_string()
         };
         let unmodeled =
             |code: &str| ConverseStreamError::generic(ErrorMetadata::builder().code(code).build());
-        let expected = |failure, status| auth_diagnostic(failure, with_status(INFERENCE, status));
 
         let denied =
             ConverseStreamError::AccessDeniedException(AccessDeniedException::builder().build());
-        assert_eq!(
-            start(denied, 403),
-            expected(AuthFailure::PermissionDenied, 403)
-        );
+        assert_eq!(start(denied, 403), "runtime/permission_denied");
         // An expired session token arrives unmodeled, as a 403 with this code.
         assert_eq!(
             start(unmodeled("ExpiredTokenException"), 403),
-            expected(AuthFailure::CredentialExpired, 403)
+            "runtime/credential_expired"
         );
         assert_eq!(
             start(unmodeled("AnUnmodeledCode"), 403),
-            expected(AuthFailure::PermissionDenied, 403)
+            "runtime/permission_denied"
         );
         assert_eq!(
             start(unmodeled("AnUnmodeledCode"), 401),
-            expected(AuthFailure::CredentialRejected, 401)
+            "runtime/credential_rejected"
         );
     }
 

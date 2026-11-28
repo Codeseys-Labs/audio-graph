@@ -441,18 +441,34 @@ export function credentialSourceLabel(
 // (audio-graph-57cc)
 const CREDENTIAL_REJECTED_PREFIX = "Credential rejected (401):";
 
-// The closed diagnostic token a migrated probe returns as its whole message
-// when the provider answered 401 to a request that carried a key — today the
-// OpenRouter probe (`auth_diagnostic`, src-tauri/src/llm/http_diag.rs). It is
-// a token, so it is matched exactly, never as a prefix or substring. Probes
-// not yet migrated still send the legacy prefix above.
-const CREDENTIAL_REJECTED_TOKEN = "credential/access_denied";
+// The closed diagnostic tokens a migrated probe returns as its whole message
+// when the provider refused the caller's identity — `RuntimeErrorCode`
+// rendered as `runtime/<code>` (today the OpenRouter probe). A token is matched
+// exactly, never as a prefix or substring. Probes not yet migrated still send
+// the legacy prefix above.
+//
+// A 401 on a request that carried a key means the same thing as that prefix,
+// so it shares the dedicated "replace the key" copy.
+const CREDENTIAL_REJECTED_TOKEN = "runtime/credential_rejected";
 
 export function isCredentialRejectedReadinessMessage(message: string): boolean {
   return (
     message === CREDENTIAL_REJECTED_TOKEN ||
     message.startsWith(CREDENTIAL_REJECTED_PREFIX)
   );
+}
+
+// An expired credential or a valid one the provider will not let do this is
+// not fixed by replacing the key, so each gets the copy for its own cause.
+function providerAuthRecoveryKey(message: string) {
+  switch (message) {
+    case "runtime/credential_expired":
+      return "runtimeDiagnostics.runtime.credential_expired" as const;
+    case "runtime/permission_denied":
+      return "runtimeDiagnostics.runtime.permission_denied" as const;
+    default:
+      return null;
+  }
 }
 
 export function providerRecoveryAction(
@@ -463,13 +479,18 @@ export function providerRecoveryAction(
   switch (entry.status) {
     case "missing_credentials":
       return t("settings.providerReadiness.recovery.missingCredentials");
-    case "error":
+    case "error": {
       if (isCredentialRejectedReadinessMessage(entry.message)) {
         return t("settings.providerReadiness.recovery.credentialRejected");
+      }
+      const authRecoveryKey = providerAuthRecoveryKey(entry.message);
+      if (authRecoveryKey) {
+        return t(authRecoveryKey);
       }
       return hasPresentCredential(entry)
         ? t("settings.providerReadiness.recovery.errorWithCredentials")
         : t("settings.providerReadiness.recovery.errorWithoutCredentials");
+    }
     case "unchecked":
       if (!hasCredentialSlots(entry) || !hasPresentCredential(entry)) {
         return null;

@@ -337,32 +337,50 @@ describe("ProviderReadinessPanel", () => {
     // A migrated probe's whole message is the token. Anything that merely
     // contains it, or a different closed token, is not a rejected credential.
     expect(
-      isCredentialRejectedReadinessMessage("credential/access_denied"),
+      isCredentialRejectedReadinessMessage("runtime/credential_rejected"),
     ).toBe(true);
     for (const other of [
       "runtime/request_rejected",
-      "credential/missing",
-      "provider said credential/access_denied",
-      "credential/access_denied_elsewhere",
+      "runtime/permission_denied",
+      "credential/access_denied",
+      "provider said runtime/credential_rejected",
+      "runtime/credential_rejected_elsewhere",
     ]) {
       expect(isCredentialRejectedReadinessMessage(other)).toBe(false);
     }
   });
 
-  it("gives the closed credential-rejected token the dedicated recovery copy", () => {
-    const action = providerRecoveryAction(
-      readiness({
-        provider_id: "llm.openrouter",
-        status: "error",
-        message: "credential/access_denied",
-        credentials: [{ key: "openrouter_api_key", present: true }],
-      }),
-      t,
+  it("gives each closed provider-auth token the recovery copy for its cause", () => {
+    const recovery = (message: string) =>
+      providerRecoveryAction(
+        readiness({
+          provider_id: "llm.openrouter",
+          status: "error",
+          message,
+          credentials: [{ key: "openrouter_api_key", present: true }],
+        }),
+        t,
+      );
+    const generic = /replace the saved key or adjust provider settings/i;
+
+    expect(recovery("runtime/credential_rejected")).toMatch(
+      /rejected \(401\)/i,
     );
-    expect(action).toMatch(/rejected \(401\)/i);
-    expect(action).not.toMatch(
-      /replace the saved key or adjust provider settings/i,
+    // Replacing the key fixes neither an expired credential nor a valid key
+    // the provider will not let do this.
+    expect(recovery("runtime/credential_expired")).toMatch(/expired/i);
+    expect(recovery("runtime/permission_denied")).toMatch(
+      /account permissions or plan/i,
     );
+    for (const token of [
+      "runtime/credential_rejected",
+      "runtime/credential_expired",
+      "runtime/permission_denied",
+    ]) {
+      expect(recovery(token)).not.toMatch(generic);
+    }
+    // A generic rejection is not evidence about the credential.
+    expect(recovery("runtime/request_rejected")).toMatch(generic);
   });
 
   it("distinguishes a 401 credential rejection from a generic saved-key error", () => {

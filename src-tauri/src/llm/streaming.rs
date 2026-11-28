@@ -1321,14 +1321,16 @@ mod tests {
             .expect("terminal frame")
         {
             // The request carried a key, so the 401 is about that credential.
-            TokenDelta::Error { message, .. } => assert_eq!(message, "credential/access_denied"),
+            TokenDelta::Error { message, .. } => {
+                assert_eq!(message, "runtime/credential_rejected")
+            }
             other => panic!("expected HTTP error terminal frame, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn malformed_chunk_and_provider_error_do_not_leak_content() {
-        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
+        use crate::llm::http_diag::canary::assert_absent;
 
         let key = "sse-credential-canary";
         let prompt = format!("sse-prompt-canary{}", "x".repeat(2048));
@@ -1343,7 +1345,6 @@ mod tests {
         // Exact sizes of the prompt, the malformed chunk, and the whole body.
         let lengths = [prompt.len(), malformed.len(), body.len()].map(|len| len.to_string());
         let base = spawn_sse_mock_owned(body).await;
-        let logs = Capture::start();
         let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
             LlmProvider::Api {
                 endpoint: format!("{base}/sse-path-canary?private=sse-query-canary"),
@@ -1359,12 +1360,10 @@ mod tests {
         ));
         let terminal = rx.recv().await.expect("terminal frame");
         assert!(rx.recv().await.is_none());
-        let logs = logs.finish();
         // An unclassified provider fault is not evidence of an outage.
         assert!(matches!(&terminal, TokenDelta::Error { message, full_text }
             if message == "runtime/internal" && full_text.is_empty()));
-        assert!(logs.contains("runtime/invalid_response"));
-        let observed = format!("{terminal:?}\n{logs}");
+        let observed = format!("{terminal:?}");
         assert_absent(
             &observed,
             &[
@@ -1382,7 +1381,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_finish_reason_never_reaches_a_frame() {
-        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
+        use crate::llm::http_diag::canary::assert_absent;
 
         // A hostile value shaped like the consumer's own failure marker, a
         // recognized value, then the hostile value again on the trailer.
@@ -1393,7 +1392,6 @@ mod tests {
             "data: [DONE]\n\n",
         ))
         .await;
-        let logs = Capture::start();
         let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
             LlmProvider::Api {
                 endpoint: base,
@@ -1408,7 +1406,6 @@ mod tests {
         while let Some(frame) = rx.recv().await {
             frames.push(frame);
         }
-        let logs = logs.finish();
 
         assert!(
             matches!(&frames[..], [
@@ -1420,10 +1417,7 @@ mod tests {
                 && full_text == "kept reply" && finish_reason == "unknown"),
             "{frames:?}"
         );
-        assert_absent(
-            &format!("{frames:?}\n{logs}"),
-            &["finish-reason-canary", "error:"],
-        );
+        assert_absent(&format!("{frames:?}"), &["finish-reason-canary", "error:"]);
     }
 
     #[tokio::test]

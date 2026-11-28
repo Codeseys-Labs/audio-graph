@@ -78,11 +78,11 @@ const COMMAND_NOT_FOUND =
 
 const RATE_LIMIT = /\b429\b|rate.?limit|too many requests|quota exceeded/i;
 
-// `credential/access_denied` and `credential/missing` are the backend's closed
-// diagnostic tokens for a provider-rejected or absent key. They are matched as
-// whole tokens; the other alternatives are loose prose patterns.
+// The last two alternatives are the backend's closed diagnostic tokens for a
+// provider that refused the caller's identity and for an absent key. They are
+// matched as whole tokens; the alternatives before them are loose prose.
 const AUTH =
-  /\b401\b|\b403\b|unauthorized|forbidden|invalid api key|rejected the api key|authentication failed|access denied|missing credential|\bcredential\/(?:access_denied|missing)\b/i;
+  /\b401\b|\b403\b|unauthorized|forbidden|invalid api key|rejected the api key|authentication failed|access denied|missing credential|\bruntime\/(?:credential_rejected|credential_expired|permission_denied)\b|\bcredential\/missing\b/i;
 
 const NETWORK =
   /network|timeout|timed out|failed to fetch|econnrefused|enotfound|\bdns\b|offline|unreachable|connection (?:refused|reset|error)|could not connect/i;

@@ -32,9 +32,15 @@ describe("classifyError", () => {
     expect(classifyError("Invalid API key")).toBe("auth");
   });
 
-  it("classifies the closed credential diagnostic tokens as auth", () => {
-    expect(classifyError("credential/access_denied")).toBe("auth");
-    expect(classifyError("credential/missing")).toBe("auth");
+  it("classifies the closed provider-auth diagnostic tokens as auth", () => {
+    for (const token of [
+      "runtime/credential_rejected",
+      "runtime/credential_expired",
+      "runtime/permission_denied",
+      "credential/missing",
+    ]) {
+      expect(classifyError(token)).toBe("auth");
+    }
     // A generic provider rejection is not evidence of a bad credential.
     expect(classifyError("runtime/request_rejected")).toBe("unknown");
   });
