@@ -12157,13 +12157,22 @@ mod tests_status {
         use super::{
             PendingPublication, retire_transcript_publications, update_transcript_saving_status,
         };
-        let status = Arc::new(Mutex::new(PipelineStatus::default()));
+        let status = crate::status::StatusAuthority::detached();
+        status.record();
         let observed = status.clone();
         let held = PendingPublication::register(
             "orchard".into(),
             &projection_asr_payload("reed", 1, "leaf", true),
             move |receipt, _, id| {
-                update_transcript_saving_status(&mut observed.lock().unwrap(), id, &receipt)
+                observed
+                    .publish_if(|status| {
+                        update_transcript_saving_status(
+                            status.transcript_saving_mut(),
+                            id,
+                            &receipt,
+                        )
+                    })
+                    .is_some()
             },
         );
         retire_transcript_publications(&held.session, std::slice::from_ref(&held.event));
@@ -12171,10 +12180,11 @@ mod tests_status {
             Err(crate::persistence::canonical_log::TranscriptCommitError::ReplyLost),
             false,
         );
-        let status = status.lock().unwrap();
-        assert!(status.pending_transcript_saves.is_empty());
-        assert!(status.transcript_not_saving.is_none());
         assert!(!changed);
+        assert!(status.recorded().is_empty(), "nothing is published");
+        let saving = status.snapshot().transcript_saving().clone();
+        assert!(saving.pending_transcript_saves.is_empty());
+        assert!(saving.transcript_not_saving.is_none());
     }
 
     fn assemblyai_speaker_revision(
