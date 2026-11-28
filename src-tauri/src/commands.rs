@@ -3678,11 +3678,10 @@ fn llm_cancelled_diagnostic() -> RuntimeDiagnostic {
 /// panicked or was aborted) yields one `internal` [`TokenDelta::Error`]
 /// carrying the text streamed so far, so each consumer finalizes the call
 /// exactly once, as a failure, and never mistakes a cut-off stream for a
-/// reply. Nothing follows a terminal frame.
+/// reply. Consumers stop reading at the first terminal frame.
 struct LlmStreamFrames {
     rx: tokio::sync::mpsc::Receiver<crate::llm::streaming::TokenDelta>,
     streamed: String,
-    ended: bool,
 }
 
 impl LlmStreamFrames {
@@ -3690,24 +3689,19 @@ impl LlmStreamFrames {
         Self {
             rx,
             streamed: String::new(),
-            ended: false,
         }
     }
 
-    async fn next(&mut self) -> Option<crate::llm::streaming::TokenDelta> {
+    async fn next(&mut self) -> crate::llm::streaming::TokenDelta {
         use crate::llm::streaming::TokenDelta;
-        if self.ended {
-            return None;
-        }
         let frame = self.rx.recv().await.unwrap_or_else(|| TokenDelta::Error {
             diagnostic: llm_internal_diagnostic(),
             full_text: std::mem::take(&mut self.streamed),
         });
-        match &frame {
-            TokenDelta::Delta { content, .. } => self.streamed.push_str(content),
-            _ => self.ended = true,
+        if let TokenDelta::Delta { content, .. } = &frame {
+            self.streamed.push_str(content);
         }
-        Some(frame)
+        frame
     }
 }
 
@@ -3719,8 +3713,8 @@ async fn collect_chat_reply(
 ) -> Result<(String, u32), RuntimeDiagnostic> {
     use crate::llm::streaming::TokenDelta;
     let mut reply = String::new();
-    while let Some(frame) = frames.next().await {
-        match frame {
+    loop {
+        match frames.next().await {
             TokenDelta::Delta { content, .. } => reply.push_str(&content),
             TokenDelta::Done {
                 full_text, usage, ..
@@ -3737,7 +3731,6 @@ async fn collect_chat_reply(
             TokenDelta::Cancelled { .. } => return Err(llm_cancelled_diagnostic()),
         }
     }
-    Err(llm_internal_diagnostic())
 }
 
 /// Returns `true` when the active LLM provider has a streaming code path.
@@ -3935,8 +3928,8 @@ fn spawn_stream_task(
             };
 
         let mut frames = LlmStreamFrames::new(rx);
-        while let Some(frame) = frames.next().await {
-            match frame {
+        loop {
+            match frames.next().await {
                 TokenDelta::Delta {
                     content,
                     finish_reason,
@@ -5507,7 +5500,7 @@ fn evaluate_answer_spend_gate(
             return Some(Reason::Duplicate);
         }
     }
-    if !state.stream_registry.is_empty() {
+    if !state.stream_registry.is_empty() || state.card_answer_in_flight.load(Ordering::SeqCst) {
         return Some(Reason::Busy);
     }
     if auto {
@@ -5973,26 +5966,23 @@ fn build_assist_answer_terminal_event(
 /// abort or unwind the answer path (the answer itself, and its telemetry,
 /// still matter even if the audit row didn't persist) — same posture as
 /// `append_capture_lifecycle_movement_for`'s callers, which log and continue.
+/// The write error names the session's file path, so only a fixed message is
+/// logged.
 fn append_assist_answer_ledger_event(
     session_id: &str,
     event: &crate::persistence::DataMovementEvent,
 ) {
-    if let Err(err) =
-        FileMemoryRepository::user_data().append_data_movement_event(session_id, event)
+    if FileMemoryRepository::user_data()
+        .append_data_movement_event(session_id, event)
+        .is_err()
     {
-        log::warn!(
-            "Failed to append assist-answer movement ledger row: {}",
-            err
-        );
+        log::warn!("Failed to append an assist-answer movement ledger row");
     }
 }
 
 /// Everything `spawn_card_answer_stream_task` needs that isn't already a
 /// parameter of `spawn_stream_task` (which this function otherwise mirrors).
-/// Bundled into one struct rather than growing the parameter list further —
-/// `spawn_stream_task` itself already carries an
-/// `#[allow(clippy::too_many_arguments)]`; this avoids needing a second one
-/// with even more parameters.
+/// Bundled into one struct rather than growing the parameter list further.
 struct CardAnswerContext {
     session_id: String,
     card_id: String,
@@ -6006,6 +5996,27 @@ struct CardAnswerContext {
     provider_id_for_ledger: String,
     requires_cloud_transfer: bool,
     cloud_transfer_allowed: bool,
+}
+
+/// How one card-answer attempt ended: what [`finalize_card_answer`] persists,
+/// and the terminal frame sent once it has.
+struct CardAnswerTerminal {
+    status: events::CardAnswerStatus,
+    full_text: String,
+    finish_reason: Option<String>,
+    diagnostic: Option<RuntimeDiagnostic>,
+    total_tokens: Option<u64>,
+    frame: events::ChatStreamFrame,
+}
+
+/// Holds [`AppState::card_answer_in_flight`] for one card-answer attempt and
+/// releases it when dropped, including when the answer task panics.
+struct CardAnswerSlot(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CardAnswerSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Build, cap, and persist the `CardAnswer` on the stream's terminal frame
@@ -6067,16 +6078,16 @@ fn finalize_card_answer(
         Some(mut card) => {
             card.answer = Some(answer);
             card.updated_at_ms = unix_millis();
-            if let Err(err) =
-                FileMemoryRepository::user_data().upsert_live_assist_card(&ctx.session_id, &card)
+            // The write error names the session's file path, so only a fixed
+            // message is logged; a card that was not written is not announced.
+            match FileMemoryRepository::user_data().upsert_live_assist_card(&ctx.session_id, &card)
             {
-                log::warn!(
-                    "Failed to persist card answer for card_id={}: {}",
-                    ctx.card_id,
-                    err
-                );
+                Ok(()) => events::emit_or_log(app, events::AGENT_CARD_UPDATE, card),
+                Err(_) => log::warn!(
+                    "Failed to persist the answer for card_id={}",
+                    ctx.card_id
+                ),
             }
-            events::emit_or_log(app, events::AGENT_CARD_UPDATE, card);
         }
         None => {
             log::warn!(
@@ -6108,12 +6119,19 @@ fn finalize_card_answer(
 /// `state.stream_registry.cancel_all()` before registering (AUD-STR1 P1),
 /// which is exactly the hazard the ordered spend gate's `Busy` check exists
 /// to avoid — this function never cancels a prior stream; the gate's
-/// `stream_registry.is_empty()` check (evaluated by the caller before this
-/// function is reached) is the ENTIRE protection. Also never touches
+/// `stream_registry.is_empty()` and `card_answer_in_flight` checks
+/// (evaluated by the caller before this function is reached) are the ENTIRE
+/// protection. Also never touches
 /// `state.chat_history` (stateless, per `prepare_card_answer_request`'s doc
 /// comment) and forces `speak_aloud` off whenever `ctx.auto` is `true`
 /// (deliverable e) by simply never constructing a `SpeakAloudPipe` for the
 /// auto path.
+///
+/// The attempt holds `card_answer_in_flight` until its answer and terminal
+/// ledger row are written, and only then sends the terminal frame. A retry
+/// that frame prompts therefore starts after this attempt is durable, and
+/// this attempt can never overwrite it. A `stream_registry` entry alone
+/// cannot hold the slot: cancelling removes it before the task finalizes.
 #[allow(clippy::too_many_arguments)]
 fn spawn_card_answer_stream_task(
     app: tauri::AppHandle,
@@ -6151,6 +6169,8 @@ fn spawn_card_answer_stream_task(
     });
     let (rx, cancel) = stream_chat_with_request(request);
     state.stream_registry.register(request_id.clone(), cancel);
+    state.card_answer_in_flight.store(true, Ordering::SeqCst);
+    let slot = CardAnswerSlot(state.card_answer_in_flight.clone());
 
     let registry = state.stream_registry.clone();
     let request_id_for_task = request_id.clone();
@@ -6205,8 +6225,8 @@ fn spawn_card_answer_stream_task(
         let mut channel_alive = true;
 
         let mut frames = LlmStreamFrames::new(rx);
-        while let Some(frame) = frames.next().await {
-            match frame {
+        let terminal = loop {
+            match frames.next().await {
                 TokenDelta::Delta {
                     content,
                     finish_reason,
@@ -6247,33 +6267,19 @@ fn spawn_card_answer_stream_task(
                     }
                     let tokens_used = tokens_used_from_stream_usage(usage.clone());
                     persist_llm_usage_for_session(&app, &ctx.session_id, tokens_used);
-                    let total_tokens = (tokens_used > 0).then(|| u64::from(tokens_used));
-                    if channel_alive
-                        && let Err(e) =
-                            channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Done {
-                                request_id: request_id_for_task.clone(),
-                                full_text: full_text.clone(),
-                                finish_reason: finish_reason.clone(),
-                                usage,
-                            }))
-                    {
-                        log::warn!(
-                            "card answer stream {}: done channel send failed: {}",
-                            request_id_for_task,
-                            e
-                        );
-                    }
-                    registry.finish(&request_id_for_task);
-                    finalize_card_answer(
-                        &app,
-                        &ctx,
-                        events::CardAnswerStatus::Answered,
+                    break CardAnswerTerminal {
+                        frame: ChatStreamFrame::Stream(ChatStreamEvent::Done {
+                            request_id: request_id_for_task.clone(),
+                            full_text: full_text.clone(),
+                            finish_reason: finish_reason.clone(),
+                            usage,
+                        }),
+                        status: events::CardAnswerStatus::Answered,
                         full_text,
-                        Some(finish_reason).filter(|s| !s.is_empty()),
-                        None,
-                        total_tokens,
-                    );
-                    return;
+                        finish_reason: Some(finish_reason).filter(|s| !s.is_empty()),
+                        diagnostic: None,
+                        total_tokens: (tokens_used > 0).then(|| u64::from(tokens_used)),
+                    };
                 }
                 TokenDelta::Error {
                     diagnostic,
@@ -6283,76 +6289,59 @@ fn spawn_card_answer_stream_task(
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    if channel_alive
-                        && let Err(e) = channel.send(ChatStreamFrame::Failed {
+                    break CardAnswerTerminal {
+                        frame: ChatStreamFrame::Failed {
                             request_id: request_id_for_task.clone(),
                             full_text: full_text.clone(),
                             diagnostic: diagnostic.clone(),
-                        })
-                    {
-                        log::warn!(
-                            "card answer stream {}: failed-frame channel send failed: {}",
-                            request_id_for_task,
-                            e
-                        );
-                    }
-                    registry.finish(&request_id_for_task);
-                    finalize_card_answer(
-                        &app,
-                        &ctx,
-                        events::CardAnswerStatus::Failed,
+                        },
+                        status: events::CardAnswerStatus::Failed,
                         full_text,
-                        None,
-                        Some(diagnostic),
-                        None,
-                    );
-                    return;
+                        finish_reason: None,
+                        diagnostic: Some(diagnostic),
+                        total_tokens: None,
+                    };
                 }
                 TokenDelta::Cancelled { full_text } => {
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    if channel_alive
-                        && let Err(e) =
-                            channel.send(ChatStreamFrame::Stream(ChatStreamEvent::Done {
-                                request_id: request_id_for_task.clone(),
-                                full_text: full_text.clone(),
-                                finish_reason: "cancelled".to_string(),
-                                usage: None,
-                            }))
-                    {
-                        log::warn!(
-                            "card answer stream {}: cancelled-done channel send failed: {}",
-                            request_id_for_task,
-                            e
-                        );
-                    }
-                    registry.finish(&request_id_for_task);
-                    finalize_card_answer(
-                        &app,
-                        &ctx,
-                        events::CardAnswerStatus::Interrupted,
+                    break CardAnswerTerminal {
+                        frame: ChatStreamFrame::Stream(ChatStreamEvent::Done {
+                            request_id: request_id_for_task.clone(),
+                            full_text: full_text.clone(),
+                            finish_reason: "cancelled".to_string(),
+                            usage: None,
+                        }),
+                        status: events::CardAnswerStatus::Interrupted,
                         full_text,
-                        Some("cancelled".to_string()),
-                        None,
-                        None,
-                    );
-                    return;
+                        finish_reason: Some("cancelled".to_string()),
+                        diagnostic: None,
+                        total_tokens: None,
+                    };
                 }
             }
-        }
-        // Fix-round finding (adversarial review, minor): if the producer
-        // ends (adapter task panic, sender dropped) WITHOUT ever sending a
-        // terminal frame, every arm's own `registry.finish` above is
-        // unreached, and — because this path is deliberately
-        // refuse-not-cancel — the leaked entry would wedge the `Busy` gate
-        // for the rest of the session (neither `answer_question_card` nor
-        // `ask_question_card` can ever cancel it themselves). This is a
-        // no-op on every normal path: each reachable match arm above
-        // already calls `return` immediately after its own
-        // `registry.finish`, so this line only executes on the abnormal
-        // no-terminal-frame path.
+        };
+
+        // Persist, then free the slot, then tell the frontend.
+        finalize_card_answer(
+            &app,
+            &ctx,
+            terminal.status,
+            terminal.full_text,
+            terminal.finish_reason,
+            terminal.diagnostic,
+            terminal.total_tokens,
+        );
         registry.finish(&request_id_for_task);
+        drop(slot);
+        if channel_alive && let Err(e) = channel.send(terminal.frame) {
+            log::warn!(
+                "card answer stream {}: terminal channel send failed: {}",
+                request_id_for_task,
+                e
+            );
+        }
     });
 }
 
@@ -25574,49 +25563,6 @@ mod tests {
     }
 
     #[test]
-    fn spawn_card_answer_stream_task_finishes_the_registry_after_the_loop_as_a_leak_backstop() {
-        // Fix-round finding (adversarial review, minor): if the stream ends
-        // without ever sending a terminal frame (producer panic, sender
-        // dropped), every match arm's own `registry.finish` is unreached,
-        // and — because this path is refuse-not-cancel — the leaked entry
-        // would wedge the `Busy` gate for the rest of the session. Pins
-        // that a `registry.finish(&request_id_for_task)` call exists
-        // OUTSIDE (after) the `while` loop as a backstop, in addition to
-        // the 4 per-arm calls inside it (Delta no longer calls it at all
-        // post the channel-drop durability fix below; Done/Error/Cancelled
-        // each still call it once).
-        let source = include_str!("commands.rs");
-        let start = source
-            .find("fn spawn_card_answer_stream_task(")
-            .expect("spawn_card_answer_stream_task must exist");
-        let end = source[start..]
-            .find("/// Shared body of `answer_question_card`")
-            .map(|rel| start + rel)
-            .expect("answer_question_card_impl must follow spawn_card_answer_stream_task");
-        let body = &source[start..end];
-
-        let loop_end = body
-            .rfind("\n        }\n")
-            .expect("the while loop's closing brace must exist");
-        let after_loop = &body[loop_end..];
-        assert!(
-            after_loop.contains("registry.finish(&request_id_for_task);"),
-            "a backstop registry.finish must run after the while loop exits, \
-             for the no-terminal-frame case none of the match arms cover"
-        );
-
-        let finish_count = body
-            .matches("registry.finish(&request_id_for_task);")
-            .count();
-        assert_eq!(
-            finish_count, 4,
-            "expected exactly 4 registry.finish calls: Done + Error + Cancelled \
-             (one each) + the post-loop backstop — Delta intentionally does not \
-             call it (see the channel-drop durability test below)"
-        );
-    }
-
-    #[test]
     fn spawn_card_answer_stream_task_keeps_draining_after_a_dropped_delta_channel() {
         // Fix-round finding (adversarial review, minor): the Delta arm used
         // to `return` immediately when `channel.send` failed (frontend
@@ -27021,20 +26967,19 @@ mod tests {
             .expect("build a current-thread runtime");
         rt.block_on(async {
             // Every consumer reads one internal failure carrying the partial
-            // text, then nothing.
+            // text.
             let mut frames = frames_then_dropped_sender(vec![delta()]);
-            assert!(matches!(frames.next().await, Some(TokenDelta::Delta { .. })));
+            assert!(matches!(frames.next().await, TokenDelta::Delta { .. }));
             match frames.next().await {
-                Some(TokenDelta::Error {
+                TokenDelta::Error {
                     diagnostic,
                     full_text,
-                }) => {
+                } => {
                     assert_eq!(diagnostic, llm_internal_diagnostic());
                     assert_eq!(full_text, PARTIAL_REPLY);
                 }
                 other => panic!("expected the synthesized failure, got {other:?}"),
             }
-            assert!(frames.next().await.is_none());
 
             // The accumulating command reports it, and a cancellation, as an
             // error; only an explicit `Done` is a reply.
@@ -27137,6 +27082,151 @@ mod tests {
             vec![
                 crate::persistence::DataMovementEventType::ProviderCallStarted,
                 crate::persistence::DataMovementEventType::ProviderCallFailed,
+            ]
+        );
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    /// What the frontend could observe the moment a card answer's terminal
+    /// frame arrived.
+    #[derive(Debug, PartialEq)]
+    struct CardTerminalSnapshot {
+        event: String,
+        ledger: Vec<crate::persistence::DataMovementEventType>,
+        answer_status: Option<events::CardAnswerStatus>,
+        retry_admitted: bool,
+    }
+
+    /// A card-answer channel that, as its terminal frame arrives, records the
+    /// ledger, the persisted answer, and whether the gate would admit a
+    /// retry at that instant.
+    fn snapshotting_answer_channel(
+        state: &AppState,
+        session_id: &str,
+        card_id: &str,
+    ) -> (
+        tauri::ipc::Channel<events::ChatStreamFrame>,
+        std::sync::mpsc::Receiver<CardTerminalSnapshot>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let registry = state.stream_registry.clone();
+        let in_flight = state.card_answer_in_flight.clone();
+        let (session_id, card_id) = (session_id.to_string(), card_id.to_string());
+        let channel = tauri::ipc::Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                let frame: serde_json::Value = serde_json::from_str(&json).expect("frame JSON");
+                if frame["event"] != "delta" {
+                    let ledger = FileMemoryRepository::user_data()
+                        .load_data_movement_events(&session_id)
+                        .expect("load movement ledger")
+                        .iter()
+                        .map(|row| row.event_type)
+                        .collect();
+                    let answer_status = existing_live_assist_card(&session_id, &card_id)
+                        .and_then(|card| card.answer)
+                        .map(|answer| answer.status);
+                    let _ = tx.send(CardTerminalSnapshot {
+                        event: frame["event"].as_str().unwrap_or_default().to_string(),
+                        ledger,
+                        answer_status,
+                        retry_admitted: registry.is_empty() && !in_flight.load(Ordering::SeqCst),
+                    });
+                }
+            }
+            Ok(())
+        });
+        (channel, rx)
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_card_answer_terminal_frame_waits_until_the_attempt_is_durable() {
+        use crate::persistence::DataMovementEventType::{ProviderCallFailed, ProviderCallStarted};
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("card-answer-retry-during-finalize");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        let card_id = "retried-card";
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_id, &seed)
+            .expect("seed the card");
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        let snapshots = rt.block_on(async {
+            let mut snapshots = Vec::new();
+            // The retry is dispatched the moment the first attempt's terminal
+            // frame arrives, the earliest the frontend could offer it.
+            for _attempt in 0..2 {
+                point_state_at_mock_llm_provider(
+                    &state,
+                    spawn_raw_http_mock(http_500_response()).await,
+                );
+                let (channel, terminal) =
+                    snapshotting_answer_channel(&state, &session_id, card_id);
+                let dispatch = answer_question_card_impl(
+                    card_id.to_string(),
+                    false,
+                    channel,
+                    app_handle.clone(),
+                    &state,
+                )
+                .await
+                .expect("the dispatch call itself must not error");
+                assert!(matches!(dispatch, AnswerDispatch::Dispatched { .. }));
+                snapshots.push(
+                    tokio::task::spawn_blocking(move || {
+                        terminal
+                            .recv_timeout(Duration::from_secs(20))
+                            .expect("terminal frame in time")
+                    })
+                    .await
+                    .expect("join the frame wait"),
+                );
+            }
+            snapshots
+        });
+
+        let failed = Some(events::CardAnswerStatus::Failed);
+        assert_eq!(
+            snapshots,
+            vec![
+                CardTerminalSnapshot {
+                    event: "failed".to_string(),
+                    ledger: vec![ProviderCallStarted, ProviderCallFailed],
+                    answer_status: failed,
+                    retry_admitted: true,
+                },
+                CardTerminalSnapshot {
+                    event: "failed".to_string(),
+                    ledger: vec![
+                        ProviderCallStarted,
+                        ProviderCallFailed,
+                        ProviderCallStarted,
+                        ProviderCallFailed,
+                    ],
+                    answer_status: failed,
+                    retry_admitted: true,
+                },
             ]
         );
 

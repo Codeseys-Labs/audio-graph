@@ -318,6 +318,12 @@ pub struct AppState {
     /// "no auto-dispatch yet this session". Backs the `min_interval_secs`
     /// gate. Reset to 0 on session rotation.
     pub agent_auto_answer_last_dispatch_ms: Arc<AtomicU64>,
+    /// Set while a live-assist card answer streams or is being persisted.
+    /// The answer gate refuses a new dispatch as `Busy` while it is set, so a
+    /// retry cannot start before the previous attempt's terminal ledger row
+    /// and card write land. Unlike a `stream_registry` entry, cancelling the
+    /// stream does not clear it; the answer task does, once it has finished.
+    pub card_answer_in_flight: Arc<AtomicBool>,
 
     // ── Audio capture infrastructure ────────────────────────────────────
     /// The capture manager (behind Mutex because AudioCaptureManager has &mut self methods).
@@ -991,6 +997,7 @@ impl AppState {
             decision_shadow,
             agent_auto_answer_session_count: Arc::new(AtomicU64::new(0)),
             agent_auto_answer_last_dispatch_ms: Arc::new(AtomicU64::new(0)),
+            card_answer_in_flight: Arc::new(AtomicBool::new(false)),
             capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),
             pipeline_tx,
             pipeline_rx,

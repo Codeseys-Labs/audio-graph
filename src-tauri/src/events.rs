@@ -708,7 +708,8 @@ pub enum AnswerRefusalReason {
     /// responsibility, same posture as Q2's "FE admit additionally
     /// required for one release" — named, bounded, not smuggled.
     Converse,
-    /// `!state.stream_registry.is_empty()`. Refuse, never cancel — see this
+    /// `!state.stream_registry.is_empty()`, or a card answer still streaming
+    /// or persisting (`state.card_answer_in_flight`). Refuse, never cancel — see this
     /// enum's module-level note and `CardAnswerStatus::Interrupted`'s doc
     /// comment for why neither dispatch path ever calls `cancel_all`/`cancel`.
     Busy,
