@@ -9993,10 +9993,10 @@ struct SessionTranscriptSnapshot {
     events: Vec<crate::projections::TranscriptEvent>,
 }
 
-fn read_legacy_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, String> {
+fn capture_legacy_session_transcript(session_id: &str) -> Result<String, String> {
     let (path, _) = indexed_session_paths_resolve_only(session_id)?;
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(String::new());
     }
     // Byte ceiling (seed audio-graph-4fa5 fix round: this legacy fallback is
     // the OTHER branch of the same fork `read_session_transcript_snapshot`
@@ -10009,7 +10009,10 @@ fn read_legacy_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegm
     // same session.
     enforce_artifact_ceiling(&path, MAX_TRANSCRIPT_EVENTS_BYTES, "transcript_events")
         .map_err(|e| e.to_string())?;
-    let contents = std::fs::read_to_string(&path).map_err(|e| format!("{}", e))?;
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
+fn parse_legacy_session_transcript(contents: &str) -> Result<Vec<TranscriptSegment>, String> {
     let mut segments = Vec::new();
     for (line_index, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
@@ -10051,6 +10054,18 @@ fn read_admitted_session_transcript_snapshot(
     repository: &FileMemoryRepository,
     session_id: &str,
 ) -> Result<SessionTranscriptSnapshot, String> {
+    capture_admitted_transcript(repository, session_id)?.verify(session_id)
+}
+
+enum AdmittedTranscriptBytes {
+    Legacy(String),
+    Canonical(crate::persistence::canonical_log::CapturedTranscript),
+}
+
+fn capture_admitted_transcript(
+    repository: &FileMemoryRepository,
+    session_id: &str,
+) -> Result<AdmittedTranscriptBytes, String> {
     // The transcript is primary content: unlike supplementary artifacts in
     // Review, an oversized transcript cannot degrade to an empty result.
     enforce_artifact_ceiling(
@@ -10059,27 +10074,36 @@ fn read_admitted_session_transcript_snapshot(
         "transcript_events",
     )
     .map_err(|error| error.to_string())?;
-    match repository.load_transcript_event_stream(session_id)? {
-        crate::persistence::canonical_reader::StrictCanonicalRead::Missing => {
-            Ok(SessionTranscriptSnapshot {
-                transcript: read_legacy_session_transcript(session_id)?,
+    match repository.capture_transcript(session_id)? {
+        Some(bytes) => Ok(AdmittedTranscriptBytes::Canonical(bytes)),
+        None => capture_legacy_session_transcript(session_id).map(AdmittedTranscriptBytes::Legacy),
+    }
+}
+
+impl AdmittedTranscriptBytes {
+    fn verify(self, session_id: &str) -> Result<SessionTranscriptSnapshot, String> {
+        match self {
+            Self::Legacy(bytes) => Ok(SessionTranscriptSnapshot {
+                transcript: parse_legacy_session_transcript(&bytes)?,
                 events: Vec::new(),
-            })
-        }
-        crate::persistence::canonical_reader::StrictCanonicalRead::Present(snapshot) => {
-            let events: Vec<_> = snapshot
-                .records
-                .into_iter()
-                .map(|record| record.payload)
-                .collect();
-            let ledger = crate::projections::TranscriptLedger::replay(session_id, events.clone())
-                .map_err(|error| {
-                format!("Transcript replay failed for session {session_id}: {error:?}")
-            })?;
-            Ok(SessionTranscriptSnapshot {
-                transcript: crate::projections::derive_legacy_transcript_segments(&ledger),
-                events,
-            })
+            }),
+            Self::Canonical(bytes) => {
+                let snapshot = bytes.verify(session_id).map_err(|e| e.to_string())?;
+                let events: Vec<_> = snapshot
+                    .records
+                    .into_iter()
+                    .map(|record| record.payload)
+                    .collect();
+                let ledger =
+                    crate::projections::TranscriptLedger::replay(session_id, events.clone())
+                        .map_err(|error| {
+                            format!("Transcript replay failed for session {session_id}: {error:?}")
+                        })?;
+                Ok(SessionTranscriptSnapshot {
+                    transcript: crate::projections::derive_legacy_transcript_segments(&ledger),
+                    events,
+                })
+            }
         }
     }
 }
@@ -10657,13 +10681,16 @@ fn load_session_graph_artifact_for_admitted_session(
 }
 
 /// A portable export extends the legacy core wire shape only when the
-/// admitted session has control-plane evidence or residue to report.
+/// admitted session has control-plane or transcript recovery evidence to report.
 #[derive(Debug, serde::Serialize)]
 pub struct SessionExportWithControlPlane {
     #[serde(flatten)]
     core: SessionExportBundle,
     #[serde(skip_serializing_if = "Option::is_none")]
     control_plane: Option<crate::persistence::session_semantics::SessionControlPlaneExport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript_recovery:
+        Option<crate::persistence::canonical_log::transcript_export::TranscriptRecoveryExport>,
 }
 
 impl std::ops::Deref for SessionExportWithControlPlane {
@@ -10675,6 +10702,7 @@ impl std::ops::Deref for SessionExportWithControlPlane {
 }
 
 const CONTROL_PLANE_EXPORT_SCHEMA_VERSION: u32 = 2;
+const TRANSCRIPT_RECOVERY_EXPORT_SCHEMA_VERSION: u32 = 3;
 
 /// Assemble the portable session bundle, including available control evidence.
 /// Usage, scheduler, live-assist audit, and data-movement records remain outside
@@ -10736,7 +10764,13 @@ fn session_export_for_admitted_session(
     let (_transcript_path, graph_path) =
         crate::sessions::resolve_indexed_session_paths(data_root, session_id, metadata.as_ref())?;
     let repository = FileMemoryRepository::user_data();
-    let transcript_snapshot = read_admitted_session_transcript_snapshot(&repository, session_id)?;
+    let (transcript_snapshot, transcript_recovery) =
+        crate::persistence::canonical_log::transcript_export::read_for_export(
+            &crate::user_data::resolve_transcript_events_path(session_id)?,
+            MAX_TRANSCRIPT_EVENTS_BYTES,
+            || capture_admitted_transcript(&repository, session_id),
+        )?;
+    let transcript_snapshot = transcript_snapshot.verify(session_id)?;
     let transcript = transcript_snapshot.transcript;
     let transcript_events = transcript_snapshot.events;
 
@@ -10782,7 +10816,9 @@ fn session_export_for_admitted_session(
 
     let bundle = SessionExportWithControlPlane {
         core: SessionExportBundle {
-            schema_version: if control_plane.is_some() {
+            schema_version: if transcript_recovery.is_some() {
+                TRANSCRIPT_RECOVERY_EXPORT_SCHEMA_VERSION
+            } else if control_plane.is_some() {
                 CONTROL_PLANE_EXPORT_SCHEMA_VERSION
             } else {
                 SESSION_EXPORT_SCHEMA_VERSION
@@ -10798,7 +10834,12 @@ fn session_export_for_admitted_session(
             graph,
         },
         control_plane,
+        transcript_recovery,
     };
+    if bundle.transcript_recovery.is_some() {
+        log::info!("session_export_bundle transcript_recovery_evidence_included");
+        return Ok(bundle);
+    }
     let response_bytes = response_len_for_log(&bundle);
     let elapsed_ms = read_start.elapsed().as_millis();
     let log_line = format!(
@@ -15784,7 +15825,8 @@ mod tests {
         guard
             .as_ref()
             .expect("transcript event writer")
-            .append(event);
+            .append(event)
+            .expect("durable transcript event");
     }
 
     fn append_projection_patch(state: &AppState, patch: &crate::projections::ProjectionPatch) {
@@ -16187,7 +16229,8 @@ mod tests {
         let secret = "private-malformed-transcript";
         seed_malformed_legacy_transcript(session_id, secret);
 
-        let error = read_legacy_session_transcript(session_id)
+        let error = capture_legacy_session_transcript(session_id)
+            .and_then(|bytes| parse_legacy_session_transcript(&bytes))
             .expect_err("the shared legacy reader must reject incomplete content");
         assert!(!error.contains(secret), "legacy read error leaked content");
 
@@ -17788,6 +17831,78 @@ mod tests {
     }
 
     #[test]
+    fn export_transcript_recovery_carries_evidence_and_keeps_it_out_of_replay() {
+        use crate::test_log_capture::{ThreadLogCapture, render};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = unique_tempdir("transcript-recovery-export");
+        let _home = HomeGuard::set(&root);
+        let session = "orchard";
+        let source = crate::user_data::transcript_events_path(session).unwrap();
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let interrupted = uuid::Uuid::new_v4().to_string();
+        let descriptor = serde_json::to_vec(&serde_json::json!({
+            "attempt": attempt, "owner": uuid::Uuid::new_v4().to_string(), "after": null,
+            "base_len": 0, "source_was_absent": false, "frame_len": 10, "frame_hash": "a".repeat(64)
+        }))
+        .unwrap();
+        let gap = br#"{"stream":"transcript_revisions","after":null,"suffix_quarantined":true}"#;
+        std::fs::write(&source, b"tor").unwrap();
+        std::fs::write(source.with_added_extension("attempt"), &descriptor).unwrap();
+        std::fs::write(
+            source.with_added_extension(format!("{interrupted}.gap")),
+            gap,
+        )
+        .unwrap();
+        std::fs::write(
+            source.with_added_extension(format!("{interrupted}.quarantine")),
+            b"apple plum",
+        )
+        .unwrap();
+        std::fs::write(source.with_added_extension("attempt-lock"), b"").unwrap();
+        std::fs::write(source.with_added_extension("attempt-stage"), b"stage").unwrap();
+
+        let capture = ThreadLogCapture::start();
+        let bundle = session_export_bundle(session).unwrap();
+        let logs = render(&capture.finish());
+        assert!(logs.contains("transcript_recovery_evidence_included"));
+        assert!(!logs.contains("apple plum") && !logs.contains("response_bytes="));
+        assert_eq!(
+            bundle.schema_version,
+            TRANSCRIPT_RECOVERY_EXPORT_SCHEMA_VERSION
+        );
+        assert!(bundle.transcript_events.is_empty() && bundle.transcript.is_empty());
+        let json = serde_json::to_value(bundle).unwrap();
+        let recovery = &json["transcript_recovery"];
+        assert_eq!(
+            recovery["gaps"],
+            serde_json::json!([serde_json::from_slice::<serde_json::Value>(gap).unwrap()])
+        );
+        let evidence = recovery["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 3);
+        for (kind, bytes, id) in [
+            ("attempt", descriptor.as_slice(), None),
+            ("gap", &gap[..], Some(interrupted.as_str())),
+            ("quarantine", &b"apple plum"[..], Some(interrupted.as_str())),
+        ] {
+            let row = evidence.iter().find(|row| row["kind"] == kind).unwrap();
+            assert_eq!(
+                row.get("attempt_id").and_then(serde_json::Value::as_str),
+                id
+            );
+            assert_eq!(row["data_base64"], STANDARD.encode(bytes));
+        }
+        assert!(
+            source.with_added_extension("attempt").exists(),
+            "export is read-only"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn export_session_bundle_missing_session_errors() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
@@ -18429,6 +18544,93 @@ mod tests {
         // otherwise misbehave.
         warn_if_display_transcript_rows_missing_at_stop(&counter, "test-session");
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn writable_subst_storage_admits_capture_with_unverified_crash_safety() {
+        use std::process::Command;
+        struct Mapping(String);
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                let _ = Command::new("subst.exe").args([&self.0, "/D"]).output();
+            }
+        }
+        const CHILD: &str = "AUDIOGRAPH_TEST_WEAK_CAPTURE_SUBST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let state = AppState::new();
+            assert!(
+                state
+                    .transcript_event_writer
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .is_unqualified()
+            );
+            ensure_session_writers_ready(&state).expect("synced unqualified writer admits capture");
+            let receipt = state
+                .transcript_event_writer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .append_after(&transcript_event_fixture("leaf", "first"), Some(0))
+                .unwrap();
+            assert_eq!(receipt.sequence, 1);
+            assert_eq!(
+                receipt.barrier,
+                crate::persistence::canonical_durability::CanonicalDurabilityBarrier::SyncedUnqualified
+            );
+            assert!(
+                state
+                    .pipeline_status
+                    .read()
+                    .unwrap()
+                    .transcript_crash_safety_unverified
+            );
+            assert!(!*state.is_capturing.read().unwrap());
+            drain_test_writers(&state);
+            std::fs::write(
+                crate::user_data::data_root()
+                    .unwrap()
+                    .join("capture-admitted"),
+                b"ok",
+            )
+            .unwrap();
+            return;
+        }
+        let real = unique_tempdir("capture-subst");
+        let mapping = (b'D'..=b'Z')
+            .rev()
+            .find_map(|letter| {
+                let drive = format!("{}:", char::from(letter));
+                if std::path::Path::new(&format!("{drive}\\")).exists() {
+                    return None;
+                }
+                Command::new("subst.exe")
+                    .arg(&drive)
+                    .arg(&real)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+                    .then(|| Mapping(drive))
+            })
+            .expect("available drive for SUBST capture fixture");
+        let root = std::path::PathBuf::from(format!("{}\\", mapping.0));
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "commands::tests::writable_subst_storage_admits_capture_with_unverified_crash_safety","--nocapture"])
+            .env(CHILD, "1")
+            .env(crate::user_data::DATA_DIR_ENV, &root)
+            .env("HOME",&root)
+            .env("USERPROFILE",&root)
+            .status().unwrap();
+        let admitted = std::fs::read(real.join("capture-admitted")).ok();
+        drop(mapping);
+        std::fs::remove_dir_all(real).unwrap();
+        assert!(child.success(), "isolated capture preflight and receipt");
+        assert_eq!(admitted.as_deref(), Some(b"ok".as_slice()));
     }
 
     #[test]

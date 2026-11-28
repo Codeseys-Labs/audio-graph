@@ -306,7 +306,15 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
             transcript_writer: Arc::new(Mutex::new(None)),
             display_transcript_write_misses: Arc::new(AtomicU64::new(0)),
             retired_session_workers: Arc::new(Mutex::new(Vec::new())),
-            transcript_event_writer: Arc::new(Mutex::new(None)),
+            transcript_event_writer: Arc::new(Mutex::new(Some(
+                TranscriptEventWriter::repository(
+                    "test-session",
+                    Arc::new(crate::persistence::FileMemoryRepository::with_data_root(
+                        &models_dir,
+                    )),
+                )
+                .expect("fallback fixture needs a durable transcript writer"),
+            ))),
             transcript_ledger: Arc::new(Mutex::new(crate::projections::TranscriptLedger::new(
                 "test-session",
             ))),
