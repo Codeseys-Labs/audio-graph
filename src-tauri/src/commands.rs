@@ -18587,18 +18587,26 @@ mod tests {
             // The real handler takes AppHandle<Wry>, not MockRuntime. Isolate
             // its event loop from the shared Wry app used by other tests.
             let dir = unique_tempdir("provider-ipc");
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "commands::tests::provider_deferred_registered_ipc_matrix",
-                    "--exact",
-                    "--include-ignored",
-                    "--nocapture",
-                ])
-                .env(IPC_DIR, &dir)
-                .env(crate::user_data::DATA_DIR_ENV, &dir)
-                .env("XDG_CONFIG_HOME", &dir)
-                .spawn()
-                .expect("launch isolated Wry IPC test");
+            let mut child = {
+                // HomeGuard tests swap HOME/USERPROFILE under this lock. The
+                // child copies the environment at spawn and needs the real
+                // profile to resolve Tauri's config directory.
+                let _home = crate::sessions::TEST_HOME_LOCK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "commands::tests::provider_deferred_registered_ipc_matrix",
+                        "--exact",
+                        "--include-ignored",
+                        "--nocapture",
+                    ])
+                    .env(IPC_DIR, &dir)
+                    .env(crate::user_data::DATA_DIR_ENV, &dir)
+                    .env("XDG_CONFIG_HOME", &dir)
+                    .spawn()
+                    .expect("launch isolated Wry IPC test")
+            };
             // Bounds WebView startup, every invoke, and shutdown.
             let deadline = std::time::Instant::now() + Duration::from_secs(180);
             let status = loop {
