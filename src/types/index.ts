@@ -3043,10 +3043,12 @@ export interface ChatMessage {
 /**
  * A chat bubble. `failure` marks a failed turn: `content` is then partial
  * model output (possibly empty). The backend recorded no turn for it, so it
- * is never sent back to a provider.
+ * is never sent back to a provider. `turnId` is set only on a reply still
+ * in flight, so its stream updates that bubble and no other.
  */
 export interface ChatThreadMessage extends ChatMessage {
   failure?: RuntimeDiagnostic;
+  turnId?: string;
 }
 
 export interface ChatResponse {
@@ -3542,26 +3544,31 @@ export interface AudioGraphStore {
 
   /**
    * `request_id` of the streaming chat reply currently being assembled
-   * (plan A3 / ADR-0006). `null` when no stream is in flight; otherwise
-   * the last entry in `chatMessages` is the assistant placeholder being
-   * grown by `appendChatTokenDelta`.
+   * (plan A3 / ADR-0006). `null` when no stream is in flight.
    */
   streamingChatRequestId: string | null;
-  /** Append a token delta to the in-progress assistant message. */
-  appendChatTokenDelta: (event: ChatTokenDeltaEvent) => void;
   /**
-   * Finalize the in-progress assistant message: replace its content with
-   * `full_text` (which is authoritative — handles cases where the
-   * provider streamed token deltas and then revised them on the terminal
-   * chunk), clear `streamingChatRequestId`, and clear `isChatLoading`.
+   * Append a token delta to the in-progress assistant message with
+   * `turnId`. A delta whose message is gone is dropped.
    */
-  finalizeChatStream: (event: ChatTokenDoneEvent) => void;
+  appendChatTokenDelta: (event: ChatTokenDeltaEvent, turnId: string) => void;
   /**
-   * Mark the in-progress assistant message as a failed turn: its content
-   * becomes the partial `full_text`, and the diagnostic is normalized so a
-   * malformed payload renders the fixed internal copy.
+   * Finalize the in-progress assistant message with `turnId`: replace its
+   * content with `full_text` (which is authoritative — handles cases where
+   * the provider streamed token deltas and then revised them on the terminal
+   * chunk) and mark a cancelled reply, clear `streamingChatRequestId`, and
+   * clear `isChatLoading`.
    */
-  finalizeChatStreamFailure: (event: ChatStreamFailedEvent) => void;
+  finalizeChatStream: (event: ChatTokenDoneEvent, turnId: string) => void;
+  /**
+   * Mark the in-progress assistant message with `turnId` as a failed turn:
+   * its content becomes the partial `full_text`, and the diagnostic is
+   * normalized so a malformed payload renders the fixed internal copy.
+   */
+  finalizeChatStreamFailure: (
+    event: ChatStreamFailedEvent,
+    turnId: string,
+  ) => void;
 
   // ── Models ────────────────────────────────────────────────────────────
   models: ModelInfo[];

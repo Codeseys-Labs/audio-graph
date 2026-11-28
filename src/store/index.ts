@@ -239,6 +239,23 @@ function providerDeferredMessage(provider: ProviderDescriptor): string {
  */
 const CHAT_DELTA_THROTTLE_MS = CHAT_STREAM_DELTA_THROTTLE_MS;
 
+/** Source of the id that binds a chat reply's frames to its own placeholder. */
+let lastChatTurnId = 0;
+
+/**
+ * `messages` with the message carrying `turnId` replaced by `next`, or
+ * unchanged when that message is gone because the chat was cleared.
+ */
+function replaceChatTurn(
+  messages: ChatThreadMessage[],
+  turnId: string,
+  next: ChatThreadMessage,
+): ChatThreadMessage[] {
+  const index = messages.findIndex((m) => m.turnId === turnId);
+  if (index === -1) return messages;
+  return [...messages.slice(0, index), next, ...messages.slice(index + 1)];
+}
+
 // ── Answer-card commands (audio-graph-83cc T4) ────────────────────────────
 // T3 (the backend answer engine, `docs/agentic-runs/2026-08-24-83cc-design-
 // panel/synthesis-ticket-cut.md` §T3) is unlanded at the time these actions
@@ -3437,11 +3454,17 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // Optimistic user message + empty assistant placeholder for the
     // streaming reply to grow into. Channel `delta` frames append onto the
     // placeholder; finalizeChatStream replaces its content with the
-    // authoritative full_text from the `done` frame.
+    // authoritative full_text from the `done` frame. Every update targets the
+    // placeholder by `turnId`, so a message appended meanwhile (an approved
+    // proposal) is never overwritten, and a reply whose placeholder was
+    // cleared is dropped.
+    lastChatTurnId += 1;
+    const turnId = `chat-turn-${lastChatTurnId}`;
     const userMsg: ChatThreadMessage = { role: "user", content: message };
     const assistantPlaceholder: ChatThreadMessage = {
       role: "assistant",
       content: "",
+      turnId,
     };
     set((state) => ({
       chatMessages: [...state.chatMessages, userMsg, assistantPlaceholder],
@@ -3477,11 +3500,10 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       const finishReason = latestFinishReason;
       pendingDelta = "";
       latestFinishReason = undefined;
-      get().appendChatTokenDelta({
-        request_id: requestId,
-        delta,
-        finish_reason: finishReason,
-      });
+      get().appendChatTokenDelta(
+        { request_id: requestId, delta, finish_reason: finishReason },
+        turnId,
+      );
     };
     const scheduleFlush = () => {
       // Only start the timer once the id is armed; before that, deltas simply
@@ -3503,8 +3525,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // Drain queued deltas first so the assistant message reflects everything
       // received before finalizing with the authoritative full_text.
       drainNow();
-      if (current.event === "done") get().finalizeChatStream(current.data);
-      else get().finalizeChatStreamFailure(current.data);
+      if (current.event === "done")
+        get().finalizeChatStream(current.data, turnId);
+      else get().finalizeChatStreamFailure(current.data, turnId);
     };
 
     const channel = new Channel<ChatStreamEvent>();
@@ -3563,22 +3586,15 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       const response = await invoke<ChatResponse>("send_chat_message", {
         message,
       });
-      set((state) => {
-        // Replace the empty placeholder (last message) with the
-        // real assistant message. If the placeholder is no longer
-        // last (concurrent agent proposal etc.), append.
-        const last = state.chatMessages[state.chatMessages.length - 1];
-        const isPlaceholder =
-          last && last.role === "assistant" && last.content === "";
-        const trimmed = isPlaceholder
-          ? state.chatMessages.slice(0, -1)
-          : state.chatMessages;
-        return {
-          chatMessages: [...trimmed, response.message],
-          isChatLoading: false,
-          streamingChatRequestId: null,
-        };
-      });
+      set((state) => ({
+        chatMessages: replaceChatTurn(
+          state.chatMessages,
+          turnId,
+          response.message,
+        ),
+        isChatLoading: false,
+        streamingChatRequestId: null,
+      }));
     } catch (e) {
       // A failed LLM call rejects with the closed diagnostic; it renders
       // through the same failed-turn bubble as a failed stream.
@@ -3586,22 +3602,14 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       const errorMsg: ChatThreadMessage = diagnostic
         ? { role: "assistant", content: "", failure: diagnostic }
         : { role: "assistant", content: `Error: ${errorToMessage(e)}` };
-      set((state) => {
-        const last = state.chatMessages[state.chatMessages.length - 1];
-        const isPlaceholder =
-          last && last.role === "assistant" && last.content === "";
-        const trimmed = isPlaceholder
-          ? state.chatMessages.slice(0, -1)
-          : state.chatMessages;
-        return {
-          chatMessages: [...trimmed, errorMsg],
-          isChatLoading: false,
-          streamingChatRequestId: null,
-        };
-      });
+      set((state) => ({
+        chatMessages: replaceChatTurn(state.chatMessages, turnId, errorMsg),
+        isChatLoading: false,
+        streamingChatRequestId: null,
+      }));
     }
   },
-  appendChatTokenDelta: (event: ChatTokenDeltaEvent) => {
+  appendChatTokenDelta: (event: ChatTokenDeltaEvent, turnId: string) => {
     // Only apply deltas for the currently-tracked request id. The
     // channel-based sender in sendChatMessage only calls this once the id is
     // armed (it coalesces + holds leading frames until then), so a null or
@@ -3613,79 +3621,62 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       return;
     }
     set((state) => {
-      if (state.chatMessages.length === 0) return {};
-      const last = state.chatMessages[state.chatMessages.length - 1];
-      if (last.role !== "assistant") return {};
-      const updated: ChatMessage = {
-        ...last,
-        content: last.content + event.delta,
-      };
+      const target = state.chatMessages.find((m) => m.turnId === turnId);
+      if (!target) return {};
       return {
-        chatMessages: [...state.chatMessages.slice(0, -1), updated],
+        chatMessages: replaceChatTurn(state.chatMessages, turnId, {
+          ...target,
+          content: target.content + event.delta,
+        }),
       };
     });
   },
-  finalizeChatStream: (event: ChatTokenDoneEvent) => {
+  finalizeChatStream: (event: ChatTokenDoneEvent, turnId: string) => {
     const current = get().streamingChatRequestId;
     if (current !== null && current !== event.request_id) {
       return;
     }
     set((state) => {
-      if (state.chatMessages.length === 0) {
-        return {
-          isChatLoading: false,
-          streamingChatRequestId: null,
-        };
-      }
-      const last = state.chatMessages[state.chatMessages.length - 1];
-      if (last.role !== "assistant") {
-        return {
-          isChatLoading: false,
-          streamingChatRequestId: null,
-        };
-      }
       // Authoritative: replace whatever the deltas accumulated with
       // the final full_text. Handles two cases:
       //   1. The provider revised the reply on the terminal chunk.
       //   2. We dropped a delta event (network glitch, IPC backlog).
-      const finalContent =
-        event.finish_reason === "cancelled" && event.full_text === ""
-          ? `${last.content} [cancelled]`
+      // A cancelled reply is always marked, however much text it has.
+      const partial =
+        event.full_text ||
+        state.chatMessages.find((m) => m.turnId === turnId)?.content ||
+        "";
+      const content =
+        event.finish_reason === "cancelled"
+          ? `${partial} [cancelled]`.trimStart()
           : event.full_text;
-      const updated: ChatThreadMessage = { ...last, content: finalContent };
       return {
-        chatMessages: [...state.chatMessages.slice(0, -1), updated],
+        chatMessages: replaceChatTurn(state.chatMessages, turnId, {
+          role: "assistant",
+          content,
+        }),
         isChatLoading: false,
         streamingChatRequestId: null,
       };
     });
   },
-  finalizeChatStreamFailure: (event: ChatStreamFailedEvent) => {
+  finalizeChatStreamFailure: (event: ChatStreamFailedEvent, turnId: string) => {
     const current = get().streamingChatRequestId;
     if (current !== null && current !== event.request_id) {
       return;
     }
-    set((state) => {
-      if (state.chatMessages.at(-1)?.role !== "assistant") {
-        return {
-          isChatLoading: false,
-          streamingChatRequestId: null,
-        };
-      }
-      // A failed turn shows its partial text (if any) and the closed
-      // diagnostic. A malformed diagnostic normalizes to the fixed internal
-      // tuple, so no raw wire value ever reaches the bubble.
-      const updated: ChatThreadMessage = {
+    // A failed turn shows its partial text (if any) and the closed
+    // diagnostic. A malformed diagnostic normalizes to the fixed internal
+    // tuple, so no raw wire value ever reaches the bubble.
+    set((state) => ({
+      chatMessages: replaceChatTurn(state.chatMessages, turnId, {
         role: "assistant",
         content: event.full_text,
         failure: normalizeRuntimeDiagnostic(event.diagnostic),
-      };
-      return {
-        chatMessages: [...state.chatMessages.slice(0, -1), updated],
-        isChatLoading: false,
-        streamingChatRequestId: null,
-      };
-    });
+      }),
+      isChatLoading: false,
+      streamingChatRequestId: null,
+    }));
   },
   clearChatHistory: async () => {
     try {

@@ -3846,30 +3846,24 @@ describe("AudioGraphStore", () => {
     useAudioGraphStore.setState({
       chatMessages: [
         { role: "user", content: "What did Alice say?" },
-        { role: "assistant", content: "" },
+        { role: "assistant", content: "", turnId: "turn-1" },
       ],
       isChatLoading: true,
       streamingChatRequestId: "req-stream-1",
     });
 
-    useAudioGraphStore.getState().appendChatTokenDelta({
-      request_id: "req-stream-1",
-      delta: "Alice ",
-    });
-    useAudioGraphStore.getState().appendChatTokenDelta({
-      request_id: "req-stream-1",
-      delta: "said ",
-    });
-    useAudioGraphStore.getState().appendChatTokenDelta({
-      request_id: "req-stream-1",
-      delta: "hello.",
-    });
+    for (const delta of ["Alice ", "said ", "hello."]) {
+      useAudioGraphStore
+        .getState()
+        .appendChatTokenDelta({ request_id: "req-stream-1", delta }, "turn-1");
+    }
 
     const messages = useAudioGraphStore.getState().chatMessages;
     expect(messages).toHaveLength(2);
     expect(messages[1]).toEqual({
       role: "assistant",
       content: "Alice said hello.",
+      turnId: "turn-1",
     });
   });
 
@@ -4032,16 +4026,18 @@ describe("AudioGraphStore", () => {
     useAudioGraphStore.setState({
       chatMessages: [
         { role: "user", content: "ping" },
-        { role: "assistant", content: "" },
+        { role: "assistant", content: "", turnId: "turn-1" },
       ],
       isChatLoading: true,
       streamingChatRequestId: "active-req",
     });
 
-    useAudioGraphStore.getState().appendChatTokenDelta({
-      request_id: "stale-req",
-      delta: "should-not-appear",
-    });
+    useAudioGraphStore
+      .getState()
+      .appendChatTokenDelta(
+        { request_id: "stale-req", delta: "should-not-appear" },
+        "turn-1",
+      );
 
     const messages = useAudioGraphStore.getState().chatMessages;
     expect(messages[1].content).toBe("");
@@ -4051,17 +4047,20 @@ describe("AudioGraphStore", () => {
     useAudioGraphStore.setState({
       chatMessages: [
         { role: "user", content: "What time is it?" },
-        { role: "assistant", content: "It is " },
+        { role: "assistant", content: "It is ", turnId: "turn-final" },
       ],
       isChatLoading: true,
       streamingChatRequestId: "req-final",
     });
 
-    useAudioGraphStore.getState().finalizeChatStream({
-      request_id: "req-final",
-      full_text: "It is 3 o'clock.",
-      finish_reason: "stop",
-    });
+    useAudioGraphStore.getState().finalizeChatStream(
+      {
+        request_id: "req-final",
+        full_text: "It is 3 o'clock.",
+        finish_reason: "stop",
+      },
+      "turn-final",
+    );
 
     const s = useAudioGraphStore.getState();
     expect(s.isChatLoading).toBe(false);
@@ -4100,21 +4099,123 @@ describe("AudioGraphStore", () => {
     expect(JSON.stringify(s.chatMessages)).not.toContain("runtime/");
   });
 
+  /** Start a streaming reply, arm its id, then append a proposal message the
+   * way approveAgentProposal does, so the placeholder is no longer last. */
+  async function streamWithAProposalAppended(reqId: string) {
+    const { getChannel, resolveStart } = captureStreamChannel();
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    const channel = getChannel();
+    resolveStart(reqId);
+    await sendPromise;
+    useAudioGraphStore.setState((s) => ({
+      chatMessages: [...s.chatMessages, PROPOSAL_MESSAGE],
+    }));
+    return channel;
+  }
+  const PROPOSAL_MESSAGE = {
+    role: "assistant" as const,
+    content: "Approved agent proposal: Follow up",
+  };
+
+  it("lands a failure on the originating placeholder, not on a proposal message appended mid-stream", async () => {
+    const channel = await streamWithAProposalAppended("req-proposal-fail");
+    channel.onmessage?.({
+      event: "failed",
+      data: {
+        request_id: "req-proposal-fail",
+        full_text: "",
+        diagnostic: RATE_LIMITED_DIAGNOSTIC,
+      },
+    });
+
+    const messages = useAudioGraphStore.getState().chatMessages;
+    expect(messages.slice(-2)).toEqual([
+      { role: "assistant", content: "", failure: RATE_LIMITED_DIAGNOSTIC },
+      PROPOSAL_MESSAGE,
+    ]);
+  });
+
+  it("lands a reply on the originating placeholder, not on a proposal message appended mid-stream", async () => {
+    const channel = await streamWithAProposalAppended("req-proposal-done");
+    channel.onmessage?.({
+      event: "done",
+      data: {
+        request_id: "req-proposal-done",
+        full_text: "The reply",
+        finish_reason: "stop",
+      },
+    });
+
+    const messages = useAudioGraphStore.getState().chatMessages;
+    expect(messages.slice(-2)).toEqual([
+      { role: "assistant", content: "The reply" },
+      PROPOSAL_MESSAGE,
+    ]);
+  });
+
+  it("marks a cancelled reply even when it already has text", async () => {
+    const { getChannel, resolveStart } = captureStreamChannel();
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    const channel = getChannel();
+    resolveStart("req-cancel");
+    await sendPromise;
+    channel.onmessage?.({
+      event: "done",
+      data: {
+        request_id: "req-cancel",
+        full_text: "Half an answer",
+        finish_reason: "cancelled",
+      },
+    });
+
+    expect(useAudioGraphStore.getState().chatMessages.at(-1)).toEqual({
+      role: "assistant",
+      content: "Half an answer [cancelled]",
+    });
+  });
+
+  it("drops a reply whose placeholder was cleared mid-stream", async () => {
+    const { getChannel, resolveStart } = captureStreamChannel();
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    const channel = getChannel();
+    resolveStart("req-cleared");
+    await sendPromise;
+    useAudioGraphStore.setState({ chatMessages: [] });
+    channel.onmessage?.({
+      event: "done",
+      data: {
+        request_id: "req-cleared",
+        full_text: "A reply to a cleared question",
+        finish_reason: "stop",
+      },
+    });
+
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages).toEqual([]);
+    expect(s.isChatLoading).toBe(false);
+  });
+
   it("fails closed to the fixed internal diagnostic for a malformed failed frame", () => {
     useAudioGraphStore.setState({
       chatMessages: [
         { role: "user", content: "ping" },
-        { role: "assistant", content: "" },
+        { role: "assistant", content: "", turnId: "turn-bad" },
       ],
       isChatLoading: true,
       streamingChatRequestId: "req-bad",
     });
 
-    useAudioGraphStore.getState().finalizeChatStreamFailure({
-      request_id: "req-bad",
-      full_text: "",
-      diagnostic: { kind: "runtime", detail: { code: "runtime/leaked-text" } },
-    });
+    useAudioGraphStore.getState().finalizeChatStreamFailure(
+      {
+        request_id: "req-bad",
+        full_text: "",
+        diagnostic: {
+          kind: "runtime",
+          detail: { code: "runtime/leaked-text" },
+        },
+      },
+      "turn-bad",
+    );
 
     expect(useAudioGraphStore.getState().chatMessages.at(-1)?.failure).toEqual(
       SAFE_INTERNAL_RUNTIME_DIAGNOSTIC,
