@@ -83,12 +83,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the next request for that set rereads the authority, so it sees another
   process's recovery without a restart. Store-wide outcomes, a rolled-back
   journal met by a request for one set included, still need explicit
-  diagnosis. An open refused by contention (another program holding the
-  journal, another process holding the lock) is a retryable
-  `operation_in_progress` and leaves the runtime as it was. A commit
-  observed from another process, including one made while the runtime was
-  closed and found on reopen, now emits a content-free signal telling
-  consumers to take a fresh snapshot.
+  diagnosis, and an activation's cleanup or compensation never narrows a
+  store-wide failure or an unknown outcome to its set. Every write refuses a
+  record whose kind disagrees with the journal, as reads do. An open refused
+  by contention (another program holding the journal, another process
+  holding the lock) is a retryable `operation_in_progress` and leaves the
+  runtime as it was. A commit observed from another process, including one
+  found by a reopen through diagnosis or an ownership repair, now emits a
+  content-free signal telling consumers to drop resolved uses and take a
+  fresh snapshot.
 
 ### Fixed
 

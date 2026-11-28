@@ -56,14 +56,15 @@ fall back to v1 or to a plaintext store. One explicit, noninteractive repair
 request takes ownership of refused authority state where the platform allows
 it and removes native records the authority journal does not track; it
 reopens only after it changed an owner, and no ordinary operation runs any
-part of it. It changes only objects whose ownership refusal this process
-recorded, while their paths still reach the same objects. Every reopen,
-whichever route starts it, keeps what the runtime adopted: a service bound
-to another authority, or over a journal older than the highest epoch the
-runtime observed, is refused as recovery-required. The floor lives only in
-memory, so a restarted process accepts an older valid journal of the same
-authority; durable ordering evidence outside the journal is owed before any
-consumer cutover (#521).
+part of it. Explicit diagnosis and that ownership repair are the two routes
+that reopen a runtime. The repair changes only objects whose ownership
+refusal this process recorded, while their paths still reach the same
+objects. Every reopen, whichever route starts it, keeps what the runtime
+adopted: a service bound to another authority, or over a journal older than
+the highest epoch the runtime observed, is refused as recovery-required. The
+floor lives only in memory, so a restarted process accepts an older valid
+journal of the same authority; durable ordering evidence outside the journal
+is owed before any consumer cutover (#521).
 
 Every recovery-class refusal (`recovery_required`, `corrupt_record`,
 `unsupported_schema`, `ambiguous_match`) carries a closed scope, decided
@@ -71,16 +72,21 @@ where the service produces it. A store-scoped refusal concerns the authority
 itself or cannot be attributed to one set: a rolled-back or overflowing
 journal, a failed authority read. It closes the runtime, and explicit
 diagnosis is the only route back; it stays store-scoped when the request
-that met it named a set, whose id it then carries. A set-scoped refusal is
-decided from one set's own state, in a journal adopted from the authority
-under the lock, or from that set's own records. It leaves the runtime ready
-for every other set, and the next request for that set reads the
-authoritative journal and record under the lock again, so it sees another
-process's recovery without a reopen. Contention before any native change
-(another program holding the journal without sharing its read or delete,
-another process holding the lock) is neither: it is a retryable
-`operation_in_progress` for that request alone. It closes nothing, and an
-open it refuses leaves the runtime in the state it had before the attempt.
+that met it named a set, whose id it then carries. A path that settles or
+compensates an activation never narrows what it met: a store-level or
+store-scoped failure there closes the runtime and an unknown outcome
+stalls it, even while the activation itself concerns one set. A set-scoped
+refusal is decided from one set's own state, in a journal adopted from the
+authority under the lock, or from that set's own records, and every write
+refuses a record the read path would refuse, its kind as well as its
+revision. It leaves the runtime ready for every other set, and the next
+request for that set reads the authoritative journal and record under the
+lock again, so it sees another process's recovery without a reopen.
+Contention before any native change (another program holding the journal
+without sharing its read or delete, another process holding the lock) is
+neither: it is a retryable `operation_in_progress` for that request alone.
+It closes nothing, and an open it refuses leaves the runtime in the state it
+had before the attempt.
 
 The store's file state is built against one adversary: another local
 principal who can create, rename or replace entries in the store's
@@ -111,14 +117,21 @@ Atomic admission allows one live operation, not a backlog of mutations. An
 async deadline limits only the caller's wait: it neither cancels nor retries
 the worker call, and it does not release admission. The worker reconciles a
 late definite commit into the cache and emits its one content-free event before
-releasing admission. An epoch another process committed, which this process
-only observed in the authority journal, emits one content-free signal with no
-receipt and no set, telling consumers to take a fresh snapshot; so does a
-reopen that adopts a journal past the last epoch the runtime reported. An
-unverified commit is not success and emits no commit event. An unhandled
-dispatch panic latches a terminal stall; dispatch enters the crash handler's
-credential redaction scope before `catch_unwind` so the panic hook sees the
-same boundary as the caller.
+releasing admission. An epoch range another process committed, which this
+process only observed in the authority journal, emits one content-free
+signal with no receipt and no set, in epoch order with local events, once
+per observed range; so does every reopen that adopts a journal past the last
+epoch the runtime reported, whichever route started it. A consumer that
+receives it must drop every use it resolved and take a fresh snapshot. The
+sink runs on the worker before admission is released, so a slow sink holds
+admission; a sink that fails latches a terminal stall, and the signals that
+would have followed are never delivered or replayed. A consumer can rely on
+every signal it receives being in order and on a stalled runtime meaning
+that some may be missing: after a stall it takes a fresh snapshot once the
+process restarts. An unverified commit is not success and emits no commit
+event. An unhandled dispatch panic latches a terminal stall; dispatch enters
+the crash handler's credential redaction scope before `catch_unwind` so the
+panic hook sees the same boundary as the caller.
 
 ## Cutover and Consequences
 

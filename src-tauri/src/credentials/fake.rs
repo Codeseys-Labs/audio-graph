@@ -61,6 +61,9 @@ struct FakeCredentialState {
     calls: Vec<FakeStoreCall>,
     failures: Vec<(FakeStoreCall, usize, CredentialStoreFailure)>,
     corrupt_next_readback: bool,
+    /// A journal to put back as the persisted one right before a session
+    /// load, once this many more loads have passed.
+    restore_before_load: Option<(usize, AuthorityJournal)>,
 }
 
 impl FakeCredentialStore {
@@ -79,6 +82,7 @@ impl FakeCredentialStore {
                 calls: Vec::new(),
                 failures: Vec::new(),
                 corrupt_next_readback: false,
+                restore_before_load: None,
             }),
             entry_reads: AtomicUsize::new(0),
             active_writes: AtomicUsize::new(0),
@@ -167,6 +171,20 @@ impl FakeCredentialStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .journal = journal;
+    }
+
+    /// Puts `journal` back as the persisted journal right before the session
+    /// load that follows `loads_before` more loads, as another process's
+    /// restore between two sessions of one operation would.
+    pub(crate) fn restore_journal_before_load(
+        &self,
+        loads_before: usize,
+        journal: AuthorityJournal,
+    ) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .restore_before_load = Some((loads_before, journal));
     }
 
     /// Leaves a staging record for `operation_id` in `set_id` that no journal
@@ -321,6 +339,13 @@ impl Drop for FakeMutationSession<'_> {
 impl CredentialMutationSession for FakeMutationSession<'_> {
     fn load_journal(&mut self) -> Result<AuthorityJournal, CredentialStoreFailure> {
         self.state.record_call(FakeStoreCall::LoadJournal)?;
+        match self.state.restore_before_load.take() {
+            Some((0, journal)) => self.state.journal = journal,
+            Some((remaining, journal)) => {
+                self.state.restore_before_load = Some((remaining - 1, journal));
+            }
+            None => {}
+        }
         Ok(self.state.journal.clone())
     }
 
