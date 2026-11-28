@@ -494,6 +494,10 @@ impl ProjectionScheduler {
             return ProjectionSchedulerDecision::Idle;
         }
 
+        if !self.resume_gaps.is_empty() && self.in_flight.is_none() {
+            return self.take_resume_repair_at_basis(basis, now_ms);
+        }
+
         if let Some(in_flight) = self.in_flight.as_ref() {
             let in_flight_age_ms = now_ms.saturating_sub(in_flight.queued_at_ms);
             let queued_span_count = basis.covered_span_count();
@@ -519,6 +523,14 @@ impl ProjectionScheduler {
             };
         }
 
+        self.observe_idle_basis(basis, now_ms)
+    }
+
+    fn observe_idle_basis(
+        &mut self,
+        basis: ProjectionBasis,
+        now_ms: u64,
+    ) -> ProjectionSchedulerDecision {
         if self.last_completed_basis.as_ref() == Some(&basis) {
             return ProjectionSchedulerDecision::Idle;
         }
@@ -940,6 +952,7 @@ impl ProjectionScheduler {
     }
 
     /// Consume the outstanding gaps once for this capture, even at an already covered basis.
+    #[cfg(test)]
     fn take_resume_repair(
         &mut self,
         ledger: &TranscriptLedger,
@@ -951,7 +964,14 @@ impl ProjectionScheduler {
         {
             return ProjectionSchedulerDecision::Idle;
         }
-        let basis = ledger.current_projection_basis();
+        self.take_resume_repair_at_basis(ledger.current_projection_basis(), now_ms)
+    }
+
+    fn take_resume_repair_at_basis(
+        &mut self,
+        basis: ProjectionBasis,
+        now_ms: u64,
+    ) -> ProjectionSchedulerDecision {
         if basis.span_revisions.is_empty() {
             return ProjectionSchedulerDecision::Idle;
         }
@@ -1107,7 +1127,7 @@ pub struct ProjectionSchedulers {
     notes: ProjectionScheduler,
     graph: ProjectionScheduler,
     coverage_check: Option<std::sync::Arc<()>>,
-    observed_while_checking: bool,
+    observed_while_checking: Option<ProjectionBasis>,
 }
 
 impl ProjectionSchedulers {
@@ -1117,7 +1137,7 @@ impl ProjectionSchedulers {
             notes: ProjectionScheduler::new(session_id.clone(), ProjectionKind::Notes),
             graph: ProjectionScheduler::new(session_id, ProjectionKind::Graph),
             coverage_check: None,
-            observed_while_checking: false,
+            observed_while_checking: None,
         }
     }
 
@@ -1141,7 +1161,7 @@ impl ProjectionSchedulers {
         now_ms: u64,
     ) -> ProjectionSchedulersObservation {
         if self.coverage_check.is_some() {
-            self.observed_while_checking = true;
+            self.observed_while_checking = Some(ledger.current_projection_basis());
             return ProjectionSchedulersObservation {
                 notes: ProjectionSchedulerDecision::Idle,
                 graph: ProjectionSchedulerDecision::Idle,
@@ -1381,19 +1401,23 @@ impl ProjectionSchedulers {
         self.clear_orphaned_deferred_retries();
         self.notes.resume_gaps.clear();
         self.graph.resume_gaps.clear();
-        self.observed_while_checking = false;
+        self.observed_while_checking = None;
         let check = std::sync::Arc::new(());
         self.coverage_check = Some(check.clone());
         check
     }
 
     pub(crate) fn owns_coverage_check(&self, session: &str, check: &std::sync::Arc<()>) -> bool {
-        self.notes.session_id == session && self.coverage_check.as_ref().is_some_and(|active| std::sync::Arc::ptr_eq(active, check))
+        self.notes.session_id == session
+            && self
+                .coverage_check
+                .as_ref()
+                .is_some_and(|active| std::sync::Arc::ptr_eq(active, check))
     }
 
     pub(crate) fn cancel_coverage_check(&mut self) {
         self.coverage_check = None;
-        self.observed_while_checking = false;
+        self.observed_while_checking = None;
     }
 
     /// The capture starts only after old workers drain. While the check is
@@ -1401,25 +1425,45 @@ impl ProjectionSchedulers {
     pub(crate) fn finish_coverage_check(
         &mut self,
         heads: (Option<ProjectionBasis>, Option<ProjectionBasis>),
-        notes_gaps: &[String],
-        graph_gaps: &[String],
+        [notes_gaps, graph_gaps]: [Vec<String>; 2],
         verified: bool,
-    ) -> bool {
+        resume_basis: Option<ProjectionBasis>,
+        now_ms: u64,
+    ) -> ProjectionSchedulersObservation {
         self.coverage_check = None;
-        for (lane, head, gaps) in [(&mut self.notes, heads.0, notes_gaps), (&mut self.graph, heads.1, graph_gaps)] {
-            lane.last_completed_basis = head;
-            lane.resume_gaps = gaps.to_vec();
-            if !verified {
-                lane.last_failed_basis = None;
-                lane.failed_attempts = 0;
-                lane.deferred_retry_at_ms = None;
-                lane.pending_since_ms = None;
-                lane.in_flight = None;
-                lane.pending_basis = None;
-                lane.repair_job = None;
-            }
+        let observed = self.observed_while_checking.take();
+        let finish =
+            |lane: &mut ProjectionScheduler, head: Option<ProjectionBasis>, gaps: Vec<String>| {
+                lane.last_completed_basis = head;
+                lane.resume_gaps = gaps;
+                if !verified {
+                    lane.last_failed_basis = None;
+                    lane.failed_attempts = 0;
+                    lane.deferred_retry_at_ms = None;
+                    lane.pending_since_ms = None;
+                    lane.in_flight = None;
+                    lane.pending_basis = None;
+                    lane.repair_job = None;
+                }
+                if lane.in_flight.is_some() {
+                    return ProjectionSchedulerDecision::Idle;
+                }
+                if !lane.resume_gaps.is_empty()
+                    && let Some(basis) = observed.as_ref().or(resume_basis.as_ref())
+                {
+                    return lane.take_resume_repair_at_basis(basis.clone(), now_ms);
+                }
+                if let Some(basis) = &observed
+                    && !basis.span_revisions.is_empty()
+                {
+                    return lane.observe_idle_basis(basis.clone(), now_ms);
+                }
+                ProjectionSchedulerDecision::Idle
+            };
+        ProjectionSchedulersObservation {
+            notes: finish(&mut self.notes, heads.0, notes_gaps),
+            graph: finish(&mut self.graph, heads.1, graph_gaps),
         }
-        std::mem::take(&mut self.observed_while_checking)
     }
 
     /// Seed the live session from one read of its accepted patches and recovery gaps.
@@ -1441,6 +1485,7 @@ impl ProjectionSchedulers {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn take_capture_repairs(
         &mut self,
         ledger: &TranscriptLedger,

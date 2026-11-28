@@ -17,6 +17,10 @@ pub(crate) struct ProjectionRepairPlan {
 }
 
 impl ProjectionRepairPlan {
+    pub(crate) fn into_lanes(self) -> [Vec<String>; 2] {
+        [self.notes, self.graph]
+    }
+
     /// Exact gap identities observed when this lane's job starts. Only an
     /// accepted repair carries these as causal references in its frame.
     pub(crate) fn for_kind(&self, kind: &ProjectionKind) -> &[String] {

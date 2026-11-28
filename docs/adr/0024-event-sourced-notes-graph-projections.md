@@ -222,9 +222,13 @@ historical session. A lane that never ran has no coverage to report.
 
 Resuming capture can admit one repair per affected lane through the ordinary
 projection executor under current consent, routing and provider settings.
-The live coverage check is independent of the Review byte ceiling. If it
-cannot verify history, transcription starts, the live views are marked
-behind, and the scheduler skips gap repairs for that resume.
+Transcription starts with both live lanes marked behind. A background task
+verifies history independently of the Review byte ceiling. Only the same
+session and capture can accept its result. Stop or rotation invalidates it.
+On verification failure the lanes stay behind, the scheduler discards stale
+completion and failure state, and it skips gap repairs for that resume. New
+speech can schedule ordinary work, which still needs a verified source basis
+and a projection receipt before it advances the live lane.
 The accepted repair references the gap it covers. If the job fails, the gap
 remains visible. A previously captured session requires an explicit user
 action before its content can enter a model again.

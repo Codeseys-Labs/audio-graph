@@ -2859,7 +2859,7 @@ fn shared_to_transcript_context(
     llm_allow_cloud_fallbacks: bool,
     asr_provider: &'static str,
 ) -> TranscriptProcessingContext {
-    let ctx = TranscriptProcessingContext {
+    TranscriptProcessingContext {
         asr_provider,
         active_session_id: shared.active_session_id,
         transcript_buffer: shared.transcript_buffer,
@@ -2885,8 +2885,7 @@ fn shared_to_transcript_context(
         graph_snapshot: shared.graph_snapshot,
         pending_agent_proposals: shared.pending_agent_proposals,
         pending_extraction: Arc::new(Mutex::new(None)),
-    };
-    ctx
+    }
 }
 
 /// True means the caller should publish this revision's live side effects once.

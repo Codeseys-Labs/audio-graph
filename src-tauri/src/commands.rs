@@ -4,7 +4,7 @@
 //! They access `AppState` through Tauri's managed state.
 //!
 //! Heavy processing logic (speech, extraction) lives in the [`crate::speech`]
-//! module â€” this file only contains thin `#[tauri::command]` wrappers.
+//! module — this file only contains thin `#[tauri::command]` wrappers.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -43,15 +43,15 @@ use crate::state::{AppState, AudioSourceInfo, TranscriptSegment};
 
 /// Transcript-lens payload for a past session (seed audio-graph-4fa5
 /// deliverable a). `notes`, `materialized_graph`, and the raw
-/// `projection_events` log used to be bundled in here too â€” that bundle,
-/// materialized 3x (Rust structs â†’ Rust JSON `String` â†’ JS `JSON.parse`) on
+/// `projection_events` log used to be bundled in here too — that bundle,
+/// materialized 3x (Rust structs → Rust JSON `String` → JS `JSON.parse`) on
 /// the synchronous main thread, is what the seed audio-graph-4fa5 field
 /// report traced to a silent renderer-OOM/allocator-abort on a 208MB legacy
 /// session (figures below are drawn from that report, not from a file that
-/// ships in this tree â€” the seed record, not a repo path, is the source of
+/// ships in this tree — the seed record, not a repo path, is the source of
 /// truth for them). Those three artifacts now have their own commands
 /// (`load_session_notes_artifacts_cmd`, `load_session_graph_artifact_cmd`),
-/// each fetched only once its own lens activates â€” genuinely deferred for
+/// each fetched only once its own lens activates — genuinely deferred for
 /// the Graph lens (not the default-active one), but the Notes lens IS
 /// `SessionsBrowser`'s default (`useState<DetailLens>("notes")`), so in
 /// practice `load_session_notes_artifacts_cmd` fires immediately after most
@@ -74,7 +74,7 @@ pub struct LoadedSession {
     /// lets `joinSpeakerTimelineToTranscript` / `speakerAttributionIndex`
     /// resolve trusted (latest-wins) speaker attribution on a loaded session
     /// instead of silently falling back to the untrusted inline ASR labels
-    /// (audio-graph-0b33; ADR-0026 Â§3/Â§4). Missing log â†’ empty vec.
+    /// (audio-graph-0b33; ADR-0026 §3/§4). Missing log → empty vec.
     pub diarization_events: Vec<crate::projections::DiarizationSpanRevision>,
     pub live_assist_cards: Vec<crate::events::LiveAssistCardRecord>,
 }
@@ -84,7 +84,7 @@ pub struct LoadedSession {
 /// length BEFORE that cap. Without this, `SeekTimeline`'s "showing the last N
 /// of TOTAL utterances" notice could never fire once the backend started
 /// tail-capping to exactly the frontend's own render window
-/// (`TRANSCRIPT_WINDOW_SIZE`) â€” `entries.len()` alone can never again exceed
+/// (`TRANSCRIPT_WINDOW_SIZE`) — `entries.len()` alone can never again exceed
 /// what `SeekTimeline` shows, so it needs the pre-cap count from here.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionTimelineFold {
@@ -95,7 +95,7 @@ pub struct SessionTimelineFold {
 /// Notes-lens artifacts for a past session (seed audio-graph-4fa5 deliverable
 /// a): the materialized notes `NotesPanel` renders plus the raw
 /// projection-patch log it derives `noteRevisionCounts` from. Fetched only
-/// when the Notes lens activates â€” `load_session` no longer carries either.
+/// when the Notes lens activates — `load_session` no longer carries either.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionNotesArtifacts {
     #[serde(
@@ -110,15 +110,15 @@ pub struct SessionNotesArtifacts {
 /// Byte-size ceilings for the historical-session read path (seed
 /// audio-graph-4fa5, field round 5: an unbounded ~208MB `load_session`
 /// response killed the app). Each ceiling is checked with a single
-/// `fs::metadata` stat call â€” see [`enforce_artifact_ceiling`] â€” BEFORE the
+/// `fs::metadata` stat call — see [`enforce_artifact_ceiling`] — BEFORE the
 /// artifact is ever read into memory, so an oversized legacy artifact is
 /// never materialized even once, let alone the 3x the old bundled response
 /// paid for.
 ///
 /// Calibration: the field session that crashed the app carried a 2.1MB
-/// transcript event log (must keep loading â€” every ceiling below leaves it
+/// transcript event log (must keep loading — every ceiling below leaves it
 /// generous headroom) alongside a 156.6MB materialized graph, a 33.3MB
-/// projection-patch log, and a 19.1MB notes artifact â€” all three predate the
+/// projection-patch log, and a 19.1MB notes artifact — all three predate the
 /// artifact-size fix (seed audio-graph-cfa1: unbounded per-fact
 /// `basis.span_revisions` growth) and must refuse rather than load. Every
 /// ceiling here sits comfortably above realistic post-cfa1 artifact sizes
@@ -147,8 +147,8 @@ mod session_artifact_ceilings {
     /// Live-assist current-cards snapshot (`live_assist/<id>.current.json`),
     /// read by `load_session` on every open (fix-round finding: this artifact
     /// had no ceiling and no byte-count logging at all). No field-crash
-    /// measurement exists for this artifact the way the other five do â€” it
-    /// wasn't part of the incident that motivated this seed â€” so this
+    /// measurement exists for this artifact the way the other five do — it
+    /// wasn't part of the incident that motivated this seed — so this
     /// ceiling is defense-in-depth calibrated by analogy to
     /// `MAX_MATERIALIZED_NOTES_BYTES` (both are a JSON array of LLM-authored
     /// text growing with session length) rather than a field measurement.
@@ -158,7 +158,7 @@ mod session_artifact_ceilings {
     /// finding: this artifact had no ceiling either). Rows are compact
     /// (data class + boundary hop + provider/model id + hashed path, no
     /// payloads), so this ceiling is comfortably higher than the
-    /// text-artifact ceilings above â€” defense-in-depth, not a field
+    /// text-artifact ceilings above — defense-in-depth, not a field
     /// measurement, same caveat as `MAX_LIVE_ASSIST_CARDS_BYTES`.
     pub const MAX_DATA_MOVEMENT_EVENTS_BYTES: u64 = 16 * 1024 * 1024;
 }
@@ -169,12 +169,12 @@ use session_artifact_ceilings::{
 };
 
 /// Refuse to read `path` into memory when it exceeds `ceiling_bytes`. Stats
-/// the file only â€” never opens or reads its contents â€” so the check is O(1)
+/// the file only — never opens or reads its contents — so the check is O(1)
 /// regardless of artifact size; the entire point is to never call
 /// `fs::read_to_string` on a 156MB legacy graph (seed audio-graph-4fa5).
 ///
 /// A missing file is NOT a ceiling violation: every caller's existing
-/// "missing artifact â†’ empty/`None`" fallback still applies, so a session
+/// "missing artifact → empty/`None`" fallback still applies, so a session
 /// that never wrote this artifact is unaffected. `artifact_class` is a
 /// stable snake_case identifier the frontend keys its translated copy off of
 /// (never raw prose).
@@ -205,7 +205,7 @@ fn enforce_artifact_ceiling(
 /// Logging-only helper (seed audio-graph-6633 deliverable d) for artifacts
 /// whose ceiling check happens somewhere else in the call chain (e.g. the
 /// transcript event log, checked inside `read_session_transcript_snapshot`)
-/// â€” never used to gate a read, only to report a byte count.
+/// — never used to gate a read, only to report a byte count.
 fn artifact_len_for_log(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
@@ -220,7 +220,7 @@ const RESPONSE_SIZE_WARN_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
 /// Lets [`response_len_for_log`] measure a response's serialized size
 /// without allocating a second full copy of it (fix-round finding: this
 /// module's whole point is to stop materializing an artifact more times
-/// than necessary â€” `serde_json::to_string` for a logging-only byte count
+/// than necessary — `serde_json::to_string` for a logging-only byte count
 /// was doing exactly that, doubling peak Rust-side memory for
 /// `session_export_bundle` at the ceiling limits).
 struct CountingSink(usize);
@@ -236,7 +236,7 @@ impl std::io::Write for CountingSink {
 }
 
 /// Serialized byte length of `value`, or 0 if serialization fails. Logging
-/// only â€” never used to decide whether to send the response. Serializes
+/// only — never used to decide whether to send the response. Serializes
 /// into a counting sink (see [`CountingSink`]) rather than a `String`, so
 /// this never holds a second full copy of the response in memory.
 fn response_len_for_log<T: serde::Serialize>(value: &T) -> usize {
@@ -278,7 +278,7 @@ pub struct SessionExportBundle {
     /// Durable diarization / speaker-timeline span revisions
     /// (`transcripts/<id>.speaker.jsonl`).
     pub diarization_events: Vec<crate::projections::DiarizationSpanRevision>,
-    /// Projection event log â€” the accepted notes/graph patches
+    /// Projection event log — the accepted notes/graph patches
     /// (`projections/<id>.events.jsonl`).
     pub projection_events: Vec<crate::projections::ProjectionPatch>,
     /// Materialized notes artifact (`notes/<id>.json`), if present.
@@ -890,12 +890,12 @@ fn enforce_session_content_policy(
 /// Map a frontend source ID string to an rsac [`CaptureTarget`].
 ///
 /// Supported formats:
-/// - `"system"` / `"system-default"` â†’ `CaptureTarget::SystemDefault`
-/// - `"device:<device_id>"`      â†’ `CaptureTarget::Device(DeviceId(device_id))`
-/// - `"app:<pid>"`               â†’ `CaptureTarget::Application(ApplicationId(pid))`
-/// - `"tree:<pid>"` / `"process-tree:<pid>"` â†’ `CaptureTarget::ProcessTree(ProcessId(pid))`
-/// - `"name:<name>"` / `"app-name:<name>"` â†’ `CaptureTarget::ApplicationByName(name)`
-/// - `"{0.0.x...}"`              â†’ Windows MMDevice ID compatibility fallback
+/// - `"system"` / `"system-default"` → `CaptureTarget::SystemDefault`
+/// - `"device:<device_id>"`      → `CaptureTarget::Device(DeviceId(device_id))`
+/// - `"app:<pid>"`               → `CaptureTarget::Application(ApplicationId(pid))`
+/// - `"tree:<pid>"` / `"process-tree:<pid>"` → `CaptureTarget::ProcessTree(ProcessId(pid))`
+/// - `"name:<name>"` / `"app-name:<name>"` → `CaptureTarget::ApplicationByName(name)`
+/// - `"{0.0.x...}"`              → Windows MMDevice ID compatibility fallback
 fn parse_capture_target(source_id: &str) -> Result<rsac::CaptureTarget, String> {
     if source_id == "system" || source_id == "system-default" {
         Ok(rsac::CaptureTarget::SystemDefault)
@@ -1129,14 +1129,14 @@ fn ensure_session_workers_quiesced(state: &AppState) -> AppResult<()> {
 /// long enough for a realistic LLM round-trip (notes/graph patch generation)
 /// plus a materializer save to finish, short enough that a wedged provider
 /// call doesn't hang the Stop command indefinitely. A timed-out handle spills
-/// into `retired_workers` via `join_worker_with_timeout` â€” the SAME vec Start
+/// into `retired_workers` via `join_worker_with_timeout` — the SAME vec Start
 /// and New Session already fence rotation on, so no new fence logic is
 /// needed here.
 ///
-/// Tuning procedure: every drain logs `projection_job.flush elapsed_ms=â€¦` at
+/// Tuning procedure: every drain logs `projection_job.flush elapsed_ms=…` at
 /// INFO. After a couple of weeks of field data, grep for that key, compute
 /// p50/p95/p99 across real sessions, and set this constant to
-/// `p99 + ~1s safety margin`, documented with a "Chosen because: â€¦" comment
+/// `p99 + ~1s safety margin`, documented with a "Chosen because: …" comment
 /// (see `TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT` for the precedent).
 const PROJECTION_JOB_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -1145,8 +1145,8 @@ const PROJECTION_JOB_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// Loops taking snapshots of the registry (`std::mem::take`) rather than
 /// locking it for the whole drain, so a job's own self-deregistration (on the
 /// job's own thread, via its RAII guard) never contends with this loop. Each
-/// handle is joined through the existing [`join_worker_with_timeout`] idiom â€”
-/// same spill into `retired_workers` on timeout â€” wrapped with elapsed-time
+/// handle is joined through the existing [`join_worker_with_timeout`] idiom —
+/// same spill into `retired_workers` on timeout — wrapped with elapsed-time
 /// instrumentation under the `projection_job.flush` log key so the timeout
 /// above can be retuned from real data.
 ///
@@ -1161,7 +1161,7 @@ const PROJECTION_JOB_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// miss a late registration.
 ///
 /// `timeout` bounds the WHOLE drain (all passes, all handles), not each
-/// handle individually â€” a handle joined late in the drain gets whatever
+/// handle individually — a handle joined late in the drain gets whatever
 /// time remains before the shared deadline, not a fresh `timeout`. It is a
 /// parameter (not hard-coded to `PROJECTION_JOB_FLUSH_TIMEOUT` internally)
 /// purely so tests can exercise the timeout/spill branch on a millisecond
@@ -1241,7 +1241,7 @@ fn log_abandoned_deferred_retries_after_stop(
 /// Count-only detector for audio-graph-64e3 (field evidence: session
 /// c95d21e6, 6 finalized spans landed in the speaker ledger's
 /// `.speaker.jsonl` but never reached the display transcript's
-/// `<session>.jsonl` â€” no WARN fired anywhere).
+/// `<session>.jsonl` — no WARN fired anywhere).
 ///
 /// Reads-and-resets `AppState::display_transcript_write_misses`, which
 /// `emit_transcript_and_extract_with_meta` increments every time a final ASR
@@ -1251,14 +1251,14 @@ fn log_abandoned_deferred_retries_after_stop(
 /// `log_abandoned_deferred_retries_after_stop`): those joins are what give
 /// the deepgram receiver thread (and, transitively, this counter) a chance
 /// to reach its final value before Stop reports the session's tally. Logs
-/// session id and the row-count gap only â€” never transcript content.
+/// session id and the row-count gap only — never transcript content.
 ///
 /// Called from both `stop_capture_impl` and `stop_transcribe` (the two
 /// session-end transitions that join sp/asr through this same tail); NOT
 /// called from `rotate_session` (a rotation deliberately does not reset the
 /// counter) or from `lib.rs`'s `graceful_shutdown` (quit while transcribing
 /// clears the writer slot without ever joining sp/asr/receiver first, and
-/// without calling this function at all â€” a miss on that path is silently
+/// without calling this function at all — a miss on that path is silently
 /// carried forward and never reported until, if ever, capture resumes and
 /// later stops).
 ///
@@ -1266,7 +1266,7 @@ fn log_abandoned_deferred_retries_after_stop(
 /// STOP, not necessarily the session whose row actually went missing. A
 /// straggler that increments the counter after this read (e.g. a receiver
 /// still draining past its own bounded join, or one of the three ASR
-/// providers whose receiver handle is still fully detached â€” see the
+/// providers whose receiver handle is still fully detached — see the
 /// audio-graph-84e0 residual) has its miss reported at the NEXT stop, under
 /// the NEXT session's id, not the one that actually missed the row. A grep
 /// for this WARN's `session_id=` should be read as "reported at this
@@ -1333,7 +1333,7 @@ fn unregister_runtime_processed_audio_consumer(
 /// `start_converse` without an intervening `stop_converse` therefore passes the
 /// `is_converse_active` guard (false) but then hits the historical
 /// `if handle.is_none()` spawn-gate as FALSE (a stale *finished* handle is still
-/// `Some`) and silently skips spawning the sender â€” no audio, no error.
+/// `Some`) and silently skips spawning the sender — no audio, no error.
 ///
 /// This reaps such a finished handle (joining it so any panic is logged) and
 /// returns `Ok(())` so the caller respawns. If the handle is still running it is
@@ -1354,7 +1354,7 @@ fn reap_finished_handle(
             }
             Ok(())
         } else {
-            // Genuinely still running â€” put it back and refuse to double-spawn.
+            // Genuinely still running — put it back and refuse to double-spawn.
             *slot = Some(handle);
             Err(AppError::SessionInvalid {
                 reason: format!("{name} is already running"),
@@ -2312,7 +2312,7 @@ async fn start_capture_impl(
     // Resolve the user-configured capture format from the in-memory settings
     // cache, falling back to defaults if the cache is uninitialised or the
     // persisted values are out of the supported whitelist. This is the
-    // "wiring through" that Task #79 is about â€” without it the capture
+    // "wiring through" that Task #79 is about — without it the capture
     // thread would always use the hard-coded 48 kHz / stereo.
     let (capture_sample_rate, capture_channels) = {
         let audio_settings = state
@@ -2550,11 +2550,15 @@ async fn stop_capture_impl(
         // ADR-0045 decision 4 (drain half, audio-graph-9cc1): flag first, then
         // join sp/asr so no new final ASR revision can dispatch another
         // projection job after this point, then drain every projection job
-        // thread (Notes and Graph) still registered â€” a graph-lane job can
+        // thread (Notes and Graph) still registered — a graph-lane job can
         // otherwise run arbitrarily long past Stop, since the graph lane's
         // backlog is unbounded by design during continuous speech.
         state.projection_lane_stopping.store(true, Ordering::SeqCst);
-        state.projection_schedulers.lock().unwrap_or_else(|p| p.into_inner()).cancel_coverage_check();
+        state
+            .projection_schedulers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel_coverage_check();
         let projection_job_workers = state.projection_job_workers.clone();
         let projection_schedulers = state.projection_schedulers.clone();
         let display_transcript_write_misses = state.display_transcript_write_misses.clone();
@@ -2581,13 +2585,13 @@ async fn stop_capture_impl(
                 PROJECTION_JOB_FLUSH_TIMEOUT,
                 &retired_speech_workers,
             );
-            // audio-graph-fa56: MUST run strictly after the drain above â€”
+            // audio-graph-fa56: MUST run strictly after the drain above —
             // see `log_abandoned_deferred_retries_after_stop`'s doc for why
             // that ordering is what makes a still-armed
             // `deferred_retry_at_ms` mean "abandoned" rather than "clock
             // still running".
             log_abandoned_deferred_retries_after_stop(&projection_schedulers, &stop_session_id);
-            // audio-graph-64e3: same ordering requirement as the call above â€”
+            // audio-graph-64e3: same ordering requirement as the call above —
             // must run strictly after the sp/asr joins so a still-draining
             // deepgram receiver has already had its bounded chance to catch
             // up before this reads the tally.
@@ -2720,7 +2724,7 @@ async fn stop_capture_impl(
 /// state are all driven from here whenever the store's `isCapturing` or elapsed
 /// counter changes.
 ///
-/// `elapsed_secs` is a bare wall-clock second count â€” the tray formats it into a
+/// `elapsed_secs` is a bare wall-clock second count — the tray formats it into a
 /// `M:SS` / `H:MM:SS` tooltip and NEVER receives or renders any captured
 /// content (transcript text, note bodies, speaker labels, meeting titles) per
 /// the UX-review privacy constraint.
@@ -2747,7 +2751,7 @@ pub fn update_tray_capturing(
 /// actionable error instead of blowing up inside the EventStream handshake.
 ///
 /// Returns `Ok(())` on success (identity resolved) or an error string on any
-/// failure â€” credentials missing, expired, wrong region, network blocked, etc.
+/// failure — credentials missing, expired, wrong region, network blocked, etc.
 /// Callers are expected to wrap this in a `tokio::time::timeout`.
 async fn aws_preflight_probe(
     region: String,
@@ -2759,7 +2763,7 @@ async fn aws_preflight_probe(
         credential_source,
         crate::settings::AwsCredentialSource::AccessKeys { .. }
     ) {
-        return Err("aws_preflight_probe called with AccessKeys â€” caller bug".to_string());
+        return Err("aws_preflight_probe called with AccessKeys — caller bug".to_string());
     }
     let sdk_config = crate::aws_util::build_aws_sdk_config(&region, credential_source).await?;
     let sts = aws_sdk_sts::Client::new(&sdk_config);
@@ -2792,7 +2796,7 @@ fn acknowledged_transcription_sources(state: &AppState) -> AppResult<Vec<String>
     })
 }
 
-/// Start transcription (streaming processed audio â†’ ASR).
+/// Start transcription (streaming processed audio → ASR).
 ///
 /// Requires capture to already be running. Spawns a speech processor thread
 /// that reads from the processed audio channel (pipeline output), accumulates
@@ -2822,7 +2826,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     // spawning the speech processor. Without these checks the processor thread
     // would try to load the model / reach the API, fail, and exit silently,
     // leaving the user staring at a UI with no feedback. Returning an Err here
-    // surfaces to the frontend as a promise rejection â†’ the existing error
+    // surfaces to the frontend as a promise rejection → the existing error
     // toast displays the message.
     {
         let mut asr_provider = settings.asr_provider.clone();
@@ -2950,7 +2954,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                 //
                 // Bounded to 5s: on a healthy machine with creds, STS responds
                 // in <200ms. If it takes longer, the user's network is bad
-                // enough that mid-stream failures are likely anyway â€” better
+                // enough that mid-stream failures are likely anyway — better
                 // to fail fast in pre-flight than stall capture.
                 if !matches!(
                     credential_source,
@@ -2977,7 +2981,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                                 },
                             );
                             return Err(AppError::Unknown(format!(
-                                "AWS credential pre-flight failed: {}. Open Settings â†’ ASR â†’ AWS Transcribe â†’ Test Connection to diagnose.",
+                                "AWS credential pre-flight failed: {}. Open Settings → ASR → AWS Transcribe → Test Connection to diagnose.",
                                 e
                             )));
                         }
@@ -2996,7 +3000,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                         name: model_dir.clone(),
                     });
                 }
-                // The directory existing isn't enough â€” sherpa-onnx needs the
+                // The directory existing isn't enough — sherpa-onnx needs the
                 // encoder/decoder/joiner ONNX graphs and the tokens vocabulary.
                 // A partial download or unpack would pass the exists() check
                 // but fail silently inside the speech processor thread.
@@ -3019,7 +3023,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             }
         }
 
-        // LLM pre-flight: only warn for LocalLlama â€” entity extraction has
+        // LLM pre-flight: only warn for LocalLlama — entity extraction has
         // fallbacks (API, rule-based) so a missing local model isn't fatal.
         if let Some(err) = local_llm_provider_availability_error(&llm_provider) {
             log::warn!("{}", err);
@@ -3031,7 +3035,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                 log::warn!(
                     "Local LLM model not downloaded; entity extraction will fall back to API or rule-based"
                 );
-                // Don't error â€” extraction has fallbacks. Just log.
+                // Don't error — extraction has fallbacks. Just log.
             }
         }
     }
@@ -3041,8 +3045,8 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     // reconciliation is still waiting for this command to release the lock.
     acknowledged_transcription_sources(state.inner())?;
 
-    // ADR-0045: restore only verified projection coverage before speech starts.
-    // Unavailable projection history leaves its lanes behind and ASR available.
+    // Start both lanes behind. After ASR starts, a worker verifies this capture's
+    // coverage and submits any eligible repair through the normal executor.
     let coverage_check = crate::persistence::begin_projection_capture(state.inner());
 
     // 1. Start speech processor thread (ASR + Diarization orchestrator).
@@ -3055,15 +3059,15 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?;
 
         // audio-graph-1609 ordering fix: clear `projection_lane_stopping`
-        // here â€” strictly BEFORE the speech processor thread actually
-        // spawns below â€” not after it (where this store used to live,
+        // here — strictly BEFORE the speech processor thread actually
+        // spawns below — not after it (where this store used to live,
         // paired with `is_transcribing`'s reset in step 3).
         // `dispatch_projection_decision` (speech/mod.rs) reads this flag
         // synchronously on every projection dispatch, including one that
         // could in principle be produced by a final ASR revision the
         // JUST-spawned speech thread processes almost immediately. Clearing
         // it only after the thread was already spawned left a real window
-        // â€” however small â€” where that first post-restart dispatch could
+        // — however small — where that first post-restart dispatch could
         // still observe the flag set from the PRIOR Stop and get discarded
         // into the same phantom-in-flight state ADR-0045 decision 4
         // (audio-graph-9cc1) already causes if left un-abandoned (see
@@ -3072,9 +3076,9 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
         // dispatch a projection decision for this run exists yet at this
         // line, so there is no dispatch left to race.
         //
-        // Placed here â€” after every fallible step earlier in this function
+        // Placed here — after every fallible step earlier in this function
         // (provider pre-flight, the `projection_patches` load, the
-        // schedulers lock) rather than at the top of the function â€” so an
+        // schedulers lock) rather than at the top of the function — so an
         // early `?` return from any of those keeps leaving this flag
         // untouched, exactly as it did before this fix. Only the ordering
         // relative to the speech-thread spawn changed; an `Err` path that
@@ -3092,7 +3096,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
         // `Running{0}` write clobbered the Degraded status right back to
         // healthy-looking, and nothing downstream ever re-derives it (the
         // per-segment sites only PRESERVE an existing Degraded, they never
-        // restore one) â€” silently reproducing the exact pre-586b failure
+        // restore one) — silently reproducing the exact pre-586b failure
         // mode for the rest of the session. Moving the pre-set here, before
         // the spawn, closes the race the same way the
         // `projection_lane_stopping` clear above already does: nothing that
@@ -3246,7 +3250,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     state.is_transcribing.store(true, Ordering::SeqCst);
     speech::spawn_capture_verification(state.inner(), &app, &settings, coverage_check);
     // `projection_lane_stopping` is reset earlier in this function now
-    // (audio-graph-1609 ordering fix â€” see the comment there), strictly
+    // (audio-graph-1609 ordering fix — see the comment there), strictly
     // before the speech thread above spawns, not paired with
     // `is_transcribing` here. It used to live at this point, after the
     // spawn; that ordering is exactly what left the post-restart
@@ -3260,7 +3264,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     // alongside the coverage-head reseed above.
     //
     // That is not the same as restoring bf5d's "retry fires even with no
-    // further finals" guarantee ACROSS a same-session restart â€” it isn't,
+    // further finals" guarantee ACROSS a same-session restart — it isn't,
     // and this fix doesn't claim to. Both `abandon_deferred_retry` and this
     // restart sweep only ever CLEAR an armed deferral, never re-arm a new
     // clock; a previously-failed basis still under budget retries only
@@ -3272,7 +3276,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     //
     // The `pipeline_status` `Running{0}` pre-set used to live here too, and
     // for the same reason as `projection_lane_stopping` above, it doesn't
-    // anymore (audio-graph-586b review follow-up) â€” see the comment at its
+    // anymore (audio-graph-586b review follow-up) — see the comment at its
     // new call site, before the speech-processor thread spawns in step 1.
     // This read+emit still belongs here: it reflects whatever the spawned
     // thread's own status writes (including a legitimate `Degraded`) have
@@ -3304,7 +3308,11 @@ async fn stop_transcribe_impl(state: &AppState, app: &tauri::AppHandle) -> AppRe
     let _session_lifecycle = state.session_lifecycle.lock().await;
 
     state.projection_lane_stopping.store(true, Ordering::SeqCst);
-    state.projection_schedulers.lock().unwrap_or_else(|p| p.into_inner()).cancel_coverage_check();
+    state
+        .projection_schedulers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .cancel_coverage_check();
     let projection_job_workers = state.projection_job_workers.clone();
     let projection_schedulers = state.projection_schedulers.clone();
 
@@ -3312,7 +3320,7 @@ async fn stop_transcribe_impl(state: &AppState, app: &tauri::AppHandle) -> AppRe
     state.is_transcribing.store(false, Ordering::SeqCst);
 
     // Join the worker threads (bounded) instead of just dropping the handles.
-    // Dropping without joining let a fast Stopâ†’Start race leave the OLD worker
+    // Dropping without joining let a fast Stop→Start race leave the OLD worker
     // still in its ~500ms recv loop while a NEW worker starts, so two consumers
     // split the same speech_audio channel (critique H2). Joining guarantees the
     // old workers have exited before this returns. Polled-join with a timeout
@@ -3355,11 +3363,11 @@ async fn stop_transcribe_impl(state: &AppState, app: &tauri::AppHandle) -> AppRe
         log_abandoned_deferred_retries_after_stop(&projection_schedulers, &stop_session_id);
         // audio-graph-64e3: `stop_capture_impl` is not the only session-end
         // transition that joins sp/asr through the same bounded-join/receiver
-        // tail â€” a transcribe-only session ends here instead. Without this
+        // tail — a transcribe-only session ends here instead. Without this
         // call a miss counted during THIS session was only ever reported at
         // the next capture-session's stop_capture_impl, under the WRONG
         // session id. Must run strictly after the joins above for the same
-        // reason `stop_capture_impl` orders it after its own joins â€” see
+        // reason `stop_capture_impl` orders it after its own joins — see
         // `warn_if_display_transcript_rows_missing_at_stop`'s doc.
         warn_if_display_transcript_rows_missing_at_stop(
             &display_transcript_write_misses,
@@ -3369,7 +3377,7 @@ async fn stop_transcribe_impl(state: &AppState, app: &tauri::AppHandle) -> AppRe
     .await
     .map_err(|error| AppError::Unknown(format!("Transcription worker drain failed: {error}")))?;
 
-    // Update pipeline status â€” ASR and downstream stages go idle
+    // Update pipeline status — ASR and downstream stages go idle
     if let Ok(mut status) = state.pipeline_status.write() {
         status.asr = StageStatus::Idle;
         status.diarization = StageStatus::Idle;
@@ -3927,7 +3935,7 @@ fn spawn_stream_task(
     let request_id_for_task = request_id.clone();
 
     // Speak-aloud: build the SpeakAloudPipe ahead of the task spawn so the
-    // task body owns it. None when speak_aloud=false or tts=None â€” the
+    // task body owns it. None when speak_aloud=false or tts=None — the
     // task then runs as plain streaming chat with no audio side effects.
     let settings_snapshot = (
         settings.speak_aloud,
@@ -3985,7 +3993,7 @@ fn spawn_stream_task(
                     })) {
                         // A closed channel means the frontend dropped the
                         // stream (window closed / navigated). Stop draining
-                        // rather than spin on a dead channel â€” mirrors the
+                        // rather than spin on a dead channel — mirrors the
                         // frontend `unlisten` teardown the old event path had.
                         log::warn!(
                             "chat stream {}: delta channel send failed ({}); \
@@ -4089,7 +4097,7 @@ fn spawn_stream_task(
 /// `cancel_streaming_chat`). Token deltas + the terminal frame are delivered
 /// over the caller-supplied `channel` (`tauri::ipc::Channel<ChatStreamFrame>`,
 /// audio-graph-1534) rather than the legacy `chat-token-delta` /
-/// `chat-token-done` events â€” the channel is ordered, per-invocation, and
+/// `chat-token-done` events — the channel is ordered, per-invocation, and
 /// avoids the per-token serialize + event-router + JS-bridge cost the event
 /// system incurs on this 20-100+/sec hot path. The actual LLM work runs on a
 /// tokio task; the frontend arms `channel.onmessage` before invoking, so no
@@ -4245,7 +4253,7 @@ pub async fn send_chat_message(
         history_generation,
     } = prepare_chat_request(state.inner(), message, history_generation)?;
 
-    // Streaming path â€” accumulate to full text via the same producer the
+    // Streaming path — accumulate to full text via the same producer the
     // event-driven command uses. The shim doesn't fire IPC events itself;
     // it consumes the channel directly so blocking callers don't see
     // delta event spam.
@@ -4304,7 +4312,7 @@ pub async fn send_chat_message(
     // (prompt + completion) count; the cloud backends routed through this
     // blocking path (Bedrock via ApiClient, OpenRouter blocking, mistral.rs)
     // report 0 because their `chat_with_history` signatures don't carry usage
-    // yet â€” never fabricated.
+    // yet — never fabricated.
     let executor = state.llm_executor.clone();
     let outcome = bounded_blocking_llm_call(BLOCKING_LLM_CALL_TIMEOUT, move || {
         executor.chat_with_history(messages, graph_context, llm_provider)
@@ -4327,7 +4335,7 @@ pub async fn send_chat_message(
 /// (ADR-0014). On-demand: reuses the chat LLM pipeline with a summarization
 /// prompt and a whole-conversation graph context (most-central nodes via an
 /// empty query) plus a wide transcript window. Returns Markdown. Does NOT touch
-/// chat history â€” notes are a separate, parallel projection of the same data.
+/// chat history — notes are a separate, parallel projection of the same data.
 #[tauri::command]
 pub async fn synthesize_notes(
     app: tauri::AppHandle,
@@ -4464,7 +4472,7 @@ fn live_assist_card_record(
     // `pending_agent_proposals`, which only ever holds transcript-detected
     // proposals (the one production mint site, `run_agent_proposal_task`),
     // so a brand-new card (no `existing` record yet) defaults to
-    // `CardOrigin::Transcript`, never `None` â€” `None` is reserved for
+    // `CardOrigin::Transcript`, never `None` — `None` is reserved for
     // records that predate this unit, not new ones created after it.
     // `answer` is never originated here (T3's job); this helper only ever
     // preserves whatever answer an existing record already carries so a
@@ -4515,10 +4523,10 @@ fn existing_live_assist_card(
 ///
 /// This path is locally generated from an approved live-assist card, not LLM
 /// output, so it never goes through `validate_projection_patch_draft`/
-/// `judge_claim_evidence` at draft time â€” but the proposal DOES carry a real
+/// `judge_claim_evidence` at draft time — but the proposal DOES carry a real
 /// citation, `proposal.source_segment_id`, which is validated when the card
 /// itself is admitted (`persistence/mod.rs`'s OR-citation rule). `EvidenceAnchor::
-/// default()` (â‡’ `KnowledgeGap`, the one class the judge always refuses)
+/// default()` (⇒ `KnowledgeGap`, the one class the judge always refuses)
 /// mislabels every approved card as an absence-shaped gap, which is wrong for
 /// a positive assertion and misleads every reader of the canonical
 /// `ProjectionOperation` log (typed-gap reports, evidence inspection,
@@ -4526,7 +4534,7 @@ fn existing_live_assist_card(
 /// later re-derives. `source_segment_id` may be the provider's
 /// `transcript_segment_id` OR the immutable `span_id`
 /// (`derive_legacy_transcript_segments`'s same fallback), so this resolves it
-/// against the ledger's `latest_spans` by either field before anchoring â€”
+/// against the ledger's `latest_spans` by either field before anchoring —
 /// `judge_claim_evidence`'s basis map is keyed by the literal `span_id` only.
 fn live_assist_evidence_anchor(
     ledger: &crate::projections::TranscriptLedger,
@@ -4772,7 +4780,7 @@ fn approve_agent_proposal_impl(
     if let Some(extraction) = extraction {
         // `proposal.created_at_ms` is Unix epoch ms (wall clock); the graph's
         // `timestamp` param is session-relative seconds (the same "media
-        // clock" the live speech path uses for eviction ordering â€” see
+        // clock" the live speech path uses for eviction ordering — see
         // `TranscriptLedger::session_relative_timestamp`). Converting via the
         // ledger anchor instead of a raw `/1000.0` keeps a manually-approved
         // node evictable on the same terms as a live one (audio-graph-4b52).
@@ -4858,7 +4866,7 @@ fn approve_agent_proposal_impl(
 
 /// Add a detected question to the knowledge graph as a `Question` node linked
 /// from the speaker. Local-only (no LLM), so it's safe to call automatically
-/// when a question is detected â€” questions default to the graph; asking the AI
+/// when a question is detected — questions default to the graph; asking the AI
 /// for an answer is a separate, optional user action.
 #[tauri::command]
 pub fn add_question_to_graph(
@@ -5055,7 +5063,7 @@ pub fn unbind_speaker_cluster(
 /// durable layer + ProjectionBasis diarization work), every relation attached to
 /// the superseded entity is invalidated (hidden via `valid_until`) and
 /// re-pointed onto the canonical entity. The superseded attribution is kept in
-/// the graph for audit â€” only hidden from the live snapshot.
+/// the graph for audit — only hidden from the live snapshot.
 ///
 /// `threshold` is the fuzzy-match cutoff for resolving both names (defaults to
 /// exact-only `1.0` when omitted). Returns the number of edges that were
@@ -5133,9 +5141,9 @@ fn merge_graph_entities_impl(
     // Same epoch-vs-session-relative conversion as `approve_agent_proposal` /
     // `add_question_to_graph` (audio-graph-4b52): `unix_millis()` is wall
     // clock, but `supersede_entity`'s `timestamp` lands in `invalidate_edge`'s
-    // `valid_until` and the re-pointed edge's `valid_from` â€” the same
+    // `valid_until` and the re-pointed edge's `valid_from` — the same
     // session-relative-seconds domain `evict_excess_edges` compares against
-    // (`graph/temporal.rs`), and the audio-time axis ADR-0026 Â§Consequences
+    // (`graph/temporal.rs`), and the audio-time axis ADR-0026 §Consequences
     // says "lives only on the live TemporalEdge". Left as raw epoch seconds,
     // a retconned edge's `valid_from` is always the graph's maximum and can
     // never be evicted, the exact immortality bug fixed for nodes, but for
@@ -5269,7 +5277,7 @@ pub fn clear_agent_proposals(
 // audio-graph-83cc T3: the answer engine.
 //
 // Two commands, `answer_question_card` (manual Ask-AI/Retry on an EXISTING
-// card, `auto` caller-supplied â€” T5's future auto trigger passes `true`) and
+// card, `auto` caller-supplied — T5's future auto trigger passes `true`) and
 // `ask_question_card` (mint-and-ask: mints a NEW `CardOrigin::User` card
 // from typed text, then answers it via the manual gate, one round trip),
 // both thin `#[tauri::command]` wrappers over one shared
@@ -5277,14 +5285,14 @@ pub fn clear_agent_proposals(
 //
 // audio-graph-83cc-b63a (T3G, this unit): T3 (above) and T4 (the frontend,
 // `store/index.ts`) were landed and individually reviewed against the SAME
-// design synthesis but resolved its command shapes differently â€” T3 kept
+// design synthesis but resolved its command shapes differently — T3 kept
 // both commands scoped to an existing card id with a hardcoded `auto`
-// literal per command, matching the design-panel synthesis's OLDER Â§2.3
+// literal per command, matching the design-panel synthesis's OLDER §2.3
 // sketch; T4 was written against the synthesis's ticket-cut FE contract
 // (`askQuestion`/`answerQuestionCard`, `store/index.ts`), which mints on
 // `ask_question_card` and threads `auto` through `answer_question_card`.
 // This unit conforms the two `#[tauri::command]` signatures below to T4's
-// landed contract â€” the frontend files are the source of truth and are
+// landed contract — the frontend files are the source of truth and are
 // UNCHANGED by this unit. `answer_question_card_impl` itself (the shared
 // gate/counter/registry/retrieval/ledger/telemetry body immediately below
 // this comment) is untouched: this is a contract-adaptation unit, not an
@@ -5300,7 +5308,7 @@ pub fn clear_agent_proposals(
 /// Result of a successful (non-erroring) call to `answer_question_card_impl`.
 /// A REFUSAL is `Ok(Refused { reason })`, not `Err(_)`, at THIS internal
 /// layer: the ordered spend gate refusing to dispatch is an expected, common
-/// outcome (busy / capped / weak signal / â€¦), not an engine failure â€” see
+/// outcome (busy / capped / weak signal / …), not an engine failure — see
 /// `events::AnswerRefusalReason`'s doc comment. Genuine failures (bad
 /// `proposal_id`, provider unavailable, privacy-blocked, lock errors) still
 /// return `Err(AppError)` via the existing typed variants.
@@ -5308,9 +5316,9 @@ pub fn clear_agent_proposals(
 /// **Not the wire type.** `answer_question_card`/`ask_question_card` (the
 /// two `#[tauri::command]`s below) convert this into their own landed
 /// response shapes (`AnswerQuestionCardDispatch`/`AskQuestionCardDispatch`,
-/// which carry no discriminant â€” a bare `request_id` on success) and turn
+/// which carry no discriminant — a bare `request_id` on success) and turn
 /// `Refused` into an `Err(AppError::Unknown(..))` at the command boundary
-/// (`answer_refusal_message`) â€” the frontend (`store/index.ts`'s
+/// (`answer_refusal_message`) — the frontend (`store/index.ts`'s
 /// `askQuestion`/`answerQuestionCard`) has no branch for a "refused but
 /// still `Ok`" response; it only ever reads `dispatch.request_id` on success
 /// and falls into its existing `catch` (`errorToMessage`) otherwise. This is
@@ -5332,7 +5340,7 @@ enum AnswerDispatch {
 /// Wire response for `answer_question_card` (manual Ask-AI/Retry on an
 /// EXISTING card). Mirrors the frontend's `AnswerQuestionCardDispatch`
 /// (`store/index.ts`) field-for-field: the card already exists, so only a
-/// `request_id` needs to come back synchronously â€” the FE keys its transient
+/// `request_id` needs to come back synchronously — the FE keys its transient
 /// `answerDrafts` entry on the proposal id it already has.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AnswerQuestionCardDispatch {
@@ -5355,8 +5363,8 @@ pub struct AskQuestionCardDispatch {
 /// Render an [`events::AnswerRefusalReason`] as a plain, content-free error
 /// message for a rejected `invoke(...)` (audio-graph-83cc-b63a, T3G). The
 /// frontend's `errorToMessage` (`utils/errorToMessage.ts`) has a generic
-/// fallback for `AppError::Unknown` â€” `case "unknown": return err.message;`
-/// â€” and no case at all for a bespoke refusal code, so this reuses that
+/// fallback for `AppError::Unknown` — `case "unknown": return err.message;`
+/// — and no case at all for a bespoke refusal code, so this reuses that
 /// existing, already-rendered variant rather than adding a new `AppError`
 /// variant the frontend's closed `AppErrorPayload` union has no arm for
 /// (which would render as `undefined` in the UI, not a helpful message).
@@ -5389,7 +5397,7 @@ fn answer_refusal_message(reason: events::AnswerRefusalReason) -> String {
 /// from two overlapping transcript spans) cannot buy a second paid
 /// dispatch. This ports, narrowly, the ONE piece of the frontend's
 /// `selectAgentQueue` duplicate-collapse admission filter that is
-/// load-bearing for spend â€” the fuller admission-time collapse stays
+/// load-bearing for spend — the fuller admission-time collapse stays
 /// frontend-only (see `events::AnswerRefusalReason::Duplicate`'s doc
 /// comment for the exact gap this leaves and why it's harmless under Q2).
 ///
@@ -5399,7 +5407,7 @@ fn answer_refusal_message(reason: events::AnswerRefusalReason) -> String {
 /// output is a `bool`. The normalized content strings
 /// (`crate::speech::agent_signal_content_text` + `normalize_queue_content`)
 /// are local to this function's stack frame and are never passed to
-/// `log::*`, never stored on `AppState`, and never returned â€” the caller
+/// `log::*`, never stored on `AppState`, and never returned — the caller
 /// (`evaluate_answer_spend_gate`) receives only `AnswerRefusalReason::Duplicate`
 /// (a unit-like enum variant with no content field), which is the ONLY
 /// thing that can reach a log line (via `card_telemetry::log_answer_event`,
@@ -5426,7 +5434,7 @@ fn is_duplicate_answered_question(
 }
 
 /// Mirrors the frontend's `normalizeQueueContent` (`agentQueue.ts`): trim,
-/// lowercase (Unicode-aware â€” `str::to_lowercase` handles accented pt text
+/// lowercase (Unicode-aware — `str::to_lowercase` handles accented pt text
 /// the same way `String.prototype.toLowerCase()` does), collapse internal
 /// whitespace runs to a single space. `split_whitespace()` already trims
 /// and collapses runs in one pass.
@@ -5434,8 +5442,8 @@ fn is_duplicate_answered_question(
 /// Accepted bound (fix-round finding, adversarial review, minor, declined):
 /// punctuation is NOT stripped, so "What changed?" and "What changed" don't
 /// normalize equal and can each buy their own auto dispatch. This is
-/// deliberate FE parity â€” `normalizeQueueContent` itself doesn't strip
-/// punctuation either â€” and any abuse is hard-bounded by the 45s interval
+/// deliberate FE parity — `normalizeQueueContent` itself doesn't strip
+/// punctuation either — and any abuse is hard-bounded by the 45s interval
 /// and 12/session cap regardless (worst case is the ratified session
 /// budget, not unbounded spend). Stripping punctuation here without also
 /// changing the frontend's copy would silently desync the two "duplicate"
@@ -5451,8 +5459,8 @@ fn normalize_queue_content(text: &str) -> String {
 /// permitted, or the first `AnswerRefusalReason` that fires otherwise.
 ///
 /// **Auto order** (cheapest/cheapest-to-verify first):
-/// `enabled â†’ NotQuestion â†’ WeakSignal â†’ Converse â†’ Duplicate â†’ Busy â†’
-/// Interval â†’ Capped`. Two deltas against the literal ticket-cut order,
+/// `enabled → NotQuestion → WeakSignal → Converse → Duplicate → Busy →
+/// Interval → Capped`. Two deltas against the literal ticket-cut order,
 /// both load-bearing:
 /// - `NotQuestion` is NOT in the ticket-cut bullet's literal list, but IS in
 ///   the design-panel synthesis's (`kind == Question`), and is load-bearing
@@ -5460,20 +5468,20 @@ fn normalize_queue_content(text: &str) -> String {
 ///   NON-question kind `Strong` by construction (see that function's doc
 ///   comment), so without this check a caller naming a `note`/
 ///   `graph_suggestion` card would clear `WeakSignal` trivially and this
-///   Rust gate would NOT "hold alone" per Q2 â€” it would depend on the
+///   Rust gate would NOT "hold alone" per Q2 — it would depend on the
 ///   frontend never sending a non-question id, exactly the
 ///   untrusted-renderer shape Q2 exists to close.
 /// - `Converse` is in the design-panel synthesis's order ("not converse
 ///   mode") but not the ticket-cut bullet; see
 ///   `events::AnswerRefusalReason::Converse`'s doc comment for what this
-///   checks (native S2S only â€” the pipelined half has no backend flag) and
+///   checks (native S2S only — the pipelined half has no backend flag) and
 ///   why it is included anyway.
 ///
 /// `Duplicate` is the ticket-cut bullet's own addition (closing the
 /// unported frontend duplicate-collapse gap) and is NOT in the synthesis's
 /// order; both additions are unioned here rather than picking one source
-/// over the other, since neither contradicts the other â€” both close a real
-/// gap. `Duplicate` fires in TWO cases: (1) `card.answer.is_some()` â€” this
+/// over the other, since neither contradicts the other — both close a real
+/// gap. `Duplicate` fires in TWO cases: (1) `card.answer.is_some()` — this
 /// exact card already carries a terminal answer, so a repeated dispatch
 /// against it is refused before ever calling
 /// `is_duplicate_answered_question` (fix-round finding, scope-honesty
@@ -5482,12 +5490,12 @@ fn normalize_queue_content(text: &str) -> String {
 /// another card in the session already carries an answer with matching
 /// normalized content, per `is_duplicate_answered_question`.
 ///
-/// **Manual order**: `enabled â†’ NotQuestion â†’ Busy`. Grade/converse/duplicate/
-/// interval/cap are skipped â€” fragments keep manual Ask AI (P4), and a user
+/// **Manual order**: `enabled → NotQuestion → Busy`. Grade/converse/duplicate/
+/// interval/cap are skipped — fragments keep manual Ask AI (P4), and a user
 /// click is not the repeated-content/contention risk those steps guard
 /// against.
 ///
-/// Neither path ever calls `stream_registry.cancel`/`cancel_all` â€” `Busy` is
+/// Neither path ever calls `stream_registry.cancel`/`cancel_all` — `Busy` is
 /// refuse-not-cancel in both directions (see
 /// `events::CardAnswerStatus::Interrupted`'s doc comment for the two
 /// pre-existing, unrelated paths `Interrupted` IS reachable from, neither of
@@ -5522,14 +5530,14 @@ fn evaluate_answer_spend_gate(
         // Fix-round finding (scope-honesty review, major): a card that
         // ALREADY carries a terminal answer must itself refuse as
         // `Duplicate` before ever reaching `is_duplicate_answered_question`
-        // (which deliberately excludes the proposal's own id â€” see that
-        // function's doc comment â€” so it alone cannot catch a card being
+        // (which deliberately excludes the proposal's own id — see that
+        // function's doc comment — so it alone cannot catch a card being
         // re-dispatched against itself). Without this, a repeated
         // `answer_question_card` call on the SAME already-answered card
         // (a re-triggered FE admit, an upserted-proposal replay, or a
         // hostile renderer) would clear every remaining auto check and buy
         // a fresh paid dispatch each time, up to burning the entire
-        // 12/session cap on one card â€” leaving Q2's "the Rust gate must
+        // 12/session cap on one card — leaving Q2's "the Rust gate must
         // hold alone" resting on the FE trigger firing at most once per
         // card, which is exactly the untrusted-renderer assumption Q2
         // exists to close. Manual (`auto == false`) intentionally does NOT
@@ -5568,7 +5576,7 @@ const CARD_ANSWER_ANCHOR_SPANS_AFTER: usize = 2;
 /// Tail-fallback window size when no anchor resolves (matches
 /// `prepare_chat_request`'s existing tail-10 constant, kept independently
 /// per this module's "no cross-module coupling for a tunable constant"
-/// convention â€” see `AGENT_SIGNAL_MIN_CHARS`'s doc comment in `speech/mod.rs`
+/// convention — see `AGENT_SIGNAL_MIN_CHARS`'s doc comment in `speech/mod.rs`
 /// for the precedent).
 const CARD_ANSWER_TAIL_FALLBACK_SPANS: usize = 10;
 
@@ -5620,16 +5628,16 @@ fn anchored_or_tail_transcript_window(
 }
 
 /// Max chars the notes-outline block may add to the answer's graph context
-/// (deliverable b's "notes headings (â‰¤ ~1,500 chars)"). Only note TITLES
-/// (with `heading_level`-based indentation) are rendered â€” never note
-/// bodies â€” so this stays a cheap outline, not a second copy of the notes
+/// (deliverable b's "notes headings (≤ ~1,500 chars)"). Only note TITLES
+/// (with `heading_level`-based indentation) are rendered — never note
+/// bodies — so this stays a cheap outline, not a second copy of the notes
 /// artifact.
 const CARD_ANSWER_NOTES_OUTLINE_MAX_CHARS: usize = 1_500;
 
 /// Render a cheap "Notes Outline" block from a session's materialized notes
 /// (deliverable b), capped at [`CARD_ANSWER_NOTES_OUTLINE_MAX_CHARS`].
 /// Returns `(block, notes_last_sequence)`; `notes_last_sequence` is `Some`
-/// only when the block actually carries content â€” matching
+/// only when the block actually carries content — matching
 /// `CardAnswer.notes_last_sequence`'s doc comment ("when notes were used to
 /// answer"), an empty session with zero notes did not use notes.
 fn notes_outline_block(
@@ -5657,9 +5665,9 @@ fn notes_outline_block(
 }
 
 /// Replica of `graph::entities::build_graph_chat_context`'s top-k relevance
-/// scoring (SAME formula: query-term overlap Ã—100 + `ln_1p(mention_count)`
+/// scoring (SAME formula: query-term overlap ×100 + `ln_1p(mention_count)`
 /// centrality tiebreak), kept independent rather than exposing node ids from
-/// that function â€” this crate's existing precedent for a scoring-formula
+/// that function — this crate's existing precedent for a scoring-formula
 /// duplication local to its own call site is `speech::agent_signal_content_text`
 /// (see that function's doc comment). Returns the SAME node ids
 /// `build_graph_chat_context` selects into its context string, for
@@ -5710,7 +5718,7 @@ fn top_k_graph_node_ids_for_query(
 const CARD_ANSWER_MAX_GRAPH_NODES: usize = 40;
 
 /// Retrieval + prompt materials `answer_question_card_impl` feeds into the
-/// answer stream. Everything here is content â€” never logged, never stored
+/// answer stream. Everything here is content — never logged, never stored
 /// outside a `CardAnswer` (`evidence_span_ids`/`evidence_graph_ids`/
 /// `notes_last_sequence` are the ONLY fields that survive past dispatch;
 /// `messages`/`graph_context` are consumed once by `spawn_card_answer_stream_task`
@@ -5725,11 +5733,11 @@ struct CardAnswerMaterials {
 
 /// Stateless sibling of `prepare_chat_request` (deliverable b): builds one
 /// system context block (graph top-40 + anchored/tail transcript window +
-/// notes outline headings) plus the ONE question message â€” NEVER touches
+/// notes outline headings) plus the ONE question message — NEVER touches
 /// `state.chat_history` (no read, no write), so an answer's prompt carries
 /// no cross-contamination from prior chat turns and no auto-answer is ever
 /// pushed into the shared 200-message buffer converse mode also reads (C4).
-/// "No retrieval state, no caching" â€” every call rebuilds its context fresh
+/// "No retrieval state, no caching" — every call rebuilds its context fresh
 /// from the current graph/ledger/notes snapshots; nothing here is stored on
 /// `AppState`.
 fn prepare_card_answer_request(
@@ -5787,12 +5795,12 @@ fn prepare_card_answer_request(
 }
 
 /// Deliverable e: whether THIS dispatch may speak its answer aloud.
-/// `auto` dispatches NEVER speak aloud, unconditionally â€” the user's
+/// `auto` dispatches NEVER speak aloud, unconditionally — the user's
 /// `speak_aloud` setting is not even consulted for `auto == true`. Manual/
 /// typed asks follow the user's setting exactly, same as
 /// `start_streaming_chat`. Extracted to its own pure function (rather than
 /// left as an inline expression) so it is directly unit-testable: combined
-/// with `SpeakAloudPipe::maybe_new`'s own unconditional `!speak_aloud â‡’
+/// with `SpeakAloudPipe::maybe_new`'s own unconditional `!speak_aloud ⇒
 /// Ok(None)` short-circuit (`speak_aloud.rs`, pre-existing/unchanged), this
 /// is the exact proof that an auto dispatch can never construct a
 /// `SpeakAloudPipe`.
@@ -5801,10 +5809,10 @@ fn effective_speak_aloud_for_dispatch(auto: bool, settings_speak_aloud: bool) ->
 }
 
 /// `AppSettings.agent_auto_answer.enabled == false` also gates manual asks
-/// (deliverable c) â€” an LLM start-gate check specific to the answer engine,
+/// (deliverable c) — an LLM start-gate check specific to the answer engine,
 /// paralleling `enforce_chat_provider_start`. Skips the TTS provider-start
 /// check entirely when `effective_speak_aloud` is `false` (always true for
-/// the auto path â€” deliverable e), so an auto-answer with speak-aloud forced
+/// the auto path — deliverable e), so an auto-answer with speak-aloud forced
 /// off never requires a TTS provider to be enabled.
 fn enforce_card_answer_provider_start(
     settings: &crate::settings::AppSettings,
@@ -6005,7 +6013,7 @@ fn build_assist_answer_terminal_event(
 
 /// Best-effort ledger append: a movement-ledger write failure must never
 /// abort or unwind the answer path (the answer itself, and its telemetry,
-/// still matter even if the audit row didn't persist) â€” same posture as
+/// still matter even if the audit row didn't persist) — same posture as
 /// `append_capture_lifecycle_movement_for`'s callers, which log and continue.
 /// The write error names the session's file path, so only a fixed message is
 /// logged.
@@ -6065,10 +6073,10 @@ impl Drop for CardAnswerSlot {
 }
 
 /// Build, cap, and persist the `CardAnswer` on the stream's terminal frame
-/// (deliverable a: "persist ONCE on the terminal frame â€” never per-delta"),
+/// (deliverable a: "persist ONCE on the terminal frame — never per-delta"),
 /// after appending the terminal ledger row, then emit `AGENT_CARD_UPDATE`
 /// and log the `Completed`/`Failed` telemetry event (`Interrupted` also logs
-/// `Failed` â€” deliverable f names exactly four telemetry events, not five).
+/// `Failed` — deliverable f names exactly four telemetry events, not five).
 /// The ledger row lands first so anyone who observes the finished answer
 /// also finds its terminal row.
 ///
@@ -6105,7 +6113,7 @@ fn finalize_card_answer(
         answered_at_ms: unix_millis(),
     };
     // T1's validator rejects an over-cap answer OUTRIGHT (no truncation
-    // seam of its own) â€” cap BEFORE persisting so an unbounded model
+    // seam of its own) — cap BEFORE persisting so an unbounded model
     // response truncates-and-marks instead of losing the whole answer to a
     // validator error, exactly the seam `CardAnswer::cap_text`'s own doc
     // comment describes.
@@ -6195,7 +6203,7 @@ fn finalize_card_answer(
 /// `spawn_stream_task`: that function unconditionally calls
 /// `state.stream_registry.cancel_all()` before registering (AUD-STR1 P1),
 /// which is exactly the hazard the ordered spend gate's `Busy` check exists
-/// to avoid â€” this function never cancels a prior stream; the gate's
+/// to avoid — this function never cancels a prior stream; the gate's
 /// `stream_registry.is_empty()` and `card_answer_in_flight` checks
 /// (evaluated by the caller before this function is reached) are the ENTIRE
 /// protection. Also never touches
@@ -6294,13 +6302,13 @@ fn spawn_card_answer_stream_task(
 
         // Fix-round finding (adversarial review, minor): once the frontend
         // channel is gone (window closed/navigated mid-stream), further
-        // `channel.send` attempts are guaranteed to keep failing â€” this
+        // `channel.send` attempts are guaranteed to keep failing — this
         // flag stops us from re-attempting (and re-logging) on every
         // remaining frame, WITHOUT aborting the loop early. The stream
         // keeps draining to its own terminal frame either way, so the paid
         // dispatch this answer represents is always finalized (persisted
         // answer + terminal ledger row), even when nobody is left to watch
-        // it stream â€” this is the ADR-0034 "1:1 started/terminal" honesty
+        // it stream — this is the ADR-0034 "1:1 started/terminal" honesty
         // property the previous shape (an early `return` on the Delta arm's
         // send failure) broke.
         let mut channel_alive = true;
@@ -6523,17 +6531,17 @@ async fn answer_question_card_impl(
     // ADR-0038 route seam, documented honestly (deliverable g): this stamps
     // the RESOLVED route id (`resolve_route`, the same resolver
     // `authorize_route_dispatch` itself uses to pick a `RouteDescriptor`),
-    // by trusted code, never model- or config-echoed â€” regardless of the
+    // by trusted code, never model- or config-echoed — regardless of the
     // eventual outcome (even a `Failed` answer carries the attempted
     // route). It does NOT obtain an `AuthorizedRoute` seal: no chat path in
     // this crate is sealed today (`llm/streaming.rs` has zero `route::`
-    // references â€” verified, not assumed), and retrofitting the seal onto
+    // references — verified, not assumed), and retrofitting the seal onto
     // the streaming path is its own Rust lane across five provider skins,
     // out of this unit's scope (assigned to the agent-runtime lane per the
     // design-panel synthesis). The seam this unit leaves for that lane: the
     // moment `llm/streaming.rs` gains an `AuthorizedRoute` parameter, this
     // one call becomes `authorize_route_dispatch(&llm_provider)?.descriptor()`
-    // (`llm/route.rs:568`) in place of `resolve_route(&llm_provider)` â€” same
+    // (`llm/route.rs:568`) in place of `resolve_route(&llm_provider)` — same
     // downstream `route_id` usage, no other line in this function needs to
     // change. Not inventing a new
     // `route.assist_answer` table row now, on the same honesty basis: a row
@@ -6558,7 +6566,7 @@ async fn answer_question_card_impl(
         .allows_session_cloud_content_transfer();
     let provider_id_for_ledger = llm_provider.runtime_provider_id().to_string();
 
-    // Count DISPATCHES, at dispatch time, before the stream starts â€” a
+    // Count DISPATCHES, at dispatch time, before the stream starts — a
     // refused or never-attempted call must never count against the cap
     // (deliverable c / state.rs's own doc comment on this counter).
     if auto {
@@ -6622,7 +6630,7 @@ async fn answer_question_card_impl(
 
 /// Mint-time cap for user-typed question text (fix-round finding,
 /// adversarial review, minor). Before this, `mint_user_question_card` only
-/// rejected EMPTY text â€” `proposal.body` was otherwise unbounded, unlike
+/// rejected EMPTY text — `proposal.body` was otherwise unbounded, unlike
 /// `CardAnswer::cap_text`'s existing cap on the answer side, so a giant
 /// composer paste would persist a multi-megabyte card body (re-read/
 /// re-written on every subsequent card upsert/load) and send an
@@ -6635,29 +6643,29 @@ async fn answer_question_card_impl(
 const MAX_USER_QUESTION_TEXT_CHARS: usize = events::MAX_CARD_ANSWER_TEXT_CHARS;
 
 /// Build + persist a `CardOrigin::User` live-assist card for a free-form
-/// chatbox question (audio-graph-83cc-b63a, T3G â€” `ask_question_card`'s mint
+/// chatbox question (audio-graph-83cc-b63a, T3G — `ask_question_card`'s mint
 /// half). Mirrors `speech::run_agent_proposal_task`'s production mint site
-/// for everything the design panel synthesis (angle-a Â§2.1, ratified Q4/Q5)
+/// for everything the design panel synthesis (angle-a §2.1, ratified Q4/Q5)
 /// asks for a user-typed question:
 ///
 /// - `kind: Question`, `confidence: 1.0` (a typed question is never a
 ///   partial-ASR guess).
 /// - The T2 Rust-authoritative grade, via the SAME `agent_signal_grade`
-///   function the transcript mint site stamps â€” this is that function's
+///   function the transcript mint site stamps — this is that function's
 ///   second production call site, never a duplicated copy of its rules.
 /// - The Q4/T3G2 validator widening (`persistence::validate_live_assist_card`):
 ///   when the session already has a transcript span, `source_segment_id`
 ///   anchors to the ledger's newest one ("asked at this point in the
 ///   conversation") and `source_span_ids` mirrors that same single-span
 ///   anchor, matching the transcript mint site's own `vec![source_span_id]`
-///   shape â€” this half is unchanged from T1. When the session has NO
+///   shape — this half is unchanged from T1. When the session has NO
 ///   transcript span yet (the idle-composer case), both fields are left
 ///   empty: `persistence::validate_live_assist_card`'s joint citation
 ///   invariant (source_span_ids OR graph_context_ids non-empty) now permits
-///   that, but ONLY for `origin: User` (audio-graph-83cc-ba04, T3G2 â€”
+///   that, but ONLY for `origin: User` (audio-graph-83cc-ba04, T3G2 —
 ///   completing the widening T1 started; see that validator's doc comment).
 /// - `graph_context_ids: Vec::new()` at mint, matching the transcript mint
-///   site's own `Vec::new()` â€” a card's citation is its `source_span_ids`;
+///   site's own `Vec::new()` — a card's citation is its `source_span_ids`;
 ///   the ANSWER's own retrieval (graph top-k, computed later by
 ///   `prepare_card_answer_request`) is a separate concern
 ///   (`CardAnswer::evidence_graph_ids`), not the card's mint-time citation.
@@ -6665,29 +6673,29 @@ const MAX_USER_QUESTION_TEXT_CHARS: usize = events::MAX_CARD_ANSWER_TEXT_CHARS;
 /// History (T3G fix-round, superseded by T3G2 above): T3G's own fix-round
 /// found that a question typed before the session's first transcript span
 /// always failed `persistence::validate_live_assist_card`'s joint citation
-/// invariant, and closed that â€” IN SCOPE for T3G, which could not touch
-/// `persistence/mod.rs` â€” by failing fast here with a clear static message
+/// invariant, and closed that — IN SCOPE for T3G, which could not touch
+/// `persistence/mod.rs` — by failing fast here with a clear static message
 /// instead of leaking the validator's raw internal prose through
 /// `AppError::Unknown`. T3G2 is the follow-up T3G filed: with the validator
 /// itself now widened for `origin: User` (this ticket touches
 /// `persistence/mod.rs` directly), that fail-fast guard is no longer needed
-/// and has been removed below â€” the mint proceeds instead.
+/// and has been removed below — the mint proceeds instead.
 /// - Q5 (ratified: a query about the meeting is not meeting content): no
-///   graph write happens here â€” that is `add_question_to_graph`'s job for
+///   graph write happens here — that is `add_question_to_graph`'s job for
 ///   transcript-detected questions only, and this function never calls it.
 /// - `card_telemetry::log_card_event(.., CardLifecycleEvent::Created { .. })`
 ///   fires exactly once, content-free, same as the one production
-///   transcript-mint site â€” a User-origin card is observable the same way a
+///   transcript-mint site — a User-origin card is observable the same way a
 ///   transcript-minted one is (deliverable b).
 ///
-/// Named, accepted race (documented rather than fixed â€” fixing it would mean
+/// Named, accepted race (documented rather than fixed — fixing it would mean
 /// widening `state.session_lifecycle`'s critical section to cover this mint,
 /// which is `answer_question_card_impl`'s own lock and is not reentrant): if
 /// a session rotation lands between this call returning and
 /// `answer_question_card_impl` re-reading `state.current_session_id()`, the
 /// freshly-minted card is durably persisted under the OLD session but looked
 /// up under the NEW one, so the round trip errors out with "does not exist"
-/// rather than silently double-minting or double-spending â€” no gate,
+/// rather than silently double-minting or double-spending — no gate,
 /// counter, or registry state is touched by this function, so this race has
 /// no spend-boundary consequence, only a rare, narrow UX one (session
 /// rotation racing a chatbox send).
@@ -6711,8 +6719,8 @@ async fn mint_user_question_card(
         .projection_runtime_handle()
         .transcript_ledger_snapshot();
     // T3G2 (audio-graph-83cc-ba04): anchor to the ledger's newest span when
-    // one exists (unchanged from T1/T3G). When the session is spanless â€”
-    // the idle-composer case â€” there is nothing to anchor to, so both
+    // one exists (unchanged from T1/T3G). When the session is spanless —
+    // the idle-composer case — there is nothing to anchor to, so both
     // `source_segment_id` and `source_span_ids` stay empty below; this is
     // now permitted for `origin: User` by
     // `persistence::validate_live_assist_card`'s own T3G2 widening (see
@@ -6807,16 +6815,16 @@ async fn mint_user_question_card(
 /// provider/privacy check, or retrieval) subsequently refuses or errors
 /// (fix-round finding, adversarial review, major: "every post-mint refusal
 /// or error orphans a persisted User card"). Before this, a mint-and-ask
-/// that failed AFTER minting â€” Disabled, Busy, a privacy-policy block, a
+/// that failed AFTER minting — Disabled, Busy, a privacy-policy block, a
 /// provider-availability error, anything `dispatch_ask_question_card` below
-/// can return `Err` for â€” left a durable, `Pending`, answer-less card in the
+/// can return `Err` for — left a durable, `Pending`, answer-less card in the
 /// session's CURRENT live-assist store that the frontend never learned about
 /// in this round trip; it would only resurface on the NEXT `load_session`
 /// (`loaded.live_assist_cards`), rendered as an orphaned read-only row. A
 /// retry while the same condition holds (e.g. busy) would mint another,
 /// growing unboundedly.
 ///
-/// Removes the card from the CURRENT store ONLY â€” the append-only audit log
+/// Removes the card from the CURRENT store ONLY — the append-only audit log
 /// (`live_assist_audit_path`) is deliberately left untouched, same posture
 /// as this codebase's other audit/ledger trails: a "created, then abandoned"
 /// pair of rows is an honest record, not a defect, and audit logs in this
@@ -6825,7 +6833,7 @@ async fn mint_user_question_card(
 ///
 /// Uses ONLY pre-existing, already-`pub`/`pub(crate)` primitives
 /// (`user_data::resolve_live_assist_current_path`, `persistence::save_json`,
-/// the trait's own `load_live_assist_cards`) â€” no new persistence surface,
+/// the trait's own `load_live_assist_cards`) — no new persistence surface,
 /// zero edits to `persistence/mod.rs`. Best-effort: a failure to read/write
 /// here is swallowed (`let _ =` / early `return`) rather than shadowing the
 /// REAL error this round trip is already returning to the caller; only ids
@@ -6846,7 +6854,7 @@ fn delete_orphaned_mint(session_id: &str, proposal_id: &str) {
 
 /// Manual path (deliverable a, T4's landed contract): a user-initiated
 /// "Ask AI" or "Retry" on an EXISTING question card (including a fragment
-/// the auto path refused â€” P4). `auto` is caller-supplied â€” the frontend
+/// the auto path refused — P4). `auto` is caller-supplied — the frontend
 /// sends `false` for every call site that exists today (T4's manual Ask-AI/
 /// Retry); `true` is T5's future auto-answer trigger, reusing this same
 /// command rather than a separate one. Passing `auto` straight through to
@@ -6854,11 +6862,11 @@ fn delete_orphaned_mint(session_id: &str, proposal_id: &str) {
 /// self-sufficient (Q2): a caller claiming `auto: true` gets the FULL
 /// ordered auto gate (Rust-stamped `Strong` signal, converse exclusion,
 /// duplicate check, interval, session cap) with no way to short-circuit it
-/// by construction â€” there is no other code path into the engine.
+/// by construction — there is no other code path into the engine.
 ///
 /// `question` is renderer-supplied and never used for anything: the engine
 /// derives its own question text from the durable card's `proposal.body`
-/// (`question_text_from_body`, inside `answer_question_card_impl`) â€” the
+/// (`question_text_from_body`, inside `answer_question_card_impl`) — the
 /// only trustworthy source. Accepted purely for wire-contract parity with
 /// the frontend (`answerQuestionCard`, `store/index.ts`, which always sends
 /// the question it already derived from the same proposal); never read,
@@ -6874,7 +6882,7 @@ fn delete_orphaned_mint(session_id: &str, proposal_id: &str) {
 /// (disproportionate for this ticket's scope, and fragile for a
 /// `Channel<ChatStreamFrame>` argument's wire encoding). Pulling the actual
 /// logic out into this plain `&AppState`-taking function means a test CAN
-/// call it directly â€” the annotated wrapper below is then a one-line
+/// call it directly — the annotated wrapper below is then a one-line
 /// delegation, correct by inspection.
 async fn dispatch_answer_question_card(
     proposal_id: String,
@@ -6908,16 +6916,16 @@ pub async fn answer_question_card(
 /// Mint-and-ask (deliverable a/b, T4's landed contract): mint a
 /// `CardOrigin::User` question card from free-form chatbox text
 /// (`mint_user_question_card`), then answer it in the SAME round trip via
-/// the manual gate â€” `auto` is hardcoded `false` here, never caller-
+/// the manual gate — `auto` is hardcoded `false` here, never caller-
 /// supplied, because a mint-and-ask is definitionally a manual ask (the
 /// ledger action id this buys, `assist_manual_answer`, is deliverable c's
 /// "mint-and-ask + manual retry = assist_manual_answer" rule). The minted
 /// `record` is returned alongside `request_id` so the frontend can render
 /// the card immediately, before the first streamed delta arrives.
 ///
-/// Fix-round addition (major, adversarial review): on EITHER failure arm â€”
+/// Fix-round addition (major, adversarial review): on EITHER failure arm —
 /// a gate `Refused` or any other `Err` from `answer_question_card_impl`
-/// (privacy policy, provider availability, retrieval) â€” the just-minted
+/// (privacy policy, provider availability, retrieval) — the just-minted
 /// card is removed from the current store via `delete_orphaned_mint` before
 /// the error is returned, so a failed mint-and-ask never leaves a durable
 /// orphan behind. See `dispatch_answer_question_card`'s doc comment above
@@ -7090,9 +7098,9 @@ pub fn load_settings_cmd(
     state: State<'_, AppState>,
 ) -> crate::settings::AppSettings {
     // Migration/redaction writeback of legacy inline credentials. Hold the
-    // process-wide settings I/O lock across the loadâ†’save so a concurrent footer
+    // process-wide settings I/O lock across the load→save so a concurrent footer
     // Save can't interleave between this read and this whole-struct writeback and
-    // have its provider/model selection reverted to our stale snapshot â€” the same
+    // have its provider/model selection reverted to our stale snapshot — the same
     // dual-writer race class as set_analytics_enabled (symmetric-writer check for
     // audio-graph-3e69 / cred-review M3, a writer the M3 enumeration omitted).
     let settings = {
@@ -7191,7 +7199,7 @@ pub fn delete_model_cmd(app: tauri::AppHandle, model_filename: String) -> AppRes
 ///
 /// Takes effect immediately for every subsequent `log::*!` macro and dirties
 /// the cached settings so the new level is visible to readers. Disk
-/// persistence is **not** performed here â€” the frontend is expected to call
+/// persistence is **not** performed here — the frontend is expected to call
 /// `save_settings_cmd` to flush the full settings blob when the user commits.
 ///
 // set_log_level only mutates runtime tracing; save_settings_cmd is the
@@ -7207,7 +7215,7 @@ pub fn set_log_level(
     crate::logging::apply_log_level(&level);
 
     // 2. Dirty the in-memory settings cache so any reader (and the next
-    //    save_settings_cmd call) sees the new value. No disk write here â€”
+    //    save_settings_cmd call) sees the new value. No disk write here —
     //    save_settings_cmd is the sole owner of that path to avoid the
     //    race flagged in the loop-13 review.
     if let Ok(mut cached) = state.app_settings.write() {
@@ -7272,7 +7280,7 @@ pub fn set_logging_config(
             .unwrap_or_else(|| "info".to_string())
     };
 
-    // 3. Persist just the logging fields to disk (load â†’ patch â†’ save) so we
+    // 3. Persist just the logging fields to disk (load → patch → save) so we
     //    don't overwrite settings the user may be editing in the form. Hold the
     //    process-wide settings I/O lock across the whole load+save so a
     //    concurrent full `save_settings` can't interleave and silently revert
@@ -7349,13 +7357,13 @@ pub fn get_analytics_info(
 /// Apply + persist the opt-in anonymous-analytics setting. Mirrors
 /// [`set_logging_config`]: a deliberate, user-initiated commit that updates the
 /// in-memory cache and patches just the `analytics_enabled` field on disk
-/// (load â†’ patch â†’ save) so it doesn't clobber unsaved edits elsewhere.
+/// (load → patch → save) so it doesn't clobber unsaved edits elsewhere.
 ///
 /// Toggle semantics (see [`crate::analytics`]): turning ON inits a fresh client
 /// if none is live (the app may have started with analytics off, or a prior OFF
 /// closed the transport) and binds it on the process hub; turning OFF unbinds on
-/// the process hub AND closes the shared client transport â€” a thread-global kill
-/// â€” then drops the guard, so a later ON re-inits. The local crash handler is
+/// the process hub AND closes the shared client transport — a thread-global kill
+/// — then drops the guard, so a later ON re-inits. The local crash handler is
 /// untouched (it is independent of this setting).
 #[tauri::command]
 pub fn set_analytics_enabled(
@@ -7379,12 +7387,12 @@ pub fn set_analytics_enabled(
         cached.analytics_enabled = Some(enabled);
     }
 
-    // 3. Persist just the analytics field to disk (load â†’ patch â†’ save) so we
+    // 3. Persist just the analytics field to disk (load → patch → save) so we
     //    don't overwrite settings the user may be editing in the form. Hold the
     //    process-wide settings I/O lock across the whole load+save so a
     //    concurrent full `save_settings` (footer Save) can't interleave between
     //    our read and write and silently revert the user's provider/model
-    //    selection â€” the credential-adjacent config this write would otherwise
+    //    selection — the credential-adjacent config this write would otherwise
     //    clobber with its stale pre-Save snapshot (audio-graph-3e69 /
     //    cred-review M3). Mirrors the `set_logging_config` pattern verbatim.
     {
@@ -7401,20 +7409,20 @@ pub fn set_analytics_enabled(
 
 /// Relay a frontend diagnostic through the backend Sentry channel.
 ///
-/// The WebView has no working Sentry egress of its own â€” CSP `connect-src`
-/// blocks the browser SDK's POST to `*.ingest.us.sentry.io` â€” so the frontend
+/// The WebView has no working Sentry egress of its own — CSP `connect-src`
+/// blocks the browser SDK's POST to `*.ingest.us.sentry.io` — so the frontend
 /// forwards structured, **controlled** ids here and the (CSP-exempt) Rust
 /// Sentry does the actual send through its mature scrubber.
 ///
-/// This command accepts ONLY short, id-shaped fields â€” never a free-text
+/// This command accepts ONLY short, id-shaped fields — never a free-text
 /// message or stack. Each field is defensively clamped to the id shape
 /// (`^[a-z0-9._:-]{1,48}$`); anything that fails is dropped (mapped to `None`)
 /// rather than forwarded, so even a misbehaving/compromised renderer cannot
 /// smuggle prose in. The backend [`scrub_event`](crate::analytics) allowlist is
 /// the belt-and-suspenders backstop, but we do not rely on it to strip prose.
 ///
-/// Mapping into [`DiagEvent`](crate::analytics::DiagEvent): `name` â†’ the event
-/// id, `component` â†’ the `provider` tag, `surface` â†’ the `kind` tag. The
+/// Mapping into [`DiagEvent`](crate::analytics::DiagEvent): `name` → the event
+/// id, `component` → the `provider` tag, `surface` → the `kind` tag. The
 /// backend picks the [`Category`](crate::analytics::Category) enum from the
 /// supplied id (always `Category::Frontend`), so no free-text category rides in.
 ///
@@ -7449,7 +7457,7 @@ pub fn report_frontend_diagnostic(
         name: &name,
         category: crate::analytics::Category::frontend(),
         level: sentry::Level::Error,
-        // component â†’ provider, surface â†’ kind (both id-shaped controlled tags).
+        // component → provider, surface → kind (both id-shaped controlled tags).
         provider: component.as_deref(),
         kind: surface.as_deref(),
         http_status: None,
@@ -7461,7 +7469,7 @@ pub fn report_frontend_diagnostic(
 
 /// Clamp a frontend-supplied string to the controlled id shape
 /// (`^[a-z0-9._:-]{1,48}$`). Returns `Some(id)` when the whole string matches,
-/// or `None` to DROP it â€” we never forward untrusted free text, so a value that
+/// or `None` to DROP it — we never forward untrusted free text, so a value that
 /// isn't already id-shaped (spaces, uppercase, prose, over-length) is discarded
 /// rather than mangled. This mirrors the backend scrubber's `is_id_shaped`
 /// gate, applied at the boundary so nothing prose-shaped reaches the SDK.
@@ -7479,8 +7487,8 @@ fn sanitize_frontend_id(s: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Closed diagnostic for a failed realtime worker-thread spawn (issue #145).
-/// The `io::Error` (OS prose, possibly paths) is discarded â€” `AppError::
-/// from_unclassified_runtime_error` keeps nothing from it â€” so the command
+/// The `io::Error` (OS prose, possibly paths) is discarded — `AppError::
+/// from_unclassified_runtime_error` keeps nothing from it — so the command
 /// result is a closed `internal` runtime diagnostic localized by the UI.
 fn realtime_worker_spawn_error(source: &std::io::Error) -> AppError {
     use audio_graph_ipc_contract::runtime_diagnostic::{
@@ -7529,9 +7537,9 @@ fn persist_gemini_turn_usage(
 ///
 /// Reads Gemini settings (API key, model) from `AppSettings`, creates a
 /// `GeminiLiveClient`, connects it, then spawns two worker threads:
-///   1. **Audio sender** â€” reads from its runtime processed-audio consumer and
+///   1. **Audio sender** — reads from its runtime processed-audio consumer and
 ///      forwards audio to Gemini.
-///   2. **Event receiver** â€” reads `GeminiEvent`s from the client and emits
+///   2. **Event receiver** — reads `GeminiEvent`s from the client and emits
 ///      Tauri events (`gemini-transcription`, `gemini-response`), also feeding
 ///      transcriptions into the knowledge graph.
 ///
@@ -7639,7 +7647,7 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
             GEMINI_NOTES_AUDIO_CONSUMER_ID,
         );
         // Issue #145: `connect()` already returns the closed typed
-        // `RuntimeDiagnostic` AppError â€” forward it unchanged.
+        // `RuntimeDiagnostic` AppError — forward it unchanged.
         return Err(err);
     }
 
@@ -7801,8 +7809,8 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
 
                                 // Feed transcription into the knowledge graph
                                 // (same extraction pipeline as local transcripts).
-                                // Run it on the shared rayon extraction pool â€”
-                                // NOT inline here â€” so a slow/blocked LLM cannot
+                                // Run it on the shared rayon extraction pool —
+                                // NOT inline here — so a slow/blocked LLM cannot
                                 // stall Gemini Live event handling (transcripts,
                                 // status, reconnects) or back up the bounded
                                 // event channel.
@@ -7880,9 +7888,9 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                                 attempt,
                                 backoff_secs,
                             } => {
-                                // Auto-reconnect in flight â€” surface through
+                                // Auto-reconnect in flight — surface through
                                 // the status event so the UI can show a
-                                // "reconnectingâ€¦" hint. Do NOT break the loop:
+                                // "reconnecting…" hint. Do NOT break the loop:
                                 // the session task handles the full setup
                                 // handshake replay and will emit Reconnected
                                 // on success or a fatal Error if the budget
@@ -7900,13 +7908,13 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                             }
                             // Native audio-out / barge-in events (ADR-0018).
                             // This `start_gemini` path runs the notes/graph
-                            // TEXT modality, which never produces these â€” the
+                            // TEXT modality, which never produces these — the
                             // converse-mode orchestrator (B18, `crate::converse`
                             // TurnMachine) consumes them via `gemini_event_to_signal`.
                             // We log + ignore here so the notes path stays
                             // exhaustive without taking on converse wiring.
                             GeminiEvent::AudioChunk { .. } => {
-                                // Issue #145: fixed label â€” no payload size.
+                                // Issue #145: fixed label — no payload size.
                                 log::debug!(
                                     "Gemini: unexpected AudioChunk on notes-mode path; ignoring"
                                 );
@@ -8002,7 +8010,7 @@ pub async fn stop_gemini(state: State<'_, AppState>, _app: tauri::AppHandle) -> 
     }
 
     // 3. Join the worker threads (bounded) so they fully exit before we return
-    //    â€” prevents a fast Stopâ†’Start race from running two Gemini workers on
+    //    — prevents a fast Stop→Start race from running two Gemini workers on
     //    the same audio channel (critique H2). Detaches on timeout.
     let audio_h = state
         .gemini_audio_thread
@@ -8040,7 +8048,7 @@ pub async fn stop_gemini(state: State<'_, AppState>, _app: tauri::AppHandle) -> 
 }
 
 // ---------------------------------------------------------------------------
-// Converse mode â€” native speech-to-speech (B18 / ADR-0018)
+// Converse mode — native speech-to-speech (B18 / ADR-0018)
 // ---------------------------------------------------------------------------
 
 /// Production [`crate::converse::ConverseSink`] for the Gemini native-S2S path.
@@ -8048,7 +8056,7 @@ pub async fn stop_gemini(state: State<'_, AppState>, _app: tauri::AppHandle) -> 
 /// Dispatches the FSM's [`crate::converse::TurnAction`]s against the live
 /// engine + audio player + capture gate. Holds only `Arc` handles (cloned from
 /// `AppState`) so it lives on the converse-driver thread. The pure
-/// [`crate::converse::ConverseDriver`] decides; this executes â€” and is the only
+/// [`crate::converse::ConverseDriver`] decides; this executes — and is the only
 /// part that touches I/O, which is why the decision logic is unit-tested
 /// against a mock sink instead.
 struct GeminiConverseSink {
@@ -8153,7 +8161,7 @@ impl crate::converse::ConverseSink for GeminiConverseSink {
 /// Forwards captured audio chunks to the engine while converse is active and
 /// the per-turn capture gate is open. Uses `recv_timeout` (not a blocking
 /// `recv`) so the loop re-checks `is_active` every tick and wakes promptly when
-/// `stop_converse` flips the flag â€” even if capture stopped first and no
+/// `stop_converse` flips the flag — even if capture stopped first and no
 /// further chunk ever arrives. A blocking `recv` would park until the *next*
 /// chunk, miss the stop, force the join to time out and detach, and then let a
 /// fast restart spawn a SECOND thread racing on the same runtime consumer rx.
@@ -8249,7 +8257,7 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
     // and breaks, but leaves the thread slots `Some(finished_handle)` and the
     // gemini_client set. We are past the `is_converse_active` guard (false) here,
     // so without this the spawn-gates below (`if handle.is_none()`) would see a
-    // stale `Some` and silently skip spawning â€” a restart-without-stop would
+    // stale `Some` and silently skip spawning — a restart-without-stop would
     // produce a converse session that sends/decodes nothing and reports no error.
     // Reap finished handles (join, surfacing panics) so the spawn gates fire; if
     // a handle is genuinely still running, refuse with "already running" rather
@@ -8318,8 +8326,8 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
         }
     }
 
-    // AUDIO modality with the configured voice (B18 step 1) â€” this is what makes
-    // the server emit AudioChunk so the FSM's Thinkingâ†’Speaking edge can fire.
+    // AUDIO modality with the configured voice (B18 step 1) — this is what makes
+    // the server emit AudioChunk so the FSM's Thinking→Speaking edge can fire.
     let mut config = GeminiConfig::audio(
         gemini_settings.auth.clone(),
         gemini_settings.model,
@@ -8384,7 +8392,7 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
         *client_guard = Some(client);
     }
 
-    // 1. Audio sender thread â€” forward captured audio while the gate is open.
+    // 1. Audio sender thread — forward captured audio while the gate is open.
     //    AUD-CV1 (#48): uses converse's OWN thread slot and runtime consumer,
     //    never the notes-mode worker/channel.
     {
@@ -8430,7 +8438,7 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
         }
     }
 
-    // 2. Converse-event driver thread â€” drives the TurnMachine from GeminiEvents.
+    // 2. Converse-event driver thread — drives the TurnMachine from GeminiEvents.
     {
         let mut conv_handle = state
             .converse_thread
@@ -8450,7 +8458,7 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
                 .spawn(move || {
                     log::info!("converse driver: starting");
                     // Gemini uses server-side VAD with NO client AEC reference,
-                    // so audio-activity barge-in is disabled â€” the engine's own
+                    // so audio-activity barge-in is disabled — the engine's own
                     // `interrupted` event drives barge-in (bypasses the gate).
                     let gate = crate::converse::InterruptionGate {
                         enabled: false,
@@ -8458,14 +8466,14 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
                     };
                     let mut driver = crate::converse::ConverseDriver::new(gate);
                     // Prime into Listening (server-VAD bridge): the first
-                    // assistant AudioChunk then drives Thinkingâ†’Speaking.
+                    // assistant AudioChunk then drives Thinking→Speaking.
                     driver.begin_listening(unix_millis(), &mut sink);
 
                     while let Ok(event) = event_rx.recv() {
                         if !is_active.read().map(|a| *a).unwrap_or(false) {
                             break;
                         }
-                        // AUD-CV2 (#49): an Auth/AuthExpired error is TERMINAL â€”
+                        // AUD-CV2 (#49): an Auth/AuthExpired error is TERMINAL —
                         // the session cannot recover without reconfiguring/
                         // refreshing credentials, and the server may stop
                         // emitting entirely WITHOUT a `Disconnected`. If we only
@@ -8494,7 +8502,7 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
                                 let _ = sink.app_handle.emit(events::GEMINI_STATUS, &event);
                             }
                             GeminiEvent::Transcription { .. } => {
-                                // User-speech transcript â†’ UI (graph extraction
+                                // User-speech transcript → UI (graph extraction
                                 // for converse is a B-future enhancement).
                                 let _ = sink.app_handle.emit(events::GEMINI_TRANSCRIPTION, &event);
                             }
@@ -8506,11 +8514,11 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
 
                         // AUD-CV2 (#49): on a terminal auth error, flip the
                         // shared flag off (so the audio-sender thread also wakes
-                        // and exits) and break â€” the driver does not spin
+                        // and exits) and break — the driver does not spin
                         // forever on a dead session.
                         if terminal_auth {
                             log::warn!(
-                                "converse driver: terminal auth error â€” tearing down session"
+                                "converse driver: terminal auth error — tearing down session"
                             );
                             if let Ok(mut active) = is_active.write() {
                                 *active = false;
@@ -8654,7 +8662,7 @@ pub async fn stop_converse(state: State<'_, AppState>, _app: tauri::AppHandle) -
 // ---------------------------------------------------------------------------
 
 /// Production [`crate::converse::ConverseSink`] for the OpenAI Realtime S2S
-/// path. Sibling of [`GeminiConverseSink`] â€” dispatches the FSM's
+/// path. Sibling of [`GeminiConverseSink`] — dispatches the FSM's
 /// [`crate::converse::TurnAction`]s against the live `OpenAiRealtimeClient` +
 /// audio player + capture gate. The pure [`crate::converse::ConverseDriver`]
 /// decides; this executes.
@@ -8784,7 +8792,7 @@ fn run_openai_realtime_audio_sender(
 /// Parallel to [`start_converse`] (Gemini native S2S): opens an OpenAI Realtime
 /// **voice** session (`gpt-realtime-2`) and drives a
 /// [`crate::converse::ConverseDriver`] from the live `OpenAiRealtimeEvent`
-/// stream â€” assistant audio is decoded + played, server-VAD speech boundaries
+/// stream — assistant audio is decoded + played, server-VAD speech boundaries
 /// drive the turn FSM, and `response.done` resumes listening. User audio is
 /// delivered through a dedicated runtime processed-audio consumer
 /// ([`ProcessedAudioConsumerStage::RealtimeAgent`]), separate from the notes
@@ -8856,7 +8864,7 @@ pub async fn start_openai_realtime(
     let agent_settings = settings.openai_realtime_agent.clone();
 
     // Validate auth early. The credential maps to `openai_api_key` (same key as
-    // the OpenAI Realtime STT provider) â€” see the credential mapping in
+    // the OpenAI Realtime STT provider) — see the credential mapping in
     // `credential_keys_for_provider` (`realtime_agent.openai_realtime`).
     // Issue #145: an empty key is the closed `invalid_configuration`
     // diagnostic, the same one `connect()` returns, not a legacy local error.
@@ -9005,7 +9013,7 @@ pub async fn start_openai_realtime(
         }
     }
 
-    // 2. Event-driver thread â€” drives the TurnMachine from OpenAiRealtimeEvents.
+    // 2. Event-driver thread — drives the TurnMachine from OpenAiRealtimeEvents.
     {
         let mut event_handle = state
             .openai_realtime_event_thread
@@ -9034,7 +9042,7 @@ pub async fn start_openai_realtime(
                     };
                     let mut driver = crate::converse::ConverseDriver::new(gate);
                     // Prime into Listening; the first assistant Audio chunk then
-                    // drives Thinkingâ†’Speaking.
+                    // drives Thinking→Speaking.
                     driver.begin_listening(unix_millis(), &mut sink);
 
                     while let Ok(event) = event_rx.recv() {
@@ -9042,7 +9050,7 @@ pub async fn start_openai_realtime(
                             break;
                         }
                         // A terminal Auth/AuthExpired error cannot recover
-                        // without reconfiguring credentials â€” tear down rather
+                        // without reconfiguring credentials — tear down rather
                         // than spin on a dead session (parallel to AUD-CV2).
                         let terminal_auth = matches!(
                             &event,
@@ -9053,7 +9061,7 @@ pub async fn start_openai_realtime(
                                 ..
                             }
                         );
-                        // Transport/lifecycle events the FSM does not model â†’
+                        // Transport/lifecycle events the FSM does not model →
                         // surface to the frontend (same envelope as Gemini).
                         match &event {
                             OpenAiRealtimeEvent::Disconnected => {
@@ -9077,7 +9085,7 @@ pub async fn start_openai_realtime(
 
                         if terminal_auth {
                             log::warn!(
-                                "openai-realtime driver: terminal auth error â€” tearing down session"
+                                "openai-realtime driver: terminal auth error — tearing down session"
                             );
                             if let Ok(mut active) = is_active.write() {
                                 *active = false;
@@ -9627,7 +9635,7 @@ fn projection_replay_latency_metrics(
         // returns fewer events than `covered_span_count()` only when the
         // basis names a span this `transcript_events` slice cannot
         // reproduce (a genuinely missing/unresolvable timestamp for this
-        // metric, same as the pre-cfa1 tail-only lookup miss below) â€” so a
+        // metric, same as the pre-cfa1 tail-only lookup miss below) — so a
         // length shortfall here carries exactly the same
         // `missing_timestamp` meaning the old per-span lookup-miss branch
         // had.
@@ -9957,7 +9965,7 @@ pub async fn get_projection_replay_report_cmd(
 /// Probes the transcripts directory with a small canary write. On success,
 /// resets the process-wide storage-full debounce so the next real ENOSPC
 /// re-emits `capture-storage-full`, and returns `Ok(())`. On failure, leaves
-/// the debounce set and returns a structured `unknown` payload â€” the UI should
+/// the debounce set and returns a structured `unknown` payload — the UI should
 /// keep the banner visible so the user knows they haven't freed enough space
 /// yet.
 #[tauri::command]
@@ -10009,7 +10017,7 @@ fn capture_legacy_session_transcript(session_id: &str) -> Result<String, String>
     }
     // Byte ceiling (seed audio-graph-4fa5 fix round: this legacy fallback is
     // the OTHER branch of the same fork `read_session_transcript_snapshot`
-    // gates â€” a pre-event-log session takes THIS path instead of the
+    // gates — a pre-event-log session takes THIS path instead of the
     // canonical `transcripts/<id>.events.jsonl` read, so it needs its own
     // stat-before-read guard rather than inheriting the canonical read's.
     // Reuses the same ceiling/class as the canonical transcript-events read:
@@ -10039,7 +10047,7 @@ fn parse_legacy_session_transcript(contents: &str) -> Result<Vec<TranscriptSegme
 }
 
 /// Read one past Session's transcript through the guarded compatibility-floor
-/// admission seam (ADR-0044 Â§5, seed audio-graph-e8e7).
+/// admission seam (ADR-0044 §5, seed audio-graph-e8e7).
 ///
 /// Standalone transcript reads admit the floor here. Review and bundle export
 /// call the admitted reader directly while holding their snapshot guard across
@@ -10195,16 +10203,16 @@ fn load_session_transcript_impl(session_id: String) -> AppResult<Vec<TranscriptS
 ///
 /// Returns the append-ordered, already-redacted [`DataMovementEvent`]s from
 /// `~/.audiograph/ledgers/<session_id>.movements.jsonl`. The ledger schema is
-/// redaction-safe by construction â€” it carries only data *classes*, boundary
+/// redaction-safe by construction — it carries only data *classes*, boundary
 /// hops, provider/model ids, hashed artifact paths, and pre-redacted error
-/// messages, never secrets or raw payloads â€” so the events can be surfaced to
+/// messages, never secrets or raw payloads — so the events can be surfaced to
 /// the user verbatim. A missing or empty ledger yields an empty vec; because
 /// production coverage is not yet exhaustive, the UI must render that as
 /// Unknown rather than proof that no content left the device.
 ///
 /// `async fn` (fix-round finding: this command was the one session-scoped
 /// historical read left sync, unbounded, and uninstrumented outside every
-/// other seed audio-graph-4fa5 deliverable) â€” moves the ledger read off the
+/// other seed audio-graph-4fa5 deliverable) — moves the ledger read off the
 /// win32 message-pump thread, same as every sibling session command.
 #[tauri::command]
 pub async fn load_session_data_movement_cmd(
@@ -10369,7 +10377,7 @@ fn choose_materialized_graph(
 ///
 /// `async fn` (seed audio-graph-e8a5): disk I/O now runs off the win32
 /// message-pump thread instead of inline in the IPC handler. The response
-/// itself is transcript-lens-only (seed audio-graph-4fa5 deliverable a) â€” see
+/// itself is transcript-lens-only (seed audio-graph-4fa5 deliverable a) — see
 /// [`load_session_notes_artifacts_cmd`] / [`load_session_graph_artifact_cmd`]
 /// for the artifacts this command used to bundle.
 #[tauri::command]
@@ -10407,18 +10415,18 @@ fn load_session_for_admitted_session(session_id: &str) -> AppResult<LoadedSessio
     let transcript_events = transcript_snapshot.events;
 
     // `load_session` bundles several artifacts behind one response, all
-    // gated by `?` â€” but only `transcript`/`transcript_events` (via
+    // gated by `?` — but only `transcript`/`transcript_events` (via
     // `read_admitted_session_transcript_snapshot` above) is the artifact this command
     // exists to keep loading no matter what. The three side artifacts below
     // (live graph, diarization log, live-assist cards) degrade to their
-    // "missing" fallback â€” logging a warning, never a silent no-op â€” rather
+    // "missing" fallback — logging a warning, never a silent no-op — rather
     // than failing the WHOLE session open when one of them alone exceeds its
     // ceiling (fix-round finding: a side-artifact ceiling refusal used to
     // take the transcript lens down with it, which is strictly worse than
     // the pre-ceiling behavior of loading it, slowly, in full). Each has its
     // own dedicated lens/consumer that can still show a visible refusal
     // (Graph lens: `load_session_graph_artifact_cmd`; this command has none
-    // for these three, so a warn log is the only signal â€” acceptable because
+    // for these three, so a warn log is the only signal — acceptable because
     // all three are supplementary to the transcript, and two of the three
     // are already structurally capped at write time).
     let live_graph_ceiling =
@@ -10451,7 +10459,7 @@ fn load_session_for_admitted_session(session_id: &str) -> AppResult<LoadedSessio
     // the live path now writes (audio-graph-719d). Surfacing it lets the
     // frontend resolve trusted latest-wins speaker attribution on reload rather
     // than trusting the inline ASR labels. A session that never emitted
-    // diarization rows loads an empty vec â€” same fallback an oversized log
+    // diarization rows loads an empty vec — same fallback an oversized log
     // degrades to (see the comment above `live_graph_ceiling`).
     let diarization_ceiling = enforce_artifact_ceiling(
         &crate::user_data::resolve_diarization_events_path(session_id)?,
@@ -10532,18 +10540,18 @@ fn load_session_for_admitted_session(session_id: &str) -> AppResult<LoadedSessio
 /// Replay the canonical projection log against the transcript/speaker
 /// histories, refusing (typed `SessionInvalid`) if any patch fails
 /// validation. Shared by [`load_session_notes_artifacts_cmd`] and
-/// [`load_session_graph_artifact_cmd`] â€” each lens replays independently when
+/// [`load_session_graph_artifact_cmd`] — each lens replays independently when
 /// it activates (seed audio-graph-4fa5 deliverable a); a shared cache across
 /// lenses is explicitly out of scope here. Seed audio-graph-4fa5 deliverable
 /// f moved this replay off the UI thread and behind a lens fetch WITHOUT
 /// restructuring `projections.rs`'s own algorithm; seed audio-graph-927a
 /// landed that algorithmic fix (`LedgerHistory`'s forward cursors,
-/// `projections.rs`) â€” each lens activation still pays one replay call, but
+/// `projections.rs`) — each lens activation still pays one replay call, but
 /// that call no longer re-folds the same raw transcript/speaker event
-/// across patches: it is now O(events + patches Ã— distinct_spans) instead
-/// of O(patches Ã— events), because `classify_basis_currency` /
+/// across patches: it is now O(events + patches × distinct_spans) instead
+/// of O(patches × events), because `classify_basis_currency` /
 /// `resolve_claim_evidence_basis_events` (deliberately left unmodified by
-/// that ticket) still clone/re-derive the current ledger once per patch â€”
+/// that ticket) still clone/re-derive the current ledger once per patch —
 /// bounded by the DISTINCT-span count, not the raw event count, and paid
 /// once either way. See `projections.rs`'s `LedgerHistory` doc comment for
 /// the precise accounting.
@@ -10646,18 +10654,18 @@ fn rebuild_projection_view(
 /// `load_session` used to do inline) plus the raw projection-patch log
 /// `NotesPanel` derives `noteRevisionCounts` from. Deferred out of
 /// `load_session` (seed audio-graph-4fa5 deliverable a) so a session open
-/// alone never pays for these â€” 19.1MB + 33.3MB for the field session that
+/// alone never pays for these — 19.1MB + 33.3MB for the field session that
 /// OOM'd the app. NOTE this is genuinely deferred only relative to
 /// `load_session` itself: the Notes lens is `SessionsBrowser`'s
 /// default-active lens (`useState<DetailLens>("notes")`), so in practice
-/// this fires immediately after most session opens too â€” only the Graph
+/// this fires immediately after most session opens too — only the Graph
 /// lens (`load_session_graph_artifact_cmd`) is deferred until the user picks
 /// a non-default tab. The real protection for THIS artifact pair is the
 /// byte ceiling below, not lens-gating.
 ///
 /// `async fn` (seed audio-graph-e8a5) so the canonical-replay work (seed
 /// audio-graph-927a's `LedgerHistory` forward-cursor replay, `projections.rs`
-/// â€” O(events + patches Ã— distinct_spans), not O(patches Ã— events); see
+/// — O(events + patches × distinct_spans), not O(patches × events); see
 /// `replay_projection_state_or_invalid`'s doc comment above) runs off the
 /// message-pump thread.
 #[tauri::command]
@@ -10730,11 +10738,11 @@ fn load_session_notes_artifacts_for_admitted_session(
     Ok(artifacts)
 }
 
-/// Load a past session's materialized (Graph-lens) knowledge graph â€”
+/// Load a past session's materialized (Graph-lens) knowledge graph —
 /// replayed against the canonical projection log when present, exactly like
 /// `load_session` used to do inline. Deferred out of `load_session` (seed
-/// audio-graph-4fa5 deliverable a) so opening a session never pays for it â€”
-/// 156.6MB for the field session that OOM'd the app â€” unless the Graph lens
+/// audio-graph-4fa5 deliverable a) so opening a session never pays for it —
+/// 156.6MB for the field session that OOM'd the app — unless the Graph lens
 /// actually activates.
 ///
 /// `async fn` (seed audio-graph-e8a5); see [`load_session_notes_artifacts_cmd`]
@@ -10763,7 +10771,7 @@ fn load_session_graph_artifact_impl(
             reason: format!("Session files not found: {}", session_id),
         });
     }
-    // Floor-admitted â€” see the matching comment in
+    // Floor-admitted — see the matching comment in
     // `load_session_notes_artifacts_impl`.
     let data_root = crate::user_data::resolve_data_root()
         .map_err(|error| AppError::Io(format!("resolve data root: {error}")))?;
@@ -10861,14 +10869,14 @@ const STREAM_EVIDENCE_EXPORT_SCHEMA_VERSION: u32 = 4;
 /// caller does not silently export an empty bundle for a bad ID.
 ///
 /// Every artifact above is ceiling-checked (seed audio-graph-4fa5 deliverable
-/// b) before being read, same as `load_session`/the lens commands â€” but
+/// b) before being read, same as `load_session`/the lens commands — but
 /// UNLIKE `load_session_impl`, an over-ceiling artifact here still fails the
 /// whole export (fix-round finding: this removes the one escape hatch that
 /// could get a field-crash-sized session's data out of the app for backup or
 /// repair). Deliberately left as-is rather than adding a partial/step-down
 /// export: which artifacts to drop from an export and how to signal that to
 /// the user is a product decision, not a mechanical fix, and is out of scope
-/// for this unit â€” flagged as a seed-worthy follow-up rather than silently
+/// for this unit — flagged as a seed-worthy follow-up rather than silently
 /// left broken.
 fn session_export_bundle(session_id: &str) -> AppResult<SessionExportWithControlPlane> {
     validate_session_id(session_id)?;
@@ -11038,22 +11046,22 @@ pub async fn export_session_bundle(session_id: String) -> AppResult<SessionExpor
 }
 
 /// Build the ordered, speaker-attributed, provenance-linked session timeline
-/// (epic 0d72 P1, ADR-0026 Â§4.1) for a session from its durable on-disk logs.
+/// (epic 0d72 P1, ADR-0026 §4.1) for a session from its durable on-disk logs.
 ///
 /// This is the backend home for the [`crate::timeline::build_session_timeline`]
 /// read-model fold. Reads (all read-only, none mutate state), then replays the
 /// three event-sourced structures the fold consumes:
-///   - transcript event log (`transcripts/<id>.events.jsonl`) â†’ [`TranscriptLedger`]
-///   - diarization span-revision log (`transcripts/<id>.speaker.jsonl`) â†’
+///   - transcript event log (`transcripts/<id>.events.jsonl`) → [`TranscriptLedger`]
+///   - diarization span-revision log (`transcripts/<id>.speaker.jsonl`) →
 ///     [`SpeakerTimeline`] (so a *loaded* session resolves trustworthy
 ///     latest-wins speakers backend-side, per ADR-0026 F3, rather than trusting
 ///     the untrusted inline ASR labels the frontend-only selector falls back to)
-///   - the **live** knowledge graph (`graphs/<id>.json`) â†’
+///   - the **live** knowledge graph (`graphs/<id>.json`) →
 ///     [`TemporalKnowledgeGraph`], whose `TemporalEdge.source_segment_id` carries
 ///     the per-utterance "relates to" link. The live graph is the ONLY structure
 ///     that carries `source_segment_id`; the materialized graph carries only the
 ///     whole-window basis, so it is deliberately NOT an input here (folding it
-///     would leave every `related_edge_ids` empty â€” ADR-0026 Â§4.1 sev4 fix).
+///     would leave every `related_edge_ids` empty — ADR-0026 §4.1 sev4 fix).
 ///
 /// The session must have at least one artifact on disk, otherwise this returns
 /// [`AppError::SessionInvalid`] (the same guard `load_session` /
@@ -11062,8 +11070,8 @@ pub async fn export_session_bundle(session_id: String) -> AppResult<SessionExpor
 /// collections / an empty graph so a transcript-only session still folds.
 ///
 /// `limit` (seed audio-graph-1f85) caps the response to the last `limit`
-/// entries by media-clock order â€” the same tail `SeekTimeline` renders
-/// (`MAX_BLOCKS` / `TRANSCRIPT_WINDOW_SIZE = 200`) â€” so a long session's full
+/// entries by media-clock order — the same tail `SeekTimeline` renders
+/// (`MAX_BLOCKS` / `TRANSCRIPT_WINDOW_SIZE = 200`) — so a long session's full
 /// span log is never serialized just to be sliced client-side. `None` keeps
 /// every entry (used by tests and `export_session_bundle`-adjacent callers
 /// that need the whole fold).
@@ -11123,7 +11131,7 @@ fn session_timeline_for_admitted_session(
             format!("Failed to replay speaker timeline for session {session_id}: {e:?}")
         })?;
     // This re-parses the same live graph file `load_session` already parsed
-    // for the `graph` field of its own (separate, earlier) response â€” a
+    // for the `graph` field of its own (separate, earlier) response — a
     // known duplicate the fold's module doc calls out (`timeline.rs:18-25`
     // explains why it needs the LIVE graph, not the materialized one, so the
     // parse itself cannot be skipped). Seed audio-graph-4fa5 deliverable e
@@ -11131,13 +11139,13 @@ fn session_timeline_for_admitted_session(
     // still fires this fold unconditionally, fire-and-forget, in the same
     // interaction as `load_session` itself (`void
     // get().loadSessionTimeline(sessionId)`), not gated on the Timeline
-    // lens activating â€” an earlier version of this comment claimed
+    // lens activating — an earlier version of this comment claimed
     // otherwise, which was inaccurate (fix-round finding). Deliverable e's
     // actually-shipped mitigation is `limit` alone: it bounds the RESPONSE
     // SIZE of this second parse, which is what field round 5's crash was
     // about, but the parse itself still runs twice per session open. Fully
     // decoupling this fetch from `load_session` (lens-gating it the way
-    // Notes/Graph are) remains a real, undone follow-up â€” declined for this
+    // Notes/Graph are) remains a real, undone follow-up — declined for this
     // unit because it would touch `SessionsBrowser`'s lens-effect wiring and
     // the existing timeline-fold test suite for a performance win, not a
     // crash-safety one; `limit` already bounds the crash-safety exposure.
@@ -11175,12 +11183,12 @@ fn session_timeline_for_admitted_session(
 }
 
 /// Fold a session's durable logs into its [`crate::timeline::TimelineEntry`]
-/// list â€” "who said what, when, in relation to what" (epic 0d72 P1,
-/// ADR-0026 Â§4.1). Ordered by media-clock start time, duplicate-free, with
+/// list — "who said what, when, in relation to what" (epic 0d72 P1,
+/// ADR-0026 §4.1). Ordered by media-clock start time, duplicate-free, with
 /// latest-wins speaker attribution and forward links to the live graph edges
 /// each utterance produced.
 ///
-/// `limit` (seed audio-graph-1f85) tail-caps the response â€” pass the
+/// `limit` (seed audio-graph-1f85) tail-caps the response — pass the
 /// frontend's `TRANSCRIPT_WINDOW_SIZE` (200) so the fold never serializes
 /// more entries than `SeekTimeline` renders. `async fn` (seed
 /// audio-graph-e8a5) moves the disk I/O + replay off the message-pump thread.
@@ -11220,7 +11228,7 @@ pub fn restore_session(session_id: String) -> AppResult<()> {
 }
 
 /// Permanently delete a session: remove from index and unlink its files.
-/// Bypasses the trash â€” intended for the "Delete permanently" action in the
+/// Bypasses the trash — intended for the "Delete permanently" action in the
 /// trash view.
 #[tauri::command]
 pub fn delete_session_permanently(session_id: String, state: State<'_, AppState>) -> AppResult<()> {
@@ -11275,7 +11283,7 @@ pub fn purge_expired_sessions(state: State<'_, AppState>) -> AppResult<Vec<Strin
 
 /// Load the token-usage record for a session from
 /// `~/.audiograph/usage/<session_id>.json`. Missing or malformed files
-/// resolve to a zeroed record â€” callers never have to disambiguate.
+/// resolve to a zeroed record — callers never have to disambiguate.
 #[tauri::command]
 pub fn get_session_usage(session_id: String) -> AppResult<crate::sessions::usage::SessionUsage> {
     validate_session_id(&session_id)?;
@@ -11295,7 +11303,7 @@ pub fn get_current_session_usage(
 }
 
 /// Aggregate usage across every on-disk session file. This is the
-/// authoritative source for the frontend's "Lifetime" totals panel â€” the
+/// authoritative source for the frontend's "Lifetime" totals panel — the
 /// prior localStorage-backed lifetime counter was only ever a best-effort
 /// mirror of this sum.
 #[tauri::command]
@@ -11342,7 +11350,7 @@ pub fn clear_all_usage() -> AppResult<()> {
 ///        - The graph-autosave thread re-reads the ID on its next 30s tick
 ///          and starts writing to the new session's file.
 ///   4. After a successful rotation, finalize the previous session's index
-///      entry (status â†’ complete).
+///      entry (status → complete).
 ///   5. Register the new session in the sessions index so list_sessions
 ///      shows it alongside the previous one.
 ///
@@ -11383,7 +11391,7 @@ pub async fn new_session_cmd(
     //    skip and return the current session ID. The caller sees a successful
     //    rotation either way (the in-flight rotate will land a fresh ID);
     //    they just don't get the one *we* seeded. The usage file we wrote in
-    //    step 2 is then orphaned â€” harmless, since seed files are zeroed and
+    //    step 2 is then orphaned — harmless, since seed files are zeroed and
     //    `load_usage` handles missing/extra entries.
     match state.rotate_session(&new_id) {
         crate::state::RotateOutcome::Rotated(rotated_from) => {
@@ -11423,7 +11431,7 @@ pub async fn new_session_cmd(
         log::warn!("new_session_cmd: register_session failed: {}", e);
     }
 
-    log::info!("new_session_cmd: rotated {} â†’ {}", previous_id, new_id);
+    log::info!("new_session_cmd: rotated {} → {}", previous_id, new_id);
     Ok(new_id)
 }
 
@@ -11489,12 +11497,12 @@ fn save_credential_impl(
     crate::credentials::validate_key(&key)?;
 
     // Empty/whitespace-only is a no-op skip (the backend `set` treats blank as
-    // "don't clobber a stored key" â€” use `delete_credential_cmd` to clear).
+    // "don't clobber a stored key" — use `delete_credential_cmd` to clear).
     // Short-circuit BEFORE the epoch bump + cache rehydrate so a skipped save
     // does no spurious work: bumping the readiness epoch invalidates the
     // provider-readiness cache and rehydrating re-clones app_settings, both
     // pointless for a write that never happened (cred-review M2.1 / N1). This
-    // backend short-circuit is the actual fix â€” it holds regardless of whether
+    // backend short-circuit is the actual fix — it holds regardless of whether
     // the caller inspects the result. Returning `SkippedEmpty` (instead of the
     // old ambiguous `Ok(())`) is forward-looking plumbing that *lets* a caller
     // tell a skip from a persist and skip its post-save presence refresh; no
@@ -13552,10 +13560,10 @@ async fn fetch_openai_compatible_model_catalog(
 
 /// Re-flag the default catalog entry as a real **chat** model.
 ///
-/// Provider-API audit (`/tmp/provider-audit/llm_openai_compat.md` Â§4a): the
+/// Provider-API audit (`/tmp/provider-audit/llm_openai_compat.md` §4a): the
 /// shared OpenAI-compatible fetch marks `whisper-1` (a speech-to-text model) as
 /// the default. That is correct for the ASR reuse but a dead marker for the LLM
-/// model list â€” a chat catalog never contains `whisper-1`, so no row is flagged
+/// model list — a chat catalog never contains `whisper-1`, so no row is flagged
 /// default. This picks a chat-appropriate default instead so the LLM Settings UI
 /// pre-selects a usable model.
 ///
@@ -13643,7 +13651,7 @@ fn cloud_asr_connection_error_message(
     let body = crate::error::redacted_error_excerpt(body, api_key, 200);
     let detail = format!("HTTP {}: {}", status, body);
     // Codex P2 (PR #92): this shared arm also probes localhost/loopback
-    // OpenAI-compatible endpoints with NO saved key â€” a 401 from such a probe
+    // OpenAI-compatible endpoints with NO saved key — a 401 from such a probe
     // is not a rejected credential, so the marker only applies when a key was
     // actually sent. The per-provider helpers always send one.
     if api_key.is_some() {
@@ -13717,7 +13725,7 @@ pub async fn list_openai_compatible_llm_models_cmd(
     let api_key = endpoint_api_key_from_draft_or_store(&endpoint, api_key)?;
     // The shared fetch marks `whisper-1` (an ASR model) as default, which is a
     // dead marker for a chat catalog. Re-select a real chat model as the default
-    // for the LLM path. Provider-API audit Â§4a.
+    // for the LLM path. Provider-API audit §4a.
     let catalog =
         fetch_openai_compatible_model_catalog_with_default(&endpoint, api_key.as_deref(), None)
             .await?;
@@ -13778,7 +13786,7 @@ fn deepgram_stt_model_catalog_from_response(
     }
 
     // Flux (v2/listen conversational-turn models) is NOT returned by Deepgram's
-    // /v1/models management catalog â€” it is a v2 model documented separately â€”
+    // /v1/models management catalog — it is a v2 model documented separately —
     // so it never appears in the picker without a curated fallback. Append the
     // two valid flux ids (confirmed against the v2/listen docs enum) if the live
     // response did not already list them (defensive against a future API that
@@ -13831,7 +13839,7 @@ async fn fetch_deepgram_stt_model_catalog(
         .build()
         .map_err(|e| format!("Failed to build client: {}", e))?;
     let resp = client
-        // Use /v1/models (works with `usage` scope â€” the scope most keys
+        // Use /v1/models (works with `usage` scope — the scope most keys
         // have for transcription). /v1/projects requires the `manage` scope
         // which would return 403 for valid transcription-only keys.
         .get("https://api.deepgram.com/v1/models")
@@ -13995,7 +14003,7 @@ pub async fn test_soniox_connection(api_key: Option<String>) -> AppResult<String
 /// provider is gated on redacted live-smoke evidence (seeds audio-graph-be03 /
 /// audio-graph-e35f, blocked on audio-graph-0b93). Exposing the catalog command
 /// ahead of the Settings picker lets saved-key readiness probe the live
-/// /v1/models catalog without offering a selection â€” so the apparent
+/// /v1/models catalog without offering a selection — so the apparent
 /// catalog-command-without-UI inconsistency is by design (see audio-graph-f9a6),
 /// not a wiring gap. Do not promote the provider here; that needs the secrets gate.
 #[tauri::command]
@@ -14164,7 +14172,7 @@ fn assemblyai_api_key_from_store(store: &crate::credentials::CredentialStore) ->
 ///
 /// Uses the `x-goog-api-key` header (not the `?key=` query string) to match
 /// the production WebSocket auth pattern. Passing the key in URL would leak
-/// it to DNS, proxies, and cert monitoring tools â€” and would silently succeed
+/// it to DNS, proxies, and cert monitoring tools — and would silently succeed
 /// even if the header-auth path is broken in production.
 #[tauri::command]
 pub async fn test_gemini_api_key(api_key: Option<String>) -> AppResult<String> {
@@ -14217,7 +14225,7 @@ fn gemini_api_key_from_store(store: &crate::credentials::CredentialStore) -> App
 
 /// Test AWS credentials via STS GetCallerIdentity (works for any AWS API access).
 ///
-/// Shared between AWS Transcribe and AWS Bedrock settings â€” both providers
+/// Shared between AWS Transcribe and AWS Bedrock settings — both providers
 /// pull from the same backend credential store.
 #[tauri::command]
 pub async fn test_aws_credentials(
@@ -14400,12 +14408,12 @@ pub async fn test_tts_connection_cmd(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Output-device selection API (reserved â€” FV-1)
+// Output-device selection API (reserved — FV-1)
 //
 // These three commands are the registered, working backend for letting the user
 // pick a *specific* audio OUTPUT device for TTS / native-S2S converse playback.
 // They are intentionally not yet wired to a settings-UI control: today both the
-// converse path (`start_converse` â†’ `audio_player.open_default`) and the
+// converse path (`start_converse` → `audio_player.open_default`) and the
 // speak-aloud TTS pipe open the **host default** output device, which is the
 // correct zero-config behavior. This API is the seam a future
 // "output device" dropdown calls (`list_*` to populate, `start_*`/`stop_*` to
@@ -14651,7 +14659,7 @@ mod tests {
             "engine prose crossed IPC: {delivered}"
         );
 
-        // No diagnosis â†’ the closed category fallback, still nothing else.
+        // No diagnosis → the closed category fallback, still nothing else.
         sink.report_error(TurnErrorCategory::Server, ENGINE_PROSE, None);
         let fallback = next_payload();
         assert_eq!(
@@ -14767,7 +14775,7 @@ mod tests {
 
     /// ADR-0037: an approved live-assist proposal must anchor to its cited
     /// span, never `EvidenceAnchor::default()` (KnowledgeGap, an
-    /// absence-shaped claim wrong for a positive assertion) â€” regardless of
+    /// absence-shaped claim wrong for a positive assertion) — regardless of
     /// whether `source_segment_id` is the provider's `transcript_segment_id`
     /// or the raw `span_id` (`derive_legacy_transcript_segments`'s same
     /// fallback), since `judge_claim_evidence`'s basis map is keyed by the
@@ -14795,7 +14803,7 @@ mod tests {
     }
 
     /// A citation that no longer resolves in the ledger degrades to
-    /// `UnavailableEvidence` with an explanatory note â€” still honest (never
+    /// `UnavailableEvidence` with an explanatory note — still honest (never
     /// `KnowledgeGap`), even though it will not carry a resolved span.
     #[test]
     fn live_assist_evidence_anchor_degrades_to_unavailable_evidence_for_an_unresolvable_citation() {
@@ -14914,8 +14922,8 @@ mod tests {
 
     /// audio-graph-cfa1 (post-scope-honesty-review fix):
     /// `projection_replay_latency_metrics` used to compute `missing_timestamp`
-    /// by walking `patch.basis.span_revisions` directly â€” only ever the
-    /// verbatim tail once a basis compacts â€” so a patch whose
+    /// by walking `patch.basis.span_revisions` directly — only ever the
+    /// verbatim tail once a basis compacts — so a patch whose
     /// SUMMARIZED-AWAY PREFIX cannot be resolved against `transcript_events`
     /// (e.g. an upstream log-retention prune of early, already-summarized
     /// revisions) silently reported a measured `basis_to_patch_ms` lag
@@ -14941,8 +14949,8 @@ mod tests {
         );
 
         // Only the TAIL's underlying events are available to this replay
-        // call â€” the prefix's (span-0 and span-1's) underlying events are
-        // pruned/unavailable â€” so the prefix cannot be reconstructed.
+        // call — the prefix's (span-0 and span-1's) underlying events are
+        // pruned/unavailable — so the prefix cannot be reconstructed.
         let available_events: Vec<crate::projections::TranscriptEvent> = all_events[2..].to_vec();
 
         let patch = crate::projections::ProjectionPatch {
@@ -14983,7 +14991,7 @@ mod tests {
     // command-handler call sites that wire `TranscriptLedger::
     // session_relative_timestamp` into `process_extraction`. The helper
     // itself was already unit-tested (see `projections.rs`), but the 3-line
-    // lock-and-derive glue at each `#[tauri::command]` site had no test â€”
+    // lock-and-derive glue at each `#[tauri::command]` site had no test —
     // a mutation probe reverting either wiring back to
     // `created_at_ms as f64 / 1000.0` / `unix_millis() as f64 / 1000.0`
     // passed the entire suite. These drive the real `*_impl` functions
@@ -15033,13 +15041,13 @@ mod tests {
             .find(|n| n.entity_type == "Question")
             .expect("a Question node should have been written");
         // Session-relative seconds close to the anchor's `start_time` (1.0),
-        // give or take the handful of milliseconds this test takes to run â€”
+        // give or take the handful of milliseconds this test takes to run —
         // nowhere near epoch scale (~1.7e9), which is what master's
         // `unix_millis() as f64 / 1000.0` would have produced here.
         assert!(
             (question_node.first_seen - 1.0).abs() < 5.0,
             "expected session-relative seconds near 1.0, got {} \
-             (looks like raw epoch seconds leaked through â€” master's bug)",
+             (looks like raw epoch seconds leaked through — master's bug)",
             question_node.first_seen
         );
     }
@@ -15106,7 +15114,7 @@ mod tests {
             (question_node.first_seen - 3.5).abs() < 1e-9,
             "expected the exact-match anchor's start_time (1.0) + 2.5s \
              wall-clock offset = 3.5, got {} \
-             (looks like raw epoch seconds leaked through â€” master's bug)",
+             (looks like raw epoch seconds leaked through — master's bug)",
             question_node.first_seen
         );
 
@@ -15166,7 +15174,7 @@ mod tests {
             );
         }
 
-        // A live span the merge can anchor against â€” 5s into the session.
+        // A live span the merge can anchor against — 5s into the session.
         let mut fixture = transcript_event_fixture("span-1", "segment-1");
         fixture.start_time = 5.0;
         fixture.received_at_ms = unix_millis();
@@ -15189,7 +15197,7 @@ mod tests {
             .live_edge_valid_from_for_test("Alice", "Acme", "works_at")
             .expect("the re-pointed live edge should exist");
         // Session-relative seconds close to the fallback anchor's
-        // `start_time` (5.0) â€” nowhere near epoch scale (~1.7e9), which is
+        // `start_time` (5.0) — nowhere near epoch scale (~1.7e9), which is
         // what master's `unix_millis() as f64 / 1000.0` would have produced
         // here.
         assert!(
@@ -15479,8 +15487,8 @@ mod tests {
     /// self-inspection technique `org_knowledge_cloud_sync_ipc_commands_remain_absent`
     /// uses above. Driving the real function end-to-end would require a
     /// fully live ASR/model pipeline; this pins the fact that actually
-    /// matters â€” `projection_lane_stopping` is cleared strictly BEFORE the
-    /// speech processor thread spawns, not after â€” so a revert of that
+    /// matters — `projection_lane_stopping` is cleared strictly BEFORE the
+    /// speech processor thread spawns, not after — so a revert of that
     /// ordering (moving the clear back below the spawn, where it used to
     /// live paired with `is_transcribing`) fails this test immediately
     /// instead of only manifesting as an intermittent, hard-to-reproduce
@@ -15498,7 +15506,7 @@ mod tests {
     /// opaque so a `//` or `/*` inside a string is never mistaken for a
     /// comment opener. This exists so the source-order pin tests below
     /// cannot be satisfied by a comment that merely *mentions* the
-    /// statement being pinned â€” e.g. deleting the real call and leaving
+    /// statement being pinned — e.g. deleting the real call and leaving
     /// `// schedulers.clear_orphaned_deferred_retries(); // removed` behind
     /// must make the marker vanish, not silently keep matching.
     fn strip_comments(source: &str) -> String {
@@ -15578,8 +15586,8 @@ mod tests {
     /// Finds `needle` in `haystack`, requiring EXACTLY one occurrence.
     /// Plain `str::find` (first-occurrence) is not enough here: a marker
     /// that only needs to exist "somewhere" in the body is trivially
-    /// satisfiable by a stray duplicate, and â€” before comment stripping was
-    /// added â€” was satisfiable by a comment that merely names the deleted
+    /// satisfiable by a stray duplicate, and — before comment stripping was
+    /// added — was satisfiable by a comment that merely names the deleted
     /// statement. Panics (with `context` in the message) on zero or on
     /// more than one match, so both failure modes surface as a loud test
     /// failure instead of a silently-passing pin.
@@ -15607,7 +15615,7 @@ mod tests {
         );
 
         // Anchored on the actual thread-spawn statement's unique `.name(...)`
-        // call, not the `log::info!` line that follows it â€” the speech
+        // call, not the `log::info!` line that follows it — the speech
         // thread is already running (and can already dispatch a projection
         // decision) for every line between the real `.spawn(...)` call and
         // that trailing log line, so anchoring on the log line would let a
@@ -15626,7 +15634,7 @@ mod tests {
         assert!(
             flag_clear_pos < spawn_pos,
             "projection_lane_stopping must be cleared BEFORE the speech processor thread \
-             spawns â€” clearing it after leaves a window where a final ASR revision the \
+             spawns — clearing it after leaves a window where a final ASR revision the \
              freshly spawned thread processes almost immediately can still observe the flag \
              set from the prior Stop and get its dispatch discarded into a phantom in-flight \
              state (audio-graph-1609)"
@@ -15641,7 +15649,7 @@ mod tests {
     /// thread) could lose a race and have its honest `Degraded` write
     /// clobbered right back to a healthy-looking `Running{0}` by this
     /// function's own step-3 write, with nothing downstream ever restoring
-    /// it â€” silently reproducing the pre-586b failure mode for the rest of
+    /// it — silently reproducing the pre-586b failure mode for the rest of
     /// the session. Same ordering reasoning, and same test technique, as
     /// `start_transcribe_clears_projection_lane_stopping_before_the_speech_thread_spawns`
     /// above.
@@ -15657,7 +15665,7 @@ mod tests {
             "start_transcribe (pipeline_status Running{0} pre-set)",
         );
 
-        // Same real-spawn anchor as the tests above â€” see their comments for
+        // Same real-spawn anchor as the tests above — see their comments for
         // why the trailing `log::info!` line is the wrong anchor.
         let spawn_marker = strip_whitespace(
             "let handle = std::thread::Builder::new()\
@@ -15672,7 +15680,7 @@ mod tests {
         assert!(
             preset_pos < spawn_pos,
             "the pipeline_status Running{{0}} pre-set must run BEFORE the speech processor \
-             thread spawns â€” pre-setting it after leaves a window where the spawned thread's \
+             thread spawns — pre-setting it after leaves a window where the spawned thread's \
              own `apply_diarization_degradation` call can lose a race and have its Degraded \
              status silently clobbered back to Running (audio-graph-586b)"
         );
@@ -15700,7 +15708,7 @@ mod tests {
             "start_transcribe (orphaned-deferral sweep call)",
         );
 
-        // Same real-spawn anchor as the test above â€” see its comment for
+        // Same real-spawn anchor as the test above — see its comment for
         // why the trailing `log::info!` line is the wrong anchor.
         let spawn_marker = strip_whitespace(
             "let handle = std::thread::Builder::new()\
@@ -15715,14 +15723,14 @@ mod tests {
         assert!(
             sweep_pos < spawn_pos,
             "the orphaned-deferral sweep must run BEFORE the speech processor thread spawns \
-             (audio-graph-1609) â€” same ordering reasoning as the projection_lane_stopping \
+             (audio-graph-1609) — same ordering reasoning as the projection_lane_stopping \
              clear above"
         );
     }
 
-    /// audio-graph-64e3: pins that `start_transcribe` â€” the ONE production
+    /// audio-graph-64e3: pins that `start_transcribe` — the ONE production
     /// site that constructs a `SpeechShared` (every other `SpeechShared {`
-    /// literal in the crate is a `#[cfg(test)]` fixture) â€” actually wires
+    /// literal in the crate is a `#[cfg(test)]` fixture) — actually wires
     /// `state.display_transcript_write_misses` and
     /// `state.retired_session_workers` into the literal it hands to the
     /// speech-processor thread, rather than a fresh/dangling `Arc`.
@@ -15786,7 +15794,7 @@ mod tests {
         assert!(
             retired_clone_pos < shared_pos && retired_field_pos > shared_pos,
             "retired_session_workers must be cloned from `state` BEFORE the SpeechShared \
-             literal and used as a field INSIDE it, not shadowed by a fresh Arc â€” otherwise \
+             literal and used as a field INSIDE it, not shadowed by a fresh Arc — otherwise \
              a timed-out Deepgram receiver join spills into a vec `ensure_session_workers_\
              quiesced` never looks at"
         );
@@ -17004,7 +17012,7 @@ mod tests {
     /// `start_transcribe` coverage-head reseed used to call
     /// `load_projection_patches(&session_id).unwrap_or_default()`, so a
     /// corrupt/truncated `projection_patches` canonical log silently reseeded
-    /// nothing instead of refusing to start â€” masking corruption exactly like
+    /// nothing instead of refusing to start — masking corruption exactly like
     /// the legacy-transcript-fallback bug this mirrors. This test pins the
     /// strict loader's error. Capture separately reports unavailable coverage.
     #[test]
@@ -17149,7 +17157,7 @@ mod tests {
         .data_classes([DataClass::TranscriptText])
         .build();
 
-        // A cloud provider call that left the device â€” carries a provider/model
+        // A cloud provider call that left the device — carries a provider/model
         // and data class but, by schema construction, no secret.
         let egress = DataMovementLedgerBuilder::new(
             session_id,
@@ -17546,7 +17554,7 @@ mod tests {
     }
 
     /// seed audio-graph-4fa5 deliverable a acceptance: `load_session`'s
-    /// response must no longer carry the heavy lenses â€” `notes`,
+    /// response must no longer carry the heavy lenses — `notes`,
     /// `materialized_graph`, and the raw `projection_events` log all had
     /// their own fetch commands split out. Seeds a session that actually HAS
     /// all three (so a field that was merely always-`None` couldn't fake a
@@ -17562,7 +17570,7 @@ mod tests {
         let session_id = "load-session-excludes-heavy-lenses";
         seed_replayable_projection_session(session_id, "Notes lens body.");
         // Confirm the artifacts this test is excluding actually exist and
-        // actually replay non-empty via their own lens commands â€” otherwise
+        // actually replay non-empty via their own lens commands — otherwise
         // "response excludes notes" would be true merely because there was
         // never anything to exclude.
         assert!(
@@ -17583,7 +17591,7 @@ mod tests {
         for heavy_field in ["notes", "materialized_graph", "projection_events"] {
             assert!(
                 !fields.contains_key(heavy_field),
-                "load_session's response must not carry `{heavy_field}` â€” it is now a \
+                "load_session's response must not carry `{heavy_field}` — it is now a \
                  separate lens-fetch command (seed audio-graph-4fa5)"
             );
         }
@@ -17606,7 +17614,7 @@ mod tests {
     /// seed audio-graph-4fa5 deliverable b: the byte-ceiling unit contract.
     /// At the ceiling, a file passes; one byte over, it refuses with the
     /// typed error carrying the observed size and configured ceiling; a
-    /// missing file is not a violation (the caller's "missing â†’ None/empty"
+    /// missing file is not a violation (the caller's "missing → None/empty"
     /// fallback still applies).
     #[test]
     fn enforce_artifact_ceiling_boundary_behavior() {
@@ -17643,7 +17651,7 @@ mod tests {
 
     /// seed audio-graph-4fa5 deliverable b acceptance: a synthetic
     /// oversized `graphs/<id>.materialized.json` refuses with the typed
-    /// `ArtifactTooLarge` error rather than being parsed â€” the ceiling check
+    /// `ArtifactTooLarge` error rather than being parsed — the ceiling check
     /// stats the file before ever reading its contents, so garbage bytes are
     /// enough to prove the refusal; this test never needs to construct a
     /// real 156MB graph (the field artifact this ceiling exists for).
@@ -17741,7 +17749,7 @@ mod tests {
     }
 
     /// Fix-round finding: the legacy (pre-event-log) transcript fallback
-    /// (`read_legacy_session_transcript`) had no ceiling at all â€” only the
+    /// (`read_legacy_session_transcript`) had no ceiling at all — only the
     /// canonical `transcripts/<id>.events.jsonl` read did. A session with no
     /// canonical stream (this one never writes `.events.jsonl`) must refuse
     /// an oversized `transcripts/<id>.jsonl` the same way the canonical path
@@ -17774,7 +17782,7 @@ mod tests {
     }
 
     /// Fix-round finding: `load_session` bundles the live graph, diarization
-    /// log, and live-assist cards behind `?` alongside the transcript â€” an
+    /// log, and live-assist cards behind `?` alongside the transcript — an
     /// oversized SIDE artifact must not take the whole session open down
     /// with it. Each degrades to its "missing" fallback instead of failing.
     #[test]
@@ -17786,7 +17794,7 @@ mod tests {
         let _guard = HomeGuard::set(&dir);
         let session_id = "load-session-degrade-side-artifacts";
 
-        // A small, valid legacy transcript â€” the artifact this command is
+        // A small, valid legacy transcript — the artifact this command is
         // required to keep loading no matter what the side artifacts do.
         seed_legacy_transcript(session_id, "the transcript lens must still work");
 
@@ -17841,15 +17849,15 @@ mod tests {
     }
 
     /// audio-graph-83cc T1 size-margin gate: a realistic worst-case card
-    /// set â€” 200 cards (the same count `MAX_PENDING_AGENT_PROPOSALS`
-    /// already caps in-memory PENDING proposals to, `speech/mod.rs:85` â€”
+    /// set — 200 cards (the same count `MAX_PENDING_AGENT_PROPOSALS`
+    /// already caps in-memory PENDING proposals to, `speech/mod.rs:85` —
     /// this is a plausible scenario size, NOT an enforced ceiling on the
     /// persisted `current.json` array, which today has no count cap of its
     /// own; `upsert_live_assist_card` appends/replaces without pruning), 12
     /// of which carry a max-length answer (`events::MAX_CARD_ANSWER_TEXT_CHARS`,
-    /// T3's eventual per-session AUTO-answer cap â€” manual `Ask AI` answers
+    /// T3's eventual per-session AUTO-answer cap — manual `Ask AI` answers
     /// are not capped by this unit, so answered-card count is not bounded
-    /// by this "12" either) â€” must sit comfortably under
+    /// by this "12" either) — must sit comfortably under
     /// `MAX_LIVE_ASSIST_CARDS_BYTES` (8 MiB). This is the exact array shape
     /// `current.json` persists
     /// (`persistence::upsert_live_assist_card`'s `save_json(&current, ...)`).
@@ -17858,7 +17866,7 @@ mod tests {
     /// `"a".repeat(...)` (plain ASCII). `serde_json` escapes control
     /// characters as `\u00XX` (6 ASCII bytes per 1 `char`), so an all-ASCII
     /// fixture understates the true byte-worst-case by roughly 6x on the
-    /// answer-text term alone â€” a prior version of this test's own doc
+    /// answer-text term alone — a prior version of this test's own doc
     /// comment (and the implementer's report) claimed a "50x" margin
     /// measured only against the ASCII case. Using a repeated control
     /// character makes this fixture reflect the actual worst-case
@@ -17945,7 +17953,7 @@ mod tests {
     }
 
     /// Fix-round finding: the primary transcript-events artifact (unlike the
-    /// three side artifacts above) has no reasonable "degrade" fallback â€” an
+    /// three side artifacts above) has no reasonable "degrade" fallback — an
     /// oversized canonical stream really cannot be shown, so `load_session`
     /// must still refuse, not silently truncate or crash.
     #[test]
@@ -17970,7 +17978,7 @@ mod tests {
         // `read_session_transcript_snapshot` collapses the typed
         // `ArtifactTooLarge` into a `String` for this one artifact (see the
         // comment there), so by the time it crosses `load_session_impl`'s
-        // `?` it has become `AppError::Unknown` â€” the refusal itself, not
+        // `?` it has become `AppError::Unknown` — the refusal itself, not
         // its typed shape, is what this test pins.
         let message = error.to_string();
         assert!(
@@ -17983,7 +17991,7 @@ mod tests {
 
     /// Fix-round finding: the Notes/Graph lens's shared canonical-replay
     /// gather (`gather_projection_lens_state`) must refuse an oversized
-    /// projection-patch log rather than reading it into memory â€” the same
+    /// projection-patch log rather than reading it into memory — the same
     /// per-artifact stat-before-read guarantee the materialized-notes/graph
     /// ceilings already have their own dedicated tests for.
     #[test]
@@ -18048,7 +18056,7 @@ mod tests {
 
     /// seed audio-graph-4fa5 deliverable e: `limit` tail-caps the timeline
     /// fold to the last N entries by media-clock order, matching
-    /// `SeekTimeline`'s own `slice(-MAX_BLOCKS)` â€” proving the backend now
+    /// `SeekTimeline`'s own `slice(-MAX_BLOCKS)` — proving the backend now
     /// does the slicing instead of shipping every span just to discard all
     /// but the tail client-side. `None` still returns every entry (used by
     /// the sibling retcon test above and any caller needing the full fold).
@@ -18106,12 +18114,12 @@ mod tests {
     /// audio-graph-a2a7 (0d72 follow-up) Part 2: the "cross-reload speaker
     /// retcon" verification. `session_timeline` (the fold `build_session_timeline_cmd`
     /// wraps) reads the diarization span-revision log FROM DISK
-    /// (`load_diarization_span_revisions` â†’ `SpeakerTimeline::replay`), so a
-    /// RELOADED session â€” one with no in-memory diarization state â€” must still
+    /// (`load_diarization_span_revisions` → `SpeakerTimeline::replay`), so a
+    /// RELOADED session — one with no in-memory diarization state — must still
     /// resolve the latest-wins (retconned) speaker for each utterance, not the
     /// inline ASR label nor the earlier provisional attribution. This proves the
     /// concern PR #80 flagged is already satisfied by the PR #67 persist+hydrate
-    /// path: a provisional label superseded mid-session (rev1 â†’ rev2) is picked
+    /// path: a provisional label superseded mid-session (rev1 → rev2) is picked
     /// up by the fold purely from disk on reload.
     #[test]
     #[cfg_attr(
@@ -18133,7 +18141,7 @@ mod tests {
 
         // Two diarization revisions on ONE diarization span, both attributing the
         // transcript segment above: a provisional "Speaker 2" superseded by a
-        // stable relabel to "Alice" â€” the mid-session correction the reload fold
+        // stable relabel to "Alice" — the mid-session correction the reload fold
         // must resolve to latest-wins.
         let repository = FileMemoryRepository::user_data();
         let mut provisional =
@@ -18156,7 +18164,7 @@ mod tests {
             .append_diarization_span_revision(session_id, &relabel)
             .expect("append relabel diarization revision");
 
-        // Fold purely from disk â€” no in-memory diarization state, exactly the
+        // Fold purely from disk — no in-memory diarization state, exactly the
         // reloaded-session path `build_session_timeline_cmd` exercises.
         let timeline = session_timeline(session_id, None).expect("fold reloaded session timeline");
 
@@ -18177,15 +18185,15 @@ mod tests {
         );
 
         // No async writers were opened (the seed + appends use the synchronous
-        // repository directly), so there is nothing to drain â€” just clean up.
+        // repository directly), so there is nothing to drain — just clean up.
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// audio-graph-0b33 acceptance: `load_session_impl` must surface the
     /// session's persisted diarization span revisions in the `LoadedSession`
     /// payload so the frontend can hydrate `diarizationSpanRevisions` and resolve
-    /// trusted latest-wins speaker attribution on reload (ADR-0026 Â§3/Â§4). A
-    /// session with a mid-session relabel (rev1 â†’ rev2 supersede) must yield the
+    /// trusted latest-wins speaker attribution on reload (ADR-0026 §3/§4). A
+    /// session with a mid-session relabel (rev1 → rev2 supersede) must yield the
     /// full append-ordered log, and a session with no diarization must yield an
     /// empty vec.
     #[test]
@@ -18200,7 +18208,7 @@ mod tests {
         seed_replayable_projection_session(session_id, "Note with diarized speaker.");
 
         // Two revisions on the same span: a provisional label superseded by a
-        // stable relabel â€” the mid-session correction the reload must carry.
+        // stable relabel — the mid-session correction the reload must carry.
         let repository = FileMemoryRepository::user_data();
         let mut provisional =
             export_test_diarization_revision(session_id, "diar-span-load", "provisional");
@@ -18417,8 +18425,8 @@ mod tests {
     fn export_session_bundle_includes_all_durable_artifacts() {
         // The session-artifact-migration export acceptance: a session export
         // must bundle the transcript event log, diarization event log,
-        // projection event log, materialized notes, and materialized graph â€”
-        // not only the legacy graph snapshot â€” plus schema metadata.
+        // projection event log, materialized notes, and materialized graph —
+        // not only the legacy graph snapshot — plus schema metadata.
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -18806,13 +18814,13 @@ mod tests {
     }
 
     /// audio-graph-9cc1 / ADR-0045 decision 4 (drain half) acceptance: no
-    /// projection job thread outlives Stop, proven for BOTH kinds â€” the graph
+    /// projection job thread outlives Stop, proven for BOTH kinds — the graph
     /// lane previously had no tracked handle at all, so a graph projection
     /// could run arbitrarily long past Stop. A handle that finishes within the
     /// flush timeout is joined outright and never spills into the rotation
     /// fence.
     ///
-    /// Adversarial-review fix: registry emptiness alone is vacuous â€” it holds
+    /// Adversarial-review fix: registry emptiness alone is vacuous — it holds
     /// even if the drain detaches the handle instead of waiting for it. Each
     /// fake thread sleeps briefly, then flips its OWN `AtomicBool`; asserting
     /// the flag is `true` immediately after `drain_projection_job_workers`
@@ -18887,8 +18895,8 @@ mod tests {
     }
 
     /// audio-graph-9cc1 acceptance: a projection job that outlives the flush
-    /// timeout spills into `retired_session_workers` â€” the SAME vec Start/New
-    /// Session already fence rotation on (zero new fence logic) â€” and
+    /// timeout spills into `retired_session_workers` — the SAME vec Start/New
+    /// Session already fence rotation on (zero new fence logic) — and
     /// rotation stays blocked until that handle is actually joined.
     #[test]
     fn wedged_projection_job_spills_into_retired_workers_and_fences_rotation_until_joined() {
@@ -18964,9 +18972,9 @@ mod tests {
     /// deadline, the clock exits without firing and the deferral was left
     /// with no visible signal beyond a `log::debug!` line. This pins that
     /// `log_abandoned_deferred_retries_after_stop` is a read-only OBSERVATION
-    /// of scheduler state â€” the armed deferral must survive the call
+    /// of scheduler state — the armed deferral must survive the call
     /// untouched, so the WARN is additive visibility, never a second place
-    /// that silently resolves the gap it reports â€” AND that it persists the
+    /// that silently resolves the gap it reports — AND that it persists the
     /// diagnostics snapshot (ticket requirement (b)) with the deferral
     /// captured.
     ///
@@ -19060,8 +19068,8 @@ mod tests {
 
     /// Companion to the test above: a fresh session (no failures at all) has
     /// nothing abandoned. Pins that `log_abandoned_deferred_retries_after_stop`
-    /// does not spuriously warn on the common case â€” most Stops have no
-    /// pending deferral to report â€” but that it still persists the
+    /// does not spuriously warn on the common case — most Stops have no
+    /// pending deferral to report — but that it still persists the
     /// diagnostics snapshot unconditionally (mirroring `rotate_session`'s
     /// existing every-rotation write), so a later audit pass sees an
     /// explicit "nothing was armed" record rather than a missing file. This
@@ -19077,7 +19085,7 @@ mod tests {
 
         let state = AppState::new();
         let session_id = state.current_session_id();
-        // Idle scheduler, freshly constructed by `AppState::new()` â€” no
+        // Idle scheduler, freshly constructed by `AppState::new()` — no
         // observation, no failure, nothing armed.
         assert_eq!(
             state
@@ -19107,7 +19115,7 @@ mod tests {
 
     /// audio-graph-fa56: pins that the new abandoned-deferred-retry WARN is
     /// wired into `stop_capture_impl` strictly AFTER
-    /// `drain_projection_job_workers` â€” reading `deferred_retry_at_ms`
+    /// `drain_projection_job_workers` — reading `deferred_retry_at_ms`
     /// BEFORE the drain would observe a clock thread that has not yet had
     /// its chance to exit (or fire), turning "abandoned" into "possibly
     /// still ticking" and making the WARN unreliable. Uses the same
@@ -19117,8 +19125,8 @@ mod tests {
     /// cannot do any more cheaply, since asserting "strictly after" would
     /// otherwise require observably delaying the drain itself. A full
     /// end-to-end behavioral pin that the detection wiring actually executes
-    /// on the real Stop path â€” driving `stop_capture_impl` against a live
-    /// `AppState` with a real armed deferral â€” is a separate, existing test:
+    /// on the real Stop path — driving `stop_capture_impl` against a live
+    /// `AppState` with a real armed deferral — is a separate, existing test:
     /// see `stop_capture_impl_reports_a_graph_lane_deferred_retry_abandoned_at_stop`
     /// below.
     #[test]
@@ -19149,13 +19157,13 @@ mod tests {
         assert!(
             drain_pos < warn_pos,
             "log_abandoned_deferred_retries_after_stop must be called strictly AFTER \
-             drain_projection_job_workers â€” otherwise a still-running retry clock thread \
+             drain_projection_job_workers — otherwise a still-running retry clock thread \
              would be misreported as abandoned"
         );
     }
 
     /// audio-graph-fa56: pins that the WARN body itself (not just the call
-    /// site's position) has not been deleted or gutted â€” a mutant that
+    /// site's position) has not been deleted or gutted — a mutant that
     /// replaces the `if !abandoned_kinds.is_empty() { log::warn!(...) }`
     /// block inside `log_abandoned_deferred_retries_after_stop` with a
     /// no-op (e.g. `let _ = abandoned_kinds;`) makes every behavioral test
@@ -19179,7 +19187,7 @@ mod tests {
 
         assert!(
             body.contains("log::warn!"),
-            "log_abandoned_deferred_retries_after_stop must still call log::warn! â€” deleting \
+            "log_abandoned_deferred_retries_after_stop must still call log::warn! — deleting \
              the WARN body is the single most obvious mutation for a logging-only fix, and \
              nothing else in this suite observes emitted log output"
         );
@@ -19192,7 +19200,7 @@ mod tests {
 
     /// audio-graph-64e3: pins that the new display-transcript-rows-missing
     /// WARN is wired into `stop_capture_impl` strictly AFTER
-    /// `log_abandoned_deferred_retries_after_stop` â€” same technique and same
+    /// `log_abandoned_deferred_retries_after_stop` — same technique and same
     /// underlying reason as
     /// `stop_capture_impl_logs_abandoned_deferred_retries_strictly_after_the_drain`
     /// above: both calls need the sp/asr joins to have already run so the
@@ -19230,14 +19238,14 @@ mod tests {
         assert!(
             deferred_retry_pos < display_warn_pos,
             "warn_if_display_transcript_rows_missing_at_stop must be called strictly AFTER \
-             log_abandoned_deferred_retries_after_stop â€” both share the same ordering \
+             log_abandoned_deferred_retries_after_stop — both share the same ordering \
              requirement of running after the sp/asr joins"
         );
     }
 
     /// audio-graph-64e3: same mutation-proof rationale as
     /// `log_abandoned_deferred_retries_after_stop_emits_the_documented_warn_key`
-    /// above â€” this test installs no `crate::test_log_capture` sink, so source-text
+    /// above — this test installs no `crate::test_log_capture` sink, so source-text
     /// inspection is the cheapest way to pin that the WARN body (not just the
     /// call site) has not been gutted, and that it is still gated on a
     /// non-zero mismatch rather than firing unconditionally.
@@ -19258,7 +19266,7 @@ mod tests {
 
         assert!(
             body.contains("log::warn!"),
-            "warn_if_display_transcript_rows_missing_at_stop must still call log::warn! â€” \
+            "warn_if_display_transcript_rows_missing_at_stop must still call log::warn! — \
              deleting the WARN body is the single most obvious mutation for a logging-only \
              fix, and nothing else in this suite observes emitted log output"
         );
@@ -19273,13 +19281,13 @@ mod tests {
         );
     }
 
-    /// audio-graph-64e3: behavioral pin on the helper itself â€” seeds the
+    /// audio-graph-64e3: behavioral pin on the helper itself — seeds the
     /// counter with a nonzero value (as `emit_transcript_and_extract_with_meta`
     /// would after detecting real misses), calls the helper directly, and
     /// checks the swap-based read-and-reset actually reset it. A mutation
     /// that swaps `swap(0, ...)` for `load(...)` (read without reset) would
     /// leave stale counts from a prior session bleeding into the next one's
-    /// tally â€” this is the one piece of behavior a pure source-text
+    /// tally — this is the one piece of behavior a pure source-text
     /// inspection can't distinguish from the correct code, so it gets a
     /// behavioral assertion instead.
     #[test]
@@ -20801,7 +20809,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PART 1 â€” configure_api_endpoint URL validation regression tests
+    // PART 1 — configure_api_endpoint URL validation regression tests
     // (loop-13 MEDIUM #4). The validation landed in loop 12 without
     // coverage; these lock in the accept/reject contract so a future
     // refactor can't silently loosen it.
@@ -20948,7 +20956,7 @@ mod tests {
     /// Serializes tests that observe or mutate `PROVIDER_CREDENTIAL_EPOCH`.
     ///
     /// CodeRabbit (PR #84): the epoch is a process-global `AtomicU64`, and the
-    /// harness runs `#[test]`s concurrently â€” any test that routes through
+    /// harness runs `#[test]`s concurrently — any test that routes through
     /// `save_credential_impl` / `delete_credential_cmd` (both bump the epoch)
     /// while an epoch-asserting test sits between its before/after reads makes
     /// the assertion flake. Every test touching the epoch must hold this lock.
@@ -21168,7 +21176,7 @@ mod tests {
         let _epoch_guard = CREDENTIAL_EPOCH_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // cred-review M2.1 / N1: a blank/whitespace save must be a true no-op â€”
+        // cred-review M2.1 / N1: a blank/whitespace save must be a true no-op —
         // it must NOT bump the readiness epoch (which invalidates the
         // provider-readiness cache) nor rehydrate the settings cache (which
         // re-clones app_settings). We assert both via observable state that is
@@ -21180,7 +21188,7 @@ mod tests {
 
         // Seed the in-memory cache with a distinctive non-empty api_key. If the
         // skip path rehydrated, `hydrate_runtime_credentials` would first redact
-        // (clear) this and then refill from the (empty) store â€” leaving it
+        // (clear) this and then refill from the (empty) store — leaving it
         // blank. So an unchanged sentinel proves rehydrate did NOT run.
         {
             let mut cached = state
@@ -23039,7 +23047,7 @@ mod tests {
         );
         // Regression (audio-graph-8773): the SambaNova endpoint must resolve to
         // the dedicated `sambanova_api_key` slot, not the `openai_api_key`
-        // fallback â€” otherwise readiness/health/model-list probes send the wrong
+        // fallback — otherwise readiness/health/model-list probes send the wrong
         // key and 401 despite a valid saved SambaNova key.
         assert_eq!(
             endpoint_api_key_from_store(crate::settings::SAMBANOVA_BASE_URL, &store).as_deref(),
@@ -23344,7 +23352,7 @@ mod tests {
             message.contains("<redacted>"),
             "error must mark the redacted value, got: {message}"
         );
-        // This case is a 403, not a 401 â€” must NOT carry the 401-only
+        // This case is a 403, not a 401 — must NOT carry the 401-only
         // credential-rejected marker (audio-graph-57cc).
         assert!(!message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
     }
@@ -23353,7 +23361,7 @@ mod tests {
     fn cloud_asr_connection_error_401_carries_credential_rejected_prefix() {
         // audio-graph-57cc: the generic OpenAI-compatible readiness arm
         // (asr.api / llm.cerebras / llm.sambanova / llm.api) shares this
-        // helper, so a 401 there also gets the stable marker â€” but only when
+        // helper, so a 401 there also gets the stable marker — but only when
         // a key was actually sent.
         let message = cloud_asr_connection_error_message(
             reqwest::StatusCode::UNAUTHORIZED,
@@ -23505,7 +23513,7 @@ mod tests {
         assert_eq!(catalog[0].display_name, "nova-3");
         assert!(catalog[0].is_default);
         // The live response already carried flux-general-en (dedup keeps ONE and
-        // preserves its live display name â€” no curated overwrite, no duplicate).
+        // preserves its live display name — no curated overwrite, no duplicate).
         assert_eq!(catalog[1].id, "flux-general-en");
         assert_eq!(catalog[1].display_name, "Flux General English");
         assert_eq!(
@@ -23588,7 +23596,7 @@ mod tests {
     fn deepgram_connection_error_403_has_no_credential_rejected_prefix() {
         // A 403 (Forbidden) is a distinct rejection class (e.g. a
         // transcription-only key hitting an endpoint that needs the `manage`
-        // scope, per the /v1/models comment above) â€” not the credential-401
+        // scope, per the /v1/models comment above) — not the credential-401
         // marker.
         let message = deepgram_connection_error_message(
             reqwest::StatusCode::FORBIDDEN,
@@ -23815,7 +23823,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FA-7 â€” send_chat_message must surface the real token count on the
+    // FA-7 — send_chat_message must surface the real token count on the
     // streaming path instead of a hardcoded 0. The streaming `Done` frame
     // carries the provider's terminal `usage` block; `tokens_used_from_stream_usage`
     // is the pure derivation used at that return site. These pin the contract:
@@ -23897,9 +23905,9 @@ mod tests {
     #[test]
     fn tokens_used_is_zero_when_provider_omits_usage() {
         use crate::llm::sse::StreamUsage;
-        // Provider never honoured include_usage â†’ no usage block at all.
+        // Provider never honoured include_usage → no usage block at all.
         assert_eq!(tokens_used_from_stream_usage(None), 0);
-        // Usage block present but total_tokens unset â†’ still honestly 0.
+        // Usage block present but total_tokens unset → still honestly 0.
         assert_eq!(
             tokens_used_from_stream_usage(Some(StreamUsage {
                 prompt_tokens: Some(5),
@@ -24559,7 +24567,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PART 2 â€” log_level persistence race (loop-13 MEDIUM #6).
+    // PART 2 — log_level persistence race (loop-13 MEDIUM #6).
     // set_log_level is now the runtime-only path; save_settings_cmd owns
     // the single disk-write path. The full command needs a Tauri AppHandle
     // (not available in unit tests), so we exercise the in-memory half
@@ -24572,11 +24580,11 @@ mod tests {
         // Simulate what `set_log_level` does to the in-memory cache: apply
         // the runtime level, then mutate `app_settings.log_level`. Repeating
         // this twice must leave the cache reflecting the final value and
-        // must not touch disk â€” which it can't, because we never hand it
+        // must not touch disk — which it can't, because we never hand it
         // an AppHandle.
         let state = AppState::new();
 
-        // First call: info â†’ debug.
+        // First call: info → debug.
         crate::logging::apply_log_level("debug");
         {
             let mut cached = state.app_settings.write().expect("lock poisoned");
@@ -24588,7 +24596,7 @@ mod tests {
             "cache must reflect first update"
         );
 
-        // Second call: debug â†’ warn. With the old contract this would have
+        // Second call: debug → warn. With the old contract this would have
         // produced a second disk write; under the new contract it only
         // mutates runtime + cache.
         crate::logging::apply_log_level("warn");
@@ -24643,7 +24651,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PART 2.5 â€” capture start/stop command lifecycle (audio-graph-1d59).
+    // PART 2.5 — capture start/stop command lifecycle (audio-graph-1d59).
     //
     // These stay entirely at the command layer with synthetic capture handles
     // so they can prove registry/flag/status cleanup without opening rsac
@@ -24770,11 +24778,11 @@ mod tests {
         }
 
         // Pin ADR-0045 decision 4's Stop-side wiring against the actual
-        // `stop_capture_impl` path (adversarial-review fix â€” audio-graph-9cc1):
+        // `stop_capture_impl` path (adversarial-review fix — audio-graph-9cc1):
         // without this, deleting/reordering the `projection_lane_stopping` store
         // or the `drain_projection_job_workers` call inside `stop_capture_impl`
         // leaves the whole suite green. The fake job sleeps briefly, then flips
-        // its OWN `AtomicBool` â€” checked synchronously right after
+        // its OWN `AtomicBool` — checked synchronously right after
         // `stop_capture_impl` returns below, the same non-vacuous technique as
         // `drain_projection_job_workers_joins_finished_threads_of_both_kinds`. If
         // the drain call were ever deleted, `stop_capture_impl` would return well
@@ -24789,8 +24797,8 @@ mod tests {
             // 750ms, not the 100ms used by the pure-unit-test sibling
             // (`drain_projection_job_workers_joins_finished_threads_of_both_kinds`):
             // this test drives the FULL async `stop_capture_impl`, which does
-            // real (if normally sub-10ms) work â€” audio pipeline reset,
-            // consumer teardown, etc. â€” before reaching the drain. A margin
+            // real (if normally sub-10ms) work — audio pipeline reset,
+            // consumer teardown, etc. — before reaching the drain. A margin
             // this wide over that baseline, and over ordinary parallel-test
             // scheduling jitter, is what keeps the assertion below from
             // passing by timing accident when the drain is skipped.
@@ -24889,7 +24897,7 @@ mod tests {
     /// the unit tests above do). Arms a real graph-lane deferral on a live
     /// `AppState` the same way
     /// `log_abandoned_deferred_retries_after_stop_leaves_an_armed_deferral_untouched`
-    /// does, then drives the full async `stop_capture_impl` â€” the sibling
+    /// does, then drives the full async `stop_capture_impl` — the sibling
     /// `stop_capture_clears_final_source_runtime_state_and_unregisters_runtime_consumers`
     /// test above already proves this suite CAN drive that path against a
     /// live capture/ASR-adjacent pipeline; this reuses the same setup rather
@@ -24987,7 +24995,7 @@ mod tests {
             .expect("final source stop should succeed even with an abandoned deferral");
 
         // The deferral was never fired (no clock thread was ever registered
-        // for it in this test), so it must still be armed after Stop â€” the
+        // for it in this test), so it must still be armed after Stop — the
         // exact "abandoned" state the new WARN reports.
         assert_eq!(
             state
@@ -25002,7 +25010,7 @@ mod tests {
 
         // Ticket requirement (b): the real Stop path must have persisted a
         // diagnostics snapshot that a later session load or replay pass can
-        // read back â€” not just emitted a log line.
+        // read back — not just emitted a log line.
         let persisted = crate::persistence::load_scheduler_queue_state(&session_id)
             .expect("stop_capture_impl must persist a scheduler queue snapshot for this session");
         assert!(
@@ -25017,7 +25025,7 @@ mod tests {
 
     /// audio-graph-64e3: end-to-end behavioral pin that
     /// `warn_if_display_transcript_rows_missing_at_stop` actually executes on
-    /// the REAL `stop_capture_impl` path â€” same rationale and same reused
+    /// the REAL `stop_capture_impl` path — same rationale and same reused
     /// setup as `stop_capture_impl_reports_a_graph_lane_deferred_retry_abandoned_at_stop`
     /// above. Seeds `display_transcript_write_misses` as if the deepgram
     /// receiver had already detected 2 misses during the session, drives the
@@ -25025,7 +25033,7 @@ mod tests {
     /// reset. Mutation coverage: deleting the
     /// `warn_if_display_transcript_rows_missing_at_stop` call from
     /// `stop_capture_impl`, or wiring it to a DIFFERENT `Arc<AtomicU64>`,
-    /// leaves this seeded counter non-zero after Stop â€” the load-bearing
+    /// leaves this seeded counter non-zero after Stop — the load-bearing
     /// assertion below.
     #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(
@@ -25212,8 +25220,9 @@ mod tests {
             CanonicalAppendOutcome, CanonicalAppender, CanonicalBasisHead, CanonicalEventMetadata,
             CanonicalTailRecovery,
         };
-        use crate::projection_scheduler::ProjectionSchedulerDecision::Idle;
+        use crate::projection_scheduler::ProjectionSchedulerDecision::{Idle, StartJob};
         use crate::projections::ProjectionCoverageStatus::BehindTranscript;
+        use crate::speech::test_probe::{Control, Phase};
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -25261,7 +25270,7 @@ mod tests {
             "a".repeat(MAX_PROJECTION_EVENTS_BYTES as usize)
         };
         assert!(matches!(
-            appender.append(&meta, &report_note_patch(1, basis, &note)),
+            appender.append(&meta, &report_note_patch(1, basis.clone(), &note)),
             CanonicalAppendOutcome::Accepted(_)
         ));
         drop(appender);
@@ -25272,19 +25281,40 @@ mod tests {
                 .projection_schedulers
                 .lock()
                 .unwrap()
-                .attach_capture(&session, (None, None), &["cedar".into()], &["larch".into()])
+                .attach_capture(
+                    &session,
+                    (Some(basis.clone()), Some(basis)),
+                    &["cedar".into()],
+                    &["larch".into()],
+                )
                 .unwrap();
         } else {
             assert!(path.metadata().unwrap().len() > MAX_PROJECTION_EVENTS_BYTES);
             assert!(repo.read_projection_history(&session, false).is_err());
         }
-        let logs = crate::test_log_capture::ThreadLogCapture::start();
+        let control = Control::arm();
         start_transcribe(manager.state(), app.clone())
             .await
             .unwrap();
         assert!(state.is_transcribing.load(Ordering::SeqCst));
-        let diagnostics: Vec<_> = logs
-            .records()
+        control.wait(Phase::BeforeRead);
+        assert_eq!(
+            control.reads(),
+            0,
+            "start returned without scanning history"
+        );
+        for phase in [Phase::BeforeInstall, Phase::Done] {
+            {
+                let view = state.materialized_projection_state.lock().unwrap();
+                assert_eq!(view.notes.transcript_coverage, Some(BehindTranscript));
+                assert_eq!(view.graph.transcript_coverage, Some(BehindTranscript));
+            }
+            control.resume();
+            control.wait(phase);
+        }
+        assert_eq!(control.reads(), 1, "one background verification");
+        let diagnostics: Vec<_> = control
+            .logs()
             .into_iter()
             .filter(|r| r.message.starts_with("projection_capture."))
             .map(|r| r.message)
@@ -25300,17 +25330,20 @@ mod tests {
                 view.notes.transcript_coverage,
                 fork.then_some(BehindTranscript)
             );
-            assert_eq!(
-                view.graph.transcript_coverage,
-                fork.then_some(BehindTranscript)
-            );
+            assert_eq!(view.graph.transcript_coverage, Some(BehindTranscript));
         }
         {
             let ledger = state.transcript_ledger.lock().unwrap();
             let mut lanes = state.projection_schedulers.lock().unwrap();
             let repairs = lanes.take_capture_repairs(&ledger, 1);
             assert!(matches!((repairs.notes, repairs.graph), (Idle, Idle)));
-            if !fork {
+            if fork {
+                let next = lanes.observe_ledger(&ledger, 2);
+                assert!(
+                    matches!((next.notes, next.graph), (StartJob { .. }, StartJob { .. })),
+                    "last capture's unverified completion must not suppress owed work"
+                );
+            } else {
                 assert!(
                     matches!(lanes.observe_ledger(&ledger, 2).notes, Idle),
                     "large verified notes log reseeds its completed basis"
@@ -25318,6 +25351,70 @@ mod tests {
             }
         }
         stop_transcribe_impl(&state, &app).await.unwrap();
+        drain_test_writers(&state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    #[allow(clippy::await_holding_lock)]
+    async fn stopped_capture_verification_cannot_publish_after_restart_or_rotation() {
+        use crate::projections::ProjectionCoverageStatus::BehindTranscript;
+        use crate::speech::test_probe::{Control, Phase};
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("capture-verification-stop");
+        let _home = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        prepare_projection_capture_source(&state);
+        for rotate in [false, true] {
+            *state.speech_processor_thread.lock().unwrap() = Some(std::thread::spawn(|| {}));
+            let old = Control::arm();
+            start_transcribe(manager.state(), app.clone())
+                .await
+                .unwrap();
+            old.wait(Phase::BeforeRead);
+            old.resume();
+            old.wait(Phase::BeforeInstall);
+            stop_transcribe_impl(&state, &app).await.unwrap();
+            if rotate {
+                state.rotate_session("capture-verification-new");
+                assert_eq!(state.current_session_id(), "capture-verification-new");
+            }
+            // A different capture of the same session also invalidates a result.
+            *state.speech_processor_thread.lock().unwrap() = Some(std::thread::spawn(|| {}));
+            let new = Control::arm();
+            start_transcribe(manager.state(), app.clone())
+                .await
+                .unwrap();
+            new.wait(Phase::BeforeRead);
+            old.resume();
+            old.wait(Phase::Done);
+            {
+                // This empty history would mark both lanes current if installed.
+                let view = state.materialized_projection_state.lock().unwrap();
+                assert_eq!(view.notes.transcript_coverage, Some(BehindTranscript));
+                assert_eq!(view.graph.transcript_coverage, Some(BehindTranscript));
+                assert!(state.projection_job_workers.lock().unwrap().is_empty());
+            }
+            new.resume();
+            new.wait(Phase::BeforeInstall);
+            new.resume();
+            new.wait(Phase::Done);
+            {
+                let view = state.materialized_projection_state.lock().unwrap();
+                assert_eq!(view.notes.transcript_coverage, None);
+                assert_eq!(view.graph.transcript_coverage, None);
+            }
+            stop_transcribe_impl(&state, &app).await.unwrap();
+        }
         drain_test_writers(&state);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -25509,9 +25606,16 @@ mod tests {
 
         // Stand in for the audio consumer while the real Start command runs.
         *state.speech_processor_thread.lock().unwrap() = Some(std::thread::spawn(|| {}));
+        use crate::speech::test_probe::{Control, Phase};
+        let control = Control::arm();
         start_transcribe(manager.state::<AppState>(), app.clone())
             .await
             .unwrap();
+        control.wait(Phase::BeforeRead);
+        control.resume();
+        control.wait(Phase::BeforeInstall);
+        control.resume();
+        control.wait(Phase::Done);
         assert!(state.is_transcribing.load(Ordering::SeqCst));
         assert!(!state.projection_lane_stopping.load(Ordering::SeqCst));
         let ledger = state.transcript_ledger.lock().unwrap();
@@ -25533,12 +25637,12 @@ mod tests {
     /// audio-graph-64e3 (finding: stop_transcribe never read the counter):
     /// end-to-end behavioral pin that a transcribe-only session (no capture
     /// involved) ALSO surfaces `transcript.display_rows_missing_at_stop`,
-    /// via the real `stop_transcribe_impl` path â€” same technique as
+    /// via the real `stop_transcribe_impl` path — same technique as
     /// `stop_capture_impl_reads_and_resets_display_transcript_write_misses`
     /// above. Before this fix, `stop_transcribe` never called
     /// `warn_if_display_transcript_rows_missing_at_stop` at all, so a miss
     /// counted during a transcribe-only session surfaced (if ever) under a
-    /// LATER, unrelated capture session's stop â€” this test pins that the
+    /// LATER, unrelated capture session's stop — this test pins that the
     /// counter is read-and-reset at THIS stop instead.
     #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(
@@ -25658,14 +25762,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PART N â€” converse audio-sender teardown (AUD-CV1 / finding #48)
+    // PART N — converse audio-sender teardown (AUD-CV1 / finding #48)
     //
     // The fix's load-bearing property: the sender must wake and exit promptly
     // when `is_converse_active` flips to false EVEN IF no further audio chunk
     // arrives (the stop-after-capture-stopped case). Before the fix the loop
     // blocked in `gemini_rx.recv()` and only re-checked the flag after the
     // NEXT chunk; with capture already stopped no chunk arrives, so the join
-    // timed out (3s) and detached â€” leaking the thread and letting a fast
+    // timed out (3s) and detached — leaking the thread and letting a fast
     // restart double-spawn on the single-consumer rx.
     //
     // This drives the extracted `run_converse_audio_sender` directly (no live
@@ -25854,7 +25958,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PART N+1 â€” converse handle reaping on restart (AUD-CV3 / finding #62)
+    // PART N+1 — converse handle reaping on restart (AUD-CV3 / finding #62)
     //
     // The driver's terminal-auth teardown flips is_converse_active=false and
     // breaks, but leaves the thread slot `Some(finished_handle)`. A restart
@@ -25866,7 +25970,7 @@ mod tests {
 
     #[test]
     fn reap_finished_handle_clears_finished_slot_for_restart() {
-        // A handle that exits immediately â€” models a thread whose driver already
+        // A handle that exits immediately — models a thread whose driver already
         // tore down on a terminal auth error.
         let handle = std::thread::spawn(|| {});
         // Wait until it has actually finished so is_finished() is deterministic.
@@ -25888,7 +25992,7 @@ mod tests {
 
     #[test]
     fn reap_finished_handle_refuses_to_clobber_running_slot() {
-        // A handle that blocks until told to exit â€” models a session that is
+        // A handle that blocks until told to exit — models a session that is
         // genuinely still running.
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -25904,7 +26008,7 @@ mod tests {
         let res = reap_finished_handle(&mut slot, "converse driver");
         assert!(
             res.is_err(),
-            "a still-running handle must NOT be reaped â€” restart must error"
+            "a still-running handle must NOT be reaped — restart must error"
         );
         assert!(
             slot.is_some(),
@@ -25927,17 +26031,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PART N â€” converse production-glue (B18 / #46), headless.
+    // PART N — converse production-glue (B18 / #46), headless.
     //
     // The pure FSM has 46 tests; these cover the PRODUCTION side-effect
-    // primitives the live `GeminiConverseSink` dispatches â€” capture-gate
-    // toggling, PCM16â†’i16 decode into a REAL AudioPlayer, barge-in
+    // primitives the live `GeminiConverseSink` dispatches — capture-gate
+    // toggling, PCM16→i16 decode into a REAL AudioPlayer, barge-in
     // cancel/resume, and the null-client guard. They exercise the exact code
     // the sink methods run (see `GeminiConverseSink`'s impl above), but WITHOUT
     // building a mock Tauri AppHandle: `tauri::test::mock_context` makes tao
     // open an X11 connection at construction, which is unavailable/flaky on a
     // headless WSL box (the only `app_handle` use in these methods is the
-    // transcript/error event emit â€” a thin `app_handle.emit(...)` not exercised
+    // transcript/error event emit — a thin `app_handle.emit(...)` not exercised
     // here). This shrinks #46's residual to the genuinely-perceptual "is audio
     // audible from the speaker" check only.
     // -----------------------------------------------------------------------
@@ -25959,7 +26063,7 @@ mod tests {
 
     #[test]
     fn converse_barge_in_cancels_then_recapture_resumes() {
-        // stop_playback â†’ player.cancel(); start_capture â†’ player.resume().
+        // stop_playback → player.cancel(); start_capture → player.resume().
         let player = crate::playback::AudioPlayer::new();
         player.cancel(); // barge-in
         assert!(
@@ -25985,12 +26089,12 @@ mod tests {
             "decode drops the odd trailing byte"
         );
         if !samples.is_empty() {
-            player.push_samples(&samples); // no stream open â†’ writes 0, no panic
+            player.push_samples(&samples); // no stream open → writes 0, no panic
         }
         assert_eq!(
             player.free_samples(),
             0,
-            "no playback stream open â†’ nothing buffered (and no panic on decode)"
+            "no playback stream open → nothing buffered (and no panic on decode)"
         );
     }
 
@@ -26005,7 +26109,7 @@ mod tests {
         {
             panic!("unreachable: client is None, got {e}");
         }
-        // Reaching here without a panic is the assertion (None â†’ no-op).
+        // Reaching here without a panic is the assertion (None → no-op).
     }
 
     // -----------------------------------------------------------------------
@@ -26056,7 +26160,7 @@ mod tests {
     fn rehydrate_clears_deleted_key_from_settings_cache() {
         // Regression: audio-graph-c4d0. The user revokes/deletes a key; the
         // reloaded store no longer holds it. The capture read-path clones this
-        // cache, so it MUST no longer serve the stale (deleted) key â€” otherwise
+        // cache, so it MUST no longer serve the stale (deleted) key — otherwise
         // the live session keeps transmitting a revoked credential.
         let state = AppState::new();
         *state.app_settings.write().expect("lock poisoned") =
@@ -26222,7 +26326,7 @@ mod tests {
     fn spend_gate_refuses_non_question_kinds_even_though_grade_defaults_strong() {
         // The renderer-untrusted case: `agent_signal_grade` (speech/mod.rs)
         // grades every non-question kind `Strong` by construction, so this
-        // pins that the Rust gate does NOT trust `signal == Strong` alone â€”
+        // pins that the Rust gate does NOT trust `signal == Strong` alone —
         // it independently re-derives `kind == Question` from the card it
         // loaded itself, never from anything a caller "claims".
         let state = AppState::new();
@@ -26273,7 +26377,7 @@ mod tests {
                 "{signal:?} (auto)"
             );
             // Manual path skips the grade check entirely (P4: fragments
-            // keep manual Ask AI) â€” the gate passes (registry empty, no
+            // keep manual Ask AI) — the gate passes (registry empty, no
             // interval/cap checks on this path).
             assert_eq!(
                 evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, false),
@@ -26330,7 +26434,7 @@ mod tests {
             evaluate_answer_spend_gate(&state, &settings, "sess-gate", &card, false),
             Some(events::AnswerRefusalReason::Busy)
         );
-        // The registered stream must still be live and uncancelled â€” the
+        // The registered stream must still be live and uncancelled — the
         // gate REFUSES, it never reaches for `cancel`/`cancel_all`.
         assert!(!state.stream_registry.is_empty());
         assert!(!token.is_cancelled());
@@ -26425,10 +26529,10 @@ mod tests {
         // Fix-round finding (scope-honesty review, major): re-dispatching
         // the SAME already-answered card must refuse as `Duplicate` on the
         // auto path. `is_duplicate_answered_question` alone cannot catch
-        // this â€” it deliberately excludes the proposal's own id (see
+        // this — it deliberately excludes the proposal's own id (see
         // `is_duplicate_answered_question_true_only_for_...`'s "the
         // answered card itself is never its own duplicate" assertion above)
-        // â€” so this gate must check `card.answer.is_some()` itself, BEFORE
+        // — so this gate must check `card.answer.is_some()` itself, BEFORE
         // that function is ever reached. No card is persisted to disk in
         // this test, so a call into that function's disk read would find
         // nothing to compare against either way: this test only passes if
@@ -26445,7 +26549,7 @@ mod tests {
             "auto must refuse to re-dispatch a card that already carries a terminal answer"
         );
         // Manual retry on an already-answered card is explicitly allowed
-        // (T4's retry affordance) â€” the self-check is auto-only.
+        // (T4's retry affordance) — the self-check is auto-only.
         assert_eq!(
             evaluate_answer_spend_gate(&state, &settings, "sess-self-answered", &answered, false),
             None
@@ -26465,7 +26569,7 @@ mod tests {
         assert_eq!(normalize_queue_content(""), "");
         // Unicode-aware lowercasing (accented pt text), matching the
         // frontend's `normalizeQueueContent`.
-        assert_eq!(normalize_queue_content("VocÃª"), "vocÃª");
+        assert_eq!(normalize_queue_content("Você"), "você");
     }
 
     #[test]
@@ -26547,7 +26651,7 @@ mod tests {
         );
         assert!(
             !is_duplicate_answered_question(session_id, &candidate.proposal),
-            "a matching-content card with NO answer yet must not count as a duplicate â€” \
+            "a matching-content card with NO answer yet must not count as a duplicate — \
              only one of the two should ever end up dispatching (single-flight), and \
              refusing the very first attempt as its own 'duplicate' would starve both"
         );
@@ -26559,7 +26663,7 @@ mod tests {
         // gate function whose stack frame holds raw normalized question
         // content (see its own doc comment's CONTENT-NEVER-ESCAPES proof).
         // A planted `log::info!("dedupe comparing content: {content}")`
-        // inside its body previously passed the entire suite â€” this
+        // inside its body previously passed the entire suite — this
         // source-text pin closes that gap the same way this file's other
         // `include_str!` pins do (`prepare_card_answer_request_never_touches_chat_history`
         // et al.): a future edit that adds ANY `log::*` call inside this
@@ -26576,7 +26680,7 @@ mod tests {
         let body = &source[start..end];
         assert!(
             !body.contains("log::"),
-            "is_duplicate_answered_question must never call log::* â€” the normalized \
+            "is_duplicate_answered_question must never call log::* — the normalized \
              question content it holds must never reach a log line"
         );
     }
@@ -26927,7 +27031,7 @@ mod tests {
         let persisted = current
             .iter()
             .find(|c| c.proposal.id == card_id)
-            .expect("card still present â€” a caps-then-persists path must not lose the card");
+            .expect("card still present — a caps-then-persists path must not lose the card");
         let answer = persisted.answer.as_ref().expect("answer persisted");
         assert!(
             answer.truncated,
@@ -27015,7 +27119,7 @@ mod tests {
     // Source-order / no-cross-contamination pins, for the properties that
     // are structural rather than behaviorally observable without a live
     // `tauri::ipc::Channel` (this crate has no test harness for
-    // constructing one â€” see e.g. `start_streaming_chat`, which for the
+    // constructing one — see e.g. `start_streaming_chat`, which for the
     // same reason has no direct test coverage of its own either).
     // -----------------------------------------------------------------
 
@@ -27064,7 +27168,7 @@ mod tests {
     fn spawn_card_answer_stream_task_keeps_draining_after_a_dropped_delta_channel() {
         // Fix-round finding (adversarial review, minor): the Delta arm used
         // to `return` immediately when `channel.send` failed (frontend
-        // window closed/navigated mid-stream) â€” WITHOUT ever calling
+        // window closed/navigated mid-stream) — WITHOUT ever calling
         // `finalize_card_answer`. That silently abandoned an
         // already-charged auto dispatch: no persisted answer, no terminal
         // ledger row, breaking the claimed 1:1 started/terminal ledger
@@ -27073,7 +27177,7 @@ mod tests {
         // The fix marks the channel dead and keeps draining to the actual
         // terminal frame instead of bailing out early. Source-text pin:
         // the `TokenDelta::Delta` arm must set a "channel is gone" flag on
-        // send failure but must NOT `return` â€” only the terminal arms
+        // send failure but must NOT `return` — only the terminal arms
         // (Done/Error/Cancelled) may return.
         let source = include_str!("commands.rs");
         let fn_start = source
@@ -27085,7 +27189,7 @@ mod tests {
             .expect("answer_question_card_impl must follow spawn_card_answer_stream_task");
         let fn_body = &source[fn_start..fn_end];
 
-        // Scoped to THIS function's body â€” `TokenDelta::Delta {` also
+        // Scoped to THIS function's body — `TokenDelta::Delta {` also
         // appears in the pre-existing, unrelated chat path
         // (`spawn_stream_task`) earlier in the file; an unscoped `find`
         // would silently pin the wrong function.
@@ -27105,7 +27209,7 @@ mod tests {
         );
         assert!(
             !delta_body.contains("return;"),
-            "the Delta arm must never `return` early â€” doing so on a channel \
+            "the Delta arm must never `return` early — doing so on a channel \
              send failure skips finalize_card_answer entirely, orphaning an \
              already-charged dispatch with no persisted answer and no \
              terminal ledger row"
@@ -27119,7 +27223,7 @@ mod tests {
         // observing "no HTTP request happened"): `enforce_session_content_policy`
         // must appear, textually, before `prepare_card_answer_request` and
         // before `spawn_card_answer_stream_task` inside
-        // `answer_question_card_impl`'s body â€” so a `PrivacyPolicyBlocked`
+        // `answer_question_card_impl`'s body — so a `PrivacyPolicyBlocked`
         // `Err` returned by the former (via `?`) makes the latter two
         // provably unreachable for that call.
         let source = include_str!("commands.rs");
@@ -27176,7 +27280,7 @@ mod tests {
             gate_return_pos < counter_pos,
             "the counter increment must be reachable only after the gate's early return"
         );
-        // The increment sits inside `if auto { ... }` â€” pinned by presence
+        // The increment sits inside `if auto { ... }` — pinned by presence
         // of the guard immediately before it in the body's byte range.
         let if_auto_pos = body
             .rfind("if auto {")
@@ -27193,8 +27297,8 @@ mod tests {
         // actually calls it WITH the real `auto` flag. A plant-and-revert
         // probe changing the call site to
         // `effective_speak_aloud_for_dispatch(false, settings.speak_aloud)`
-        // â€” which makes every AUTO answer speak aloud whenever the user's
-        // `speak_aloud` setting is on, violating Q6 â€” passed the entire
+        // — which makes every AUTO answer speak aloud whenever the user's
+        // `speak_aloud` setting is on, violating Q6 — passed the entire
         // `commands::tests` suite AND `cargo clippy -D warnings` before this
         // pin existed. Source-text presence pin: the literal call must
         // appear inside this function's body with `auto` (not a hardcoded
@@ -27219,14 +27323,14 @@ mod tests {
     #[test]
     fn answer_question_card_passes_the_callers_auto_flag_through_unchanged() {
         // audio-graph-83cc-b63a (T3G) rewrite of the pre-T3G pin (which
-        // asserted a HARDCODED `true` literal here â€” that was T3's
+        // asserted a HARDCODED `true` literal here — that was T3's
         // pre-integration shape; the landed frontend contract instead sends
         // `auto` as a real argument, `false` for every call site that exists
         // today (T4's manual Ask-AI/Retry) and reserving `true` for T5's
         // future auto-answer trigger). The security invariant this pin
         // exists to hold is unchanged from the pre-T3G version: nothing in
         // this wrapper may override, coerce, or ignore the caller's `auto`
-        // value â€” a plant-and-revert probe hardcoding either literal here
+        // value — a plant-and-revert probe hardcoding either literal here
         // would silently drop the full ordered auto gate (WeakSignal/
         // Converse/Duplicate/Interval/Capped) for what the frontend believes
         // is the auto path, uncapping automatic spend.
@@ -27236,7 +27340,7 @@ mod tests {
         // ever executed by a test"): the actual dispatch logic now lives in
         // `dispatch_answer_question_card` (a plain `&AppState`-taking
         // function other new tests below call directly), with
-        // `answer_question_card` reduced to a one-line delegation â€” this pin
+        // `answer_question_card` reduced to a one-line delegation — this pin
         // follows the logic to where it actually lives.
         let start = source
             .find("async fn dispatch_answer_question_card(")
@@ -27266,8 +27370,8 @@ mod tests {
     #[test]
     fn answer_question_card_never_uses_the_callers_question_argument_as_the_dispatch_text() {
         // Deliverable (a)'s "validate it is consistent with the card if you
-        // use it, or ignore it â€” never trust it as a spend-widening input
-        // and never log it" â€” this unit chose "ignore it" outright. Source
+        // use it, or ignore it — never trust it as a spend-widening input
+        // and never log it" — this unit chose "ignore it" outright. Source
         // pin: the ONLY reference to the `question` parameter inside
         // `dispatch_answer_question_card`'s body is the explicit
         // unused-but-accepted marker; it is never threaded into
@@ -27287,14 +27391,14 @@ mod tests {
         // name/return type embed "question"/"Question" inside longer
         // identifiers (`answer_question_card_impl`, `AnswerQuestionCardDispatch`)
         // with no boundary around the lowercase substring, so those don't
-        // count here â€” only the standalone `question` IDENTIFIER can match.
+        // count here — only the standalone `question` IDENTIFIER can match.
         let standalone = regex::Regex::new(r"\bquestion\b").expect("valid regex");
         let occurrences = standalone.find_iter(body).count();
         assert_eq!(
             occurrences, 2,
             "the standalone `question` identifier must appear exactly twice in \
-             this command's body â€” its own parameter declaration and the \
-             explicit `let _ = &question;` marker â€” and nowhere else; got body: {body}"
+             this command's body — its own parameter declaration and the \
+             explicit `let _ = &question;` marker — and nowhere else; got body: {body}"
         );
         assert!(body.contains("let _ = &question;"));
     }
@@ -27304,7 +27408,7 @@ mod tests {
     /// command/wrapper.rs`: `WrapperAttributes::argument_case` defaults to
     /// `ArgumentCase::Camel`, applied via `key.to_lower_camel_case()`, and
     /// neither command below overrides it with a `#[tauri::command(rename_all
-    /// = "snake_case")]`) â€” a minimal, dependency-free re-implementation
+    /// = "snake_case")]`) — a minimal, dependency-free re-implementation
     /// (this crate does not depend on `heck` directly) of the SAME
     /// ASCII-snake-case-to-lowerCamelCase algorithm, so this test does not
     /// need that crate to pin the wire shape.
@@ -27332,7 +27436,7 @@ mod tests {
     /// camelCase argument-renaming rule (pinned by
     /// `ascii_snake_to_lower_camel`'s doc comment above). A rename of any
     /// parameter here (e.g. `proposal_id` -> `card_id`) changes the wire key
-    /// Tauri looks for and desyncs from the frontend's literal object keys â€”
+    /// Tauri looks for and desyncs from the frontend's literal object keys —
     /// this test fails the moment that happens, without needing a full
     /// webview/IPC round trip.
     #[test]
@@ -27360,7 +27464,7 @@ mod tests {
         // the actual parameter list, so the negative assertion below
         // (`!ask_params.contains("proposal_id")`) passed only because the
         // window happened to cut off six bytes before `ask_question_card`'s
-        // own `let proposal_id = ...` local binding â€” any reformatting or a
+        // own `let proposal_id = ...` local binding — any reformatting or a
         // longer identifier would have flipped it. Slicing to the `) ->`
         // that actually closes each parameter list removes the magic
         // number.
@@ -27394,12 +27498,12 @@ mod tests {
         );
         assert!(
             !ask_params.contains("proposal_id"),
-            "ask_question_card must NOT take a proposal_id â€” it mints a new card from `text`"
+            "ask_question_card must NOT take a proposal_id — it mints a new card from `text`"
         );
 
         // Fix-round addition (minor, scope-honesty review): the camelCase
         // re-implementation above only holds if neither command overrides
-        // Tauri's default `ArgumentCase::Camel` â€” assert the bare
+        // Tauri's default `ArgumentCase::Camel` — assert the bare
         // `#[tauri::command]` attribute (no `rename_all`) actually precedes
         // each signature, rather than merely asserting it in a doc comment.
         for (name, marker) in [
@@ -27413,7 +27517,7 @@ mod tests {
             assert!(
                 preceding.ends_with("#[tauri::command]"),
                 "{name} must carry a bare `#[tauri::command]` with no \
-                 `rename_all` override immediately before its signature â€” \
+                 `rename_all` override immediately before its signature — \
                  a rename_all=\"snake_case\" override would silently break \
                  the camelCase wire mapping this test otherwise pins; got \
                  tail: {:?}",
@@ -27426,7 +27530,7 @@ mod tests {
     /// response type and asserts the EXACT field-name set the TS types
     /// declare (`AnswerQuestionCardDispatch { request_id }` /
     /// `AskQuestionCardDispatch { record, request_id }`, `src/types/
-    /// index.ts` mirror in `store/index.ts`'s local interfaces) â€” not a
+    /// index.ts` mirror in `store/index.ts`'s local interfaces) — not a
     /// source-text scan, an actual `serde_json` round trip, so a `#[serde]`
     /// attribute added later (e.g. a stray `rename_all = "camelCase"`) would
     /// fail this test even though the Rust field names never changed.
@@ -27485,7 +27589,7 @@ mod tests {
 
     /// Fix-round addition (minor, scope-honesty review): `answer_refusal_message`
     /// is the ONE place a refusal reason turns into user-facing text, and
-    /// nothing pinned it before this â€” a mutation widening it to interpolate
+    /// nothing pinned it before this — a mutation widening it to interpolate
     /// card/question content (`format!("... {}", card.proposal.body)`) would
     /// pass the whole suite plus clippy. A source-text scan for `format!`
     /// closes that: every arm today is a static `&str` literal + `.to_string()`,
@@ -27505,7 +27609,7 @@ mod tests {
         let body = &source[start..end];
         assert!(
             !body.contains("format!"),
-            "answer_refusal_message must return only static string literals â€” \
+            "answer_refusal_message must return only static string literals — \
              a `format!` call here is exactly the shape that could interpolate \
              card/question content into a user-facing error string; got body: {body}"
         );
@@ -27552,7 +27656,7 @@ mod tests {
         );
         assert!(
             body.contains("CardLifecycleEvent::Created {"),
-            "mint_user_question_card's telemetry line must be Created â€” a \
+            "mint_user_question_card's telemetry line must be Created — a \
              User-origin card must be observable the same way a \
              transcript-minted one is"
         );
@@ -27563,14 +27667,14 @@ mod tests {
     // above this point pins the ordered gate and source-shape via unit tests
     // and source-order scans (the pre-existing "Channel-construction gap"
     // this module's own comments name). `tauri::ipc::Channel::new` takes a
-    // plain closure â€” no real `AppHandle`/webview needed â€” so a REAL round
+    // plain closure — no real `AppHandle`/webview needed — so a REAL round
     // trip through `mint_user_question_card` +
     // `answer_question_card_impl` (mock HTTP server standing in for the LLM
     // provider, same pattern `llm::streaming::tests::spawn_sse_mock` already
     // uses) is possible after all; these two tests exercise it.
     // =======================================================================
 
-    /// A no-op sink for a `ChatStreamFrame` channel â€” the test only needs
+    /// A no-op sink for a `ChatStreamFrame` channel — the test only needs
     /// the CALL to succeed and the background task to run; frame content is
     /// asserted by re-reading the persisted card instead of by inspecting
     /// what this channel receives.
@@ -27634,7 +27738,7 @@ mod tests {
 
     /// Poll the durable card store until `proposal_id`'s card carries an
     /// `answer` (the background `spawn_card_answer_stream_task` task
-    /// finalizes asynchronously â€” `answer_question_card_impl` itself returns
+    /// finalizes asynchronously — `answer_question_card_impl` itself returns
     /// as soon as the stream is DISPATCHED, not once it completes).
     async fn wait_for_answered_card(
         session_id: &str,
@@ -27696,7 +27800,7 @@ mod tests {
             // --- Mint-and-ask, through the REAL wrapper assembly (fix-round:
             // this now calls `dispatch_ask_question_card` itself rather than
             // its two halves (`mint_user_question_card` +
-            // `answer_question_card_impl`) separately â€” closing the
+            // `answer_question_card_impl`) separately — closing the
             // adversarial-review finding that "neither wrapper is ever
             // executed by a test"; `dispatch_ask_question_card` is the plain
             // `&AppState`-taking function the `#[tauri::command]`-annotated
@@ -27722,7 +27826,7 @@ mod tests {
             assert!(
                 record.answer.is_none(),
                 "the record returned alongside request_id is the MINT-time \
-                 snapshot â€” no answer yet"
+                 snapshot — no answer yet"
             );
             assert_eq!(
                 record.source_span_ids,
@@ -27732,7 +27836,7 @@ mod tests {
             assert_eq!(record.proposal.source_segment_id, "span-1");
 
             // Content-hygiene proof: the persisted card carries the question
-            // text (it is allowed to â€” CardAnswer/proposal.body are the
+            // text (it is allowed to — CardAnswer/proposal.body are the
             // sanctioned content-carrying fields), but nothing about the MINT
             // path itself logs it (log lines only ever carry ids/enums, per
             // `card_telemetry`'s content-free contract, unit-tested elsewhere).
@@ -27804,7 +27908,7 @@ mod tests {
     }
 
     /// audio-graph-83cc-ba04 (T3G2, completing ratified Q4): the same
-    /// mint-and-ask round trip as the test above, but on an IDLE session â€”
+    /// mint-and-ask round trip as the test above, but on an IDLE session —
     /// zero transcript spans, the exact case the design panel's
     /// idle-composer affordance exists for ("a question typed before any
     /// speech works"). Before this ticket, `mint_user_question_card` failed
@@ -27827,7 +27931,7 @@ mod tests {
         let app_handle = crate::speech::shared_test_app_handle();
         let session_id = state.current_session_id();
 
-        // Deliberately NO ledger seed â€” an idle session, zero transcript
+        // Deliberately NO ledger seed — an idle session, zero transcript
         // spans, is the point of this test.
 
         let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
@@ -27859,7 +27963,7 @@ mod tests {
             assert_eq!(
                 record.source_span_ids,
                 Vec::<String>::new(),
-                "a spanless mint must cite no spans â€” it is the user's own \
+                "a spanless mint must cite no spans — it is the user's own \
                  text, not a claim, so ADR-0037 evidence-for-claims never \
                  applied to it"
             );
@@ -27899,8 +28003,8 @@ mod tests {
             // inspection, not execution.
             // `mint_user_question_card`'s `card_telemetry::log_card_event(..,
             // Created { .. })` call (commands.rs, just above the upsert) is
-            // unconditional â€” the spanless branch this test exercises only
-            // changes `source_segment_id`'s `Option`, never that call â€” so
+            // unconditional — the spanless branch this test exercises only
+            // changes `source_segment_id`'s `Option`, never that call — so
             // the existing structural pin,
             // `mint_user_question_card_emits_the_created_telemetry_line`
             // above, already covers this call path; no spanless-specific
@@ -27964,7 +28068,7 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
         rt.block_on(async {
-            // auto=true REFUSES with WeakSignal â€” checked BEFORE the gate
+            // auto=true REFUSES with WeakSignal — checked BEFORE the gate
             // ever touches provider/network setup, so this needs no mock
             // server.
             let auto_dispatch = answer_question_card_impl(
@@ -27986,7 +28090,7 @@ mod tests {
                 "auto must refuse a Weak-signal card with WeakSignal, got {auto_dispatch:?}"
             );
 
-            // manual (auto=false) SUCCEEDS on the exact same card â€” proving
+            // manual (auto=false) SUCCEEDS on the exact same card — proving
             // manual skips the Strong-signal gate step entirely (P4:
             // fragments/weak cards keep manual Ask AI).
             let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Manual retry answer.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n\
@@ -29324,14 +29428,14 @@ mod tests {
 
     /// audio-graph-83cc-ba04 (T3G2, completing ratified Q4). FLIPPED,
     /// explicitly, from T3G's `..._refuses_cleanly_in_a_spanless_session_
-    /// instead_of_leaking_validator_prose` â€” that test pinned
+    /// instead_of_leaking_validator_prose` — that test pinned
     /// `mint_user_question_card`'s OWN fail-fast refusal, which existed only
     /// because `persistence::validate_live_assist_card`'s joint citation
     /// invariant unconditionally rejected an empty-citation card (see that
     /// function's doc comment, and this one's, for the full history). Now
     /// that the validator itself widens the joint invariant for `origin:
     /// User` (this ticket's deliverable (a)), the fail-fast guard is gone
-    /// and the mint SUCCEEDS instead â€” this is the idle-composer affordance
+    /// and the mint SUCCEEDS instead — this is the idle-composer affordance
     /// ratified Q4 exists for. Unlike the old test (a pure in-memory
     /// precondition check that never touched disk), this one actually
     /// persists, so it needs the same `TEST_HOME_LOCK`/`HomeGuard` isolation
@@ -29370,10 +29474,10 @@ mod tests {
     }
 
     /// Fix-round addition (minor, scope-honesty review): before this fix,
-    /// `proposal.body` had no cap at all â€” only an empty-text check. The
+    /// `proposal.body` had no cap at all — only an empty-text check. The
     /// at-cap boundary used to rely on the spanless-session fail-fast (now
     /// removed by T3G2, audio-graph-83cc-ba04) to prove "rejected for an
-    /// unrelated reason, never length" without needing disk isolation â€”
+    /// unrelated reason, never length" without needing disk isolation —
     /// with that guard gone the at-cap case now SUCCEEDS, so this asserts
     /// success directly and needs the same `TEST_HOME_LOCK`/`HomeGuard`
     /// every other persisting test in this module uses.
@@ -29396,7 +29500,7 @@ mod tests {
         );
 
         // Boundary: exactly at the cap succeeds (T3G2: a spanless session no
-        // longer refuses) â€” proving the cap check itself is `>`, not `>=`.
+        // longer refuses) — proving the cap check itself is `>`, not `>=`.
         let at_cap = "a".repeat(MAX_USER_QUESTION_TEXT_CHARS);
         let record = tauri::async_runtime::block_on(mint_user_question_card(&state, &at_cap, None))
             .expect("text at exactly the cap must be accepted, not rejected for length");
@@ -29407,7 +29511,7 @@ mod tests {
     }
 
     /// Fix-round addition (major, adversarial review): `Disabled` is the
-    /// first check the manual gate runs, purely off `AppSettings` â€” no
+    /// first check the manual gate runs, purely off `AppSettings` — no
     /// mock LLM provider needed since dispatch never reaches provider setup.
     #[test]
     #[cfg_attr(
@@ -29462,7 +29566,7 @@ mod tests {
         assert!(
             current.is_empty(),
             "the minted card must NOT survive in the current store after a \
-             Disabled refusal â€” got {} card(s)",
+             Disabled refusal — got {} card(s)",
             current.len()
         );
 
@@ -29524,7 +29628,7 @@ mod tests {
     }
 
     /// Fix-round addition (major, adversarial review): the finding's own
-    /// motivating scenario â€” "user is mid-chat... asks a composer question".
+    /// motivating scenario — "user is mid-chat... asks a composer question".
     #[test]
     #[cfg_attr(
         target_os = "macos",
@@ -29582,7 +29686,7 @@ mod tests {
         assert!(
             current.is_empty(),
             "the minted card must NOT survive in the current store after a \
-             Busy refusal â€” got {} card(s)",
+             Busy refusal — got {} card(s)",
             current.len()
         );
     }

@@ -1,7 +1,7 @@
 //! Projection history verification belongs to the capture that requested it.
 use super::*;
 use crate::persistence::{FileMemoryRepository, VerifiedCaptureCoverage};
-use crate::projections::{ProjectionCoverageStatus::BehindTranscript, ProjectionKind};
+use crate::projections::ProjectionCoverageStatus::BehindTranscript;
 
 pub(crate) fn spawn_capture_verification(
     state: &crate::state::AppState,
@@ -17,19 +17,27 @@ pub(crate) fn spawn_capture_verification(
         projection_runtime: state.projection_runtime_handle(),
         projection_job_workers: state.projection_job_workers.clone(),
         projection_lane_stopping: state.projection_lane_stopping.clone(),
-        event_sink: Arc::new(TauriProjectionRuntimeEventSink { app_handle: app.clone() }),
+        event_sink: Arc::new(TauriProjectionRuntimeEventSink {
+            app_handle: app.clone(),
+        }),
         patch_generator: Arc::new(ExecutorProjectionPatchGenerator {
             llm_executor: state.llm_executor.clone(),
             llm_provider: provider.clone(),
         }),
         llm_provider: provider,
-        llm_allow_cloud_fallbacks: settings.privacy_mode.allows_session_cloud_content_transfer(),
+        llm_allow_cloud_fallbacks: settings
+            .privacy_mode
+            .allows_session_cloud_content_transfer(),
         data_movement_sink: Arc::new(FileProjectionDataMovementSink),
     };
     launch(state, check, dispatch);
 }
 
-pub(super) fn launch(state: &crate::state::AppState, check: Arc<()>, dispatch: ProjectionDispatchContext) {
+pub(super) fn launch(
+    state: &crate::state::AppState,
+    check: Arc<()>,
+    dispatch: ProjectionDispatchContext,
+) {
     let session = state.current_session_id();
     let lifecycle = state.session_lifecycle.clone();
     let view = state.materialized_projection_state.clone();
@@ -41,7 +49,12 @@ pub(super) fn launch(state: &crate::state::AppState, check: Arc<()>, dispatch: P
         // reading any history or acquiring any filesystem coordination guard.
         {
             let _lifecycle = lifecycle.blocking_lock();
-            if !dispatch.projection_schedulers.lock().unwrap_or_else(|p| p.into_inner()).owns_coverage_check(&session, &check) {
+            if !dispatch
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .owns_coverage_check(&session, &check)
+            {
                 return;
             }
         }
@@ -57,82 +70,174 @@ pub(super) fn launch(state: &crate::state::AppState, check: Arc<()>, dispatch: P
         // session swap. A new visit to the same session gets a different token.
         let _lifecycle = lifecycle.blocking_lock();
         let _epoch = publication.read().unwrap_or_else(|p| p.into_inner());
-        let (repairs, observations) = {
-            let ledger = dispatch.transcript_ledger.lock().unwrap_or_else(|p| p.into_inner());
-            let mut lanes = dispatch.projection_schedulers.lock().unwrap_or_else(|p| p.into_inner());
+        let decisions = {
+            let ledger = dispatch
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut lanes = dispatch
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             if !lanes.owns_coverage_check(&session, &check) || ledger.session_id != session {
                 return;
             }
             let ok = verified.is_ok();
-            let (coverage, behind) = match verified {
-                Ok(VerifiedCaptureCoverage { coverage, transcript_count, behind }) => {
-                    (coverage, if transcript_count == ledger.accepted_event_count { behind } else { [true, true] })
+            let (coverage, behind, resume_basis) = match verified {
+                Ok(VerifiedCaptureCoverage {
+                    coverage,
+                    transcript_count,
+                    behind,
+                    resume_basis,
+                }) => {
+                    let same_prefix = transcript_count == ledger.accepted_event_count;
+                    // A partial can extend the live prefix without creating an
+                    // eligible scheduler observation. Keep the verified repair
+                    // for that prefix. A newer observation, if any, supersedes
+                    // its basis and normal job admission rechecks it.
+                    let basis = if transcript_count <= ledger.accepted_event_count {
+                        resume_basis
+                    } else {
+                        None
+                    };
+                    (
+                        coverage,
+                        if same_prefix { behind } else { [true, true] },
+                        basis,
+                    )
                 }
                 Err(_) => {
                     log::warn!("projection_capture.coverage_unverified");
-                    (Default::default(), [true, true])
+                    (Default::default(), [true, true], None)
                 }
             };
             let (heads, gaps) = coverage;
-            let observe = lanes.finish_coverage_check(heads, gaps.for_kind(&ProjectionKind::Notes), gaps.for_kind(&ProjectionKind::Graph), ok);
             {
                 let mut view = view.lock().unwrap_or_else(|p| p.into_inner());
                 view.notes.transcript_coverage = behind[0].then_some(BehindTranscript);
                 view.graph.transcript_coverage = behind[1].then_some(BehindTranscript);
             }
-            let now = current_unix_millis();
-            (lanes.take_capture_repairs(&ledger, now), observe.then(|| lanes.observe_ledger(&ledger, now)))
+            lanes.finish_coverage_check(
+                heads,
+                gaps.into_lanes(),
+                ok,
+                resume_basis,
+                current_unix_millis(),
+            )
         };
-        dispatch_projection_observation(dispatch.clone(), repairs);
-        if let Some(observation) = observations {
-            dispatch_projection_observation(dispatch, observation);
-        }
+        dispatch_projection_observation(dispatch, decisions);
     });
 }
 
 #[cfg(test)]
 pub(crate) mod test_probe {
-    use std::{cell::RefCell, sync::{Arc, atomic::{AtomicUsize, Ordering}, mpsc}, time::Duration};
+    use std::{
+        cell::RefCell,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
     const HANG: Duration = Duration::from_secs(60);
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-    pub(crate) enum Phase { BeforeRead, BeforeInstall, Done }
+    pub(crate) enum Phase {
+        BeforeRead,
+        BeforeInstall,
+        Done,
+    }
     pub(super) struct Probe {
         arrived: mpsc::Sender<Phase>,
         resume: mpsc::Receiver<()>,
         reads: Arc<AtomicUsize>,
+        logs: Arc<std::sync::Mutex<Vec<crate::test_log_capture::CapturedLog>>>,
     }
     thread_local! {
         static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) };
         static READS: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
     }
-    pub(crate) struct Control { arrived: mpsc::Receiver<Phase>, resume: mpsc::Sender<()>, reads: Arc<AtomicUsize> }
+    pub(crate) struct Control {
+        arrived: mpsc::Receiver<Phase>,
+        resume: mpsc::Sender<()>,
+        reads: Arc<AtomicUsize>,
+        logs: Arc<std::sync::Mutex<Vec<crate::test_log_capture::CapturedLog>>>,
+    }
     impl Control {
         pub(crate) fn arm() -> Self {
             let (arrived, events) = mpsc::channel();
             let (next, resume) = mpsc::channel();
             let reads = Arc::new(AtomicUsize::new(0));
+            let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
             READS.replace(Some(reads.clone()));
-            PROBE.replace(Some(Probe { arrived, resume, reads: reads.clone() }));
-            Self { arrived: events, resume: next, reads }
+            PROBE.replace(Some(Probe {
+                arrived,
+                resume,
+                reads: reads.clone(),
+                logs: logs.clone(),
+            }));
+            Self {
+                arrived: events,
+                resume: next,
+                reads,
+                logs,
+            }
         }
-        pub(crate) fn wait(&self, phase: Phase) { assert_eq!(self.arrived.recv_timeout(HANG).unwrap(), phase); }
-        pub(crate) fn resume(&self) { self.resume.send(()).unwrap(); }
-        pub(crate) fn reads(&self) -> usize { self.reads.load(Ordering::SeqCst) }
+        pub(crate) fn wait(&self, phase: Phase) {
+            assert_eq!(self.arrived.recv_timeout(HANG).unwrap(), phase);
+        }
+        pub(crate) fn resume(&self) {
+            self.resume.send(()).unwrap();
+        }
+        pub(crate) fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+        pub(crate) fn logs(&self) -> Vec<crate::test_log_capture::CapturedLog> {
+            self.logs.lock().unwrap().clone()
+        }
     }
-    impl Drop for Control { fn drop(&mut self) { READS.take(); PROBE.take(); } }
-    pub(super) fn take() -> Option<Probe> { PROBE.take() }
-    pub(super) struct Worker;
+    impl Drop for Control {
+        fn drop(&mut self) {
+            READS.take();
+            PROBE.take();
+        }
+    }
+    pub(super) fn take() -> Option<Probe> {
+        PROBE.take()
+    }
+    pub(super) struct Worker(Option<crate::test_log_capture::ThreadLogCapture>);
     pub(super) fn enter(probe: Option<Probe>) -> Worker {
         READS.replace(probe.as_ref().map(|p| p.reads.clone()));
-        PROBE.replace(probe); Worker
+        let logs = probe
+            .is_some()
+            .then(crate::test_log_capture::ThreadLogCapture::start);
+        PROBE.replace(probe);
+        Worker(logs)
     }
     impl Drop for Worker {
-        fn drop(&mut self) { if let Some(p) = PROBE.take() { let _ = p.arrived.send(Phase::Done); } READS.take(); }
+        fn drop(&mut self) {
+            if let Some(p) = PROBE.take() {
+                if let Some(logs) = self.0.take() {
+                    *p.logs.lock().unwrap() = logs.finish();
+                }
+                let _ = p.arrived.send(Phase::Done);
+            }
+            READS.take();
+        }
     }
     pub(super) fn point(phase: Phase) {
-        PROBE.with_borrow(|p| if let Some(p) = p { p.arrived.send(phase).unwrap(); p.resume.recv_timeout(HANG).unwrap(); });
+        PROBE.with_borrow(|p| {
+            if let Some(p) = p {
+                p.arrived.send(phase).unwrap();
+                p.resume.recv_timeout(HANG).unwrap();
+            }
+        });
     }
     pub(crate) fn record_read() {
-        READS.with_borrow(|r| if let Some(n) = r { n.fetch_add(1, Ordering::SeqCst); });
+        READS.with_borrow(|r| {
+            if let Some(n) = r {
+                n.fetch_add(1, Ordering::SeqCst);
+            }
+        });
     }
 }

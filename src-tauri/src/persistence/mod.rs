@@ -41,6 +41,7 @@ pub(crate) use projection_history::{MAX_PROJECTION_EVENTS_BYTES, ProjectionHisto
 pub(crate) struct VerifiedCaptureCoverage {
     pub(crate) coverage: projection_history::ProjectionCaptureCoverage,
     pub(crate) transcript_count: u64,
+    pub(crate) resume_basis: Option<crate::projections::ProjectionBasis>,
     pub(crate) behind: [bool; 2],
 }
 pub(crate) mod canonical_reader;
@@ -75,7 +76,7 @@ pub use audio_graph_ipc_contract::session_data_movement::{
 ///
 /// Probes the transcripts directory with a tiny write. On success, clears the
 /// process-wide storage-full flag so the next real ENOSPC will re-emit, and
-/// returns `Ok(())` â€” the banner should dismiss. On failure (disk still
+/// returns `Ok(())` — the banner should dismiss. On failure (disk still
 /// full), leaves the flag set and returns `Err(io::Error)` so the UI keeps
 /// the banner visible and can show the user they still need to free space.
 ///
@@ -105,8 +106,8 @@ pub fn retry_storage_write() -> Result<(), std::io::Error> {
 // disk-full errors, so we stash one in a process-wide `OnceLock` that the
 // speech processor (which receives an `AppHandle` at startup) initialises.
 //
-// If the handle hasn't been registered yet â€” e.g. a disk-full error fires
-// before any speech processor has started â€” we fall back to logging only.
+// If the handle hasn't been registered yet — e.g. a disk-full error fires
+// before any speech processor has started — we fall back to logging only.
 
 static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
@@ -138,8 +139,15 @@ pub fn transcript_events_path(session_id: &str) -> Option<PathBuf> {
 
 /// Invalidate the prior capture's coverage before ASR can publish a revision.
 pub(crate) fn begin_projection_capture(state: &crate::state::AppState) -> Arc<()> {
-    let check = state.projection_schedulers.lock().unwrap_or_else(|p| p.into_inner()).begin_coverage_check();
-    let mut view = state.materialized_projection_state.lock().unwrap_or_else(|p| p.into_inner());
+    let check = state
+        .projection_schedulers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .begin_coverage_check();
+    let mut view = state
+        .materialized_projection_state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     use crate::projections::ProjectionCoverageStatus::BehindTranscript;
     view.notes.transcript_coverage = Some(BehindTranscript);
     view.graph.transcript_coverage = Some(BehindTranscript);
@@ -372,7 +380,7 @@ fn validate_live_assist_card(session_id: &str, card: &LiveAssistCardRecord) -> R
     // Q4 (ratified, audio-graph-83cc T1): a user-typed question asked
     // before any speech exists in the session has no real transcript
     // segment to cite. `origin: User` narrowly relaxes the otherwise-
-    // unconditional non-empty `source_segment_id` requirement â€” every
+    // unconditional non-empty `source_segment_id` requirement — every
     // OTHER origin, including the default `Transcript` (every
     // transcript-detected proposal AND every legacy pre-83cc record with no
     // `origin` at all), keeps the full invariant unchanged. T1 stopped here;
@@ -392,7 +400,7 @@ fn validate_live_assist_card(session_id: &str, card: &LiveAssistCardRecord) -> R
     // does NOT touch ADR-0037's evidence-for-claims semantics. The joint
     // check below (source_span_ids OR graph_context_ids non-empty) is this
     // module's own pre-existing live-assist admission rule, which predates
-    // ADR-0037; ADR-0037 does not impose it â€” it cites this exact rule as
+    // ADR-0037; ADR-0037 does not impose it — it cites this exact rule as
     // its own *layering precedent* for a different surface (claims the
     // agent asserts about the meeting), and explicitly contemplates claim
     // classes with no citation at all. So "ADR-0037 semantics unchanged"
@@ -400,13 +408,13 @@ fn validate_live_assist_card(session_id: &str, card: &LiveAssistCardRecord) -> R
     // actually governs. A `CardOrigin::User` card's `proposal.body` is the
     // user's OWN typed text, not a claim about the meeting; there is
     // nothing for it to cite when it is asked before any speech exists in
-    // the session (an idle-composer question). Every other origin â€”
+    // the session (an idle-composer question). Every other origin —
     // `Transcript` and the legacy `None` origin every pre-83cc record
-    // implies â€” is unconditionally still bound by the full citation
+    // implies — is unconditionally still bound by the full citation
     // requirement below, unchanged. NOTE: this widening means ADR-0037's
     // own descriptive sentence about live-assist cards ("admitted if it
     // cites transcript spans or graph context") is no longer universally
-    // true, and its `mod.rs` line reference is now stale â€” filed as a
+    // true, and its `mod.rs` line reference is now stale — filed as a
     // follow-up to update the ADR, not fixed here (out of this ticket's
     // scope).
     let citation_required = !matches!(card.origin, Some(CardOrigin::User));
@@ -431,7 +439,7 @@ fn validate_live_assist_card(session_id: &str, card: &LiveAssistCardRecord) -> R
         ));
     }
     // audio-graph-83cc T1: `CardAnswer` invariants, additive to the
-    // citation rule above â€” a card's answer (once T3 starts writing one) is
+    // citation rule above — a card's answer (once T3 starts writing one) is
     // still bound by ADR-0037 evidence validation.
     if let Some(answer) = &card.answer {
         // An answer that was cut short (failed, or cancelled before its first
@@ -442,7 +450,7 @@ fn validate_live_assist_card(session_id: &str, card: &LiveAssistCardRecord) -> R
                 card.proposal.id
             ));
         }
-        // This rejection is a hard, terminal failure for the caller â€” it
+        // This rejection is a hard, terminal failure for the caller — it
         // does NOT truncate. Whoever writes an answer built from unbounded
         // model output (T3) should call `CardAnswer::cap_text` before
         // reaching this validator, so the cap is enforced by truncation
@@ -702,7 +710,7 @@ pub trait LocalMemoryRepository: Send + Sync {
     /// go?": capture start/stop, provider calls, artifact writes/loads/
     /// export/delete, credential save/delete/readiness, projection jobs/
     /// patches, and org promotion state. The event is redacted by
-    /// construction â€” it carries data classes, provider/model ids, source ids,
+    /// construction — it carries data classes, provider/model ids, source ids,
     /// destination boundaries, counts/hashes, statuses, and redacted errors,
     /// but never raw audio, raw transcript, prompt bodies, API keys, bearer
     /// tokens, service-account JSON, or full provider payloads.
@@ -752,15 +760,15 @@ pub trait LocalMemoryRepository: Send + Sync {
     ) -> Result<Option<MaterializedGraph>, String>;
 
     /// Read-modify-write on the session's live-assist "current" JSON array
-    /// (audio-graph-83cc T3G review finding, filed then, documented â€” not
-    /// fixed â€” here by T3G2 while this file was already open for the
+    /// (audio-graph-83cc T3G review finding, filed then, documented — not
+    /// fixed — here by T3G2 while this file was already open for the
     /// citation-invariant widening above): this call has no lock of its
     /// own, and neither does `load_live_assist_cards`. Ticket deliverable
     /// (d) named three `commands.rs` call sites that read-modify-write a
-    /// session's live-assist current array â€” `mint_user_question_card`'s
+    /// session's live-assist current array — `mint_user_question_card`'s
     /// mint, `finalize_card_answer`'s (called from
     /// `answer_question_card_impl`) finalize-on-terminal upsert, and
-    /// `delete_orphaned_mint`'s compensating delete â€” but this is NOT an
+    /// `delete_orphaned_mint`'s compensating delete — but this is NOT an
     /// exhaustive list of every such call site: `approve_agent_proposal_impl`,
     /// `dismiss_agent_proposal`, and `clear_agent_proposals` (all in
     /// `commands.rs`) and the transcript-mint path in `speech/mod.rs` do
@@ -768,12 +776,12 @@ pub trait LocalMemoryRepository: Send + Sync {
     /// the three named sites runs inside `state.session_lifecycle`'s
     /// critical section: they are plain sync `fn`s (not `async fn`), so
     /// none of them can `.await` the `tokio::sync::Mutex<()>` guard without
-    /// first being restructured into async â€” that restructuring, not lock
+    /// first being restructured into async — that restructuring, not lock
     /// reentrancy, is why the lock is absent here. Two concurrent upserts
     /// against the same session can each read the same on-disk snapshot,
     /// then each write back their own modification, silently losing
     /// whichever write lands first. Pre-existing risk profile, unchanged by
-    /// T3G2's scope (a validator + mint-path widening only) â€” named here
+    /// T3G2's scope (a validator + mint-path widening only) — named here
     /// rather than fixed.
     fn upsert_live_assist_card(
         &self,
@@ -1101,26 +1109,48 @@ impl FileMemoryRepository {
         Ok(self.verify_capture_coverage(session_id)?.coverage)
     }
 
-    pub(crate) fn verify_capture_coverage(&self, session_id: &str) -> Result<VerifiedCaptureCoverage, String> {
+    pub(crate) fn verify_capture_coverage(
+        &self,
+        session_id: &str,
+    ) -> Result<VerifiedCaptureCoverage, String> {
         #[cfg(test)]
         crate::speech::test_probe::record_read();
         let (history, _) = self.read_projection_history_with_limit(session_id, false, u64::MAX)?;
         let transcript = self.load_transcript_event_stream(session_id)?;
         history.verify_source("transcript_revisions", transcript.records())?;
-        history.verify_source("speaker_revisions", self.load_speaker_revision_stream(session_id)?.records())?;
-        let ledger = TranscriptLedger::replay_source_prefix(session_id, &transcript.into_payloads())
-            .map_err(|_| "unverified transcript coverage")?;
+        history.verify_source(
+            "speaker_revisions",
+            self.load_speaker_revision_stream(session_id)?.records(),
+        )?;
+        let ledger =
+            TranscriptLedger::replay_source_prefix(session_id, &transcript.into_payloads())
+                .map_err(|_| "unverified transcript coverage")?;
         let coverage = history.into_capture_coverage();
         let ((notes, graph), gaps) = &coverage;
         let behind = |basis: &Option<crate::projections::ProjectionBasis>, kind| {
-            !gaps.for_kind(&kind).is_empty() || match basis {
-                Some(basis) => ledger.projection_coverage(Some(basis)).is_some(),
-                None => ledger.latest_spans.iter().any(crate::projections::projection_event_is_eligible),
-            }
+            !gaps.for_kind(&kind).is_empty()
+                || match basis {
+                    Some(basis) => ledger.projection_coverage(Some(basis)).is_some(),
+                    None => ledger
+                        .latest_spans
+                        .iter()
+                        .any(crate::projections::projection_event_is_eligible),
+                }
         };
         use crate::projections::ProjectionKind;
-        let behind = [behind(notes, ProjectionKind::Notes), behind(graph, ProjectionKind::Graph)];
-        Ok(VerifiedCaptureCoverage { coverage, transcript_count: ledger.accepted_event_count, behind })
+        let behind = [
+            behind(notes, ProjectionKind::Notes),
+            behind(graph, ProjectionKind::Graph),
+        ];
+        let resume_basis = (!gaps.for_kind(&ProjectionKind::Notes).is_empty()
+            || !gaps.for_kind(&ProjectionKind::Graph).is_empty())
+        .then(|| ledger.current_projection_basis());
+        Ok(VerifiedCaptureCoverage {
+            coverage,
+            transcript_count: ledger.accepted_event_count,
+            resume_basis,
+            behind,
+        })
     }
 
     pub(crate) fn load_projection_patch_stream(
@@ -2309,7 +2339,7 @@ pub struct TranscriptWriter {
     /// Shutdown flag shared with the writer thread. Set by `shutdown()` /
     /// `shutdown_with_timeout()`; the writer's `recv_timeout` poll checks it
     /// each tick and exits promptly even if no `Shutdown` message is drained.
-    /// Dropping the `Sender` alone is not enough â€” if the channel still has
+    /// Dropping the `Sender` alone is not enough — if the channel still has
     /// buffered `Append` messages, the writer would keep flushing them before
     /// seeing the hang-up, holding the file handle open. The flag lets the
     /// writer short-circuit after draining what's already queued, so a new
@@ -2437,18 +2467,18 @@ impl TranscriptWriter {
     /// Signal shutdown and wait (up to `timeout`) for the writer thread to exit.
     ///
     /// Returns `true` if the thread joined within the timeout, `false` if the
-    /// wait expired (the thread is left detached â€” it will eventually exit on
+    /// wait expired (the thread is left detached — it will eventually exit on
     /// its own when the underlying I/O unsticks, or be torn down at process
     /// exit). On `false` the caller should assume some un-flushed segments may
     /// still be in the writer's BufWriter and proceed with spawning a new
-    /// writer anyway â€” the alternative is blocking the rotation IPC
+    /// writer anyway — the alternative is blocking the rotation IPC
     /// indefinitely on a wedged disk, which is worse than a rare lost tail.
     ///
     /// Implementation note: `JoinHandle::join` is blocking with no timeout
     /// overload in std. We move the handle into a watchdog thread that
     /// performs the join, and signal completion via a `mpsc` channel so the
     /// calling thread can `recv_timeout`. On timeout the watchdog is itself
-    /// leaked â€” the JoinHandle inside it prevents the writer thread from
+    /// leaked — the JoinHandle inside it prevents the writer thread from
     /// becoming a true zombie, just an unobserved one.
     pub fn shutdown_with_timeout(mut self, timeout: std::time::Duration) -> bool {
         self.shutdown_requested.store(true, Ordering::SeqCst);
@@ -2474,8 +2504,8 @@ impl TranscriptWriter {
                 //
                 // Instrumentation (ag#8): time how long the join actually
                 // takes. Combined with the writer-thread-side
-                // `transcript_writer.final_flush elapsed_ms=â€¦` line, this
-                // gives us the full picture â€” caller-observed wall clock
+                // `transcript_writer.final_flush elapsed_ms=…` line, this
+                // gives us the full picture — caller-observed wall clock
                 // vs. kernel-side flush cost. Once we have a couple of
                 // weeks of field data, tune TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
                 // to p99(join) + safety margin.
@@ -2492,7 +2522,7 @@ impl TranscriptWriter {
             }
             Err(e) => {
                 log::warn!(
-                    "Failed to spawn transcript-writer-join watchdog: {} â€” \
+                    "Failed to spawn transcript-writer-join watchdog: {} — \
                      writer thread is detached",
                     e
                 );
@@ -2903,7 +2933,7 @@ impl TranscriptEventWriter {
             }
             Err(e) => {
                 log::warn!(
-                    "Failed to spawn transcript-event-writer-join watchdog: {} â€” \
+                    "Failed to spawn transcript-event-writer-join watchdog: {} — \
                      writer thread is detached",
                     e
                 );
@@ -3084,7 +3114,7 @@ impl ProjectionEventWriter {
             }
             Err(e) => {
                 log::warn!(
-                    "Failed to spawn projection-event-writer-join watchdog: {} â€” \
+                    "Failed to spawn projection-event-writer-join watchdog: {} — \
                      writer thread is detached",
                     e
                 );
@@ -3121,7 +3151,7 @@ pub fn save_json<T: serde::Serialize>(value: &T, path: &Path) -> Result<(), Stri
     let mut writer = BufWriter::new(file);
     if let Err(e) = serde_json::to_writer_pretty(&mut writer, value) {
         // `serde_json::Error::classify() == Category::Io` indicates the
-        // underlying writer failed â€” surface storage-full conditions via
+        // underlying writer failed — surface storage-full conditions via
         // the shared handler before returning.
         if e.classify() == serde_json::error::Category::Io {
             let io_err = std::io::Error::from(e);
@@ -3159,7 +3189,7 @@ pub fn save_json<T: serde::Serialize>(value: &T, path: &Path) -> Result<(), Stri
     crate::fs_util::set_owner_only(&tmp_path);
 
     fs::rename(&tmp_path, path)
-        .map_err(|e| format!("Failed to rename {:?} â†’ {:?}: {}", tmp_path, path, e))?;
+        .map_err(|e| format!("Failed to rename {:?} → {:?}: {}", tmp_path, path, e))?;
 
     // Re-apply after rename in case rename semantics differ across platforms.
     crate::fs_util::set_owner_only(path);
@@ -3245,7 +3275,7 @@ pub fn load_transcript_events(session_id: &str) -> Result<Vec<TranscriptEvent>, 
 ///    Superseding partial revisions collapse to one segment per final span.
 /// 2. Only when the canonical stream is missing, fall back to the legacy
 ///    `<session>.jsonl` rows exactly as they
-///    were written â€” each line is a serialized [`TranscriptSegment`] and is
+///    were written — each line is a serialized [`TranscriptSegment`] and is
 ///    returned unchanged, with no migration into the event log.
 pub fn load_transcript_segments_preferring_ledger(
     session_id: &str,
@@ -3356,7 +3386,7 @@ pub fn load_materialized_graph(session_id: &str) -> Result<Option<MaterializedGr
 
 /// Persist the scheduler queue state snapshot for a session to disk.
 ///
-/// Best-effort: log a warning on failure but never propagate â€” a missing
+/// Best-effort: log a warning on failure but never propagate — a missing
 /// snapshot means the scheduler restarts clean, which is safe.
 pub fn save_scheduler_queue_state(
     session_id: &str,
@@ -3429,9 +3459,9 @@ fn run_autosave_tick(
     transcript_buffer: &Arc<RwLock<VecDeque<TranscriptSegment>>>,
 ) {
     // Snapshot session_id ONCE at tick entry. Every subsequent write in this
-    // tick uses `current_sid` â€” never re-reads `session_id` â€” so the file path
+    // tick uses `current_sid` — never re-reads `session_id` — so the file path
     // and the stats update are guaranteed to target the same session even if a
-    // rotation lands between sub-steps. Poisoned lock â†’ recover; the inner
+    // rotation lands between sub-steps. Poisoned lock → recover; the inner
     // String has no broken invariant.
     let current_sid = match session_id.read() {
         Ok(g) => g.clone(),
@@ -3439,7 +3469,7 @@ fn run_autosave_tick(
     };
     let file_path = dir.join(format!("{}.json", current_sid));
 
-    // â”€â”€ Graph snapshot: save to disk + capture entity count â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Graph snapshot: save to disk + capture entity count ────────
     let entity_count: u64 = {
         let graph = match knowledge_graph.lock() {
             Ok(g) => g,
@@ -3458,7 +3488,7 @@ fn run_autosave_tick(
         node_count as u64
     };
 
-    // â”€â”€ Transcript buffer: segment + unique speaker counts â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Transcript buffer: segment + unique speaker counts ─────────
     let (segment_count, speaker_count): (u64, u64) = match transcript_buffer.read() {
         Ok(buf) => {
             let segments = buf.len() as u64;
@@ -3476,7 +3506,7 @@ fn run_autosave_tick(
         }
     };
 
-    // â”€â”€ Refresh session index stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Refresh session index stats ────────────────────────────────
     // Pass the tick-start-cached `current_sid`, NOT a fresh read of
     // session_id, so the stats update matches the file we just wrote above.
     if let Err(e) =
@@ -3491,11 +3521,11 @@ fn run_autosave_tick(
 /// Called from the `RunEvent::Exit` handler AFTER the autosave thread has been
 /// signalled to stop and joined, so there is no concurrent writer for the same
 /// session file. Best-effort and bounded: it does a single graph save + stats
-/// refresh (the same work as one loop tick) so a clean Fileâ†’Quit doesn't lose
+/// refresh (the same work as one loop tick) so a clean File→Quit doesn't lose
 /// up to ~30s of derived-graph state to the next-missed autosave tick.
 ///
 /// A no-op (returns without touching disk) if the graphs directory cannot be
-/// resolved â€” mirrors [`spawn_graph_autosave`] returning `None`.
+/// resolved — mirrors [`spawn_graph_autosave`] returning `None`.
 pub fn autosave_final_save(
     session_id: &Arc<RwLock<String>>,
     knowledge_graph: &Arc<Mutex<TemporalKnowledgeGraph>>,
@@ -3520,7 +3550,7 @@ pub fn autosave_final_save(
 /// [`AppState::rotate_session`](crate::state::AppState::rotate_session) can
 /// repoint the autosave target mid-run without respawning this thread. Each
 /// tick snapshots the current ID once at entry and uses that single value for
-/// both the file path *and* the `update_stats` call â€” so even if a rotation
+/// both the file path *and* the `update_stats` call — so even if a rotation
 /// lands mid-tick, the tick's writes all target the same session.
 ///
 /// `rotation_in_progress` is the shared guard from `AppState`: if a rotation
@@ -3551,12 +3581,12 @@ pub fn spawn_graph_autosave(
     let handle = std::thread::Builder::new()
         .name("graph-autosave".to_string())
         .spawn(move || {
-            log::info!("Graph auto-save: started (every 30s â†’ {:?})", dir);
+            log::info!("Graph auto-save: started (every 30s → {:?})", dir);
             let mut last_save = std::time::Instant::now();
             loop {
                 std::thread::sleep(AUTOSAVE_POLL_INTERVAL);
 
-                // Graceful-shutdown stop signal. Exit WITHOUT saving here â€” the
+                // Graceful-shutdown stop signal. Exit WITHOUT saving here — the
                 // Exit handler owns the single final save (via
                 // `autosave_final_save`) once this thread has joined, so we
                 // never race the final writer for the same session file.
@@ -3591,7 +3621,7 @@ pub fn spawn_graph_autosave(
 }
 
 // ---------------------------------------------------------------------------
-// Tests â€” transcript writer shutdown contract (ag#7)
+// Tests — transcript writer shutdown contract (ag#7)
 // ---------------------------------------------------------------------------
 //
 // These pin the behavior that matters for session rotation:
@@ -3726,9 +3756,9 @@ mod shutdown_tests {
             .unwrap();
         tx.send(TranscriptWriteMsg::Append(seg("b", "second")))
             .unwrap();
-        // Shutdown sentinel mid-queue â€” drain_remaining must stop here.
+        // Shutdown sentinel mid-queue — drain_remaining must stop here.
         tx.send(TranscriptWriteMsg::Shutdown).unwrap();
-        // This one must NOT be written â€” it comes after the sentinel.
+        // This one must NOT be written — it comes after the sentinel.
         tx.send(TranscriptWriteMsg::Append(seg("c", "after-sentinel")))
             .unwrap();
 
@@ -3858,7 +3888,7 @@ mod shutdown_tests {
         // sentinel lands in the channel, so a writer polling the flag on
         // recv_timeout observes shutdown even if it hasn't consumed the
         // sentinel yet. We stand up a fake TranscriptWriter (no real thread)
-        // and assert flag state after the call â€” the send itself is covered
+        // and assert flag state after the call — the send itself is covered
         // by the end-to-end `#[ignore]`d rotation tests in state.rs.
         let (tx, _rx) = mpsc::channel::<TranscriptWriteMsg>();
         let flag = Arc::new(AtomicBool::new(false));
@@ -5432,7 +5462,7 @@ mod local_memory_repository_tests {
     }
 
     // -----------------------------------------------------------------------
-    // audio-graph-83cc T1: Q4's narrow `validate_live_assist_card` widening â€”
+    // audio-graph-83cc T1: Q4's narrow `validate_live_assist_card` widening —
     // an empty `source_segment_id` is permitted ONLY when `origin ==
     // CardOrigin::User`; every other origin (including the default
     // `Transcript` a legacy `None` origin implies) keeps the full,
@@ -5452,7 +5482,7 @@ mod local_memory_repository_tests {
         card.origin = Some(CardOrigin::User);
         card.proposal.source_segment_id = String::new();
         // The OTHER half of the citation invariant (spans OR graph context)
-        // must still hold independently of this widening â€” keep a graph
+        // must still hold independently of this widening — keep a graph
         // context id so this test isolates the `source_segment_id` rule.
         card.source_span_ids = Vec::new();
         card.graph_context_ids = vec!["node-1".into()];
@@ -5517,7 +5547,7 @@ mod local_memory_repository_tests {
     // -----------------------------------------------------------------------
     // audio-graph-83cc T3G2 (ba04): completes Q4 by widening the SECOND,
     // joint citation invariant (source_span_ids OR graph_context_ids
-    // non-empty) the same way T1 widened `source_segment_id` â€” ONLY for
+    // non-empty) the same way T1 widened `source_segment_id` — ONLY for
     // `origin: User`, and ONLY when BOTH citation fields are empty. Pinned
     // both ways, same idiom as T1's own pair of tests above.
     // -----------------------------------------------------------------------
@@ -5564,7 +5594,7 @@ mod local_memory_repository_tests {
         let session_id = "session-t3g2-transcript-spanless";
 
         // Explicit `Transcript` origin: the ADR-0037 evidence-for-claims
-        // invariant is UNCHANGED â€” a transcript-detected proposal must
+        // invariant is UNCHANGED — a transcript-detected proposal must
         // still cite a span or graph context.
         let mut explicit_transcript = sample_live_assist_card(
             session_id,
@@ -5785,7 +5815,7 @@ mod local_memory_repository_tests {
         let session_id = "session-legacy-on-disk-83cc";
 
         // Hand-written OLD-SHAPE row: exactly what a pre-83cc
-        // `current.json`/audit `.jsonl` record looks like on disk today â€”
+        // `current.json`/audit `.jsonl` record looks like on disk today —
         // no `origin`, `answer`, `signal`, or `proposal.signal` key at all.
         let legacy_row = serde_json::json!({
             "session_id": session_id,
@@ -6690,7 +6720,7 @@ pub(crate) mod repository_conformance {
 }
 
 // ---------------------------------------------------------------------------
-// Tests â€” graph autosave stop signal + graceful-shutdown final save
+// Tests — graph autosave stop signal + graceful-shutdown final save
 // ---------------------------------------------------------------------------
 //
 // Pins the graceful-shutdown wiring the RunEvent::Exit handler relies on:
@@ -6791,7 +6821,7 @@ mod autosave_shutdown_tests {
         let handle = spawn_graph_autosave(session_id, graph, buffer, rotation, stop.clone())
             .expect("autosave thread must spawn with HOME override");
 
-        // Signal stop and confirm the thread joins well within the 30s cadence â€”
+        // Signal stop and confirm the thread joins well within the 30s cadence —
         // proving the loop polls the flag on the short interval, not the sleep.
         stop.store(true, Ordering::SeqCst);
         let start = Instant::now();
@@ -6871,7 +6901,7 @@ mod autosave_shutdown_tests {
 
         autosave_final_save(&session_id, &graph, &buffer);
 
-        // An empty graph (node_count == 0) is not persisted â€” mirrors the loop
+        // An empty graph (node_count == 0) is not persisted — mirrors the loop
         // tick's `node_count > 0` guard.
         let graph_file = graphs_dir()
             .expect("graphs dir resolves under HOME override")
@@ -7121,7 +7151,7 @@ mod autosave_shutdown_tests {
         let repo = FileMemoryRepository::with_data_root(&dir);
         let session_id = "session-failed";
 
-        // Runtime-assembled key-shaped sentinel â€” no static sk- literal appears
+        // Runtime-assembled key-shaped sentinel — no static sk- literal appears
         // in source (avoids tripping secret scanners on the fake test sentinel)
         // while still exercising the redactor on real credential shape.
         let fake_key = ["s", "k", "-", &"A".repeat(24)].concat();
