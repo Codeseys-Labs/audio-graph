@@ -321,6 +321,24 @@ mod diagnostic_tests {
         pub(super) rejections: tokio::task::JoinHandle<()>,
     }
 
+    pub(super) async fn close_before_readiness(
+        expect_config: bool,
+    ) -> Vec<(
+        String,
+        tokio::task::JoinHandle<Vec<ws_fixture::ClientFrame>>,
+    )> {
+        let mut servers = Vec::new();
+        for _ in crate::reconnect::DEFAULT_BACKOFF_SECONDS {
+            let mut steps = Vec::new();
+            if expect_config {
+                steps.push(ws_fixture::ServerStep::expect_any_text());
+            }
+            steps.push(ws_fixture::ServerStep::send_close());
+            servers.push(ws_fixture::spawn_scripted_server(steps).await);
+        }
+        servers
+    }
+
     pub(super) async fn fresh_outage(
         recovery_steps: Vec<ws_fixture::ServerStep>,
         credential_sent: bool,

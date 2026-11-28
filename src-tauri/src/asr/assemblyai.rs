@@ -1350,6 +1350,72 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_exhausts_budget_when_every_socket_closes_before_readiness() {
+        use super::super::diagnostic_tests::close_before_readiness;
+        use std::sync::atomic::AtomicUsize;
+
+        let (initial_url, initial) =
+            ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
+        let (writer, reader) = ws_fixture::connect_client(&initial_url).await.split();
+        let (endpoints, servers): (Vec<_>, Vec<_>) =
+            close_before_readiness(false).await.into_iter().unzip();
+        let budget = endpoints.len();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        let opener: ReconnectOpener = Arc::new(move |config| {
+            let url = endpoints[count.fetch_add(1, Ordering::SeqCst)].clone();
+            Box::pin(async move { open_ws_url(&config, &url).await })
+        });
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            session_task_with_backoff(
+                AssemblyAISessionCtx {
+                    writer,
+                    reader,
+                    config: test_config(),
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(true)),
+                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    pending_chunks: Arc::new(AtomicUsize::new(0)),
+                    reconnect_opener: Some(opener),
+                    run_io_entries: None,
+                },
+                |_| Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("unconfirmed upgrades must exhaust the budget");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), budget);
+        initial.await.unwrap();
+        for server in servers {
+            server.await.unwrap();
+        }
+        let events: Vec<_> = event_rx.try_iter().collect();
+        let (retry_events, terminal) = events.split_at(budget);
+        assert!(
+            retry_events
+                .iter()
+                .enumerate()
+                .all(|(index, event)| matches!(
+                    event,
+                    AssemblyAIEvent::Reconnecting { attempt, .. } if *attempt == index as u32 + 1
+                )),
+            "each unconfirmed upgrade must advance the ladder: {events:?}"
+        );
+        assert!(
+            matches!(
+                terminal,
+                [AssemblyAIEvent::Error { message }, AssemblyAIEvent::SessionTerminated] if *message == websocket_diagnostic(Code::ProviderUnavailable)
+            ),
+            "expected exhaustion after the final attempt: {events:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn reconnect_exhausts_fresh_budget_with_last_diagnostic() {
         use super::super::diagnostic_tests::{assert_fresh_outage, fresh_outage};
         use std::sync::atomic::AtomicUsize;
