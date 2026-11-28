@@ -11,9 +11,10 @@
  * `SessionMetadata`) on the left, a detail pane on the right. Selecting a
  * row sets `nav.sessionId` (`useAudioGraphStore`'s `setNavSessionId`) and, for
  * any row that ISN'T the session that just finished recording, calls
- * `loadSession` — the existing `sessions.reviewLockedWhileLive` guard inside
- * it still applies. The just-stopped session's row is a special case: see
- * `isResidentLiveSession` below.
+ * `loadSession` when no capture is running (while it runs, the Transcript lens
+ * is a query-backed Review pane instead and Notes/Timeline/Graph are gated —
+ * see `globalHoldsRow` in `SessionDetail`). The just-stopped session's row is
+ * a special case: see `handleSelect` below.
  *
  * Source of truth is still the backend `sessions.json` index —
  * `list_sessions` returns all known sessions, `load_session` hydrates the
@@ -40,7 +41,6 @@
  */
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useReviewStore } from "../session/reviewStore";
 import { SessionViewProvider } from "../session/SessionViewProvider";
 import { useAudioGraphStore } from "../store";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
@@ -268,7 +268,7 @@ function SessionsBrowser() {
   const exportSessionBundle = useAudioGraphStore((s) => s.exportSessionBundle);
   const navSessionId = useAudioGraphStore((s) => s.nav.sessionId);
   const setNavSessionId = useAudioGraphStore((s) => s.setNavSessionId);
-  const markSessionSelected = useReviewStore((s) => s.markSessionSelected);
+  const loadSession = useAudioGraphStore((s) => s.loadSession);
 
   const [search, setSearch] = useState("");
   const [sortMode, setSortMode] = useState<SessionSortMode>(() =>
@@ -317,21 +317,21 @@ function SessionsBrowser() {
     saveSortPreference(mode);
   };
 
-  // Choosing a row only records the choice and navigates; `SessionDetail` owns
-  // bringing the global store up to date for lenses that still read it (see
-  // `awaitingHydration` there). Outside a live run that is the same
-  // `loadSession` this used to call here. While capture runs NOTHING is
-  // written to the global store: the Transcript lens is a Review pane that
-  // queries `load_session` itself, keyed by the row's id, whatever the capture
-  // flags say. The optimistic just-stopped row is skipped: its data is
-  // already resident (it WAS the live session) and re-reading it could race
-  // the finalize-on-disk gap `pendingFinalizingSession` exists to route
-  // around. `row.optimistic` (not the write-only `pendingFinalizingSession`
-  // slot) is the key because it self-clears with `mergeSessionRows`.
+  // Choosing a row is an explicit user action, so (as on master) it is what
+  // loads the global store, and only when no capture or transcription is
+  // running: while capture runs NOTHING is written to the global store, the
+  // Transcript lens is a Review pane that queries `load_session` itself keyed
+  // by the row's id, whatever the capture flags say. The optimistic
+  // just-stopped row is skipped: its data is already resident (it WAS the live
+  // session) and re-reading it could race the finalize-on-disk gap
+  // `pendingFinalizingSession` exists to route around. `row.optimistic` (not
+  // the write-only `pendingFinalizingSession` slot) is the key because it
+  // self-clears with `mergeSessionRows`.
   const handleSelect = (row: SessionRow) => {
     setNavSessionId(row.id);
     if (row.optimistic === true) return;
-    markSessionSelected(row.id);
+    if (liveRunning) return;
+    void loadSession(row.id);
   };
 
   const handleDelete = async (sessionId: string) => {
@@ -750,34 +750,33 @@ function SessionDetail({
     loadSessionGraphArtifact,
   ]);
 
-  // Global-store hydration for the lenses that still read it (Notes, Timeline,
-  // Graph). The global store holds whatever the live session left there, so
-  // once the run is over it may belong to a different session than `row` (e.g.
-  // Stop could not resolve the live session's id and left `nav` on a session
-  // that was opened in Review). Until `loadSession` has landed the row, those
-  // lenses show a loading or a closed error state, never the other session's
-  // data. `row.optimistic` is exempt: its data IS the resident live session.
-  // Derived from store state, not a component-local flag, so it survives the
-  // browser unmounting between choosing the session and Stop.
-  const lastSelectedSessionId = useReviewStore((s) => s.lastSelectedSessionId);
+  // ONE predicate decides whether anything that reads the global store, or
+  // asks the backend about its current buffers (Notes, Timeline and Graph
+  // lenses, Ask, "Generate prose summary"), may be shown for this row: the
+  // global store holds THIS session (`loadedSessionId`, store truth, cleared by
+  // `startCapture` before it awaits anything) and nothing is capturing or
+  // transcribing. Two exceptions hold the global store by construction: sample
+  // preview, and the optimistic just-stopped row, whose data IS the resident
+  // live session (`pendingFinalizingSession`, also cleared by `startCapture`).
+  // When it is false the lens shows a gated or placeholder state with an
+  // explicit "Load" action; nothing here ever loads the global store on the
+  // user's behalf.
   const loadSession = useAudioGraphStore((s) => s.loadSession);
-  const awaitingHydration =
-    !liveRunning &&
-    !samplePreviewActive &&
-    row !== null &&
-    row.optimistic !== true &&
-    lastSelectedSessionId === row.id &&
-    loadedSessionId !== row.id;
-  const [hydrationFailed, setHydrationFailed] = useState(false);
-  const [hydrationAttempt, setHydrationAttempt] = useState(0);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: hydrationAttempt is the retry trigger
-  useEffect(() => {
-    if (!awaitingHydration || activeSessionId === null) return;
-    setHydrationFailed(false);
+  const globalHoldsRow =
+    samplePreviewActive ||
+    (!liveRunning &&
+      row !== null &&
+      (loadedSessionId === row.id || row.optimistic === true));
+  const [loadState, setLoadState] = useState<"idle" | "loading" | "failed">(
+    "idle",
+  );
+  const handleLoadClick = () => {
+    if (activeSessionId === null || liveRunning) return;
+    setLoadState("loading");
     void loadSession(activeSessionId).then((loaded) => {
-      if (loaded === null) setHydrationFailed(true);
+      setLoadState(loaded === null ? "failed" : "idle");
     });
-  }, [awaitingHydration, activeSessionId, loadSession, hydrationAttempt]);
+  };
 
   // Concurrent Live + Review (ADR-0028): the Transcript lens is a Review pane
   // keyed by the row's own id, for every row except the optimistic just-stopped
@@ -834,18 +833,15 @@ function SessionDetail({
     tabs?.[nextIndex]?.focus();
   };
 
-  // Ask/Chat reads the Live global fields; keep it off while capture runs or
-  // before the global store holds this session (it is only offered on the
-  // Notes/Graph lenses anyway).
-  const canAsk = askAvailable(lens) && !liveRunning && !awaitingHydration;
+  // Ask/Chat and the overflow actions read the global store or the backend's
+  // current buffers, so they follow the same predicate as the lenses.
+  const canAsk = askAvailable(lens) && globalHoldsRow;
   // Notes, Graph and Timeline still read the global store (slice 2 of #140
-  // migrates them): gated while capture runs, and until `loadSession` has
-  // landed this row afterwards.
+  // migrates them).
   const lensUsesGlobalStore =
     lens === "notes" || lens === "graph" || lens === "timeline";
-  const lensGatedWhileLive = liveRunning && lensUsesGlobalStore;
-  const lensAwaitingHydration = awaitingHydration && lensUsesGlobalStore;
-  const lensBlocked = lensGatedWhileLive || lensAwaitingHydration;
+  const lensBlocked = lensUsesGlobalStore && !globalHoldsRow;
+  const lensGatedWhileLive = lensBlocked && liveRunning;
   const sessionIdForRoute = samplePreviewActive ? null : (row?.id ?? null);
 
   return (
@@ -877,7 +873,7 @@ function SessionDetail({
           >
             <Icon name="chat" size={14} /> {t("sessions.ask")}
           </button>
-          {!loadedSessionId && !liveRunning && (
+          {globalHoldsRow && !loadedSessionId && (
             <Popover
               trigger={
                 <IconButton
@@ -942,30 +938,38 @@ function SessionDetail({
               message={t("sessions.reviewLensLockedWhileLive")}
             />
           )}
-          {lensAwaitingHydration &&
-            (hydrationFailed ? (
-              <div className="flex flex-1 min-w-0 flex-col items-center justify-center gap-(--space-3) p-(--space-6) text-center">
+          {lensBlocked && !liveRunning && (
+            <div className="flex flex-1 min-w-0 flex-col items-center justify-center gap-(--space-3) p-(--space-6) text-center">
+              {loadState === "failed" ? (
                 <p
                   className="m-0 max-w-[360px] text-sm text-text-secondary"
                   role="alert"
                 >
                   {t("sessions.review.viewUnavailable")}
                 </p>
-                <button
-                  type="button"
-                  className="ag-btn-micro"
-                  onClick={() => setHydrationAttempt((n) => n + 1)}
+              ) : (
+                <p
+                  className="m-0 max-w-[360px] text-sm text-text-secondary"
+                  role="status"
                 >
-                  <Icon name="refresh" size={14} /> {t("sessions.review.retry")}
-                </button>
-              </div>
-            ) : (
-              <div className="flex flex-1 min-w-0 items-center justify-center p-(--space-6)">
-                <p className="m-0 text-sm italic text-text-muted" role="status">
-                  {t("common.loading")}
+                  {loadState === "loading"
+                    ? t("common.loading")
+                    : t("sessions.review.needsLoad")}
                 </p>
-              </div>
-            ))}
+              )}
+              <button
+                type="button"
+                className="ag-btn-micro"
+                onClick={handleLoadClick}
+                disabled={loadState === "loading"}
+              >
+                <Icon name="refresh" size={14} />{" "}
+                {loadState === "failed"
+                  ? t("sessions.review.retry")
+                  : t("sessions.review.loadSession")}
+              </button>
+            </div>
+          )}
           {!lensBlocked &&
             lens === "notes" &&
             (notesLensStatus.type === "refused" ? (

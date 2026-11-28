@@ -19,6 +19,7 @@ import {
 import { useAudioGraphStore } from "../store";
 import type { SessionMetadata } from "../types";
 import { downloadAsFile } from "../utils/download";
+import NowStrip from "./NowStrip";
 import SessionsBrowser from "./SessionsBrowser";
 
 vi.mock("../utils/download", async (importOriginal) => ({
@@ -30,11 +31,17 @@ const mockedInvoke = vi.mocked(invoke);
 const mockedDownload = vi.mocked(downloadAsFile);
 
 /**
- * Stop handoff for a session opened in Review while capture ran (PR #536
- * review). The live session B's data is resident in the global store; the user
- * is reviewing completed session A. When capture stops without re-routing
- * `nav` (Stop could not resolve B's id), nothing about A's pane or exports may
- * ever be sourced from B's global data.
+ * Review across Start and Stop (PR #536 review rounds 1 and 2).
+ *
+ * Rule A: the global store is loaded only by an explicit user action (row
+ * selection, the "Load session" / retry button), never by an effect, and never
+ * while capture runs or between Start and its acknowledgement.
+ * Rule B: one predicate (`loadedSessionId` equals the selected id, and no run
+ * is active) decides whether anything that reads the global store or the
+ * backend's current buffers may be shown or run for the selected row.
+ *
+ * Live session B's data is resident in the global store while the user reviews
+ * completed session A.
  */
 
 const SESSION_A: SessionMetadata = {
@@ -83,30 +90,45 @@ function stopCaptureWithoutReroute(): void {
   useAudioGraphStore.setState({ isCapturing: false, isTranscribing: false });
 }
 
+interface LoadControl {
+  /** The next `load_session` call is answered by `answer()` instead. */
+  armGlobalLoad: (answer: () => Promise<unknown>) => void;
+}
+
 /**
- * `load_session` answers. Call 1 is the Review query made while live; call 2 is
- * the global-store reload that follows the run ending (`later`); any other call
- * (a Review query after remounting) resolves with A's payload.
+ * `load_session` answers A's payload (the Review query) unless a test armed the
+ * next call, which is how a click on "Load session" is told apart from Review.
  */
-function mockLoadSession(later: () => Promise<unknown>): void {
-  let loadCalls = 0;
+function mockBackend(): LoadControl {
+  let armed: (() => Promise<unknown>) | null = null;
   mockedInvoke.mockImplementation(async (cmd: string) => {
     if (cmd === "list_sessions") return [SESSION_A];
     if (cmd === "load_session") {
-      loadCalls += 1;
-      return loadCalls === 2 ? later() : payloadA();
+      if (armed) {
+        const answer = armed;
+        armed = null;
+        return answer();
+      }
+      return payloadA();
     }
     if (cmd === "purge_expired_sessions") return [];
     if (cmd === "build_session_timeline_cmd")
       return { entries: [], total_count: 0 };
     return null;
   });
+  return {
+    armGlobalLoad: (answer) => {
+      armed = answer;
+    },
+  };
 }
 
-async function exportJson(): Promise<{
-  segments: Array<Record<string, unknown>>;
-  filename: string;
-}> {
+function loadSessionCalls(): number {
+  return mockedInvoke.mock.calls.filter(([cmd]) => cmd === "load_session")
+    .length;
+}
+
+async function exportJson(): Promise<Array<Record<string, unknown>>> {
   mockedDownload.mockClear();
   await act(async () => {
     fireEvent.click(
@@ -114,13 +136,11 @@ async function exportJson(): Promise<{
     );
   });
   await waitFor(() => expect(mockedDownload).toHaveBeenCalledTimes(1));
-  return {
-    segments: JSON.parse(mockedDownload.mock.calls[0][0] as string),
-    filename: mockedDownload.mock.calls[0][1] as string,
-  };
+  expect(mockedDownload.mock.calls[0][1]).toMatch(/^transcript-session-a-/);
+  return JSON.parse(mockedDownload.mock.calls[0][0] as string);
 }
 
-async function exportTxt(): Promise<{ text: string; filename: string }> {
+async function exportTxt(): Promise<string> {
   mockedDownload.mockClear();
   await act(async () => {
     fireEvent.click(
@@ -128,10 +148,37 @@ async function exportTxt(): Promise<{ text: string; filename: string }> {
     );
   });
   await waitFor(() => expect(mockedDownload).toHaveBeenCalledTimes(1));
-  return {
-    text: mockedDownload.mock.calls[0][0] as string,
-    filename: mockedDownload.mock.calls[0][1] as string,
-  };
+  expect(mockedDownload.mock.calls[0][1]).toMatch(/^transcript-session-a-/);
+  return mockedDownload.mock.calls[0][0] as string;
+}
+
+/** Both exports of the Transcript lens are A's, never B's or the live one's. */
+async function expectBothExportsBoundToA(): Promise<void> {
+  fireEvent.click(screen.getByRole("tab", { name: /^transcript$/i }));
+  const pane = screen.getByRole("tabpanel");
+  expect(await within(pane).findByText(A_TEXT)).toBeVisible();
+  expect(within(pane).queryByText(B_TEXT)).not.toBeInTheDocument();
+
+  const txt = await exportTxt();
+  expect(txt).toContain(A_TEXT);
+  expect(txt).not.toContain(B_TEXT);
+
+  const segments = await exportJson();
+  expect(segments).toMatchObject([{ text: A_TEXT, speaker_label: "Alice" }]);
+  expect(JSON.stringify(segments)).not.toContain(B_TEXT);
+  expect(useAudioGraphStore.getState().exportTranscript).not.toHaveBeenCalled();
+  expect(mockedInvoke).not.toHaveBeenCalledWith("export_transcript");
+}
+
+/** No command that reads the backend's current buffers was ever issued. */
+function expectNoBackendBufferCommand(): void {
+  const commands = mockedInvoke.mock.calls.map(([cmd]) => cmd);
+  expect(commands).not.toContain("synthesize_notes");
+  expect(commands).not.toContain("export_transcript");
+}
+
+function moreActions(): HTMLElement | null {
+  return screen.queryByRole("button", { name: /more actions/i });
 }
 
 async function openSessionAWhileLive(): Promise<void> {
@@ -139,14 +186,22 @@ async function openSessionAWhileLive(): Promise<void> {
   expect(await screen.findByText(A_TEXT)).toBeVisible();
 }
 
-describe("SessionsBrowser: Review across the Stop handoff", () => {
+function notesGated(): void {
+  fireEvent.click(screen.getByRole("tab", { name: /^notes$/i }));
+  const pane = screen.getByRole("tabpanel");
+  expect(within(pane).queryByText(B_TEXT)).not.toBeInTheDocument();
+  expect(
+    within(pane).getByRole("button", { name: /load session/i }),
+  ).toBeVisible();
+}
+
+describe("SessionsBrowser: Review across Start and Stop", () => {
   beforeEach(async () => {
     mockedInvoke.mockReset();
     mockedDownload.mockReset();
     localStorage.clear();
     useReviewStore.getState().close();
     await i18n.changeLanguage("en");
-    startLiveSessionB();
   });
 
   afterEach(() => {
@@ -158,137 +213,211 @@ describe("SessionsBrowser: Review across the Stop handoff", () => {
       captureStartTime: null,
       transcriptSegments: [],
       loadedSessionId: null,
+      materializedNotes: null,
     });
   });
 
-  it("keeps A's transcript and both exports bound to A while the post-stop reload is still pending", async () => {
-    const reload = deferred<unknown>();
-    mockLoadSession(() => reload.promise);
-    render(<SessionsBrowser />);
-    await openSessionAWhileLive();
+  describe("unresolved Stop of B while A is reviewed", () => {
+    beforeEach(() => startLiveSessionB());
 
-    act(() => stopCaptureWithoutReroute());
+    it("never loads the global store by itself; A stays bound, B's data and the summary action are gated, and an explicit Load works", async () => {
+      const backend = mockBackend();
+      render(<SessionsBrowser />);
+      await openSessionAWhileLive();
+      const callsWhileLive = loadSessionCalls();
 
-    // Reload of A into the global store has started but not settled; B's data
-    // is still what the global store holds.
-    await waitFor(() =>
+      act(() => stopCaptureWithoutReroute());
+      // Let any effect that could (wrongly) start a load run.
+      await act(async () => {});
+
+      // Rule A: nothing loaded the global store.
+      expect(loadSessionCalls()).toBe(callsWhileLive);
+      expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
+      expect(useAudioGraphStore.getState().transcriptSegments[0].text).toBe(
+        B_TEXT,
+      );
+
+      // Rule B: lenses gated with an explicit action, summary not offered.
+      notesGated();
+      expect(moreActions()).toBeNull();
+      fireEvent.click(screen.getByRole("tab", { name: /^graph$/i }));
       expect(
-        mockedInvoke.mock.calls.filter(([cmd]) => cmd === "load_session"),
-      ).toHaveLength(2),
+        within(screen.getByRole("tabpanel")).getByRole("button", {
+          name: /load session/i,
+        }),
+      ).toBeVisible();
+
+      // Transcript and both exports: A.
+      await expectBothExportsBoundToA();
+
+      // Explicit Load, answered slowly: still gated, still no summary.
+      const reload = deferred<unknown>();
+      backend.armGlobalLoad(() => reload.promise);
+      fireEvent.click(screen.getByRole("tab", { name: /^notes$/i }));
+      const callsBeforeLoad = loadSessionCalls();
+      fireEvent.click(screen.getByRole("button", { name: /load session/i }));
+      await waitFor(() => expect(loadSessionCalls()).toBe(callsBeforeLoad + 1));
+      expect(
+        within(screen.getByRole("tabpanel")).getByRole("status"),
+      ).toHaveTextContent(/loading/i);
+      expect(moreActions()).toBeNull();
+      await expectBothExportsBoundToA();
+
+      // It lands: the lens is released.
+      fireEvent.click(screen.getByRole("tab", { name: /^notes$/i }));
+      await act(async () => {
+        reload.resolve(payloadA());
+      });
+      await waitFor(() =>
+        expect(useAudioGraphStore.getState().loadedSessionId).toBe("session-a"),
+      );
+      expect(
+        screen.queryByRole("button", { name: /load session/i }),
+      ).not.toBeInTheDocument();
+      expectNoBackendBufferCommand();
+    });
+
+    it("shows a closed localized error with retry when the explicit Load fails, with exports still A's and no summary", async () => {
+      const backend = mockBackend();
+      render(<SessionsBrowser />);
+      await openSessionAWhileLive();
+      act(() => stopCaptureWithoutReroute());
+      await act(async () => {});
+
+      fireEvent.click(screen.getByRole("tab", { name: /^notes$/i }));
+      backend.armGlobalLoad(() =>
+        Promise.reject({ code: "io", message: "disk gone" }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: /load session/i }));
+
+      const pane = screen.getByRole("tabpanel");
+      expect(await within(pane).findByRole("alert")).toHaveTextContent(
+        "This session could not be loaded.",
+      );
+      expect(pane.textContent).not.toContain("disk gone");
+      expect(within(pane).queryByText(B_TEXT)).not.toBeInTheDocument();
+      expect(
+        within(pane).getByRole("button", { name: /try again/i }),
+      ).toBeVisible();
+      expect(moreActions()).toBeNull();
+
+      await expectBothExportsBoundToA();
+      expectNoBackendBufferCommand();
+    });
+
+    it("after leaving Sessions before Stop and returning, loads nothing by itself and keeps A bound", async () => {
+      mockBackend();
+      const first = render(<SessionsBrowser />);
+      await openSessionAWhileLive();
+      first.unmount();
+      act(() => stopCaptureWithoutReroute());
+      expect(useAudioGraphStore.getState().nav.sessionId).toBe("session-a");
+
+      render(<SessionsBrowser />);
+      await screen.findByRole("tabpanel");
+      await act(async () => {});
+
+      notesGated();
+      expect(moreActions()).toBeNull();
+      expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
+      await expectBothExportsBoundToA();
+      expectNoBackendBufferCommand();
+    });
+  });
+
+  it("gates Notes, Timeline and Graph for an auto-selected A after an unresolved Stop of a later B", async () => {
+    // An earlier successful Stop routed `nav` to A (its row has reconciled, so
+    // it is no longer the optimistic row) and the user never clicked A. B then
+    // ran and its unresolved Stop left `nav` on A; the global store holds B.
+    mockBackend();
+    useAudioGraphStore.setState({
+      sessions: [SESSION_A],
+      sessionsLoading: false,
+      isCapturing: false,
+      isTranscribing: false,
+      loadedSessionId: null,
+      transcriptSegments: [segment("b-1", B_TEXT)],
+      nav: { dest: "sessions", sessionId: "session-a", lens: "notes" },
+    });
+    render(<SessionsBrowser />);
+    await screen.findByRole("tabpanel");
+
+    for (const lens of [/^notes$/i, /^timeline$/i, /^graph$/i]) {
+      fireEvent.click(screen.getByRole("tab", { name: lens }));
+      const pane = screen.getByRole("tabpanel");
+      expect(
+        within(pane).getByRole("button", { name: /load session/i }),
+      ).toBeVisible();
+      expect(within(pane).queryByText(B_TEXT)).not.toBeInTheDocument();
+    }
+    expect(moreActions()).toBeNull();
+    expect(loadSessionCalls()).toBe(0);
+  });
+
+  it("does not reload history into the Live store when Start is pressed on a hydrated A", async () => {
+    mockBackend();
+    const startAck = deferred<unknown>();
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_sessions") return [SESSION_A];
+      if (cmd === "load_session") return payloadA();
+      if (cmd === "start_capture") return startAck.promise;
+      if (cmd === "purge_expired_sessions") return [];
+      return null;
+    });
+    useAudioGraphStore.setState({
+      sessions: [SESSION_A],
+      sessionsLoading: false,
+      selectedSourceIds: ["system-default"],
+      isCapturing: false,
+      isTranscribing: false,
+    });
+    render(
+      <>
+        <NowStrip />
+        <SessionsBrowser />
+      </>,
+    );
+
+    // Open A normally: row selection is the explicit action that hydrates.
+    fireEvent.click(await screen.findByTestId("session-select-session-a"));
+    await waitFor(() =>
+      expect(useAudioGraphStore.getState().loadedSessionId).toBe("session-a"),
     );
     expect(useAudioGraphStore.getState().transcriptSegments[0].text).toBe(
-      B_TEXT,
+      A_TEXT,
     );
+    const callsBeforeStart = loadSessionCalls();
 
-    const pane = screen.getByRole("tabpanel");
-    expect(within(pane).getByText(A_TEXT)).toBeVisible();
-    expect(within(pane).queryByText(B_TEXT)).not.toBeInTheDocument();
+    // Press Start; capture is not acknowledged yet.
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await act(async () => {});
+    await waitFor(() =>
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "start_capture",
+        expect.anything(),
+      ),
+    );
+    await act(async () => {});
 
-    const txt = await exportTxt();
-    expect(txt.text).toContain(A_TEXT);
-    expect(txt.text).not.toContain(B_TEXT);
-    expect(txt.filename).toMatch(/^transcript-session-a-/);
+    // startCapture cleared the store; nothing reloaded history into it.
+    expect(loadSessionCalls()).toBe(callsBeforeStart);
+    const mid = useAudioGraphStore.getState();
+    expect(mid.loadedSessionId).toBeNull();
+    expect(mid.transcriptSegments).toEqual([]);
+    expect(mid.graphSnapshot.nodes).toEqual([]);
 
-    mockedInvoke.mockClear();
-    const json = await exportJson();
-    // Same shape as the backend `export_transcript`: a TranscriptSegment[].
-    expect(Array.isArray(json.segments)).toBe(true);
-    expect(json.segments).toMatchObject([
-      { text: A_TEXT, speaker_label: "Alice" },
-    ]);
-    expect(json.filename).toMatch(/^transcript-session-a-/);
-    expect(JSON.stringify(json.segments)).not.toContain(B_TEXT);
-    expect(
-      useAudioGraphStore.getState().exportTranscript,
-    ).not.toHaveBeenCalled();
-    expect(mockedInvoke).not.toHaveBeenCalledWith("export_transcript");
-
-    // The reload settles: the pane is still A.
+    // Acknowledged: Capture would mount with none of A's data resident.
     await act(async () => {
-      reload.resolve(payloadA());
+      startAck.resolve(null);
     });
     await waitFor(() =>
-      expect(useAudioGraphStore.getState().loadedSessionId).toBe("session-a"),
+      expect(useAudioGraphStore.getState().isCapturing).toBe(true),
     );
-    expect(
-      within(screen.getByRole("tabpanel")).getByText(A_TEXT),
-    ).toBeVisible();
-  });
-
-  it("never shows B under A's title when the reload fails, and says so on the lenses that need it", async () => {
-    mockLoadSession(() => Promise.reject({ code: "io", message: "disk gone" }));
-    render(<SessionsBrowser />);
-    await openSessionAWhileLive();
-
-    act(() => stopCaptureWithoutReroute());
-    await waitFor(() =>
-      expect(
-        mockedInvoke.mock.calls.filter(([cmd]) => cmd === "load_session"),
-      ).toHaveLength(2),
-    );
-
-    // Transcript: still A, and A's exports are A's.
-    await waitFor(() =>
-      expect(useAudioGraphStore.getState().error).not.toBeNull(),
-    );
-    expect(
-      within(screen.getByRole("tabpanel")).getByText(A_TEXT),
-    ).toBeVisible();
-    expect((await exportTxt()).text).not.toContain(B_TEXT);
-
-    // Notes reads the global store, which still holds B: it must show a closed
-    // error with a retry instead.
-    fireEvent.click(screen.getByRole("tab", { name: /^notes$/i }));
-    const pane = screen.getByRole("tabpanel");
-    expect(await within(pane).findByRole("alert")).toHaveTextContent(
-      "This session could not be loaded.",
-    );
-    expect(within(pane).queryByText(B_TEXT)).not.toBeInTheDocument();
-    expect(pane.textContent).not.toContain("disk gone");
-    expect(
-      within(pane).getByRole("button", { name: /try again/i }),
-    ).toBeVisible();
-  });
-
-  it("still shows A, and still loads A, after leaving Sessions before Stop and returning afterwards", async () => {
-    const reload = deferred<unknown>();
-    mockLoadSession(() => reload.promise);
-    const first = render(<SessionsBrowser />);
-    await openSessionAWhileLive();
-
-    // Leave Sessions (component unmounts), then Stop while away.
-    first.unmount();
-    act(() => stopCaptureWithoutReroute());
-    expect(useAudioGraphStore.getState().nav.sessionId).toBe("session-a");
-
-    render(<SessionsBrowser />);
-    // Back on Sessions, not live any more: the browser opens on its default
-    // (Notes) lens, which must not show B; the Transcript lens shows A.
-    const landing = await screen.findByRole("tabpanel");
-    expect(within(landing).queryByText(B_TEXT)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("tab", { name: /^transcript$/i }));
-    const pane = screen.getByRole("tabpanel");
-    expect(await within(pane).findByText(A_TEXT)).toBeVisible();
-    expect(within(pane).queryByText(B_TEXT)).not.toBeInTheDocument();
-
-    // The pending hydration of A into the global store still happens, and the
-    // lens that reads the global store never shows B meanwhile.
-    await waitFor(() =>
-      expect(
-        mockedInvoke.mock.calls.filter(([cmd]) => cmd === "load_session")
-          .length,
-      ).toBeGreaterThanOrEqual(2),
-    );
-    fireEvent.click(screen.getByRole("tab", { name: /^notes$/i }));
-    const notes = screen.getByRole("tabpanel");
-    expect(within(notes).getByRole("status")).toHaveTextContent(/loading/i);
-    expect(within(notes).queryByText(B_TEXT)).not.toBeInTheDocument();
-
-    await act(async () => {
-      reload.resolve(payloadA());
-    });
-    await waitFor(() =>
-      expect(useAudioGraphStore.getState().loadedSessionId).toBe("session-a"),
-    );
+    await act(async () => {});
+    expect(loadSessionCalls()).toBe(callsBeforeStart);
+    const after = useAudioGraphStore.getState();
+    expect(after.loadedSessionId).toBeNull();
+    expect(after.transcriptSegments).toEqual([]);
+    expect(after.graphSnapshot.nodes).toEqual([]);
   });
 });

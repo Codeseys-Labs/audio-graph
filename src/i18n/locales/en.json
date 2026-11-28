@@ -833,6 +833,8 @@
       "unavailable": "This session's transcript is missing or could not be read.",
       "retry": "Try again",
       "stale": "This transcript may be out of date: the latest refresh failed. Showing the last copy that loaded.",
+      "needsLoad": "This view needs the session loaded first.",
+      "loadSession": "Load session",
       "viewUnavailable": "This session could not be loaded.",
       "emptyTranscript": "This session has no transcript."
     },

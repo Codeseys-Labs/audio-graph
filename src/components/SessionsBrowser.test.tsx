@@ -838,7 +838,7 @@ describe("SessionsBrowser component", () => {
       );
     });
 
-    it("keeps Notes, Timeline and Graph gated with the existing message, for those lenses only", async () => {
+    it("keeps Notes, Timeline and Graph gated with the stop-the-live-capture-to-use-this-view message, for those lenses only", async () => {
       seed([makeSession({ id: "past-session", title: "Past Session" })]);
       startLiveCapture();
       render(<SessionsBrowser />);
@@ -927,32 +927,6 @@ describe("SessionsBrowser component", () => {
       expect(document.body.textContent).not.toContain("boom");
       // Live is untouched by the failed Review.
       expect(useAudioGraphStore.getState().error).toBeNull();
-    });
-
-    it("a Review opened while live loads normally if the run ends with nav still on that session", async () => {
-      seed([makeSession({ id: "past-session", title: "Past Session" })]);
-      startLiveCapture();
-      render(<SessionsBrowser />);
-      fireEvent.click(await screen.findByTestId("session-select-past-session"));
-      await screen.findByText("historical transcript");
-      expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
-
-      // Stop that could not re-route nav (e.g. unresolved session id).
-      act(() => {
-        useAudioGraphStore.setState({
-          isCapturing: false,
-          isTranscribing: false,
-        });
-      });
-
-      await waitFor(() =>
-        expect(useAudioGraphStore.getState().loadedSessionId).toBe(
-          "past-session",
-        ),
-      );
-      expect(
-        useAudioGraphStore.getState().transcriptSegments.map((s) => s.text),
-      ).toEqual(["historical transcript"]);
     });
   });
 

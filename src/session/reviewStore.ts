@@ -63,16 +63,6 @@ interface ReviewState {
    */
   stale: boolean;
   error: ReviewErrorCode | null;
-  /**
-   * The session the user last explicitly chose in the Sessions browser. After
-   * a capture run ends, a lens that reads the global store must show that
-   * session's data, not whatever the live session left there, so the browser
-   * hydrates the global store for this id on demand. Lives outside the Review
-   * selection (and survives `close()`) because the browser can unmount
-   * between choosing a session and Stop.
-   */
-  lastSelectedSessionId: string | null;
-  markSessionSelected: (sessionId: string | null) => void;
   /** Open (or re-open) a session. Returns once its response settled/dropped. */
   select: (sessionId: string) => Promise<void>;
   /** Re-query the selected session, keeping the current snapshot meanwhile. */
@@ -149,9 +139,6 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     refreshing: false,
     stale: false,
     error: null,
-    lastSelectedSessionId: null,
-    markSessionSelected: (sessionId) =>
-      set({ lastSelectedSessionId: sessionId }),
     select: (sessionId) => {
       const sameSession = get().snapshot?.sessionId === sessionId;
       set({

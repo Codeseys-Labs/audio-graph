@@ -240,8 +240,11 @@ function LiveTranscript() {
   // no signal that the view moved. Cancelling auto-follow
   // (wasNearBottom=false) keeps the tail from yanking the view back to the
   // bottom while the user inspects a moment.
+  // A Review pane has no segments until its snapshot has loaded, so it waits
+  // for `ready` (once: a later refresh does not re-fire the jump).
+  const seekReady = !review || review.status === "ready";
   useEffect(() => {
-    if (!transcriptSeekTarget || isReview) return;
+    if (!transcriptSeekTarget || !seekReady) return;
     const { segmentId } = transcriptSeekTarget;
     const container = scrollRef.current;
     const el = container?.querySelector<HTMLElement>(
@@ -269,7 +272,7 @@ function LiveTranscript() {
       setSeekAnnouncement("");
     }, 1600);
     return () => window.clearTimeout(timer);
-  }, [transcriptSeekTarget, isReview, t]);
+  }, [transcriptSeekTarget, seekReady, t]);
 
   // Display only the shared tail window for performance. The After
   // SeekTimeline caps its blocks to the SAME constant so every timeline block

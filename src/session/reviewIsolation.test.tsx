@@ -242,6 +242,45 @@ describe("Review pane isolation from Live (issue #140)", () => {
     expect(await screen.findByText("recovered line")).toBeInTheDocument();
   });
 
+  it("honours a retained timeline seek target in the Review pane once its snapshot has loaded", async () => {
+    // The timeline lens set this target against the loaded session; opening the
+    // Transcript lens (a Review pane) must consume it like the Live pane does.
+    const scrollIntoView = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    try {
+      useAudioGraphStore.setState({
+        transcriptSeekTarget: { segmentId: "past-1", nonce: 1 },
+      });
+      const payload = loadedSession("past-1", "historical line", "Alice");
+      payload.transcript = [
+        { ...payload.transcript[0], start_time: 42, speaker_label: "Alice" },
+      ];
+      mockedInvoke.mockResolvedValue(payload);
+
+      const { container } = render(
+        <SessionViewProvider reviewSessionId="past">
+          <LiveTranscript />
+        </SessionViewProvider>,
+      );
+      // Not yet loaded: nothing to scroll to, and no premature jump.
+      expect(scrollIntoView).not.toHaveBeenCalled();
+
+      await screen.findByText("historical line");
+      await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
+      expect(scrollIntoView).toHaveBeenCalledWith(
+        expect.objectContaining({ block: "center" }),
+      );
+      expect(screen.getByText(/jumped to alice at 0:42/i)).toBeInTheDocument();
+      expect(
+        container.querySelector('[data-segment-id="past-1"]'),
+      ).toBeInTheDocument();
+    } finally {
+      HTMLElement.prototype.scrollIntoView = original;
+      useAudioGraphStore.setState({ transcriptSeekTarget: null });
+    }
+  });
+
   it("tells the user (en + pt) when a refresh failed and the shown transcript may be old, and recovers on retry", async () => {
     mockedInvoke.mockResolvedValueOnce(
       loadedSession("past-1", "historical line", "Alice"),
