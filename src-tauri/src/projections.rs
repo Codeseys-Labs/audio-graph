@@ -2072,7 +2072,11 @@ impl fmt::Debug for DebugGraphNodeDraft<'_> {
 
 /// Per-item LLM provenance, cloned into every materialized note / node / edge and
 /// persisted, so per-item byte cost governs what may live here (ADR-0038).
+///
+/// Decoded through [`StoredProjectionProvenance`], so a stored model id is read
+/// by where the record says the model ran.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(from = "StoredProjectionProvenance")]
 pub struct ProjectionProvenance {
     /// The REGISTRY provider id the route was authorized against (`llm.openrouter`,
     /// `llm.cerebras`, …). Before ADR-0038 this carried a fourth ad-hoc naming
@@ -2081,6 +2085,10 @@ pub struct ProjectionProvenance {
     /// The SERVED model when the response reported one; see
     /// [`model_source`](Self::model_source), which says which it is rather than
     /// leaving a reader to assume.
+    ///
+    /// A hosted identifier for a model that ran at a remote endpoint, and a
+    /// display name for a local one: never a filesystem path (see
+    /// `ipc_contract::model_id`).
     pub model: String,
     pub prompt_id: String,
     /// The stamped route id (`route.cerebras_via_openrouter`, …). `None` on records
@@ -2092,6 +2100,50 @@ pub struct ProjectionProvenance {
     /// mistaken for served identity.
     #[serde(default)]
     pub model_source: crate::llm::route::ModelIdentitySource,
+    /// Where the model ran, written with the model rule applied at the
+    /// endpoint the client dialled. `None` on records written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_placement: Option<audio_graph_ipc_contract::model_id::ModelPlacement>,
+}
+
+/// A [`ProjectionProvenance`] as a patch, note or graph item stores it.
+///
+/// Records written before the model rule can hold a local model's path, or
+/// what the old character filter left of a Windows path, and carry no
+/// `model_placement`. Building the typed value from this one applies the rule
+/// on every read: a marked record is read by its placement, and an unmarked
+/// one by what its provider and route say. Nothing loaded, exported or
+/// written again carries the path, and the stored record is not rewritten.
+#[derive(serde::Deserialize)]
+struct StoredProjectionProvenance {
+    provider: String,
+    model: String,
+    prompt_id: String,
+    #[serde(default)]
+    route_id: Option<String>,
+    #[serde(default)]
+    model_source: crate::llm::route::ModelIdentitySource,
+    #[serde(default)]
+    model_placement: Option<audio_graph_ipc_contract::model_id::ModelPlacement>,
+}
+
+impl From<StoredProjectionProvenance> for ProjectionProvenance {
+    fn from(stored: StoredProjectionProvenance) -> Self {
+        let legacy_remote =
+            crate::llm::route::recorded_as_remote(&stored.provider, stored.route_id.as_deref());
+        Self {
+            model: audio_graph_ipc_contract::model_id::stored_for_place(
+                stored.model,
+                stored.model_placement,
+                legacy_remote,
+            ),
+            provider: stored.provider,
+            prompt_id: stored.prompt_id,
+            route_id: stored.route_id,
+            model_source: stored.model_source,
+            model_placement: stored.model_placement,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema, PartialEq)]
@@ -6179,10 +6231,11 @@ mod tests {
             confidence: 0.86,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -6259,6 +6312,7 @@ mod tests {
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -6388,10 +6442,11 @@ mod tests {
             confidence: 0.86,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -7271,10 +7326,11 @@ mod tests {
             confidence: 0.86,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -7317,10 +7373,11 @@ mod tests {
             confidence: 0.81,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -7731,6 +7788,7 @@ mod tests {
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -9456,6 +9514,7 @@ mod tests {
                     prompt_id: "complexity_v1".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 },
                 queued_at_ms: Some(created_at_ms),
                 generation_latency_ms: Some(5),
@@ -11803,10 +11862,11 @@ mod tests {
                 confidence: 0.9,
                 provenance: ProjectionProvenance {
                     provider: "openrouter".to_string(),
-                    model: "anthropic/claude-sonnet-4".to_string(),
+                    model: "claude-sonnet-4".to_string(),
                     prompt_id: "graph-v1".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 },
                 queued_at_ms: None,
                 generation_latency_ms: None,
@@ -11925,10 +11985,11 @@ mod tests {
             confidence: 0.9,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -11981,10 +12042,11 @@ mod tests {
             confidence: 0.9,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,

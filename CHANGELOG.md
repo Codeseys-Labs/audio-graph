@@ -77,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Speaker revisions now correct only the affected turn in the graph, preserving
   other turns and their timeline links. Whole-speaker renames keep the original
   graph node when the new name is unused.
+- Notes, graph items, Live Assist decisions and the data-movement view no
+  longer record the file path of a local model. A model that runs on this
+  machine or at a local endpoint is recorded by its name alone (for example
+  `private.gguf` for `/home/name/private.gguf`); a model at a remote endpoint
+  keeps its provider's identifier. Sessions saved before this fix are read and
+  exported the same way, and a local model whose stored path cannot be reduced
+  to a name shows as `local-model`; their files are not rewritten (#540).
 - vLLM's documented `yes`/`no` noul probability keys are now normalized to the
   canonical `true`/`false` pair at the parse boundary, so documented responses
   validate; mixed, partial, or overlong key pairs are rejected, and the raw

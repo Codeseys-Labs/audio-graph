@@ -3956,6 +3956,12 @@ fn projection_movement_facts(
     backend: ProjectionLedgerBackend<'_>,
 ) -> crate::projection_data_movement::ProjectionMovementFacts {
     let shape = crate::projection_llm::projection_prompt_shape_with_notes(job, ledger, snapshot);
+    // Only an accepted patch names a model, and its provenance says where the
+    // model ran.
+    let model_placement = match &backend {
+        ProjectionLedgerBackend::Actual(provenance, _) => provenance.model_placement,
+        _ => None,
+    };
     let (provider_id, requires_cloud_transfer, has_cached_prefix, model_id) = match backend {
         ProjectionLedgerBackend::Actual(provenance, attempted_route) => {
             let (provider_id, cloud, prefix) =
@@ -4004,6 +4010,7 @@ fn projection_movement_facts(
         session_id: job.session_id.clone(),
         provider_id,
         model_id,
+        model_placement,
         requires_cloud_transfer,
         cloud_transfer_allowed: dispatch.llm_allow_cloud_fallbacks,
         projection_sequence: sequence,
@@ -11226,6 +11233,7 @@ mod tests_status {
                 prompt_id: "projection_patch_v1_test".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -17419,6 +17427,7 @@ mod tests_status {
                             prompt_id: "race".to_string(),
                             route_id: None,
                             model_source: crate::llm::route::ModelIdentitySource::Requested,
+                            model_placement: None,
                         },
                         route: None,
                         queued_at_ms: None,

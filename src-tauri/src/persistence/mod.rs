@@ -3698,6 +3698,7 @@ mod shutdown_tests {
                 prompt_id: "notes-v1".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -4125,6 +4126,7 @@ mod local_memory_repository_tests {
                 prompt_id: "notes-v1".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: Some(created_at_ms.saturating_sub(50)),
             generation_latency_ms: Some(120),
@@ -4159,6 +4161,7 @@ mod local_memory_repository_tests {
                 prompt_id: "graph-v1".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: Some(created_at_ms.saturating_sub(50)),
             generation_latency_ms: Some(140),
@@ -4189,6 +4192,7 @@ mod local_memory_repository_tests {
                 prompt_id: "repository-replay-parity".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: Some(created_at_ms.saturating_sub(25)),
             generation_latency_ms: Some(50),
@@ -4571,6 +4575,7 @@ mod local_memory_repository_tests {
                     prompt_id: "projection-v1".into(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 }),
                 confidence: Some(0.91),
                 created_at_ms: 1_700_000_000_000,
@@ -6901,6 +6906,7 @@ mod autosave_shutdown_tests {
         .model(MovementModel {
             provider_id: Some("llm.openrouter".to_string()),
             model_id: Some("anthropic/claude-sonnet-4".to_string()),
+            model_placement: Some(audio_graph_ipc_contract::model_id::ModelPlacement::Remote),
         })
         .counts(MovementCounts {
             audio_ms: None,

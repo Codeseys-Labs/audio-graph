@@ -374,6 +374,8 @@ pub struct ProjectionPatchBuildContext {
     pub model: String,
     /// Whether `model` is the served id or the requested one (ADR-0038 defect 3).
     pub model_source: crate::llm::route::ModelIdentitySource,
+    /// Where the model ran, decided at the endpoint the client dialled.
+    pub model_placement: Option<audio_graph_ipc_contract::model_id::ModelPlacement>,
     /// The stamped route id, supplied by trusted code only.
     pub route_id: Option<String>,
     /// Content-free route evidence for this patch.
@@ -1438,6 +1440,7 @@ pub fn trusted_projection_patch_from_model_json<'a>(
                 prompt_id: context.prompt_id,
                 route_id: context.route_id,
                 model_source: context.model_source,
+                model_placement: context.model_placement,
             },
             route: context.route,
             queued_at_ms: Some(job.queued_at_ms),
@@ -2670,6 +2673,7 @@ mod tests {
             provider: "llm.api".to_string(),
             model: "test-model".to_string(),
             model_source: crate::llm::route::ModelIdentitySource::Served,
+            model_placement: Some(audio_graph_ipc_contract::model_id::ModelPlacement::Local),
             route_id: Some("route.openai_compatible".to_string()),
             route: None,
             prompt_id: PROJECTION_PATCH_PROMPT_ID.to_string(),
@@ -3981,6 +3985,7 @@ mod tests {
                 prompt_id: PROJECTION_PATCH_PROMPT_ID.to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
