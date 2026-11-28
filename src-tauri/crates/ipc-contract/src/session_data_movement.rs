@@ -227,8 +227,31 @@ pub struct MovementBasis {
 pub struct MovementModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Never a filesystem path. A row stored before `model_id::without_path`
+    // existed can hold a local model's path, so it is cut as the row is read
+    // and the stored row is left as it is. Not a doc comment: the generated
+    // schema would carry it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "stored_model_id"
+    )]
     pub model_id: Option<String>,
+}
+
+fn stored_model_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = Option::<String>::deserialize(deserializer)?;
+    Ok(stored.map(|stored| {
+        let kept = crate::model_id::without_path(&stored);
+        if kept.len() == stored.len() {
+            stored
+        } else {
+            kept.to_string()
+        }
+    }))
 }
 
 /// Quantitative, non-content measures of the movement.
@@ -666,6 +689,31 @@ mod tests {
 
         let round_trip: DataMovementEvent = serde_json::from_value(value).expect("deserialize");
         assert_eq!(round_trip, event);
+    }
+
+    #[test]
+    fn a_stored_model_path_is_cut_when_a_row_is_read() {
+        for (stored, read_back) in [
+            ("/home/numbat-user/models/private.gguf", "private.gguf"),
+            (
+                "C:\\Users\\numbat-user\\models\\private.gguf",
+                "private.gguf",
+            ),
+            ("numbat-org/probe-model", "numbat-org/probe-model"),
+        ] {
+            let model: MovementModel =
+                serde_json::from_value(serde_json::json!({ "model_id": stored }))
+                    .expect("a stored model row");
+            assert_eq!(model.model_id.as_deref(), Some(read_back), "{stored}");
+        }
+        // A row with no model id, or a null one, still reads as none.
+        for row in [
+            serde_json::json!({}),
+            serde_json::json!({ "model_id": null }),
+        ] {
+            let model: MovementModel = serde_json::from_value(row).expect("a stored model row");
+            assert_eq!(model.model_id, None);
+        }
     }
 
     #[test]

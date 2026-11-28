@@ -16636,6 +16636,95 @@ mod tests {
     }
 
     #[test]
+    fn load_session_data_movement_cmd_cuts_a_stored_model_path() {
+        use crate::persistence::{
+            DataClass, DataMovementActor, DataMovementDestination, DataMovementEventType,
+            DataMovementLedgerBuilder, DestinationBoundary, MovementModel, MovementPolicy,
+            PrivacyMode, RetentionClass,
+        };
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("data-movement-model-path");
+        let _guard = HomeGuard::set(&dir);
+
+        let session_id = "session-with-model-path";
+        // What rows written before the cut hold for a self-hosted server: the
+        // path of its model file. The third is an ordinary id.
+        let stored: Vec<_> = [
+            "/home/numbat-user/models/private.gguf",
+            "C:\\Users\\numbat-user\\models\\private.gguf",
+            "numbat-org/probe-model",
+        ]
+        .into_iter()
+        .zip(1_000..)
+        .map(|(model_id, created_at_ms)| {
+            DataMovementLedgerBuilder::new(
+                session_id,
+                DataMovementActor::System,
+                DataMovementEventType::ProviderCallSucceeded,
+                MovementPolicy {
+                    privacy_mode: PrivacyMode::ByokCloud,
+                    user_visible: true,
+                    retention_class: RetentionClass::Transient,
+                },
+                DataMovementDestination {
+                    boundary: DestinationBoundary::Provider,
+                    provider_id: Some("llm.api".to_string()),
+                    endpoint_class: Some("chat_completions".to_string()),
+                },
+            )
+            .created_at_ms(created_at_ms)
+            .data_classes([DataClass::Prompts])
+            .model(MovementModel {
+                provider_id: Some("llm.api".to_string()),
+                model_id: Some(model_id.to_string()),
+            })
+            .build()
+        })
+        .collect();
+        seed_data_movement_ledger(session_id, &stored);
+        let ledger_path =
+            crate::user_data::data_movement_ledger_path(session_id).expect("resolve ledger path");
+        let stored_bytes = std::fs::read(&ledger_path).expect("read the ledger");
+        assert!(
+            String::from_utf8_lossy(&stored_bytes).contains("numbat-user"),
+            "the fixture must store the path"
+        );
+
+        let loaded = load_session_data_movement_impl(session_id.to_string()).expect("ledger loads");
+
+        let model_ids: Vec<_> = loaded
+            .iter()
+            .map(|event| {
+                event
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.model_id.as_deref())
+            })
+            .collect();
+        assert_eq!(
+            model_ids,
+            [
+                Some("private.gguf"),
+                Some("private.gguf"),
+                Some("numbat-org/probe-model")
+            ]
+        );
+        // The serialized form is what the frontend receives.
+        let reply = serde_json::to_string(&loaded).expect("serialize loaded ledger");
+        assert!(!reply.contains("numbat-user"), "{reply}");
+        // The stored rows were read, not rewritten.
+        assert_eq!(
+            std::fs::read(&ledger_path).expect("re-read the ledger"),
+            stored_bytes
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn load_session_data_movement_cmd_rejects_path_traversal_session_ids() {
         // Defense-in-depth (audio-graph-e692): the session id is joined into the
         // ledgers directory, so a `..` segment or a path separator would let a
