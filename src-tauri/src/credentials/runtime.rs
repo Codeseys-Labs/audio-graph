@@ -1078,7 +1078,11 @@ impl RuntimeWorker {
     /// recovery class concerns only its set: the runtime stays ready for
     /// every other set, and the next request for that set reads the
     /// authoritative journal and record under the lock again, so it sees
-    /// another process's recovery without a reopen.
+    /// another process's recovery without a reopen. A failed
+    /// reconciliation (an event lost, or one the sink refused) stalls the
+    /// runtime; a request that failed too keeps the wider of the two (see
+    /// [`ScopedRefusal::wider`]), so an unknown outcome stays
+    /// `CommitUnknown`.
     fn finalize_scoped<T>(
         &mut self,
         shared: &RuntimeShared,
@@ -1088,7 +1092,11 @@ impl RuntimeWorker {
         if self.service.is_some()
             && let Err(reconcile) = self.reconcile_service(shared)
         {
-            result = Err(reconcile.into());
+            let stalled = ScopedRefusal::from(reconcile);
+            result = Err(match result {
+                Err(refusal) => refusal.wider(Some(stalled)),
+                Ok(_) => stalled,
+            });
         }
         match &result {
             Err(refusal) if refusal.reach() == RefusalReach::Terminal => {
@@ -3621,6 +3629,51 @@ mod tests {
         assert_eq!(emitted.load(Ordering::SeqCst), 1);
     }
 
+    /// A request whose publication outcome is unknown keeps `CommitUnknown`
+    /// when the sink also refuses the signal of another process's commit
+    /// that the request observed: the runtime stalls either way, and only
+    /// the unknown outcome says that a publication needs reconciling.
+    #[tokio::test]
+    async fn an_unknown_outcome_survives_a_refused_event() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let mut external = journal.clone();
+        external.global_epoch = 1;
+        store.restore_journal(external);
+        store.fail_next(
+            FakeStoreCall::CommitJournal,
+            CredentialStoreFailure::CommitUnknown,
+        );
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let runtime = CredentialRuntime::dormant_with_token_source(
+            CredentialBackendKind::InMemory,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        runtime
+            .configure(
+                Box::new(AlwaysReadyBackend { journal, store }),
+                Arc::new(RejectingEventSink {
+                    emitted: Arc::clone(&emitted),
+                }),
+            )
+            .expect("configure runtime");
+
+        let failure = runtime
+            .replace_set(
+                api_key_draft("00000000-0000-0000-0000-000000000901", None),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("the publication's outcome is unknown");
+
+        assert_eq!(failure.code, CredentialErrorCode::CommitUnknown);
+        assert_eq!(emitted.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Stalled
+        );
+    }
+
     #[tokio::test]
     async fn disconnected_channel_is_terminal_and_has_no_locator_or_secret_artifact() {
         let runtime = CredentialRuntime::dormant_with_token_source(
@@ -4594,7 +4647,7 @@ mod tests {
             let refused = if let Some((call, failure)) = recovery_fault {
                 settings.fail_next(
                     FakeSettingsCall::VerifyCommitted,
-                    CredentialStoreFailure::Unavailable,
+                    CredentialStoreFailure::RevisionConflict,
                 );
                 let cleanup = runtime
                     .commit_settings_activation(prepared, Duration::from_secs(1))
@@ -4608,7 +4661,7 @@ mod tests {
                 assert_eq!(
                     runtime.status().lifecycle,
                     CredentialRuntimeLifecycle::Ready,
-                    "a settings refusal concerns its set: {case}"
+                    "a settings conflict concerns its set: {case}"
                 );
                 let operation_id = runtime
                     .status()
@@ -4622,10 +4675,10 @@ mod tests {
                     .await
                     .expect_err(case)
             } else {
-                // The commit loads the journal to check its target, to stage
-                // settings, then to verify the activation before
-                // compensating, and then to abort.
-                store.restore_journal_before_load(3, older);
+                // The commit loads the journal to check its target and
+                // stage settings, then to check that the activation can be
+                // compensated, and then to abort.
+                store.restore_journal_before_load(2, older);
                 settings.fail_next(
                     FakeSettingsCall::VerifyPending,
                     CredentialStoreFailure::RevisionConflict,

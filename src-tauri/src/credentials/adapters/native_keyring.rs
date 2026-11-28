@@ -859,7 +859,7 @@ mod tests {
         EncodedCredentialRecord, PendingCredentialIntent, PendingSettingsActivation,
         StoredSecretBundle,
     };
-    use crate::credentials::fake::FakeSettingsActivationPort;
+    use crate::credentials::fake::{FakeSettingsActivationPort, FakeSettingsCall};
     use crate::credentials::service::{
         AuthoritativeActiveRead, CredentialEntryStore, CredentialService, CredentialUseRequest,
         DeleteCredentialSet, PrepareCredentialActivation, ReplaceCredentialSet,
@@ -3767,6 +3767,19 @@ mod tests {
         keyring: &Arc<MemoryKeyringBoundary>,
         journal: &Arc<MemoryJournalBoundary>,
     ) -> (Arc<NativeKeyringCredentialStore>, CredentialService) {
+        activation_service_with(
+            keyring,
+            journal,
+            Arc::new(FakeSettingsActivationPort::new(1)),
+        )
+    }
+
+    /// [`activation_service`] with the settings port `settings`.
+    fn activation_service_with(
+        keyring: &Arc<MemoryKeyringBoundary>,
+        journal: &Arc<MemoryJournalBoundary>,
+        settings: Arc<FakeSettingsActivationPort>,
+    ) -> (Arc<NativeKeyringCredentialStore>, CredentialService) {
         let opened =
             NativeKeyringCredentialStore::open_with_boundaries(keyring.clone(), journal.clone())
                 .expect("open absent authority");
@@ -3784,9 +3797,75 @@ mod tests {
             store.clone(),
             *journal,
             Arc::new(DeterministicTokenSource::default()),
-            Arc::new(FakeSettingsActivationPort::new(1)),
+            settings,
         );
         (store, service)
+    }
+
+    /// Through the native store: once an activation's credential took
+    /// effect and its cleanup failed, a retry of the same prepared
+    /// activation is refused with nothing changed, never aborted, so the
+    /// journal's reservation, the staging record and the settings marker
+    /// stay together until recovery completes the activation.
+    #[test]
+    fn a_retried_activation_whose_credential_took_effect_is_left_for_recovery() {
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let settings = Arc::new(FakeSettingsActivationPort::new(1));
+        let (_store, service) = activation_service_with(
+            &keyring,
+            &Arc::new(MemoryJournalBoundary::default()),
+            settings.clone(),
+        );
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let prepared = service
+            .prepare_settings_activation(deepgram_activation(
+                "7c7c7c7c-7c7c-4c7c-8c7c-7c7c7c7c7c7c",
+            ))
+            .expect("prepare the activation");
+        let operation_id = service
+            .snapshot_status()
+            .pending_activation
+            .expect("the journal records the prepared activation")
+            .operation_id;
+        let staging = EntryLocator::staging(&operation_id, &set_id);
+        settings.fail_next(
+            FakeSettingsCall::VerifyCommitted,
+            CredentialStoreFailure::Unavailable,
+        );
+        assert_eq!(
+            service
+                .commit_settings_activation(prepared.clone())
+                .expect_err("the cleanup's settings check fails")
+                .code,
+            CredentialErrorCode::RecoveryRequired
+        );
+
+        assert_eq!(
+            service
+                .commit_settings_activation(prepared.clone())
+                .expect_err("a retry after the credential took effect is refused")
+                .code,
+            CredentialErrorCode::RecoveryRequired
+        );
+
+        let epoch = service.snapshot_status().global_epoch;
+        assert_eq!(
+            service
+                .snapshot_status()
+                .pending_activation
+                .map(|pending| pending.stage),
+            Some(CredentialActivationStage::CleanupPending)
+        );
+        assert!(settings.has_pending_marker());
+        assert!(native_entry(&keyring, staging.account()).is_some());
+        let receipt = service
+            .recover_settings_activation(&operation_id)
+            .expect("recovery completes the activation");
+        assert_eq!(receipt.result_code, CredentialMutationResultCode::Recovered);
+        assert_eq!(service.snapshot_status().global_epoch, epoch + 1);
+        assert!(service.snapshot_status().pending_activation.is_none());
+        assert!(!settings.has_pending_marker());
+        assert_eq!(native_entry(&keyring, staging.account()), None);
     }
 
     fn deepgram_activation(token: &str) -> PrepareCredentialActivation {

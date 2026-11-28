@@ -74,8 +74,13 @@ journal, a failed authority read. It closes the runtime, and explicit
 diagnosis is the only route back; it stays store-scoped when the request
 that met it named a set, whose id it then carries. A path that settles or
 compensates an activation never narrows what it met: a store-level or
-store-scoped failure there closes the runtime and an unknown outcome
-stalls it, even while the activation itself concerns one set. A set-scoped
+store-scoped failure there, from the store or the settings, closes the
+runtime and an unknown outcome stalls it, even while the activation itself
+concerns one set. Failures met together combine in one order that does not
+depend on which came first, so an unknown outcome is never combined away. An
+activation commit runs only from its first stage: a retry of one that took
+a step is refused unchanged and left for recovery, and no activation is
+aborted once the journal records its credential written. A set-scoped
 refusal is decided from one set's own state, in a journal adopted from the
 authority under the lock, or from that set's own records, and every write
 refuses a record the read path would refuse, its kind as well as its
@@ -124,8 +129,11 @@ per observed range; so does every reopen that adopts a journal past the last
 epoch the runtime reported, whichever route started it. A consumer that
 receives it must drop every use it resolved and take a fresh snapshot. A
 publication of this process whose outcome was unknown, and which an adopted
-journal later records, is this process's own commit: it gets its local event
-with its receipt, never the external signal. The sink runs on the worker
+journal later records, may be this process's commit or another process's
+recovery of the same operation: it gets its local event with its receipt
+and the external signal too. Only a publication this process saw succeed
+suppresses the signal, and one that failed definitely is never taken for
+this process's. The sink runs on the worker
 before admission is released, so a slow sink holds admission; a sink that
 fails latches a terminal stall, and the signals that would have followed are
 never delivered or replayed. A consumer can rely on every signal it receives
