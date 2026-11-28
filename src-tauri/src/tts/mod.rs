@@ -380,46 +380,34 @@ pub mod deepgram_aura;
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use crate::test_log_capture::ThreadLogCapture;
     use std::cell::RefCell;
-    use std::sync::Once;
 
     thread_local! {
-        static TTS_LOGS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
-    }
-
-    struct TtsTestLogger;
-
-    impl log::Log for TtsTestLogger {
-        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            let target = metadata.target();
-            target.starts_with(module_path!().trim_end_matches("::test_support"))
-                || target.ends_with("::speak_aloud")
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            if self.enabled(record.metadata()) {
-                TTS_LOGS.with_borrow_mut(|capture| {
-                    if let Some(logs) = capture {
-                        logs.push(record.args().to_string());
-                    }
-                });
-            }
-        }
-
-        fn flush(&self) {}
+        static TTS_LOGS: RefCell<Option<ThreadLogCapture>> = const { RefCell::new(None) };
     }
 
     /// Test tasks that produce logs must run on the capturing thread.
     pub(crate) fn capture_tts_logs() {
-        static INIT: Once = Once::new();
-        static LOGGER: TtsTestLogger = TtsTestLogger;
-        INIT.call_once(|| log::set_logger(&LOGGER).expect("install TTS test logger"));
-        log::set_max_level(log::LevelFilter::Debug);
-        TTS_LOGS.with_borrow_mut(|capture| *capture = Some(Vec::new()));
+        TTS_LOGS.with_borrow_mut(|capture| {
+            *capture = None;
+            *capture = Some(ThreadLogCapture::start());
+        });
     }
 
     pub(crate) fn take_tts_logs() -> Vec<String> {
-        TTS_LOGS.with_borrow_mut(|capture| capture.take().expect("start TTS log capture"))
+        TTS_LOGS
+            .with_borrow_mut(|capture| capture.take().expect("start TTS log capture"))
+            .finish()
+            .into_iter()
+            .filter(|record| {
+                record
+                    .target
+                    .starts_with(module_path!().trim_end_matches("::test_support"))
+                    || record.target.ends_with("::speak_aloud")
+            })
+            .map(|record| record.message)
+            .collect()
     }
 
     pub(crate) fn assert_no_canaries(output: &str, canaries: &[&str]) {
