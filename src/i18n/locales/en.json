@@ -1427,7 +1427,9 @@
     "stageGraph": "Graph",
     "statusIdle": "Idle",
     "statusRunning": "Running — {{count}} processed",
-    "statusError": "Error: {{message}}",
+    "statusCredentialRejected": "The provider rejected the credential.",
+    "statusCredentialExpired": "The provider credential expired.",
+    "statusReconnecting": "Reconnecting to the provider.",
     "statusDegraded": "Degraded: {{reason}}",
     "diarizationDegradedReason": {
       "engine_not_compiled": "Speaker detection is running in basic mode — this build doesn't include the neural diarization engine.",

@@ -406,10 +406,26 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
     let expected_reason = "asset_not_downloaded";
     #[cfg(not(any(feature = "diarization", feature = "diarization-clustering")))]
     let expected_reason = "engine_not_compiled";
+    let expected_code = if cfg!(any(
+        feature = "diarization",
+        feature = "diarization-clustering"
+    )) {
+        RuntimeErrorCode::ProviderUnavailable
+    } else {
+        RuntimeErrorCode::Unsupported
+    };
+    let expected_diagnostic = RuntimeErrorDiagnostic::new(
+        expected_code,
+        false,
+        RuntimeSafeRecoveryAction::ReviewConfiguration,
+        RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+            .with_transport(RuntimeTransport::Native),
+    )
+    .into();
     assert!(
         matches!(
             &status.diarization,
-            StageStatus::Degraded { reason, diagnostic } if reason.as_wire_code() == expected_reason && diagnostic == &reason.diagnostic()
+            StageStatus::Degraded { reason, diagnostic } if reason.as_wire_code() == expected_reason && diagnostic == &expected_diagnostic
         ),
         "a session whose configured diarization engine cannot run must report \
          Degraded {{ reason: {expected_reason:?} }}, not a healthy-looking \

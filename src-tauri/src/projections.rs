@@ -9979,7 +9979,7 @@ mod tests {
         );
         assert!(
             speech_source.contains(
-                "Projection job apply failed job_id={} kind={:?} stale_apply={} error={:?}"
+                "Projection job apply failed job_id={} kind={:?} stale_apply={stale_apply} error_code={error_code}"
             ),
             "the stale_apply warn telemetry must stay in place"
         );

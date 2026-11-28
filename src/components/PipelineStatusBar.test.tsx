@@ -1,5 +1,6 @@
 import { render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
+import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
 import type {
   PersistenceQueueBackpressurePayload,
@@ -240,11 +241,75 @@ describe("PipelineStatusBar", () => {
     render(<PipelineStatusBar />);
     expect(
       screen.getByRole("img", {
-        name: /Graph: The provider rejected the request\./i,
+        name: /^Graph: The provider rejected the request\.$/i,
       }),
     ).toBeInTheDocument();
     for (const canary of canaries) {
-      expect(document.body.textContent).not.toContain(canary);
+      expect(document.body.innerHTML).not.toContain(canary);
+    }
+  });
+
+  it.each([
+    [
+      "en",
+      "credential_rejected",
+      "reenter_credential",
+      undefined,
+      "The provider rejected the credential. Re-enter the credential in Settings.",
+    ],
+    [
+      "en",
+      "network_unreachable",
+      "retry_after_delay",
+      "short",
+      "Reconnecting to the provider.",
+    ],
+    [
+      "en",
+      "network_unreachable",
+      "retry_after_delay",
+      undefined,
+      "The app could not reach the provider. Check your connection.",
+    ],
+    [
+      "pt",
+      "network_unreachable",
+      "retry_after_delay",
+      "short",
+      "Reconectando ao provedor.",
+    ],
+  ] as const)("presents %s %s with %s and delay %s", async (locale, code, recovery_action, retry_delay, expected) => {
+    resetStore({
+      pipelineStatus: {
+        ...allIdle(),
+        asr: {
+          type: "Error",
+          diagnostic: {
+            kind: "runtime",
+            detail: {
+              code,
+              recovery_action,
+              retryable: recovery_action === "retry_after_delay",
+              context: {
+                operation: "transcription",
+                transport: "websocket",
+                ...(retry_delay ? { retry_delay } : {}),
+              },
+            },
+          },
+        },
+      },
+    });
+    const previousLanguage = i18n.language;
+    await i18n.changeLanguage(locale);
+    const view = render(<PipelineStatusBar />);
+    try {
+      expect(
+        screen.getByRole("img", { name: `ASR: ${expected}` }),
+      ).toBeInTheDocument();
+    } finally {
+      view.unmount();
+      await i18n.changeLanguage(previousLanguage);
     }
   });
 

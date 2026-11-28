@@ -878,21 +878,30 @@ pub struct AwsErrorPayload {
 }
 
 impl AwsErrorPayload {
-    pub(crate) fn from_transcribe_diagnostic(diagnostic: &RuntimeDiagnostic) -> Self {
+    pub(crate) fn from_transcribe_diagnostic(
+        failure: &crate::asr::aws_transcribe::TranscribeFailure,
+    ) -> Self {
+        use crate::asr::aws_transcribe::TranscribeAuthFailure as Auth;
         use crate::aws_util::UiAwsError;
         use audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode;
-        let raw_message = diagnostic.to_string();
-        let error = match diagnostic {
-            RuntimeDiagnostic::Runtime(detail)
-                if matches!(
-                    detail.code,
-                    RuntimeErrorCode::NetworkUnreachable | RuntimeErrorCode::Timeout
-                ) =>
-            {
-                UiAwsError::NetworkUnreachable
-            }
-            _ => UiAwsError::Unknown {
-                message: raw_message.clone(),
+        let raw_message = failure.diagnostic.to_string();
+        let error = match failure.auth {
+            Some(Auth::InvalidKey) => UiAwsError::InvalidAccessKey,
+            Some(Auth::SignatureMismatch) => UiAwsError::SignatureMismatch,
+            Some(Auth::ExpiredToken) => UiAwsError::ExpiredToken,
+            Some(Auth::AccessDenied) => UiAwsError::AccessDenied { permission: None },
+            None => match &failure.diagnostic {
+                RuntimeDiagnostic::Runtime(detail)
+                    if matches!(
+                        detail.code,
+                        RuntimeErrorCode::NetworkUnreachable | RuntimeErrorCode::Timeout
+                    ) =>
+                {
+                    UiAwsError::NetworkUnreachable
+                }
+                _ => UiAwsError::Unknown {
+                    message: raw_message.clone(),
+                },
             },
         };
         Self { error, raw_message }
