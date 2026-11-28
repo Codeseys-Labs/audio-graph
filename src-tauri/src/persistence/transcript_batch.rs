@@ -301,13 +301,11 @@ pub(super) fn run(
                 let _ = reply.send(result);
             }
             #[cfg(test)]
-            Ok(Message::FailSync(started, failed, resumed)) => {
+            Ok(Message::PauseAfterFault(fault, started, failed, resumed)) => {
                 started.recv_timeout(Duration::from_secs(60)).unwrap();
-                super::canonical_log::simulate_failed_sync();
+                fault();
                 paused = Some((failed, resumed));
             }
-            #[cfg(test)]
-            Ok(Message::SimulateDiskFull) => super::canonical_log::simulate_disk_full(),
             #[cfg(test)]
             Ok(Message::GroupCounts(reply)) => {
                 let _ = reply.send(Ok(group_counts));

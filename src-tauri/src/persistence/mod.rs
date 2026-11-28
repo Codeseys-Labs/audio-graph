@@ -1920,9 +1920,12 @@ pub enum TranscriptWriteMsg {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum TranscriptEventWriteMsg {
     #[cfg(test)]
-    SimulateDiskFull,
-    #[cfg(test)]
-    FailSync(mpsc::Receiver<()>, mpsc::Sender<()>, mpsc::Receiver<()>),
+    PauseAfterFault(
+        fn(),
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        mpsc::Receiver<()>,
+    ),
     #[cfg(test)]
     GroupCounts(mpsc::Sender<Result<(usize, usize), canonical_log::TranscriptCommitError>>),
     Live(TranscriptEvent, Arc<Mutex<TranscriptLedger>>, LiveReply),
@@ -2615,20 +2618,30 @@ impl TranscriptEventWriter {
     pub(crate) fn pause_recovery_after_next_sync_failure(
         &self,
     ) -> (mpsc::Sender<()>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        self.pause_recovery_after_fault(canonical_log::simulate_failed_sync)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_recovery_after_next_disk_full(
+        &self,
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        self.pause_recovery_after_fault(canonical_log::simulate_disk_full)
+    }
+
+    #[cfg(test)]
+    fn pause_recovery_after_fault(
+        &self,
+        fault: fn(),
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (start, started) = mpsc::channel();
         let (failed, observed) = mpsc::channel();
         let (resume, resumed) = mpsc::channel();
         self.tx
-            .send(TranscriptEventWriteMsg::FailSync(started, failed, resumed))
+            .send(TranscriptEventWriteMsg::PauseAfterFault(
+                fault, started, failed, resumed,
+            ))
             .unwrap();
         (start, observed, resume)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn simulate_disk_full_on_next_append(&self) {
-        self.tx
-            .send(TranscriptEventWriteMsg::SimulateDiskFull)
-            .expect("test writer is available");
     }
 
     pub(crate) fn client(&self) -> TranscriptCommitClient {

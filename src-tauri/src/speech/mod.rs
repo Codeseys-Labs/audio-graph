@@ -943,6 +943,8 @@ fn mark_websocket_disconnected(app: &AppHandle, pipeline: &Arc<RwLock<PipelineSt
 }
 
 fn emit_asr_span_revision(app_handle: &AppHandle, payload: events::AsrSpanRevisionPayload) {
+    #[cfg(test)]
+    tests_status::observe_publication(events::ASR_SPAN_REVISION, &payload.source_id, &payload.text);
     events::emit_or_log(app_handle, events::ASR_SPAN_REVISION, payload);
 }
 
@@ -1176,6 +1178,10 @@ fn revision_end_of_turn(
 
 /// Emit a provider-neutral speech turn lifecycle event.
 fn emit_turn_event(app_handle: &AppHandle, input: TurnEventInput) {
+    #[cfg(test)]
+    if let Some(text) = &input.text {
+        tests_status::observe_publication(events::TURN_EVENT, &input.source_id, text);
+    }
     events::emit_or_log(
         app_handle,
         events::TURN_EVENT,
@@ -10356,6 +10362,55 @@ mod tests_status {
 
     // ── audio-graph-586b: diarization backend-selection honesty ─────────
 
+    // The process-wide native Tauri handle can defer delivery of an event
+    // until a later event with a listener. Observe the actual emit boundary
+    // for this source only, including callbacks on the recovery worker.
+    #[derive(Default)]
+    struct PublicationObserver {
+        channel: &'static str,
+        source: String,
+        sender: Option<std::sync::mpsc::Sender<String>>,
+    }
+    static PUBLICATION_OBSERVER: std::sync::LazyLock<Mutex<PublicationObserver>> =
+        std::sync::LazyLock::new(Default::default);
+
+    pub(super) fn observe_publication(channel: &str, source: &str, text: &str) {
+        let observer = PUBLICATION_OBSERVER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if observer.channel == channel
+            && observer.source == source
+            && let Some(sender) = &observer.sender
+        {
+            let _ = sender.send(text.to_owned());
+        }
+    }
+
+    struct PublicationCapture {
+        received: std::sync::mpsc::Receiver<String>,
+    }
+    impl PublicationCapture {
+        // Both callers hold TEST_HOME_LOCK throughout this observation.
+        fn start(channel: &'static str, source: &str) -> Self {
+            let (sender, received) = std::sync::mpsc::channel();
+            *PUBLICATION_OBSERVER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = PublicationObserver {
+                channel,
+                source: source.to_owned(),
+                sender: Some(sender),
+            };
+            Self { received }
+        }
+    }
+    impl Drop for PublicationCapture {
+        fn drop(&mut self) {
+            *PUBLICATION_OBSERVER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = PublicationObserver::default();
+        }
+    }
+
     #[test]
     fn diarization_mode_off_skips_asset_probing_and_never_degrades() {
         // A user who explicitly turned diarization off must get Simple with
@@ -14126,14 +14181,7 @@ mod tests_status {
         let app = AppState::new();
         app.projection_lane_stopping.store(true, Ordering::SeqCst);
         let handle = super::shared_test_app_handle();
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let output = observed.clone();
-        let listener = handle.listen_any(events::ASR_SPAN_REVISION, move |event| {
-            let revision: AsrSpanRevisionPayload = serde_json::from_str(event.payload()).unwrap();
-            if revision.source_id == "burst-source" {
-                output.lock().unwrap().push(revision.text);
-            }
-        });
+        let observed = PublicationCapture::start(events::ASR_SPAN_REVISION, "burst-source");
         let ctx = super::shared_to_transcript_context(
             moonshine_shared_for_app(&app, handle.clone()),
             LlmProvider::default(),
@@ -14168,11 +14216,14 @@ mod tests_status {
             app.transcript_ledger.lock().unwrap().accepted_event_count,
             0
         );
-        assert!(observed.lock().unwrap().is_empty());
+        assert!(observed.received.try_recv().is_err());
         assert!(app.transcript_buffer.read().unwrap().is_empty());
         drop(guard);
         receipts.publish();
-        assert_eq!(*observed.lock().unwrap(), ["leaf", "fern"]);
+        assert_eq!(
+            observed.received.try_iter().collect::<Vec<_>>(),
+            ["leaf", "fern"]
+        );
         let disk = load_transcript_events(&session).unwrap();
         assert_eq!(disk.len(), 2);
         assert_eq!(
@@ -14189,12 +14240,11 @@ mod tests_status {
             crate::state::RotateOutcome::Rotated(_)
         ));
         receipts.publish();
-        assert_eq!(*observed.lock().unwrap(), ["leaf", "fern"]);
+        assert!(observed.received.try_recv().is_err());
         assert_eq!(
             app.transcript_ledger.lock().unwrap().accepted_event_count,
             0
         );
-        handle.unlisten(listener);
         drain_app_writers(&app);
         drop(ctx);
         drop(app);
@@ -14209,7 +14259,6 @@ mod tests_status {
     fn idle_recovery_publishes_uncertain_members_once_in_order_and_clears_pending() {
         use crate::persistence::canonical_durability::CanonicalDurabilityBarrier;
         use crate::persistence::canonical_log::{TranscriptCommitError, TranscriptReceipt};
-        use std::sync::mpsc;
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -14221,14 +14270,7 @@ mod tests_status {
             app.projection_lane_stopping.store(true, Ordering::SeqCst);
             let handle = super::shared_test_app_handle();
             let marker = format!("recovery-{session}");
-            let (turn_tx, turns) = mpsc::channel();
-            let source = marker.clone();
-            let listener = handle.listen_any(events::TURN_EVENT, move |event| {
-                let turn: events::TurnEventPayload = serde_json::from_str(event.payload()).unwrap();
-                if turn.source_id == source {
-                    turn_tx.send(turn.text.unwrap()).unwrap();
-                }
-            });
+            let turns = PublicationCapture::start(events::TURN_EVENT, &marker);
             let ctx = super::shared_to_transcript_context(
                 moonshine_shared_for_app(&app, handle.clone()),
                 LlmProvider::default(),
@@ -14279,10 +14321,16 @@ mod tests_status {
                 Some(events::TranscriptSavingFailure::ConfirmationDelayed)
             );
             assert!(app.transcript_buffer.read().unwrap().is_empty());
-            assert!(turns.try_recv().is_err());
+            assert!(turns.received.try_recv().is_err());
             resume.send(()).unwrap();
             for word in words {
-                assert_eq!(turns.recv_timeout(Duration::from_secs(60)).unwrap(), *word);
+                assert_eq!(
+                    turns
+                        .received
+                        .recv_timeout(Duration::from_secs(60))
+                        .unwrap(),
+                    *word
+                );
             }
             let disk = load_transcript_events(&session).unwrap();
             assert_eq!(disk.len(), members + 1);
@@ -14323,8 +14371,7 @@ mod tests_status {
                 app.pipeline_status.read().unwrap().transcript_not_saving,
                 None
             );
-            assert!(turns.try_recv().is_err());
-            handle.unlisten(listener);
+            assert!(turns.received.try_recv().is_err());
             drain_app_writers(&app);
             drop(ctx);
             drop(app);
@@ -14364,16 +14411,21 @@ mod tests_status {
                 &graph_updates,
             )
         };
-        app.transcript_event_writer
+        let (begin, failed, resume) = app
+            .transcript_event_writer
             .lock()
             .unwrap()
             .as_ref()
             .unwrap()
-            .simulate_disk_full_on_next_append();
+            .pause_recovery_after_next_disk_full();
+        begin.send(()).unwrap();
         assert!(!publish("reed", "pond"));
+        failed.recv_timeout(Duration::from_secs(60)).unwrap();
+        // ENOSPC happened after the descriptor was installed. The writer
+        // still owes the live client a conclusive disposition for this attempt.
         assert_eq!(
             app.pipeline_status.read().unwrap().transcript_not_saving,
-            Some(events::TranscriptSavingFailure::StorageFull)
+            Some(events::TranscriptSavingFailure::ConfirmationDelayed)
         );
         assert!(app.transcript_buffer.read().unwrap().is_empty());
         assert_eq!(
@@ -14381,6 +14433,7 @@ mod tests_status {
             0
         );
 
+        resume.send(()).unwrap();
         assert!(publish("branch", "fern"));
         assert_eq!(
             app.pipeline_status.read().unwrap().transcript_not_saving,
