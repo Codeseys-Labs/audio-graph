@@ -2593,6 +2593,11 @@ mod tests {
 
     #[test]
     fn diarization_log_is_a_default_session_artifact_path() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("diarization-artifact");
+        let _home = HomeGuard::set(&dir);
         let paths = default_session_artifact_paths("artifact-session-1");
         let expected = crate::user_data::diarization_events_path("artifact-session-1")
             .expect("diarization path");
@@ -2600,6 +2605,7 @@ mod tests {
             paths.contains(&expected),
             "diarization speaker log must be in the cleanup/delete artifact set"
         );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -886,6 +886,105 @@ fn restart_syncs_a_complete_frame_then_replays_it_once_and_never_reuses_its_sequ
     assert!(writer.shutdown_with_timeout(HANG_LIMIT));
 }
 
+#[test]
+fn retry_fences_an_uncertain_intent_publication_before_touching_the_source() {
+    for grouped in [false, true] {
+        let fixture = Fixture::new();
+        let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+        storage
+            .commit_after(&transcript_event("seed", CONTENT), Some(0))
+            .unwrap();
+        let original = fs::read(&fixture.path).unwrap();
+        let events = group_events();
+        let append = || {
+            if grouped {
+                storage
+                    .commit_group_after(&events, 1)
+                    .map(|r| r.unwrap().len())
+            } else {
+                storage.commit_after(&events[0], Some(1)).map(|_| 1)
+            }
+        };
+        CUT.set(Some(Cut::IntentPublish));
+        assert!(matches!(
+            append(),
+            Err(TranscriptCommitError::Indeterminate(_)
+                | TranscriptCommitError::Io {
+                    phase: CanonicalAppendPhase::RecoverySync,
+                    ..
+                })
+        ));
+        assert!(fixture.path.with_added_extension("attempt").is_file());
+        CUT.set(Some(Cut::IntentResync));
+        assert_eq!(
+            append(),
+            Err(io_failure(
+                CanonicalAppendPhase::RecoverySync,
+                io::ErrorKind::Other.into()
+            ))
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(append().unwrap(), if grouped { events.len() } else { 1 });
+    }
+}
+
+#[test]
+fn first_writer_overlapping_an_unlocked_read_returns_a_consistent_prefix() {
+    let fixture = Fixture::new();
+    let path = fixture.path.clone();
+    // The reader has observed absence and copied no source bytes. Let the
+    // first writer publish, then leave the second frame torn before rechecking.
+    AFTER_SOURCE_READ.set(Some(Box::new(move || {
+        commit_transcript(&path, SESSION, &transcript_event("seed", CONTENT)).unwrap();
+        CUT.set(Some(Cut::Short));
+        assert!(commit_transcript(&path, SESSION, &transcript_event("leaf", CONTENT)).is_err());
+    })));
+    let snapshot = read_committed::<TranscriptEvent>(&fixture.path, SESSION).unwrap();
+    assert_eq!(snapshot.head.unwrap().sequence, 1);
+    assert_eq!(snapshot.records[0].payload.span_id, "seed");
+    commit_transcript(&fixture.path, SESSION, &transcript_event("leaf", CONTENT)).unwrap();
+}
+
+#[test]
+fn same_session_commit_finishes_while_the_reader_parses_the_previous_prefix() {
+    thread_local! { static PARSING: std::cell::RefCell<Option<(mpsc::Sender<()>,mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) }; }
+    struct SlowRow;
+    impl<'de> Deserialize<'de> for SlowRow {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            if let Some((entered, resume)) = PARSING.take() {
+                entered.send(()).unwrap();
+                resume.recv_timeout(HANG_LIMIT).unwrap();
+            }
+            TranscriptEvent::deserialize(deserializer)?;
+            Ok(Self)
+        }
+    }
+    let fixture = Fixture::new();
+    let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+    storage
+        .commit_after(&transcript_event("seed", CONTENT), Some(0))
+        .unwrap();
+    let (entered, parsing) = mpsc::channel();
+    let (resume, released) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let path = &fixture.path;
+        let reader = scope.spawn(move || {
+            PARSING.set(Some((entered, released)));
+            read_committed::<SlowRow>(path, SESSION)
+                .unwrap()
+                .head
+                .unwrap()
+                .sequence
+        });
+        parsing.recv_timeout(HANG_LIMIT).unwrap();
+        let committed = storage.commit_after(&transcript_event("leaf", CONTENT), Some(1));
+        resume.send(()).unwrap();
+        assert_eq!(reader.join().unwrap(), 1);
+        assert_eq!(committed.unwrap().sequence, 2);
+    });
+    assert_eq!(fixture.replay().head.unwrap().sequence, 2);
+}
+
 /// Release-only timing probe. Each sample uses the production queue, live
 /// ledger and receipt path. Cold verification and fixture creation are untimed.
 #[test]
@@ -901,8 +1000,43 @@ fn release_transcript_receipt_latency() {
         row.end_time = row.start_time + 0.5;
         row
     };
+    // Optional load used to measure actual reader/writer interference. The
+    // reader takes strict snapshots every 250 ms (or as fast as parsing allows).
+    fn sample(path: PathBuf, with_reader: bool, write: impl FnOnce()) -> usize {
+        if !with_reader {
+            write();
+            return 0;
+        }
+        let (stop, stopped) = mpsc::channel::<()>();
+        let (start, ready) = mpsc::sync_channel(0);
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(move || {
+                start.send(()).unwrap();
+                let mut completed = 0;
+                loop {
+                    let began = Instant::now();
+                    read_committed::<TranscriptEvent>(&path, SESSION).unwrap();
+                    completed += 1;
+                    if !matches!(
+                        stopped.recv_timeout(
+                            Duration::from_millis(250).saturating_sub(began.elapsed())
+                        ),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        return completed;
+                    }
+                }
+            });
+            ready.recv().unwrap();
+            write();
+            drop(stop);
+            reader.join().unwrap()
+        })
+    }
+    let with_reader = std::env::var_os("AUDIOGRAPH_BENCH_SAME_SESSION_READER").is_some();
     struct Probe {
-        _fixture: Fixture,
+        fixture: Fixture,
+        reads: usize,
         writer: TranscriptEventWriter,
         ledger: Arc<Mutex<TranscriptLedger>>,
         depth: u64,
@@ -936,7 +1070,8 @@ fn release_transcript_receipt_latency() {
             assert_eq!(receipt.sequence, sequence);
         }
         probes.push(Probe {
-            _fixture: fixture,
+            fixture,
+            reads: 0,
             writer,
             ledger,
             depth,
@@ -951,36 +1086,43 @@ fn release_transcript_receipt_latency() {
     for round in 0..16 {
         for offset in 0..3 {
             let probe = &mut probes[(round + offset) % 3];
-            let client = probe.writer.client();
-            for _ in 0..16 {
-                let revision = event(probe.next);
-                let started = Instant::now();
-                let (_, receipt) = client.append_live(&revision, probe.ledger.clone()).unwrap();
-                probe.solo.push(started.elapsed());
-                assert_eq!(receipt.sequence, probe.next);
-                probe.next += 1;
-            }
-            let burst_start = Instant::now();
-            let pending: Vec<_> = (probe.next..probe.next + 16)
-                .map(|sequence| {
-                    let revision = event(sequence);
+            let reads = sample(probe.fixture.path.clone(), with_reader, || {
+                let client = probe.writer.client();
+                for _ in 0..16 {
+                    let revision = event(probe.next);
                     let started = Instant::now();
-                    let pending = client.submit_live(&revision, probe.ledger.clone()).unwrap();
-                    (sequence, started, pending)
-                })
-                .collect();
-            for (sequence, started, pending) in pending {
-                assert_eq!(pending.wait().unwrap().1.sequence, sequence);
-                probe.burst.push(started.elapsed());
-            }
-            probe.burst_elapsed += burst_start.elapsed();
-            probe.next += 16;
+                    let (_, receipt) = client.append_live(&revision, probe.ledger.clone()).unwrap();
+                    probe.solo.push(started.elapsed());
+                    assert_eq!(receipt.sequence, probe.next);
+                    probe.next += 1;
+                }
+                let burst_start = Instant::now();
+                let pending: Vec<_> = (probe.next..probe.next + 16)
+                    .map(|sequence| {
+                        let revision = event(sequence);
+                        let started = Instant::now();
+                        let pending = client.submit_live(&revision, probe.ledger.clone()).unwrap();
+                        (sequence, started, pending)
+                    })
+                    .collect();
+                for (sequence, started, pending) in pending {
+                    assert_eq!(pending.wait().unwrap().1.sequence, sequence);
+                    probe.burst.push(started.elapsed());
+                }
+                probe.burst_elapsed += burst_start.elapsed();
+                probe.next += 16;
+            });
+            probe.reads += reads;
         }
     }
     for mut probe in probes {
         probe.solo.sort_unstable();
         probe.burst.sort_unstable();
         let (groups, members) = probe.writer.group_counts();
+        println!(
+            "concurrent_reads depth={} completed={}",
+            probe.depth, probe.reads
+        );
         println!(
             "receipt_latency depth={} samples={} p50_us={} p95_us={}",
             probe.depth,

@@ -118,6 +118,7 @@ impl Commit<'_> {
         if let Some(bytes) = checked_bytes_bounded(&intent_path, 4096)? {
             let intent: Intent = serde_json::from_slice(&bytes)
                 .map_err(|_| TranscriptCommitError::InvalidHistory)?;
+            self.sync_existing_intent(&intent_path)?;
             return self.retry_group(&intent, events, previous, verified);
         }
         let mut cached = verified.borrow_mut();

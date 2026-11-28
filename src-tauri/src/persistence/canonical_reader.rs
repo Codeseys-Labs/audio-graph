@@ -87,7 +87,7 @@ impl<T> StrictCanonicalRead<T> {
 /// Content-redacted strict reader failures. No path, session id, event id, or
 /// payload value is included in `Debug` or `Display`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum CanonicalReaderError {
+pub(crate) enum CanonicalReaderError {
     Canonical(CanonicalLogError),
     TranscriptAttemptUnreadable,
     DataMovementSessionMismatch { record_index: usize },

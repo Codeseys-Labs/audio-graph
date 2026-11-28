@@ -324,6 +324,17 @@ impl<'a> Commit<'a> {
         }
     }
     fn publish(&self, path: &Path, bytes: &[u8]) -> Result<(), TranscriptCommitError> {
+        #[cfg(test)]
+        let fault = if CUT.get() == Some(Cut::IntentPublish)
+            && path.extension() == Some(std::ffi::OsStr::new("attempt"))
+        {
+            CUT.set(None);
+            Some(super::super::canonical_durability::CanonicalDurabilityStage::ParentSync)
+        } else {
+            None
+        };
+        #[cfg(not(test))]
+        let fault = None;
         let staging = self.path.with_added_extension("attempt-stage");
         // A staged file alone never authorized a source mutation. It may be
         // left by a killed publisher, including a partially written staging file.
@@ -349,7 +360,7 @@ impl<'a> Commit<'a> {
                         Some(qualification),
                         self.key,
                         false,
-                        None,
+                        fault,
                     ))?;
                 }
                 TranscriptGuard::Unqualified(_) => {
@@ -370,6 +381,13 @@ impl<'a> Commit<'a> {
                     drop(temporary);
                     fs::rename(&staging, path)
                         .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
+                    #[cfg(test)]
+                    if fault.is_some() {
+                        return Err(io_failure(
+                            CanonicalAppendPhase::RecoverySync,
+                            io::ErrorKind::Other.into(),
+                        ));
+                    }
                     self.weak_parent_barrier()?;
                 }
             }
@@ -491,6 +509,9 @@ impl<'a> Commit<'a> {
             .map(|bytes| serde_json::from_slice(&bytes))
             .transpose()
             .map_err(|_| TranscriptCommitError::InvalidHistory)?;
+        if intent.is_some() {
+            self.sync_existing_intent(&intent_path)?;
+        }
         if let Some(group) = intent.as_ref().filter(|intent| !intent.members.is_empty()) {
             self.resolve_group_for_request(group, &mut lease, event, payload_digest.as_deref())?;
             *verified.borrow_mut() = None;
@@ -820,6 +841,21 @@ impl<'a> Commit<'a> {
         self.sync_entry(self.path)
     }
 
+    // A named intent can survive a failed publication without its directory
+    // entry having crossed the barrier. Establish that barrier before replay,
+    // retry, or recovery can change the source.
+    fn sync_existing_intent(&self, path: &Path) -> Result<(), TranscriptCommitError> {
+        #[cfg(test)]
+        if CUT.get() == Some(Cut::IntentResync) {
+            CUT.set(None);
+            return Err(io_failure(
+                CanonicalAppendPhase::RecoverySync,
+                io::ErrorKind::Other.into(),
+            ));
+        }
+        self.sync_entry(path).map(|_| ())
+    }
+
     fn sync_entry(&self, path: &Path) -> Result<CanonicalDurabilityBarrier, TranscriptCommitError> {
         match &self.guard {
             TranscriptGuard::Qualified(guard, qualification) => {
@@ -958,6 +994,8 @@ enum Cut {
     KillComplete,
     KillGroupTorn,
     KillGroupMember,
+    IntentPublish,
+    IntentResync,
     KillIntent,
     KillQuarantine,
     KillTruncated,
@@ -1286,6 +1324,28 @@ pub(in crate::persistence) fn read_committed<T: DeserializeOwned>(
     path: &Path,
     session: &str,
 ) -> Result<CanonicalLogSnapshot<T>, super::super::canonical_reader::CanonicalReaderError> {
+    capture_committed(path, session)?
+        .ok_or(CanonicalLogError::Io {
+            operation: CanonicalIoOperation::Read,
+            kind: io::ErrorKind::NotFound,
+        })?
+        .verify(session)
+}
+
+pub(crate) struct CapturedTranscript {
+    bytes: Vec<u8>,
+    intent: Option<Intent>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SOURCE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(in crate::persistence) fn capture_committed(
+    path: &Path,
+    session: &str,
+) -> Result<Option<CapturedTranscript>, super::super::canonical_reader::CanonicalReaderError> {
     use super::super::canonical_reader::CanonicalReaderError;
     let pending = || {
         checked_bytes_bounded(&path.with_added_extension("attempt"), 4096)
@@ -1318,57 +1378,76 @@ pub(in crate::persistence) fn read_committed<T: DeserializeOwned>(
     } else {
         None
     };
-    let bytes = fs::read(path);
-    let after = pending()?;
-    if guard.is_none()
-        && before.is_none()
-        && after.is_none()
-        && !matches!(acquire(), Err(CanonicalCoordinationError::Missing))
-    {
-        return Err(CanonicalLogError::LockContended.into());
+    let started_without_lock = before.is_none() && guard.is_none();
+    let mut bytes = fs::read(path);
+    #[cfg(test)]
+    if let Some(hook) = AFTER_SOURCE_READ.take() {
+        hook();
     }
-    let intent = before.or(after);
+    let mut intent = before.or(pending()?);
+    if started_without_lock {
+        // A first writer may have created the stable lock, published a frame,
+        // and retired its descriptor during our unlocked read. Discard those
+        // bytes and take one coordinated snapshot in that case.
+        match acquire() {
+            Ok(_new_guard) => {
+                bytes = fs::read(path);
+                intent = pending()?;
+            }
+            Err(CanonicalCoordinationError::Missing) => {}
+            Err(_) => return Err(CanonicalReaderError::TranscriptAttemptUnreadable),
+        }
+    }
+    drop(guard);
     if let Some(intent) = &intent
         && intent.source_was_absent
     {
         if intent.base_len != 0 || intent.after.is_some() {
             return Err(CanonicalReaderError::TranscriptAttemptUnreadable);
         }
-        return Err(CanonicalLogError::Io {
-            operation: CanonicalIoOperation::Read,
-            kind: io::ErrorKind::NotFound,
-        }
-        .into());
+        return Ok(None);
     }
-    let bytes = match bytes {
-        Err(e) if e.kind() == io::ErrorKind::NotFound && intent.is_some() => {
-            return Err(CanonicalReaderError::TranscriptAttemptUnreadable);
+    let mut bytes = match bytes {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if intent.is_some() {
+                return Err(CanonicalReaderError::TranscriptAttemptUnreadable);
+            }
+            return Ok(None);
         }
         result => result.map_err(|e| CanonicalLogError::Io {
             operation: CanonicalIoOperation::Read,
             kind: e.kind(),
         })?,
     };
-    let prefix = if let Some(intent) = &intent {
-        usize::try_from(intent.base_len)
+    if let Some(intent) = &intent {
+        let length = usize::try_from(intent.base_len)
             .ok()
-            .and_then(|n| bytes.get(..n))
-            .ok_or(CanonicalReaderError::TranscriptAttemptUnreadable)?
-    } else {
-        &bytes
-    };
-    let raw = parse_structural_records(prefix, session, STREAM, 1).map_err(|e| e.error)?;
-    let snapshot = raw_to_typed(raw)?;
-    if let Some(intent) = intent {
-        let actual = snapshot.head.as_ref().map(|head| VerifiedTranscriptHead {
-            sequence: head.sequence,
-            record_hash: head.record_hash.clone(),
-        });
-        if actual != intent.after {
-            return Err(CanonicalReaderError::TranscriptAttemptUnreadable);
-        }
+            .filter(|n| *n <= bytes.len())
+            .ok_or(CanonicalReaderError::TranscriptAttemptUnreadable)?;
+        bytes.truncate(length);
     }
-    Ok(snapshot)
+    Ok(Some(CapturedTranscript { bytes, intent }))
+}
+
+impl CapturedTranscript {
+    pub(crate) fn verify<T: DeserializeOwned>(
+        self,
+        session: &str,
+    ) -> Result<CanonicalLogSnapshot<T>, super::super::canonical_reader::CanonicalReaderError> {
+        use super::super::canonical_reader::CanonicalReaderError;
+        let raw = parse_structural_records(&self.bytes, session, STREAM, 1).map_err(|e| e.error)?;
+        let snapshot = raw_to_typed(raw)?;
+        if let Some(intent) = self.intent {
+            let actual = snapshot.head.as_ref().map(|head| VerifiedTranscriptHead {
+                sequence: head.sequence,
+                record_hash: head.record_hash.clone(),
+            });
+            if actual != intent.after {
+                return Err(CanonicalReaderError::TranscriptAttemptUnreadable);
+            }
+        }
+        Ok(snapshot)
+    }
 }
 
 pub(crate) fn transcript_recovery_artifacts(path: &Path) -> Result<Vec<PathBuf>, io::Error> {

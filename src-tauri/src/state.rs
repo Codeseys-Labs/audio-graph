@@ -2249,6 +2249,11 @@ mod rotation_tests {
 
     #[test]
     fn rotate_session_resets_projection_schedulers() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("scheduler-rotation");
+        let _home = HomeGuard::set(&dir);
         let app = AppState::new();
         {
             let mut ledger = app.transcript_ledger.lock().unwrap();
@@ -2289,6 +2294,7 @@ mod rotation_tests {
         }
 
         drain_writers(&app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

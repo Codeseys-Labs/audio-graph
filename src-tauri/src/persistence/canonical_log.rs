@@ -1847,7 +1847,7 @@ struct PendingAppend {
 
 mod transcript_commit;
 pub(crate) mod transcript_export;
-pub(super) use transcript_commit::read_committed;
+pub(crate) use transcript_commit::CapturedTranscript;
 #[cfg(test)]
 pub(super) use transcript_commit::simulate_disk_full;
 pub(crate) use transcript_commit::{
@@ -1857,6 +1857,7 @@ pub(crate) use transcript_commit::{
 pub use transcript_commit::{
     TranscriptCommitError, TranscriptGap, TranscriptReceipt, transcript_gaps,
 };
+pub(super) use transcript_commit::{capture_committed, read_committed};
 
 struct FrameBasis<'a> {
     session_id: &'a str,

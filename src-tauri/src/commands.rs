@@ -9993,10 +9993,10 @@ struct SessionTranscriptSnapshot {
     events: Vec<crate::projections::TranscriptEvent>,
 }
 
-fn read_legacy_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, String> {
+fn capture_legacy_session_transcript(session_id: &str) -> Result<String, String> {
     let (path, _) = indexed_session_paths_resolve_only(session_id)?;
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(String::new());
     }
     // Byte ceiling (seed audio-graph-4fa5 fix round: this legacy fallback is
     // the OTHER branch of the same fork `read_session_transcript_snapshot`
@@ -10009,7 +10009,10 @@ fn read_legacy_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegm
     // same session.
     enforce_artifact_ceiling(&path, MAX_TRANSCRIPT_EVENTS_BYTES, "transcript_events")
         .map_err(|e| e.to_string())?;
-    let contents = std::fs::read_to_string(&path).map_err(|e| format!("{}", e))?;
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
+fn parse_legacy_session_transcript(contents: &str) -> Result<Vec<TranscriptSegment>, String> {
     let mut segments = Vec::new();
     for (line_index, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
@@ -10051,6 +10054,18 @@ fn read_admitted_session_transcript_snapshot(
     repository: &FileMemoryRepository,
     session_id: &str,
 ) -> Result<SessionTranscriptSnapshot, String> {
+    capture_admitted_transcript(repository, session_id)?.verify(session_id)
+}
+
+enum AdmittedTranscriptBytes {
+    Legacy(String),
+    Canonical(crate::persistence::canonical_log::CapturedTranscript),
+}
+
+fn capture_admitted_transcript(
+    repository: &FileMemoryRepository,
+    session_id: &str,
+) -> Result<AdmittedTranscriptBytes, String> {
     // The transcript is primary content: unlike supplementary artifacts in
     // Review, an oversized transcript cannot degrade to an empty result.
     enforce_artifact_ceiling(
@@ -10059,27 +10074,36 @@ fn read_admitted_session_transcript_snapshot(
         "transcript_events",
     )
     .map_err(|error| error.to_string())?;
-    match repository.load_transcript_event_stream(session_id)? {
-        crate::persistence::canonical_reader::StrictCanonicalRead::Missing => {
-            Ok(SessionTranscriptSnapshot {
-                transcript: read_legacy_session_transcript(session_id)?,
+    match repository.capture_transcript(session_id)? {
+        Some(bytes) => Ok(AdmittedTranscriptBytes::Canonical(bytes)),
+        None => capture_legacy_session_transcript(session_id).map(AdmittedTranscriptBytes::Legacy),
+    }
+}
+
+impl AdmittedTranscriptBytes {
+    fn verify(self, session_id: &str) -> Result<SessionTranscriptSnapshot, String> {
+        match self {
+            Self::Legacy(bytes) => Ok(SessionTranscriptSnapshot {
+                transcript: parse_legacy_session_transcript(&bytes)?,
                 events: Vec::new(),
-            })
-        }
-        crate::persistence::canonical_reader::StrictCanonicalRead::Present(snapshot) => {
-            let events: Vec<_> = snapshot
-                .records
-                .into_iter()
-                .map(|record| record.payload)
-                .collect();
-            let ledger = crate::projections::TranscriptLedger::replay(session_id, events.clone())
-                .map_err(|error| {
-                format!("Transcript replay failed for session {session_id}: {error:?}")
-            })?;
-            Ok(SessionTranscriptSnapshot {
-                transcript: crate::projections::derive_legacy_transcript_segments(&ledger),
-                events,
-            })
+            }),
+            Self::Canonical(bytes) => {
+                let snapshot = bytes.verify(session_id).map_err(|e| e.to_string())?;
+                let events: Vec<_> = snapshot
+                    .records
+                    .into_iter()
+                    .map(|record| record.payload)
+                    .collect();
+                let ledger =
+                    crate::projections::TranscriptLedger::replay(session_id, events.clone())
+                        .map_err(|error| {
+                            format!("Transcript replay failed for session {session_id}: {error:?}")
+                        })?;
+                Ok(SessionTranscriptSnapshot {
+                    transcript: crate::projections::derive_legacy_transcript_segments(&ledger),
+                    events,
+                })
+            }
         }
     }
 }
@@ -10744,8 +10768,9 @@ fn session_export_for_admitted_session(
         crate::persistence::canonical_log::transcript_export::read_for_export(
             &crate::user_data::resolve_transcript_events_path(session_id)?,
             MAX_TRANSCRIPT_EVENTS_BYTES,
-            || read_admitted_session_transcript_snapshot(&repository, session_id),
+            || capture_admitted_transcript(&repository, session_id),
         )?;
+    let transcript_snapshot = transcript_snapshot.verify(session_id)?;
     let transcript = transcript_snapshot.transcript;
     let transcript_events = transcript_snapshot.events;
 
@@ -16204,7 +16229,8 @@ mod tests {
         let secret = "private-malformed-transcript";
         seed_malformed_legacy_transcript(session_id, secret);
 
-        let error = read_legacy_session_transcript(session_id)
+        let error = capture_legacy_session_transcript(session_id)
+            .and_then(|bytes| parse_legacy_session_transcript(&bytes))
             .expect_err("the shared legacy reader must reject incomplete content");
         assert!(!error.contains(secret), "legacy read error leaked content");
 

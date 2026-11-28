@@ -969,6 +969,14 @@ impl FileMemoryRepository {
         canonical_log::transcript_gaps(&path)
     }
 
+    pub(crate) fn capture_transcript(
+        &self,
+        session: &str,
+    ) -> Result<Option<canonical_log::CapturedTranscript>, String> {
+        canonical_log::capture_committed(&self.resolve_transcript_events_path(session)?, session)
+            .map_err(|e| e.to_string())
+    }
+
     pub(crate) fn load_transcript_event_stream(
         &self,
         session_id: &str,

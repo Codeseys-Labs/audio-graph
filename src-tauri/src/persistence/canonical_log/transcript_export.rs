@@ -134,8 +134,7 @@ pub(crate) fn read_for_export<T>(
         }
         return Ok((transcript, None));
     }
-    let mut evidence = Vec::new();
-    let mut gaps = Vec::new();
+    let mut captured_evidence = Vec::new();
     let source_bytes = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata.len(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
@@ -149,6 +148,18 @@ pub(crate) fn read_for_export<T>(
             continue;
         };
         let bytes = read_evidence(artifact, &mut remaining).map_err(evidence_io)?;
+        captured_evidence.push((kind, bytes));
+    }
+    if guard.is_none()
+        && (inventory(path)? != paths
+            || !matches!(acquire(), Err(CanonicalCoordinationError::Missing)))
+    {
+        return Err("Transcript recovery evidence changed during export".into());
+    }
+    drop(guard);
+    let mut evidence = Vec::new();
+    let mut gaps = Vec::new();
+    for (kind, bytes) in captured_evidence {
         if matches!(kind, EvidenceKind::Gap { .. }) {
             gaps.push(
                 decode_gap(&bytes)
@@ -159,12 +170,6 @@ pub(crate) fn read_for_export<T>(
             kind,
             data_base64: STANDARD.encode(bytes),
         });
-    }
-    if guard.is_none()
-        && (inventory(path)? != paths
-            || !matches!(acquire(), Err(CanonicalCoordinationError::Missing)))
-    {
-        return Err("Transcript recovery evidence changed during export".into());
     }
     gaps.sort_by_key(|gap| gap.after.as_ref().map(|head| head.sequence));
     Ok((
