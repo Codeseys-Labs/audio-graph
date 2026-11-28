@@ -7,7 +7,9 @@ use audio_graph_ipc_contract::credential_contract::{CredentialOperationId, Crede
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
-const CREDENTIAL_SERVICE: &str = "com.codeseys.audiograph.credentials";
+/// The native namespace every v2 target lives in. The cross-process mutation
+/// lock is named by it too, so lock identity and target identity coincide.
+pub(super) const CREDENTIAL_SERVICE: &str = "com.codeseys.audiograph.credentials";
 const WINDOWS_TARGET_PREFIX: &str = "Codeseys.AudioGraph.Credentials/";
 const AUTHORITY_ACCOUNT: &str = "v2/_authority";
 

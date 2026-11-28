@@ -110,8 +110,10 @@ wdio-e2e = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]
 [target.'cfg(target_os = "linux")'.dependencies]
 rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "b50d4cb646c57fd0fd79452f71088d9a3e9521f7", default-features = false, features = ["feat_linux", "hotplug-recovery"] }
 # Held-descriptor filesystem inspection for the dormant credential-v2
-# filesystem policy. Exact version already in the lock; no new package.
-rustix = { version = "=1.1.4", features = ["fs"] }
+# filesystem policy and authority journal. `process` provides `geteuid`, so
+# the journal verifies ownership on the descriptor it uses. Exact version
+# already in the lock; no new package.
+rustix = { version = "=1.1.4", features = ["fs", "process"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "b50d4cb646c57fd0fd79452f71088d9a3e9521f7", default-features = false, features = ["feat_windows", "hotplug-recovery"] }
@@ -124,8 +126,11 @@ rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.gi
 # volume, identity, and namespace operations (`Win32_Storage_FileSystem`,
 # `Win32_System_SystemServices`, `Win32_System_WindowsProgramming`).
 # Credential-v2 adds only feature gates as well: direct
-# CredReadW/CredWriteW/CredDeleteW types (`Win32_Security_Credentials`) and the
-# volume/cloud-root probes behind the dormant filesystem policy.
+# CredReadW/CredWriteW/CredDeleteW types (`Win32_Security_Credentials`), the
+# volume/cloud-root probes behind the dormant filesystem policy, and
+# `GetUserProfileDirectoryW` (`Win32_UI_Shell`), which names the namespace
+# lock from the process token; `SHGetKnownFolderPath` expands `%USERPROFILE%`
+# from the process environment instead.
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -138,13 +143,16 @@ windows = { version = "0.62.2", features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "b50d4cb646c57fd0fd79452f71088d9a3e9521f7", default-features = false, features = ["feat_macos"] }
 # Safe descriptor-bound mounted-filesystem identity for canonical durability.
 # Target-only so Linux and Windows retain their existing dependency surface.
-nix = { version = "0.31.3", features = ["fs"] }
+# `user` resolves the effective user's passwd home for the credential-v2
+# namespace lock, independent of `HOME`.
+nix = { version = "0.31.3", features = ["fs", "user"] }
 # Dormant credential-v2 macOS boundary: checked Security.framework Keychain
 # calls plus held-descriptor filesystem inspection. Every version below is the
 # one already resolved in the lock (via keyring/native-tls/rsac), so these add
@@ -154,7 +162,7 @@ nix = { version = "0.31.3", features = ["fs"] }
 core-foundation = "=0.10.1"
 security-framework = { version = "=3.7.0", default-features = false }
 security-framework-sys = "=2.17.0"
-rustix = { version = "=1.1.4", features = ["fs"] }
+rustix = { version = "=1.1.4", features = ["fs", "process"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "std",
     "NSArray",
@@ -384,10 +392,6 @@ serde_yaml = "0.9"
 # falls back to the YAML credential adapter in tests/headless override modes.
 keyring = "4.1.1"
 
-# Old-or-new replacement for the secret-free credential-v2 authority journal
-# only. This is not approval for a plaintext credential fallback.
-atomic-write-file = "=0.3.0"
-
 # Optional embedded local memory adapter. The default file repository remains
 # the product store until file-backed engines have cross-platform release proof.
 surrealdb = { version = "3.3.5", default-features = false, features = ["kv-mem"], optional = true }
@@ -417,7 +421,3 @@ sentry = { version = "0.48.3", default-features = false, features = [
 [dev-dependencies]
 tauri = { version = "2.11.0", features = ["test"] }
 serde-saphyr = "0.0.28"
-
-# The credential-v2 journal test sets a permissive umask in a child process.
-[target.'cfg(unix)'.dev-dependencies]
-rustix = { version = "=1.1.4", features = ["process"] }

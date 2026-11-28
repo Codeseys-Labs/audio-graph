@@ -1,13 +1,15 @@
+use super::keyring_entry::CREDENTIAL_SERVICE;
 use crate::credentials::domain::{AuthorityJournal, CredentialStoreFailure};
-use atomic_write_file::AtomicWriteFile;
+use held_directory::{HeldDirectory, StagedFile};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+mod held_directory;
+
 const JOURNAL_FILE_NAME: &str = "state.json";
-const MUTATION_LOCK_FILE_NAME: &str = "mutation.lock";
+const NAMESPACE_LOCK_FILE_NAME: &str = "v2-authority.lock";
 const AUTHORITY_ENVELOPE_SCHEMA_VERSION: u32 = 1;
 pub(super) const MAX_AUTHORITY_JOURNAL_BYTES: usize = 256 * 1024;
 
@@ -103,160 +105,135 @@ pub(super) trait AuthorityJournalBoundary: Send + Sync {
     ) -> Result<Box<dyn AuthorityMutationLock>, CredentialStoreFailure>;
 }
 
-trait AtomicJournalWriter: Send {
+/// One staged journal replacement. Bytes become visible only through
+/// `commit`; dropping an uncommitted writer discards them.
+trait AtomicJournalWriter {
     fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()>;
     fn commit(self: Box<Self>) -> std::io::Result<()>;
 }
 
+/// Journal file operations relative to an already held and hardened root.
 trait AtomicJournalFileSystem: Send + Sync {
-    fn open_atomic(&self, path: &Path) -> std::io::Result<Box<dyn AtomicJournalWriter>>;
-    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;
+    fn open_atomic<'directory>(
+        &self,
+        directory: &'directory HeldDirectory,
+        name: &str,
+    ) -> Result<Box<dyn AtomicJournalWriter + 'directory>, CredentialStoreFailure>;
+    /// Reads at most `limit` bytes; `None` when the file is absent.
+    fn read(
+        &self,
+        directory: &HeldDirectory,
+        name: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, CredentialStoreFailure>;
 }
 
 struct SystemAtomicJournalFileSystem;
 
-struct SystemAtomicJournalWriter(AtomicWriteFile);
-
-impl AtomicJournalWriter for SystemAtomicJournalWriter {
+impl AtomicJournalWriter for StagedFile<'_> {
     fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        Write::write_all(&mut self.0, bytes)
+        StagedFile::write_all(self, bytes)
     }
 
     fn commit(self: Box<Self>) -> std::io::Result<()> {
-        let Self(file) = *self;
-        file.commit()
+        StagedFile::commit(*self)
     }
 }
 
 impl AtomicJournalFileSystem for SystemAtomicJournalFileSystem {
-    fn open_atomic(&self, path: &Path) -> std::io::Result<Box<dyn AtomicJournalWriter>> {
-        #[cfg(unix)]
-        let file = {
-            let mut options = atomic_write_file::OpenOptions::new();
-            atomic_write_file::unix::OpenOptionsExt::preserve_mode(&mut options, false);
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-            options.open(path)?
-        };
-        #[cfg(not(unix))]
-        let file = AtomicWriteFile::open(path)?;
-
-        Ok(Box::new(SystemAtomicJournalWriter(file)))
+    fn open_atomic<'directory>(
+        &self,
+        directory: &'directory HeldDirectory,
+        name: &str,
+    ) -> Result<Box<dyn AtomicJournalWriter + 'directory>, CredentialStoreFailure> {
+        Ok(Box::new(directory.create_staged(name)?))
     }
 
-    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-        std::fs::read(path)
+    fn read(
+        &self,
+        directory: &HeldDirectory,
+        name: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, CredentialStoreFailure> {
+        directory.read_capped(name, limit)
     }
+}
+
+/// The per-user directory that names the native credential namespace.
+///
+/// It depends only on the OS user and the fixed native service name, never on
+/// the journal root or the process environment. Every process that addresses
+/// the same native targets therefore contends on one mutation lock, whichever
+/// journal root it was given.
+fn canonical_namespace_lock_root() -> Result<PathBuf, CredentialStoreFailure> {
+    per_user_base().map(|base| base.join(CREDENTIAL_SERVICE))
+}
+
+/// The default `LocalAppData` location under the profile registered for the
+/// process token's user. `SHGetKnownFolderPath` would expand `%USERPROFILE%`
+/// from the process environment, so two processes of one user could name
+/// different locks; only the token decides this path.
+#[cfg(windows)]
+fn per_user_base() -> Result<PathBuf, CredentialStoreFailure> {
+    held_directory::token_profile_directory()
+        .map(|profile| profile.join("AppData").join("Local"))
+        .ok_or(CredentialStoreFailure::Unavailable)
+}
+
+/// The passwd home of the effective user, which ignores `HOME`.
+#[cfg(target_os = "macos")]
+fn per_user_base() -> Result<PathBuf, CredentialStoreFailure> {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .map_err(|_| CredentialStoreFailure::Unavailable)?
+        .ok_or(CredentialStoreFailure::Unavailable)?;
+    Ok(user.dir.join("Library").join("Application Support"))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn per_user_base() -> Result<PathBuf, CredentialStoreFailure> {
+    Err(CredentialStoreFailure::Unsupported)
 }
 
 pub(super) struct FileAuthorityJournalBoundary {
     root: PathBuf,
-    journal_path: PathBuf,
-    mutation_lock_path: PathBuf,
+    namespace_lock_root: PathBuf,
     file_system: Arc<dyn AtomicJournalFileSystem>,
 }
 
 impl FileAuthorityJournalBoundary {
-    pub(super) fn new(root: impl Into<PathBuf>) -> Self {
-        Self::with_file_system(root.into(), Arc::new(SystemAtomicJournalFileSystem))
+    /// The journal root is caller-selected. The mutation lock is not: it lives
+    /// in the canonical per-user namespace directory.
+    pub(super) fn new(root: impl Into<PathBuf>) -> Result<Self, CredentialStoreFailure> {
+        Ok(Self::with_namespace_lock_root(
+            root.into(),
+            canonical_namespace_lock_root()?,
+        ))
     }
 
-    fn with_file_system(root: PathBuf, file_system: Arc<dyn AtomicJournalFileSystem>) -> Self {
-        Self {
-            journal_path: root.join(JOURNAL_FILE_NAME),
-            mutation_lock_path: root.join(MUTATION_LOCK_FILE_NAME),
+    pub(super) fn with_namespace_lock_root(root: PathBuf, namespace_lock_root: PathBuf) -> Self {
+        Self::with_file_system(
             root,
+            namespace_lock_root,
+            Arc::new(SystemAtomicJournalFileSystem),
+        )
+    }
+
+    fn with_file_system(
+        root: PathBuf,
+        namespace_lock_root: PathBuf,
+        file_system: Arc<dyn AtomicJournalFileSystem>,
+    ) -> Self {
+        Self {
+            root,
+            namespace_lock_root,
             file_system,
         }
-    }
-
-    fn ensure_root(&self) -> Result<(), CredentialStoreFailure> {
-        match std::fs::symlink_metadata(&self.root) {
-            Ok(_) => return Self::harden_directory(&self.root),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(CredentialStoreFailure::PermissionHardeningFailed),
-        }
-
-        Self::create_root_owner_only(&self.root)?;
-        Self::harden_directory(&self.root)
-    }
-
-    #[cfg(unix)]
-    fn create_root_owner_only(path: &Path) -> Result<(), CredentialStoreFailure> {
-        use std::os::unix::fs::DirBuilderExt;
-
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        builder.mode(0o700);
-        builder
-            .create(path)
-            .map_err(|_| CredentialStoreFailure::Unavailable)
-    }
-
-    #[cfg(not(unix))]
-    fn create_root_owner_only(path: &Path) -> Result<(), CredentialStoreFailure> {
-        std::fs::create_dir_all(path).map_err(|_| CredentialStoreFailure::Unavailable)
-    }
-
-    fn open_lock_file(path: &Path) -> Result<File, CredentialStoreFailure> {
-        Self::harden_file_if_present(path)?;
-        let mut options = OpenOptions::new();
-        options.create(true).truncate(false).read(true).write(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let file = options
-            .open(path)
-            .map_err(|_| CredentialStoreFailure::Unavailable)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|_| CredentialStoreFailure::PermissionHardeningFailed)?;
-        }
-        Ok(file)
-    }
-
-    #[cfg(unix)]
-    fn harden_directory(path: &Path) -> Result<(), CredentialStoreFailure> {
-        use std::os::unix::fs::PermissionsExt;
-
-        let metadata = std::fs::symlink_metadata(path)
-            .map_err(|_| CredentialStoreFailure::PermissionHardeningFailed)?;
-        if !metadata.file_type().is_dir() {
-            return Err(CredentialStoreFailure::PermissionHardeningFailed);
-        }
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| CredentialStoreFailure::PermissionHardeningFailed)
-    }
-
-    #[cfg(not(unix))]
-    fn harden_directory(_path: &Path) -> Result<(), CredentialStoreFailure> {
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    fn harden_file_if_present(path: &Path) -> Result<(), CredentialStoreFailure> {
-        use std::os::unix::fs::PermissionsExt;
-
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_file() => {
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                    .map_err(|_| CredentialStoreFailure::PermissionHardeningFailed)
-            }
-            Ok(_) => Err(CredentialStoreFailure::PermissionHardeningFailed),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(CredentialStoreFailure::PermissionHardeningFailed),
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn harden_file_if_present(_path: &Path) -> Result<(), CredentialStoreFailure> {
-        Ok(())
     }
 }
 
 struct FileAuthorityMutationLock {
     file: File,
+    _directory: HeldDirectory,
 }
 
 impl AuthorityMutationLock for FileAuthorityMutationLock {}
@@ -269,29 +246,35 @@ impl Drop for FileAuthorityMutationLock {
 
 impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
     fn read(&self) -> Result<Option<Vec<u8>>, CredentialStoreFailure> {
-        Self::harden_file_if_present(&self.journal_path)?;
-        match self.file_system.read(&self.journal_path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(_) => Err(CredentialStoreFailure::Unavailable),
-        }
+        let Some(directory) = HeldDirectory::open_existing(&self.root)? else {
+            return Ok(None);
+        };
+        // One byte past the ceiling is enough for the decoder to refuse an
+        // oversized journal as recovery-required.
+        self.file_system.read(
+            &directory,
+            JOURNAL_FILE_NAME,
+            MAX_AUTHORITY_JOURNAL_BYTES + 1,
+        )
     }
 
     fn replace(&self, bytes: &[u8]) -> Result<(), CredentialStoreFailure> {
-        self.ensure_root()?;
-        Self::harden_file_if_present(&self.journal_path)?;
+        // The root and the staged file are both hardened before any byte is
+        // written; a hardening failure stops here as a definite failure.
+        let directory = HeldDirectory::open_or_create(&self.root)?;
         let mut file = self
             .file_system
-            .open_atomic(&self.journal_path)
-            .map_err(|_| CredentialStoreFailure::Unavailable)?;
+            .open_atomic(&directory, JOURNAL_FILE_NAME)?;
         file.write_all(bytes)
             .map_err(|_| CredentialStoreFailure::Unavailable)?;
         file.commit()
             .map_err(|_| CredentialStoreFailure::CommitUnknown)?;
-        Self::harden_file_if_present(&self.journal_path)
-            .map_err(|_| CredentialStoreFailure::CommitUnknown)?;
-        match self.file_system.read(&self.journal_path) {
-            Ok(readback) if readback == bytes => Ok(()),
+        match self.file_system.read(
+            &directory,
+            JOURNAL_FILE_NAME,
+            MAX_AUTHORITY_JOURNAL_BYTES + 1,
+        ) {
+            Ok(Some(readback)) if readback == bytes => Ok(()),
             Ok(_) | Err(_) => Err(CredentialStoreFailure::CommitUnknown),
         }
     }
@@ -299,10 +282,13 @@ impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
     fn acquire_mutation_lock(
         &self,
     ) -> Result<Box<dyn AuthorityMutationLock>, CredentialStoreFailure> {
-        self.ensure_root()?;
-        let file = Self::open_lock_file(&self.mutation_lock_path)?;
+        let directory = HeldDirectory::open_or_create(&self.namespace_lock_root)?;
+        let file = directory.open_lock_file(NAMESPACE_LOCK_FILE_NAME)?;
         match file.try_lock() {
-            Ok(()) => Ok(Box::new(FileAuthorityMutationLock { file })),
+            Ok(()) => Ok(Box::new(FileAuthorityMutationLock {
+                file,
+                _directory: directory,
+            })),
             Err(std::fs::TryLockError::WouldBlock) => {
                 Err(CredentialStoreFailure::OperationInProgress)
             }
@@ -313,12 +299,11 @@ impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::JOURNAL_FILE_NAME;
     use super::{
         AtomicJournalFileSystem, AtomicJournalWriter, AuthorityJournalBoundary,
-        FileAuthorityJournalBoundary, MAX_AUTHORITY_JOURNAL_BYTES, MUTATION_LOCK_FILE_NAME,
-        decode_authority_journal, encode_authority_journal,
+        FileAuthorityJournalBoundary, HeldDirectory, JOURNAL_FILE_NAME,
+        MAX_AUTHORITY_JOURNAL_BYTES, NAMESPACE_LOCK_FILE_NAME, decode_authority_journal,
+        encode_authority_journal,
     };
     use crate::credentials::domain::{AuthorityJournal, CredentialStoreFailure};
     use audio_graph_ipc_contract::credential_contract::CredentialBackendKind;
@@ -327,13 +312,33 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
 
+    const CHILD_MODE_ENV: &str = "AUDIO_GRAPH_FB2B_LOCK_CHILD_MODE";
+    const CHILD_ROOT_ENV: &str = "AUDIO_GRAPH_FB2B_LOCK_CHILD_ROOT";
+    const CHILD_NAMESPACE_ENV: &str = "AUDIO_GRAPH_FB2B_LOCK_CHILD_NAMESPACE";
+    #[cfg(any(windows, target_os = "macos"))]
+    const CHILD_EXPECTED_ENV: &str = "AUDIO_GRAPH_FB2B_LOCK_CHILD_EXPECTED";
+
+    fn scratch(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "audio-graph-journal-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    /// A journal root and a namespace lock directory side by side in `base`.
+    fn boundary(base: &Path, root: &str, namespace: &str) -> FileAuthorityJournalBoundary {
+        FileAuthorityJournalBoundary::with_namespace_lock_root(
+            base.join(root),
+            base.join(namespace),
+        )
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum AtomicFileCut {
         None,
         Open,
         Write,
         Commit,
-        PostCommitPermission,
         Readback,
         Mismatch,
     }
@@ -363,7 +368,6 @@ mod tests {
         cut: AtomicFileCut,
         pending: Vec<u8>,
         published: Arc<Mutex<Option<Vec<u8>>>>,
-        path: PathBuf,
     }
 
     impl AtomicJournalWriter for ScriptedAtomicWriter {
@@ -379,42 +383,55 @@ mod tests {
             if self.cut == AtomicFileCut::Commit {
                 return Err(std::io::Error::other("scripted uncertain commit cut"));
             }
-            let cut = self.cut;
-            let path = self.path.clone();
-            let mut published = self.published.lock().expect("scripted publication lock");
             let mut bytes = self.pending;
             if self.cut == AtomicFileCut::Mismatch {
                 bytes.push(b'!');
             }
-            *published = Some(bytes);
-            drop(published);
-            if cut == AtomicFileCut::PostCommitPermission {
-                std::fs::create_dir(path)?;
-            }
+            *self.published.lock().expect("scripted publication lock") = Some(bytes);
             Ok(())
         }
     }
 
     impl AtomicJournalFileSystem for ScriptedAtomicFileSystem {
-        fn open_atomic(&self, path: &Path) -> std::io::Result<Box<dyn AtomicJournalWriter>> {
+        fn open_atomic<'directory>(
+            &self,
+            _directory: &'directory HeldDirectory,
+            _name: &str,
+        ) -> Result<Box<dyn AtomicJournalWriter + 'directory>, CredentialStoreFailure> {
             if self.cut == AtomicFileCut::Open {
-                return Err(std::io::Error::other("scripted prepublication open cut"));
+                return Err(CredentialStoreFailure::Unavailable);
             }
             Ok(Box::new(ScriptedAtomicWriter {
                 cut: self.cut,
                 pending: Vec::new(),
                 published: self.published.clone(),
-                path: path.to_path_buf(),
             }))
         }
 
-        fn read(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+        fn read(
+            &self,
+            _directory: &HeldDirectory,
+            _name: &str,
+            limit: usize,
+        ) -> Result<Option<Vec<u8>>, CredentialStoreFailure> {
             if self.cut == AtomicFileCut::Readback {
-                return Err(std::io::Error::other("scripted uncertain readback cut"));
+                return Err(CredentialStoreFailure::Unavailable);
             }
-            self.published()
-                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+            Ok(self
+                .published()
+                .map(|bytes| bytes.into_iter().take(limit).collect()))
         }
+    }
+
+    fn scripted_boundary(
+        base: &Path,
+        file_system: Arc<ScriptedAtomicFileSystem>,
+    ) -> FileAuthorityJournalBoundary {
+        FileAuthorityJournalBoundary::with_file_system(
+            base.join("journal"),
+            base.join("namespace"),
+            file_system,
+        )
     }
 
     #[test]
@@ -535,10 +552,7 @@ mod tests {
 
     #[test]
     fn atomic_journal_stage_mapping_preserves_only_provable_prepublication_failures() {
-        let root = std::env::temp_dir().join(format!(
-            "audio-graph-fb2b-stage-map-{}",
-            uuid::Uuid::new_v4().hyphenated()
-        ));
+        let base = scratch("stage-map");
         let replacement = b"replacement-journal";
 
         for (cut, expected) in [
@@ -554,10 +568,8 @@ mod tests {
                 CredentialStoreFailure::CommitUnknown,
             ),
         ] {
-            let case_root = root.join(format!("{cut:?}"));
             let file_system = Arc::new(ScriptedAtomicFileSystem::new(cut, Some(b"old-journal")));
-            let boundary =
-                FileAuthorityJournalBoundary::with_file_system(case_root, file_system.clone());
+            let boundary = scripted_boundary(&base.join(format!("{cut:?}")), file_system.clone());
 
             assert_eq!(boundary.replace(replacement), Err(expected), "cut {cut:?}");
             if matches!(
@@ -571,58 +583,71 @@ mod tests {
             }
         }
 
-        let success_root = root.join("success");
         let file_system = Arc::new(ScriptedAtomicFileSystem::new(AtomicFileCut::None, None));
-        let boundary =
-            FileAuthorityJournalBoundary::with_file_system(success_root, file_system.clone());
+        let boundary = scripted_boundary(&base.join("success"), file_system.clone());
         assert_eq!(boundary.replace(replacement), Ok(()));
         assert_eq!(
             file_system.published().as_deref(),
             Some(replacement.as_slice())
         );
 
-        std::fs::remove_dir_all(&root).expect("remove isolated stage-map test directory");
+        std::fs::remove_dir_all(&base).expect("remove isolated stage-map test directory");
     }
 
     #[test]
     fn ordinary_journal_read_failure_remains_unavailable() {
-        let root = std::env::temp_dir().join(format!(
-            "audio-graph-fb2b-read-failure-{}",
-            uuid::Uuid::new_v4().hyphenated()
-        ));
+        let base = scratch("read-failure");
+        std::fs::create_dir_all(base.join("journal")).expect("create journal root");
         let file_system = Arc::new(ScriptedAtomicFileSystem::new(AtomicFileCut::Readback, None));
-        let boundary = FileAuthorityJournalBoundary::with_file_system(root, file_system);
+        let boundary = scripted_boundary(&base, file_system);
 
         assert_eq!(boundary.read(), Err(CredentialStoreFailure::Unavailable));
+        std::fs::remove_dir_all(&base).expect("remove isolated read-failure test directory");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn postpublication_permission_hardening_failure_is_commit_unknown() {
-        let root = std::env::temp_dir().join(format!(
-            "audio-graph-fb2b-postcommit-permission-{}",
-            uuid::Uuid::new_v4().hyphenated()
-        ));
-        let replacement = b"published-before-permission-hardening";
-        let file_system = Arc::new(ScriptedAtomicFileSystem::new(
-            AtomicFileCut::PostCommitPermission,
-            Some(b"old-journal"),
-        ));
-        let boundary =
-            FileAuthorityJournalBoundary::with_file_system(root.clone(), file_system.clone());
+    fn absent_root_reads_as_absent_without_creating_it() {
+        let base = scratch("absent-root");
+        assert_eq!(boundary(&base, "journal", "namespace").read(), Ok(None));
+        assert!(!base.exists());
+    }
 
-        assert_eq!(
-            boundary.replace(replacement),
-            Err(CredentialStoreFailure::CommitUnknown)
-        );
-        assert_eq!(
-            file_system.published().as_deref(),
-            Some(replacement.as_slice()),
-            "publication occurred before permission hardening failed"
-        );
-        assert!(root.join(JOURNAL_FILE_NAME).is_dir());
+    #[test]
+    fn oversized_journal_is_read_only_to_the_ceiling_and_refused_by_the_decoder() {
+        let base = scratch("oversized");
+        let root = base.join("journal");
+        std::fs::create_dir_all(&root).expect("create journal root");
+        std::fs::write(
+            root.join(JOURNAL_FILE_NAME),
+            vec![b' '; MAX_AUTHORITY_JOURNAL_BYTES * 4],
+        )
+        .expect("write oversized journal");
 
-        std::fs::remove_dir_all(&root).expect("remove postcommit permission test root");
+        let bytes = boundary(&base, "journal", "namespace")
+            .read()
+            .expect("read oversized journal")
+            .expect("oversized journal present");
+        assert_eq!(bytes.len(), MAX_AUTHORITY_JOURNAL_BYTES + 1);
+        assert!(decode_authority_journal(&bytes).is_none());
+
+        std::fs::remove_dir_all(&base).expect("remove isolated oversized test directory");
+    }
+
+    #[test]
+    fn system_replace_publishes_exact_bytes_and_leaves_no_staged_file() {
+        let base = scratch("replace");
+        let journal = boundary(&base, "journal", "namespace");
+        journal.replace(b"first-journal").expect("first replace");
+        journal.replace(b"second-journal").expect("second replace");
+
+        assert_eq!(journal.read(), Ok(Some(b"second-journal".to_vec())));
+        let names: Vec<_> = std::fs::read_dir(base.join("journal"))
+            .expect("list journal root")
+            .map(|entry| entry.expect("journal root entry").file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from(JOURNAL_FILE_NAME)]);
+
+        std::fs::remove_dir_all(&base).expect("remove isolated replace test directory");
     }
 
     #[cfg(unix)]
@@ -630,37 +655,37 @@ mod tests {
     fn unix_wrong_type_and_symlink_hardening_returns_typed_permission_failure() {
         use std::os::unix::fs::symlink;
 
-        let base = std::env::temp_dir().join(format!(
-            "audio-graph-fb2b-permission-denials-{}",
-            uuid::Uuid::new_v4().hyphenated()
-        ));
-        std::fs::create_dir_all(&base).expect("create isolated permission denial base");
-
-        let target = base.join("root-symlink-target");
-        let root_symlink = base.join("root-symlink");
-        std::fs::create_dir(&target).expect("create root symlink target");
-        symlink(&target, &root_symlink).expect("create root symlink");
+        let base = scratch("permission-denials");
+        std::fs::create_dir_all(base.join("target")).expect("create symlink target");
+        symlink(base.join("target"), base.join("root-link")).expect("create root symlink");
+        assert_eq!(
+            boundary(&base, "root-link", "namespace").replace(b"journal"),
+            Err(CredentialStoreFailure::PermissionHardeningFailed)
+        );
+        symlink(base.join("target"), base.join("namespace-link"))
+            .expect("create namespace symlink");
         assert!(matches!(
-            FileAuthorityJournalBoundary::new(&root_symlink).acquire_mutation_lock(),
+            boundary(&base, "journal", "namespace-link").acquire_mutation_lock(),
             Err(CredentialStoreFailure::PermissionHardeningFailed)
         ));
 
-        let lock_root = base.join("wrong-lock-type");
-        std::fs::create_dir_all(lock_root.join(MUTATION_LOCK_FILE_NAME))
+        std::fs::create_dir_all(base.join("namespace").join(NAMESPACE_LOCK_FILE_NAME))
             .expect("create directory at lock path");
         assert!(matches!(
-            FileAuthorityJournalBoundary::new(&lock_root).acquire_mutation_lock(),
+            boundary(&base, "journal", "namespace").acquire_mutation_lock(),
             Err(CredentialStoreFailure::PermissionHardeningFailed)
         ));
 
-        let journal_root = base.join("journal-symlink");
-        std::fs::create_dir_all(&journal_root).expect("create journal symlink root");
-        let journal_target = journal_root.join("journal-target");
-        std::fs::write(&journal_target, b"target").expect("create journal symlink target");
-        symlink(&journal_target, journal_root.join(JOURNAL_FILE_NAME))
-            .expect("create journal symlink");
+        std::fs::create_dir_all(base.join("journal")).expect("create journal root");
+        std::fs::write(base.join("target").join("journal-target"), b"target")
+            .expect("create journal symlink target");
+        symlink(
+            base.join("target").join("journal-target"),
+            base.join("journal").join(JOURNAL_FILE_NAME),
+        )
+        .expect("create journal symlink");
         assert_eq!(
-            FileAuthorityJournalBoundary::new(&journal_root).read(),
+            boundary(&base, "journal", "namespace").read(),
             Err(CredentialStoreFailure::PermissionHardeningFailed)
         );
 
@@ -668,87 +693,110 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn unix_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path)
+            .expect("permission metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
     #[test]
     fn unix_journal_root_state_and_lock_are_owner_only_and_broad_modes_are_corrected() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = std::env::temp_dir().join(format!(
-            "audio-graph-fb2b-permissions-{}",
-            uuid::Uuid::new_v4().hyphenated()
-        ));
-        std::fs::create_dir_all(&root).expect("create isolated permission test root");
+        let base = scratch("permissions");
+        let root = base.join("journal");
+        let namespace = base.join("namespace");
+        std::fs::create_dir_all(&root).expect("create isolated journal root");
+        std::fs::create_dir_all(&namespace).expect("create isolated namespace root");
         let journal_path = root.join(JOURNAL_FILE_NAME);
-        let lock_path = root.join(MUTATION_LOCK_FILE_NAME);
+        let lock_path = namespace.join(NAMESPACE_LOCK_FILE_NAME);
         std::fs::write(&journal_path, b"old-journal").expect("create broad journal");
         std::fs::write(&lock_path, b"").expect("create broad lock");
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777))
-            .expect("broaden root mode");
-        std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o666))
-            .expect("broaden journal mode");
-        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o666))
-            .expect("broaden lock mode");
+        for (path, mode) in [
+            (&root, 0o777),
+            (&namespace, 0o777),
+            (&journal_path, 0o666),
+            (&lock_path, 0o666),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .expect("broaden mode");
+        }
 
-        let boundary = FileAuthorityJournalBoundary::new(&root);
-        let guard = boundary
+        let journal = boundary(&base, "journal", "namespace");
+        let guard = journal
             .acquire_mutation_lock()
             .expect("acquire hardened mutation lock");
-        boundary
+        journal
             .replace(b"new-journal")
             .expect("replace hardened journal");
 
-        let mode = |path: &Path| {
-            std::fs::metadata(path)
-                .expect("permission metadata")
-                .permissions()
-                .mode()
-                & 0o777
-        };
-        assert_eq!(mode(&root), 0o700);
-        assert_eq!(mode(&journal_path), 0o600);
-        assert_eq!(mode(&lock_path), 0o600);
+        assert_eq!(unix_mode(&root), 0o700);
+        assert_eq!(unix_mode(&journal_path), 0o600);
+        assert_eq!(unix_mode(&namespace), 0o700);
+        assert_eq!(unix_mode(&lock_path), 0o600);
 
         drop(guard);
-        std::fs::remove_dir_all(&root).expect("remove isolated permission test directory");
+        std::fs::remove_dir_all(&base).expect("remove isolated permission test directory");
     }
 
     #[test]
-    fn stable_file_lock_contends_until_the_owned_guard_is_dropped() {
-        let root = std::env::temp_dir().join(format!(
-            "audio-graph-fb2b-lock-{}",
-            uuid::Uuid::new_v4().hyphenated()
-        ));
-        let first_boundary = FileAuthorityJournalBoundary::new(&root);
-        let second_boundary = FileAuthorityJournalBoundary::new(&root);
+    fn two_journal_roots_contend_on_one_namespace_lock_until_the_guard_drops() {
+        let base = scratch("lock");
+        let first = boundary(&base, "journal-a", "namespace");
+        let second = boundary(&base, "journal-b", "namespace");
+        let elsewhere = boundary(&base, "journal-b", "other-namespace");
 
-        let first_guard = first_boundary
+        let first_guard = first
             .acquire_mutation_lock()
-            .expect("first process-shaped owner acquires lock");
+            .expect("first journal root acquires the namespace lock");
         assert!(matches!(
-            second_boundary.acquire_mutation_lock(),
+            second.acquire_mutation_lock(),
             Err(CredentialStoreFailure::OperationInProgress)
         ));
-        assert!(root.join(MUTATION_LOCK_FILE_NAME).is_file());
+        drop(
+            elsewhere
+                .acquire_mutation_lock()
+                .expect("a different namespace does not contend"),
+        );
+        assert!(
+            base.join("namespace")
+                .join(NAMESPACE_LOCK_FILE_NAME)
+                .is_file()
+        );
 
         drop(first_guard);
-        let second_guard = second_boundary
-            .acquire_mutation_lock()
-            .expect("lock releases with the owned guard");
-        drop(second_guard);
-        assert!(root.join(MUTATION_LOCK_FILE_NAME).is_file());
+        drop(
+            second
+                .acquire_mutation_lock()
+                .expect("lock releases with the owned guard"),
+        );
 
-        std::fs::remove_dir_all(&root).expect("remove isolated lock test directory");
+        std::fs::remove_dir_all(&base).expect("remove isolated lock test directory");
     }
 
     #[test]
     fn file_lock_child_harness() {
-        let Ok(mode) = std::env::var("AUDIO_GRAPH_FB2B_LOCK_CHILD_MODE") else {
+        let Ok(mode) = std::env::var(CHILD_MODE_ENV) else {
             return;
         };
-        let root = PathBuf::from(
-            std::env::var_os("AUDIO_GRAPH_FB2B_LOCK_CHILD_ROOT")
-                .expect("child lock root environment"),
+        if mode == "canonical" {
+            #[cfg(any(windows, target_os = "macos"))]
+            assert_eq!(
+                super::canonical_namespace_lock_root().expect("canonical namespace root"),
+                PathBuf::from(std::env::var_os(CHILD_EXPECTED_ENV).expect("expected root"))
+            );
+            return;
+        }
+        let path = |name| PathBuf::from(std::env::var_os(name).expect("child path environment"));
+        let boundary = FileAuthorityJournalBoundary::with_namespace_lock_root(
+            path(CHILD_ROOT_ENV),
+            path(CHILD_NAMESPACE_ENV),
         );
-        let boundary = FileAuthorityJournalBoundary::new(&root);
 
         match mode.as_str() {
             "owner" => {
@@ -773,20 +821,7 @@ mod tests {
             ),
             #[cfg(unix)]
             "create_owner_only" => {
-                use std::os::unix::fs::PermissionsExt;
-
                 rustix::process::umask(rustix::fs::Mode::empty());
-                FileAuthorityJournalBoundary::create_root_owner_only(&root)
-                    .expect("create owner-only root under child umask");
-                assert_eq!(
-                    std::fs::metadata(&root)
-                        .expect("new root metadata")
-                        .permissions()
-                        .mode()
-                        & 0o777,
-                    0o700,
-                    "root must be private before final hardening"
-                );
                 let guard = boundary
                     .acquire_mutation_lock()
                     .expect("create mutation lock under child umask");
@@ -799,97 +834,383 @@ mod tests {
         }
     }
 
-    fn lock_child_command(mode: &str, root: &Path) -> Command {
+    fn lock_child_command(mode: &str, root: &Path, namespace: &Path) -> Command {
         let mut command = Command::new(std::env::current_exe().expect("current test executable"));
         command
             .arg("file_lock_child_harness")
             .arg("--nocapture")
             .arg("--test-threads=1")
-            .env("AUDIO_GRAPH_FB2B_LOCK_CHILD_MODE", mode)
-            .env("AUDIO_GRAPH_FB2B_LOCK_CHILD_ROOT", root);
+            .env(CHILD_MODE_ENV, mode)
+            .env(CHILD_ROOT_ENV, root)
+            .env(CHILD_NAMESPACE_ENV, namespace);
         command
     }
 
     #[cfg(unix)]
     #[test]
     fn unix_owner_only_paths_survive_a_permissive_child_umask() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = std::env::temp_dir().join(format!(
-            "audio-graph-fb2b-child-umask-{}",
-            uuid::Uuid::new_v4().hyphenated()
-        ));
-        let output = lock_child_command("create_owner_only", &root)
+        let base = scratch("child-umask");
+        let root = base.join("journal");
+        let namespace = base.join("namespace");
+        let output = lock_child_command("create_owner_only", &root, &namespace)
             .output()
             .expect("run permissive-umask child");
-        assert!(
-            output.status.success(),
-            "permissive-umask child failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(output.status.success(), "permissive-umask child failed");
 
-        let mode = |path: &Path| {
-            std::fs::metadata(path)
-                .expect("permission metadata")
-                .permissions()
-                .mode()
-                & 0o777
-        };
-        assert_eq!(mode(&root), 0o700);
-        assert_eq!(mode(&root.join(JOURNAL_FILE_NAME)), 0o600);
-        assert_eq!(mode(&root.join(MUTATION_LOCK_FILE_NAME)), 0o600);
+        assert_eq!(unix_mode(&root), 0o700);
+        assert_eq!(unix_mode(&root.join(JOURNAL_FILE_NAME)), 0o600);
+        assert_eq!(unix_mode(&namespace), 0o700);
+        assert_eq!(unix_mode(&namespace.join(NAMESPACE_LOCK_FILE_NAME)), 0o600);
 
-        std::fs::remove_dir_all(&root).expect("remove permissive-umask child root");
+        std::fs::remove_dir_all(&base).expect("remove permissive-umask child root");
     }
 
-    #[test]
-    fn file_lock_contends_across_processes_and_releases_when_owner_is_killed() {
-        let root = std::env::temp_dir().join(format!(
-            "audio-graph-fb2b-child-lock-{}",
-            uuid::Uuid::new_v4().hyphenated()
-        ));
-        let mut owner = lock_child_command("owner", &root)
+    /// Starts an owner child holding the namespace lock through `root` and
+    /// returns it once it reports the lock is held.
+    fn spawn_lock_owner(root: &Path, namespace: &Path) -> std::process::Child {
+        let mut owner = lock_child_command("owner", root, namespace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn lock owner child");
         let mut owner_output =
             std::io::BufReader::new(owner.stdout.take().expect("owner child stdout pipe"));
-        loop {
-            let mut line = String::new();
-            assert_ne!(
-                owner_output
-                    .read_line(&mut line)
-                    .expect("read owner readiness"),
-                0,
-                "owner exited before acquiring the lock"
-            );
-            if line.contains("AUDIO_GRAPH_FB2B_LOCKED") {
-                break;
+        let mut line = String::new();
+        while !line.contains("AUDIO_GRAPH_FB2B_LOCKED") {
+            line.clear();
+            if owner_output.read_line(&mut line).unwrap_or(0) == 0 {
+                let _ = owner.kill();
+                owner.wait().expect("reap failed lock owner child");
+                panic!("owner exited before acquiring the lock");
             }
         }
+        owner
+    }
 
-        let contender = lock_child_command("contend", &root)
+    fn run_lock_child(mode: &str, root: &Path, namespace: &Path) {
+        let output = lock_child_command(mode, root, namespace)
             .output()
-            .expect("run lock contender child");
-        assert!(
-            contender.status.success(),
-            "contender child failed: {}",
-            String::from_utf8_lossy(&contender.stderr)
-        );
+            .expect("run lock child");
+        assert!(output.status.success(), "{mode} child failed");
+    }
 
+    #[test]
+    fn file_lock_contends_across_processes_and_releases_when_owner_is_killed() {
+        let base = scratch("child-lock");
+        let root = base.join("journal");
+        let namespace = base.join("namespace");
+        let mut owner = spawn_lock_owner(&root, &namespace);
+
+        run_lock_child("contend", &root, &namespace);
         owner.kill().expect("kill lock owner child");
         owner.wait().expect("reap killed lock owner child");
+        run_lock_child("acquire", &root, &namespace);
 
-        let reacquirer = lock_child_command("acquire", &root)
+        std::fs::remove_dir_all(&base).expect("remove isolated child-lock test directory");
+    }
+
+    /// Two processes given different journal roots for the same native
+    /// namespace must still exclude each other: before this binding, each took
+    /// a lock under its own root and both could pass the absence checks before
+    /// either wrote the shared native marker.
+    #[test]
+    fn processes_with_different_journal_roots_contend_on_the_namespace_lock() {
+        let base = scratch("two-root-lock");
+        let namespace = base.join("namespace");
+        let mut owner = spawn_lock_owner(&base.join("journal-a"), &namespace);
+
+        run_lock_child("contend", &base.join("journal-b"), &namespace);
+        run_lock_child(
+            "acquire",
+            &base.join("journal-b"),
+            &base.join("other-namespace"),
+        );
+        owner.kill().expect("kill lock owner child");
+        owner.wait().expect("reap killed lock owner child");
+        run_lock_child("acquire", &base.join("journal-b"), &namespace);
+
+        std::fs::remove_dir_all(&base).expect("remove isolated two-root lock test directory");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn canonical_namespace_lock_root_ignores_the_environment_and_names_the_namespace() {
+        let expected = super::canonical_namespace_lock_root().expect("canonical namespace root");
+        assert_eq!(
+            expected.file_name(),
+            Some(std::ffi::OsStr::new(super::CREDENTIAL_SERVICE))
+        );
+        let decoy = scratch("canonical-decoy");
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("file_lock_child_harness")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_MODE_ENV, "canonical")
+            .env(CHILD_EXPECTED_ENV, &expected)
+            .env("LOCALAPPDATA", &decoy)
+            .env("USERPROFILE", &decoy)
+            .env("HOME", &decoy)
+            .env(crate::user_data::DATA_DIR_ENV, &decoy)
             .output()
-            .expect("run lock reacquirer child");
+            .expect("run canonical-root child");
         assert!(
-            reacquirer.status.success(),
-            "reacquirer child failed: {}",
-            String::from_utf8_lossy(&reacquirer.stderr)
+            output.status.success(),
+            "canonical root followed the environment"
+        );
+        assert!(!decoy.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_acl_lines(path: &Path) -> Vec<String> {
+        let output = Command::new("/bin/ls")
+            .arg("-lde")
+            .arg(path)
+            .output()
+            .expect("list extended ACL");
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .skip(1)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// An inherited allow entry on the root would otherwise reach every file
+    /// created under it. The root and the published journal must both end up
+    /// with no extended ACL entry.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_inherited_allow_entry_is_cleared_before_any_byte() {
+        let base = scratch("macos-acl");
+        let root = base.join("journal");
+        std::fs::create_dir_all(&root).expect("create journal root");
+        let granted = Command::new("/bin/chmod")
+            .arg("+a")
+            .arg("everyone allow list,search,add_file,read,write,file_inherit,directory_inherit")
+            .arg(&root)
+            .status()
+            .expect("add inherited allow entry");
+        assert!(granted.success());
+        assert!(!macos_acl_lines(&root).is_empty(), "fixture ACL missing");
+
+        boundary(&base, "journal", "namespace")
+            .replace(b"journal")
+            .expect("replace under a cleared ACL");
+
+        assert_eq!(macos_acl_lines(&root), Vec::<String>::new());
+        assert_eq!(
+            macos_acl_lines(&root.join(JOURNAL_FILE_NAME)),
+            Vec::<String>::new()
+        );
+        std::fs::remove_dir_all(&base).expect("remove isolated macOS ACL test directory");
+    }
+
+    #[cfg(windows)]
+    fn windows_command(program: &str, args: &[&std::ffi::OsStr], cwd: &Path) {
+        let status = Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .stdout(Stdio::null())
+            .status()
+            .expect("run Windows fixture command");
+        assert!(status.success(), "{program} fixture command failed");
+    }
+
+    /// The DACL of `path` as SDDL, read with `icacls /save` so the control
+    /// flags are included independent of localized display text.
+    #[cfg(windows)]
+    fn windows_dacl(path: &Path, scratch_dir: &Path) -> String {
+        let saved = scratch_dir.join(format!("{}.acl", uuid::Uuid::new_v4().simple()));
+        windows_command(
+            "icacls.exe",
+            &[path.as_os_str(), "/save".as_ref(), saved.as_os_str()],
+            scratch_dir,
+        );
+        let bytes = std::fs::read(&saved).expect("read saved ACL");
+        std::fs::remove_file(&saved).expect("remove saved ACL");
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+            .lines()
+            .nth(1)
+            .expect("saved DACL line")
+            .trim()
+            .to_owned()
+    }
+
+    #[cfg(windows)]
+    fn windows_current_sid() -> String {
+        let output = Command::new("whoami.exe")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .expect("query current user SID");
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .rsplit(',')
+            .next()
+            .expect("SID column")
+            .trim_matches('"')
+            .to_owned()
+    }
+
+    #[cfg(windows)]
+    fn assert_protected_owner_only(sddl: &str) {
+        assert!(sddl.starts_with("D:P"), "DACL is not protected: {sddl}");
+        assert_eq!(
+            sddl.matches('(').count(),
+            1,
+            "DACL has extra entries: {sddl}"
+        );
+        assert!(
+            sddl.ends_with(&format!(";;;{})", windows_current_sid())),
+            "DACL is not owner-only: {sddl}"
+        );
+    }
+
+    /// A root whose DACL grants Everyone full control is hardened to a
+    /// protected owner-only DACL before the write stage runs; the scripted
+    /// writer refuses the write, so no journal byte ever exists.
+    #[cfg(windows)]
+    #[test]
+    fn windows_root_granting_another_principal_is_hardened_before_any_byte() {
+        let base = scratch("windows-dacl");
+        let root = base.join("journal");
+        std::fs::create_dir_all(&root).expect("create journal root");
+        windows_command(
+            "icacls.exe",
+            &[
+                root.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-1-0:(OI)(CI)F".as_ref(),
+            ],
+            &base,
+        );
+        assert!(
+            windows_dacl(&root, &base).contains(";;;WD)"),
+            "fixture grant missing"
         );
 
-        std::fs::remove_dir_all(&root).expect("remove isolated child-lock test directory");
+        let file_system = Arc::new(ScriptedAtomicFileSystem::new(AtomicFileCut::Write, None));
+        assert_eq!(
+            scripted_boundary(&base, file_system.clone()).replace(b"journal"),
+            Err(CredentialStoreFailure::Unavailable)
+        );
+        assert_eq!(file_system.published(), None);
+        assert_protected_owner_only(&windows_dacl(&root, &base));
+
+        let journal = boundary(&base, "journal", "namespace");
+        journal
+            .replace(b"journal")
+            .expect("replace hardened journal");
+        assert_protected_owner_only(&windows_dacl(&root.join(JOURNAL_FILE_NAME), &base));
+        drop(
+            journal
+                .acquire_mutation_lock()
+                .expect("acquire hardened lock"),
+        );
+        assert_protected_owner_only(&windows_dacl(&base.join("namespace"), &base));
+        assert_protected_owner_only(&windows_dacl(
+            &base.join("namespace").join(NAMESPACE_LOCK_FILE_NAME),
+            &base,
+        ));
+
+        std::fs::remove_dir_all(&base).expect("remove isolated Windows DACL test directory");
+    }
+
+    /// Swaps an ancestor junction to a decoy after the root is held and before
+    /// the staged file is created.
+    #[cfg(windows)]
+    struct SwapBeforeStaging {
+        base: PathBuf,
+    }
+
+    #[cfg(windows)]
+    impl AtomicJournalFileSystem for SwapBeforeStaging {
+        fn open_atomic<'directory>(
+            &self,
+            directory: &'directory HeldDirectory,
+            name: &str,
+        ) -> Result<Box<dyn AtomicJournalWriter + 'directory>, CredentialStoreFailure> {
+            std::fs::remove_dir(self.base.join("parent")).expect("remove parent junction");
+            windows_command(
+                "cmd.exe",
+                &[
+                    "/d".as_ref(),
+                    "/c".as_ref(),
+                    "mklink".as_ref(),
+                    "/j".as_ref(),
+                    "parent".as_ref(),
+                    "decoy".as_ref(),
+                ],
+                &self.base,
+            );
+            super::SystemAtomicJournalFileSystem.open_atomic(directory, name)
+        }
+
+        fn read(
+            &self,
+            directory: &HeldDirectory,
+            name: &str,
+            limit: usize,
+        ) -> Result<Option<Vec<u8>>, CredentialStoreFailure> {
+            super::SystemAtomicJournalFileSystem.read(directory, name, limit)
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_swap_after_open_does_not_redirect_hardening_or_bytes() {
+        let base = scratch("windows-swap");
+        let held = base.join("held").join("journal");
+        let decoy = base.join("decoy").join("journal");
+        std::fs::create_dir_all(&held).expect("create held journal root");
+        std::fs::create_dir_all(&decoy).expect("create decoy journal root");
+        windows_command(
+            "cmd.exe",
+            &[
+                "/d".as_ref(),
+                "/c".as_ref(),
+                "mklink".as_ref(),
+                "/j".as_ref(),
+                "parent".as_ref(),
+                "held".as_ref(),
+            ],
+            &base,
+        );
+        windows_command(
+            "icacls.exe",
+            &[decoy.as_os_str(), "/grant".as_ref(), "*S-1-1-0:R".as_ref()],
+            &base,
+        );
+        let decoy_dacl = windows_dacl(&decoy, &base);
+
+        let journal = FileAuthorityJournalBoundary::with_file_system(
+            base.join("parent").join("journal"),
+            base.join("namespace"),
+            Arc::new(SwapBeforeStaging { base: base.clone() }),
+        );
+        assert_eq!(
+            journal.replace(b"journal"),
+            Err(CredentialStoreFailure::PermissionHardeningFailed)
+        );
+
+        assert_protected_owner_only(&windows_dacl(&held, &base));
+        assert_eq!(windows_dacl(&decoy, &base), decoy_dacl);
+        assert!(!held.join(JOURNAL_FILE_NAME).exists());
+        assert!(!decoy.join(JOURNAL_FILE_NAME).exists());
+        for entry in std::fs::read_dir(&decoy).expect("list decoy root") {
+            let entry = entry.expect("decoy entry");
+            assert_eq!(
+                entry.metadata().expect("decoy entry metadata").len(),
+                0,
+                "journal bytes reached the decoy"
+            );
+        }
+
+        std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
+        std::fs::remove_dir_all(&base).expect("remove isolated Windows swap test directory");
     }
 }

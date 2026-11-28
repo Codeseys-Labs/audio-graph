@@ -70,7 +70,7 @@ impl NativeKeyringCredentialStore {
     ) -> Result<NativeCredentialStoreOpen, CredentialStoreFailure> {
         Self::open_with_adapters(
             KeyringEntryAdapter::production()?,
-            Arc::new(FileAuthorityJournalBoundary::new(root)),
+            Arc::new(FileAuthorityJournalBoundary::new(root)?),
         )
     }
 
@@ -2307,7 +2307,10 @@ mod tests {
             uuid::Uuid::new_v4().hyphenated()
         ));
         let keyring = Arc::new(MemoryKeyringBoundary::default());
-        let journal_boundary = Arc::new(FileAuthorityJournalBoundary::new(&root));
+        let journal_boundary = Arc::new(FileAuthorityJournalBoundary::with_namespace_lock_root(
+            root.join("journal"),
+            root.join("namespace"),
+        ));
         let opened = NativeKeyringCredentialStore::open_with_adapters(
             KeyringEntryAdapter::new(keyring),
             journal_boundary.clone(),

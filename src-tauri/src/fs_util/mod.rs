@@ -35,6 +35,17 @@ pub(crate) fn try_set_owner_only_file(file: &std::fs::File) -> std::io::Result<(
     windows_owner_only_acl::set_file_dacl(file)
 }
 
+/// Apply the current user's protected DACL to a directory through a handle
+/// that was opened with `WRITE_DAC`, without reopening it, which
+/// [`try_set_owner_only_file`] cannot do for a directory. The one owner ACE is
+/// inherited by the directory's existing and future children.
+#[cfg(windows)]
+pub(crate) fn try_set_owner_only_directory_handle(
+    directory: &std::fs::File,
+) -> std::io::Result<()> {
+    windows_owner_only_acl::set_directory_handle_dacl(directory)
+}
+
 /// Set owner-only permissions on paths whose callers can tolerate best-effort hardening.
 pub fn set_owner_only(path: &Path) {
     if let Err(e) = try_set_owner_only(path) {
@@ -216,10 +227,26 @@ mod windows_owner_only_acl {
         ),
         String,
     > {
+        build_owner_only_dacl_with_ace_flags(path, "")
+    }
+
+    /// [`build_owner_only_dacl`] with SDDL ACE flags on its single ACE, so a
+    /// directory can pass its one owner ACE on to the objects inside it.
+    fn build_owner_only_dacl_with_ace_flags(
+        path: &Path,
+        ace_flags: &str,
+    ) -> Result<
+        (
+            LocalSecurityDescriptor,
+            *const windows::Win32::Security::ACL,
+        ),
+        String,
+    > {
         let sid = current_token_sid_string(path)?;
-        // D:PAI(A;;FA;;;<SID>) — Protected, Auto-inherited, one Allow ACE of
-        // Full Access (FA) for the resolved current-user SID and nothing else.
-        let sddl = format!("D:PAI(A;;FA;;;{sid})");
+        // D:PAI(A;<flags>;FA;;;<SID>) — Protected, Auto-inherited, one Allow
+        // ACE of Full Access (FA) for the resolved current-user SID and nothing
+        // else.
+        let sddl = format!("D:PAI(A;{ace_flags};FA;;;{sid})");
 
         // Encode SDDL as a NUL-terminated wide string.
         let sddl_wide: Vec<u16> = std::ffi::OsStr::new(&sddl)
@@ -281,7 +308,6 @@ mod windows_owner_only_acl {
 
     pub(super) fn set_file_dacl(file: &std::fs::File) -> std::io::Result<()> {
         use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Security::Authorization::SetSecurityInfo;
         use windows::Win32::Storage::FileSystem::{
             FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
             ReOpenFile, WRITE_DAC,
@@ -301,10 +327,31 @@ mod windows_owner_only_acl {
             }
             .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))?,
         );
-        // SAFETY: the descriptor backing dacl and the file handle remain alive.
+        apply_protected_dacl(handle.0, dacl)
+    }
+
+    /// Applies an owner-only DACL whose one ACE is inherited by files and
+    /// subdirectories (`OICI`) through `directory` itself, which must already
+    /// carry `WRITE_DAC`. `ReOpenFile` refuses directory handles. Applying a
+    /// DACL to a directory rewrites the inherited ACEs of its existing
+    /// children, so they keep owner access and lose every other principal.
+    pub(super) fn set_directory_handle_dacl(directory: &std::fs::File) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        let (_descriptor, dacl) =
+            build_owner_only_dacl_with_ace_flags(Path::new("open directory"), "OICI")
+                .map_err(std::io::Error::other)?;
+        apply_protected_dacl(HANDLE(directory.as_raw_handle()), dacl)
+    }
+
+    fn apply_protected_dacl(
+        handle: HANDLE,
+        dacl: *const windows::Win32::Security::ACL,
+    ) -> std::io::Result<()> {
+        use windows::Win32::Security::Authorization::SetSecurityInfo;
+        // SAFETY: the caller keeps the descriptor backing dacl and the handle alive.
         let result = unsafe {
             SetSecurityInfo(
-                handle.0,
+                handle,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 None,
