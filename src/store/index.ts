@@ -242,6 +242,27 @@ const CHAT_DELTA_THROTTLE_MS = CHAT_STREAM_DELTA_THROTTLE_MS;
 /** Source of the id that binds a chat reply's frames to its own placeholder. */
 let lastChatTurnId = 0;
 
+/** How many times the chat has been cleared, counted when the clear starts. */
+let chatClears = 0;
+
+/**
+ * The chat-wide loading state to reset when `turnId`'s reply ends. Only the
+ * turn the chat is currently waiting for resets it, so a superseded turn
+ * ending late leaves a newer turn's loading state alone.
+ */
+function releaseChatTurn(
+  state: AudioGraphStore,
+  turnId: string,
+): Partial<AudioGraphStore> {
+  return state.chatReplyTurnId === turnId
+    ? {
+        isChatLoading: false,
+        streamingChatRequestId: null,
+        chatReplyTurnId: null,
+      }
+    : {};
+}
+
 /**
  * `messages` with the message carrying `turnId` replaced by `next`, or
  * unchanged when that message is gone because the chat was cleared.
@@ -3318,6 +3339,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   chatMessages: [],
   isChatLoading: false,
   streamingChatRequestId: null,
+  chatReplyTurnId: null,
   rightPanelTab: "transcript",
   setRightPanelTab: (tab) => set({ rightPanelTab: tab }),
   agentOverlayOpen: false,
@@ -3460,6 +3482,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // cleared is dropped.
     lastChatTurnId += 1;
     const turnId = `chat-turn-${lastChatTurnId}`;
+    const clearsAtSend = chatClears;
     const userMsg: ChatThreadMessage = { role: "user", content: message };
     const assistantPlaceholder: ChatThreadMessage = {
       role: "assistant",
@@ -3469,6 +3492,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     set((state) => ({
       chatMessages: [...state.chatMessages, userMsg, assistantPlaceholder],
       isChatLoading: true,
+      chatReplyTurnId: turnId,
     }));
 
     // Try streaming first (Api / OpenRouter providers). If the active
@@ -3559,7 +3583,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         message,
         channel,
       });
-      set({ streamingChatRequestId: requestId });
+      set((state) =>
+        state.chatReplyTurnId === turnId
+          ? { streamingChatRequestId: requestId }
+          : {},
+      );
       // Id armed: flush any deltas that arrived before it, then apply a
       // terminal frame if one already landed (done-before-resolve ordering).
       drainNow();
@@ -3576,6 +3604,31 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         flushTimer = null;
       }
       channel.onmessage = () => {};
+      // Never retry a send the user cleared meanwhile, or one the backend
+      // refused because the chat was cleared before it was sent.
+      if (chatClears !== clearsAtSend) {
+        set((state) => ({
+          chatMessages: state.chatMessages.filter((m) => m.turnId !== turnId),
+          ...releaseChatTurn(state, turnId),
+        }));
+        return;
+      }
+      const startDiagnostic =
+        parseRuntimeDiagnosticAppError(streamErr)?.diagnostic;
+      if (
+        startDiagnostic?.kind === "runtime" &&
+        startDiagnostic.detail.code === "cancelled"
+      ) {
+        set((state) => ({
+          chatMessages: replaceChatTurn(state.chatMessages, turnId, {
+            role: "assistant",
+            content: "",
+            failure: startDiagnostic,
+          }),
+          ...releaseChatTurn(state, turnId),
+        }));
+        return;
+      }
       console.info(
         "Streaming chat unavailable; using blocking path:",
         streamErr,
@@ -3592,8 +3645,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
           turnId,
           response.message,
         ),
-        isChatLoading: false,
-        streamingChatRequestId: null,
+        ...releaseChatTurn(state, turnId),
       }));
     } catch (e) {
       // A failed LLM call rejects with the closed diagnostic; it renders
@@ -3604,22 +3656,13 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         : { role: "assistant", content: `Error: ${errorToMessage(e)}` };
       set((state) => ({
         chatMessages: replaceChatTurn(state.chatMessages, turnId, errorMsg),
-        isChatLoading: false,
-        streamingChatRequestId: null,
+        ...releaseChatTurn(state, turnId),
       }));
     }
   },
   appendChatTokenDelta: (event: ChatTokenDeltaEvent, turnId: string) => {
-    // Only apply deltas for the currently-tracked request id. The
-    // channel-based sender in sendChatMessage only calls this once the id is
-    // armed (it coalesces + holds leading frames until then), so a null or
-    // mismatched id here means the stream is stale — e.g. a delta racing a
-    // clearChatHistory, or a second stream started while the first drained.
-    // Drop it: there's no placeholder this delta legitimately belongs to.
-    const current = get().streamingChatRequestId;
-    if (current === null || current !== event.request_id) {
-      return;
-    }
+    // A delta grows only its own turn's bubble. One whose bubble is gone
+    // (the chat was cleared) is dropped.
     set((state) => {
       const target = state.chatMessages.find((m) => m.turnId === turnId);
       if (!target) return {};
@@ -3632,16 +3675,13 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     });
   },
   finalizeChatStream: (event: ChatTokenDoneEvent, turnId: string) => {
-    const current = get().streamingChatRequestId;
-    if (current !== null && current !== event.request_id) {
-      return;
-    }
     set((state) => {
       // Authoritative: replace whatever the deltas accumulated with
       // the final full_text. Handles two cases:
       //   1. The provider revised the reply on the terminal chunk.
       //   2. We dropped a delta event (network glitch, IPC backlog).
-      // A cancelled reply is always marked, however much text it has.
+      // A cancelled reply is always marked, however much text it has, even
+      // when a newer turn superseded it.
       const partial =
         event.full_text ||
         state.chatMessages.find((m) => m.turnId === turnId)?.content ||
@@ -3655,16 +3695,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
           role: "assistant",
           content,
         }),
-        isChatLoading: false,
-        streamingChatRequestId: null,
+        ...releaseChatTurn(state, turnId),
       };
     });
   },
   finalizeChatStreamFailure: (event: ChatStreamFailedEvent, turnId: string) => {
-    const current = get().streamingChatRequestId;
-    if (current !== null && current !== event.request_id) {
-      return;
-    }
     // A failed turn shows its partial text (if any) and the closed
     // diagnostic. A malformed diagnostic normalizes to the fixed internal
     // tuple, so no raw wire value ever reaches the bubble.
@@ -3674,11 +3709,13 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         content: event.full_text,
         failure: normalizeRuntimeDiagnostic(event.diagnostic),
       }),
-      isChatLoading: false,
-      streamingChatRequestId: null,
+      ...releaseChatTurn(state, turnId),
     }));
   },
   clearChatHistory: async () => {
+    // Counted before the backend clears, so a send already in flight never
+    // falls back to the blocking command after the user asked to clear.
+    chatClears += 1;
     try {
       await invoke("clear_chat_history");
       set({ chatMessages: [], streamingChatRequestId: null });

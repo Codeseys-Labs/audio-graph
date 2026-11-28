@@ -3548,6 +3548,11 @@ export interface AudioGraphStore {
    */
   streamingChatRequestId: string | null;
   /**
+   * `turnId` of the reply `isChatLoading` waits for, or `null`. Only that
+   * turn's end resets the chat-wide loading state.
+   */
+  chatReplyTurnId: string | null;
+  /**
    * Append a token delta to the in-progress assistant message with
    * `turnId`. A delta whose message is gone is dropped.
    */

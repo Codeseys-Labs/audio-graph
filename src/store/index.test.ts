@@ -195,6 +195,7 @@ describe("AudioGraphStore", () => {
       chatMessages: [],
       isChatLoading: false,
       streamingChatRequestId: null,
+      chatReplyTurnId: null,
       isCapturing: false,
       isTranscribing: false,
       captureStartTime: null,
@@ -4022,7 +4023,7 @@ describe("AudioGraphStore", () => {
     expect(s.streamingChatRequestId).toBeNull();
   });
 
-  it("ignores token deltas for a stale request_id", () => {
+  it("ignores token deltas for a turn whose bubble is gone", () => {
     useAudioGraphStore.setState({
       chatMessages: [
         { role: "user", content: "ping" },
@@ -4035,8 +4036,8 @@ describe("AudioGraphStore", () => {
     useAudioGraphStore
       .getState()
       .appendChatTokenDelta(
-        { request_id: "stale-req", delta: "should-not-appear" },
-        "turn-1",
+        { request_id: "cleared-req", delta: "should-not-appear" },
+        "turn-cleared",
       );
 
     const messages = useAudioGraphStore.getState().chatMessages;
@@ -4051,6 +4052,7 @@ describe("AudioGraphStore", () => {
       ],
       isChatLoading: true,
       streamingChatRequestId: "req-final",
+      chatReplyTurnId: "turn-final",
     });
 
     useAudioGraphStore.getState().finalizeChatStream(
@@ -4244,6 +4246,140 @@ describe("AudioGraphStore", () => {
       content: "",
       failure: RATE_LIMITED_DIAGNOSTIC,
     });
+  });
+
+  it("marks a superseded turn's cancellation on its own bubble and keeps the newer turn loading", () => {
+    useAudioGraphStore.setState({
+      chatMessages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: "Half an", turnId: "turn-a" },
+        { role: "user", content: "second" },
+        { role: "assistant", content: "", turnId: "turn-b" },
+      ],
+      isChatLoading: true,
+      streamingChatRequestId: "req-b",
+      chatReplyTurnId: "turn-b",
+    });
+
+    useAudioGraphStore.getState().finalizeChatStream(
+      {
+        request_id: "req-a",
+        full_text: "Half an answer",
+        finish_reason: "cancelled",
+      },
+      "turn-a",
+    );
+
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages[1]).toEqual({
+      role: "assistant",
+      content: "Half an answer [cancelled]",
+    });
+    expect(s.chatMessages[3]).toEqual({
+      role: "assistant",
+      content: "",
+      turnId: "turn-b",
+    });
+    expect(s.isChatLoading).toBe(true);
+    expect(s.streamingChatRequestId).toBe("req-b");
+  });
+
+  it("lets a late blocking reply fill its own bubble without releasing a newer turn", async () => {
+    let resolveFirst: (response: unknown) => void = () => {};
+    let starts = 0;
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        starts += 1;
+        if (starts === 1) throw new Error("streaming unsupported by provider");
+        return new Promise<string>(() => {});
+      }
+      if (cmd === "send_chat_message") {
+        return new Promise((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return undefined;
+    });
+
+    const first = useAudioGraphStore.getState().sendChatMessage("first");
+    await vi.waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("send_chat_message", {
+        message: "first",
+      }),
+    );
+    void useAudioGraphStore.getState().sendChatMessage("second");
+    resolveFirst({
+      message: { role: "assistant", content: "first reply" },
+      tokens_used: 1,
+    });
+    await first;
+
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages.map((m) => m.content)).toEqual([
+      "first",
+      "first reply",
+      "second",
+      "",
+    ]);
+    expect(s.isChatLoading).toBe(true);
+    expect(s.chatReplyTurnId).toBe(s.chatMessages[3].turnId);
+  });
+
+  it("does not fall back to the blocking command for a send the user cleared", async () => {
+    let rejectStart: (error: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        return new Promise<string>((_, reject) => {
+          rejectStart = reject;
+        });
+      }
+      return undefined;
+    });
+
+    const send = useAudioGraphStore.getState().sendChatMessage("private");
+    await useAudioGraphStore.getState().clearChatHistory();
+    rejectStart(new Error("streaming unsupported by provider"));
+    await send;
+
+    expect(invoke).not.toHaveBeenCalledWith(
+      "send_chat_message",
+      expect.anything(),
+    );
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages).toEqual([]);
+    expect(s.isChatLoading).toBe(false);
+  });
+
+  it("shows a start the backend refused as cancelled instead of retrying it", async () => {
+    const CANCELLED_DIAGNOSTIC = {
+      kind: "runtime",
+      detail: {
+        code: "cancelled",
+        retryable: false,
+        recovery_action: "none",
+        context: { operation: "language_model_inference" },
+      },
+    } as const;
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        throw { code: "runtime_diagnostic", diagnostic: CANCELLED_DIAGNOSTIC };
+      }
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().sendChatMessage("hello");
+
+    expect(invoke).not.toHaveBeenCalledWith(
+      "send_chat_message",
+      expect.anything(),
+    );
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages.at(-1)).toEqual({
+      role: "assistant",
+      content: "",
+      failure: CANCELLED_DIAGNOSTIC,
+    });
+    expect(s.isChatLoading).toBe(false);
   });
 
   // -----------------------------------------------------------------------
