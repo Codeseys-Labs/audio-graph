@@ -18387,9 +18387,50 @@ mod tests {
                 let _ = Command::new("subst.exe").args([&self.0, "/D"]).output();
             }
         }
-        let _lock = crate::sessions::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        const CHILD: &str = "AUDIOGRAPH_TEST_WEAK_CAPTURE_SUBST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let state = AppState::new();
+            assert!(
+                state
+                    .transcript_event_writer
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .is_unqualified()
+            );
+            ensure_session_writers_ready(&state).expect("synced unqualified writer admits capture");
+            let receipt = state
+                .transcript_event_writer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .append_after(&transcript_event_fixture("leaf", "first"), Some(0))
+                .unwrap();
+            assert_eq!(receipt.sequence, 1);
+            assert_eq!(
+                receipt.barrier,
+                crate::persistence::canonical_durability::CanonicalDurabilityBarrier::SyncedUnqualified
+            );
+            assert!(
+                state
+                    .pipeline_status
+                    .read()
+                    .unwrap()
+                    .transcript_crash_safety_unverified
+            );
+            assert!(!*state.is_capturing.read().unwrap());
+            drain_test_writers(&state);
+            std::fs::write(
+                crate::user_data::data_root()
+                    .unwrap()
+                    .join("capture-admitted"),
+                b"ok",
+            )
+            .unwrap();
+            return;
+        }
         let real = unique_tempdir("capture-subst");
         let mapping = (b'D'..=b'Z')
             .rev()
@@ -18409,24 +18450,18 @@ mod tests {
             })
             .expect("available drive for SUBST capture fixture");
         let root = std::path::PathBuf::from(format!("{}\\", mapping.0));
-        let home = HomeGuard::set(&root);
-        let state = AppState::new();
-        assert!(
-            state
-                .transcript_event_writer
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .is_unqualified()
-        );
-        ensure_session_writers_ready(&state).expect("synced unqualified writer admits capture");
-        assert!(!*state.is_capturing.read().unwrap());
-        drain_test_writers(&state);
-        drop(state);
-        drop(home);
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "commands::tests::writable_subst_storage_admits_capture_with_unverified_crash_safety","--nocapture"])
+            .env(CHILD, "1")
+            .env(crate::user_data::DATA_DIR_ENV, &root)
+            .env("HOME",&root)
+            .env("USERPROFILE",&root)
+            .status().unwrap();
+        let admitted = std::fs::read(real.join("capture-admitted")).ok();
         drop(mapping);
         std::fs::remove_dir_all(real).unwrap();
+        assert!(child.success(), "isolated capture preflight and receipt");
+        assert_eq!(admitted.as_deref(), Some(b"ok".as_slice()));
     }
 
     #[test]

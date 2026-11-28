@@ -709,6 +709,7 @@ pub enum ManifestCasOutcome {
 enum UnqualifiedReadPolicy {
     PlatformDefault,
     ReadOnly,
+    ExistingGuardRequired,
 }
 
 /// One explicit-root manifest store. It never resolves or provisions a
@@ -768,14 +769,23 @@ impl SessionArtifactManifestStore {
                 refusal,
                 Error::ParentProvisioningRequired | Error::ManagedRootNotDirectory
             ));
-        if !read_only {
+        if matches!(
+            refusal,
+            Error::ParentProvisioningRequired | Error::ManagedRootNotDirectory
+        ) {
             return Err(ManifestStoreError::Qualification(refusal));
         }
         let mut store = Self::for_session(root, session_id)?;
         store.root = root
             .canonicalize()
             .map_err(|error| ManifestStoreError::Load(load_io(&error)))?;
-        store.qualification = Err(UnqualifiedReadPolicy::ReadOnly);
+        store.qualification = Err(if read_only {
+            UnqualifiedReadPolicy::ReadOnly
+        } else {
+            // An inconclusive probe cannot authorize unguarded absence. A
+            // weak v1 writer has already established the real floor lock.
+            UnqualifiedReadPolicy::ExistingGuardRequired
+        });
         Ok(store)
     }
 
@@ -839,7 +849,13 @@ impl SessionArtifactManifestStore {
         let coordination_path = self.root.join(COORDINATION_FILE_NAME);
         let manifest_exists = entry_exists(&manifest_path)?;
         let coordination_exists = entry_exists(&coordination_path)?;
-        if !manifest_exists && !coordination_exists {
+        if !manifest_exists
+            && !coordination_exists
+            && !matches!(
+                self.qualification,
+                Err(UnqualifiedReadPolicy::ExistingGuardRequired)
+            )
+        {
             return Ok(ManifestLoadOutcome::Absent);
         }
         let _guard = self
@@ -856,7 +872,9 @@ impl SessionArtifactManifestStore {
     fn shared_guard(&self) -> Result<CanonicalSharedGuard, CanonicalCoordinationError> {
         match &self.qualification {
             Ok(proof) => self.durability.try_lock_shared_qualified(&self.root, proof),
-            Err(UnqualifiedReadPolicy::ReadOnly) => CanonicalSharedGuard::open_existing(&self.root),
+            Err(UnqualifiedReadPolicy::ReadOnly | UnqualifiedReadPolicy::ExistingGuardRequired) => {
+                CanonicalSharedGuard::open_existing(&self.root)
+            }
             Err(UnqualifiedReadPolicy::PlatformDefault) => {
                 self.durability.try_lock_shared(&self.root)
             }
@@ -900,7 +918,12 @@ impl SessionArtifactManifestStore {
                     .map_err(CheckedManifestReadError::Load)?;
                 return reader(head).map_err(CheckedManifestReadError::Reader);
             }
-            if manifest_before {
+            if manifest_before
+                || matches!(
+                    self.qualification,
+                    Err(UnqualifiedReadPolicy::ExistingGuardRequired)
+                )
+            {
                 return Err(CheckedManifestReadError::Load(
                     ManifestLoadError::Coordination(CanonicalCoordinationError::Missing),
                 ));
