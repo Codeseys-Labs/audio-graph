@@ -39,7 +39,8 @@ pub struct ApiConfig {
 impl std::fmt::Debug for ApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiConfig")
-            .field("endpoint", &self.endpoint)
+            // Presence only: an endpoint can embed a host, path, or credential.
+            .field("has_endpoint", &!self.endpoint.is_empty())
             .field(
                 "api_key",
                 &crate::credentials::redacted_secret_presence(self.api_key.as_deref()),
@@ -233,7 +234,9 @@ struct Usage {
 #[derive(Clone)]
 pub struct ApiClient {
     config: ApiConfig,
-    client: reqwest::blocking::Client,
+    /// `None` when the HTTP client could not be built. Dispatch then fails
+    /// closed rather than retrying construction in a path that panics.
+    client: Option<reqwest::blocking::Client>,
     content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 }
 
@@ -244,13 +247,13 @@ impl ApiClient {
             .connect_timeout(API_CONNECT_TIMEOUT)
             .timeout(API_REQUEST_TIMEOUT)
             .build()
-            .unwrap_or_else(|_| {
-                log::warn!(
-                    "API HTTP client setup failed: {}",
-                    HttpFailure::new(Code::Internal, INFERENCE)
-                );
-                reqwest::blocking::Client::new()
-            });
+            .ok();
+        if client.is_none() {
+            log::warn!(
+                "API HTTP client setup failed: {}",
+                HttpFailure::new(Code::Internal, INFERENCE)
+            );
+        }
 
         Self {
             config,
@@ -349,6 +352,9 @@ impl ApiClient {
         self.content_egress_policy
             .check_prompt("llm.api")
             .map_err(|_| HttpFailure::new(Code::PolicyBlocked, INFERENCE))?;
+        let Some(client) = &self.client else {
+            return Err(HttpFailure::new(Code::Internal, INFERENCE));
+        };
 
         let api_messages: Vec<ApiMessage> = messages
             .into_iter()
@@ -402,14 +408,18 @@ impl ApiClient {
                 .capability
                 .constrained_decoding;
 
-        let mut req = self.client.post(&url).json(&request);
+        let mut req = client.post(&url).json(&request);
 
         // Trim before deciding: a whitespace-only key ("   ") is effectively
         // unset, and sending it as a bearer token turns "no key" into a hard auth
         // failure (CodeRabbit api_client.rs:187).
-        if let Some(key) = self.config.api_key.as_deref().map(str::trim)
-            && !key.is_empty()
-        {
+        let key = self
+            .config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        if let Some(key) = key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
 
@@ -419,7 +429,7 @@ impl ApiClient {
 
         let status = response.status();
         if !status.is_success() {
-            return Err(HttpFailure::status(status, INFERENCE));
+            return Err(HttpFailure::status(status, INFERENCE, key.is_some()));
         }
 
         let completion: ChatCompletionResponse = response
@@ -504,11 +514,15 @@ impl ApiClient {
                 RequestOutputForm::VllmStructuredOutputs { schema },
             ) {
                 Ok((raw, _, _)) => raw,
-                Err(error) => {
+                // A mode downgrade answers a refused schema and nothing else.
+                // Resending after any other failure would repeat a timeout's
+                // unknown remote effect or bury a rate limit under the retry.
+                Err(error) if error.schema_rejection.is_some() => {
                     log::warn!("vLLM structured output failed; falling back to JSON mode: {error}");
                     self.chat_completion_with_wire_outcome(messages, RequestOutputForm::JsonObject)?
                         .0
                 }
+                Err(error) => return Err(error),
             }
         } else {
             self.chat_completion_with_wire_outcome(messages, RequestOutputForm::JsonObject)?
@@ -646,7 +660,8 @@ mod tests {
 
         assert!(!debug.contains("sk-api-debug-secret"));
         assert!(debug.contains("<present>"));
-        assert!(debug.contains("https://api.openai.com/v1"));
+        assert!(debug.contains("has_endpoint: true"));
+        assert!(!debug.contains("api.openai.com"));
         assert!(debug.contains("test-model"));
     }
 
@@ -1104,33 +1119,85 @@ mod tests {
 
     #[test]
     fn chat_completion_non_2xx_returns_only_the_diagnostic_token() {
-        use crate::llm::http_diag::log_canary::Capture;
+        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
 
         let rt = tokio::runtime::Runtime::new().expect("rt");
         let key = "api-credential-canary";
-        let body = "provider-private-body-canary";
+        let body = format!("provider-private-body-canary{}", "b".repeat(5000));
         let path = "private-endpoint-canary";
-        let (base, _) = rt.block_on(spawn_mock(429, "Too Many Requests", body.to_owned()));
         let prompt = format!("api-prompt-canary{}", "x".repeat(2048));
-        let length = prompt.len().to_string();
+        // Exact sizes of the prompt and of the response body.
+        let lengths = [prompt.len(), body.len()].map(|len| len.to_string());
+        let (base, _) = rt.block_on(spawn_mock(429, "Too Many Requests", body));
         let endpoint = format!("{base}/{path}?private=query-canary");
-        let err = run_blocking(move || {
+        let (err, logs) = run_blocking(move || {
             let logs = Capture::start();
             let client = ApiClient::new(config(&endpoint, Some(key)))
                 .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
             let result = client.chat_completion(vec![("user".into(), prompt)], false);
-            logs.assert_absent(&[
+            (
+                result.expect_err("provider rejected the request"),
+                logs.finish(),
+            )
+        });
+        assert_eq!(err, "runtime/rate_limited");
+        assert_absent(
+            &logs,
+            &[
                 key,
-                body,
+                "provider-private-body-canary",
                 path,
                 "query-canary",
                 "api-request-canary",
                 "api-prompt-canary",
-                &length,
-            ]);
-            result.expect_err("provider rejected the request")
-        });
+            ],
+        );
+        assert_absent(&logs, &lengths.each_ref().map(String::as_str));
+    }
+
+    #[test]
+    fn a_rejected_key_is_a_credential_failure_only_when_a_key_was_sent() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        for (key, expected) in [
+            (Some("sk-test"), "credential/access_denied"),
+            (None, "runtime/request_rejected"),
+        ] {
+            let (base, _) = rt.block_on(spawn_mock(401, "Unauthorized", String::new()));
+            let err = run_blocking(move || {
+                ApiClient::new(config(&base, key))
+                    .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
+                    .chat_completion(vec![("user".into(), "hi".into())], false)
+            })
+            .expect_err("the provider answered 401");
+            assert_eq!(err, expected, "key sent: {}", key.is_some());
+        }
+    }
+
+    #[test]
+    fn vllm_extraction_does_not_resend_after_a_rate_limit() {
+        // The mock answers one request. A JSON-mode resend would fail some
+        // other way and replace the rate limit the cooldown needs to see.
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (base, _) = rt.block_on(spawn_mock(429, "Too Many Requests", String::new()));
+        let client = ApiClient::new(config(&format!("{base}/vllm/v1"), None))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        assert!(client.prefers_vllm_structured_outputs());
+
+        let err = run_blocking(move || client.extract_entities("Alice met Bob", "Alice", ""))
+            .expect_err("the endpoint is rate limited");
         assert_eq!(err, "runtime/rate_limited");
+    }
+
+    #[test]
+    fn a_client_that_failed_to_initialize_fails_closed() {
+        let mut client = ApiClient::new(config("http://127.0.0.1:1/v1", None))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        client.client = None;
+
+        let err = client
+            .chat_completion(vec![("user".into(), "hi".into())], false)
+            .expect_err("there is no HTTP client to dispatch with");
+        assert_eq!(err, "runtime/internal");
     }
 
     #[test]

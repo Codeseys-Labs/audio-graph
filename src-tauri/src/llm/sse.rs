@@ -36,7 +36,7 @@
 
 use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
 
-use crate::llm::http_diag::{INFERENCE, diagnostic};
+use crate::llm::http_diag::{INFERENCE, diagnostic, status_code};
 pub use crate::llm::stream_contract::StreamUsage;
 
 /// Default maximum size for one buffered SSE frame before the decoder reports
@@ -167,10 +167,11 @@ impl SseDecoder {
         }
 
         if is_error_event {
-            return Some(SseEvent::Error(diagnostic(
-                Code::ProviderUnavailable,
-                INFERENCE,
-            )));
+            // The payload may be a bare error object or an envelope; either
+            // way only its structured fields are read.
+            let code = serde_json::from_str::<serde_json::Value>(&data)
+                .map_or(Code::Internal, |frame| fault_code(&frame));
+            return Some(SseEvent::Error(diagnostic(code, INFERENCE)));
         }
 
         if !have_data {
@@ -190,26 +191,75 @@ impl SseDecoder {
         // as an error so it isn't deserialized into an empty `StreamChunk` and
         // dropped. A normal token chunk has no top-level `error` field, so this
         // never misclassifies real deltas.
-        if has_error_envelope(&data) {
-            return Some(SseEvent::Error(diagnostic(
-                Code::ProviderUnavailable,
-                INFERENCE,
-            )));
+        if let Some(code) = fault_in_data(&data) {
+            return Some(SseEvent::Error(diagnostic(code, INFERENCE)));
         }
 
         Some(SseEvent::Data(data))
     }
 }
 
-/// Detect an error signal without extracting or formatting its contents.
-fn has_error_envelope(data: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-        return false;
-    };
-    value
+/// `Some` when a `data:` frame is a provider fault rather than a token chunk.
+/// A healthy chunk may carry `"error": null` or `"error": false`.
+fn fault_in_data(data: &str) -> Option<Code> {
+    let frame: serde_json::Value = serde_json::from_str(data).ok()?;
+    let has_error = frame
         .get("error")
-        .is_some_and(|error| !error.is_null() && error.as_bool() != Some(false))
-        || value.get("type").and_then(|kind| kind.as_str()) == Some("error")
+        .is_some_and(|error| !error.is_null() && error.as_bool() != Some(false));
+    let is_error = frame.get("type").and_then(|kind| kind.as_str()) == Some("error");
+    (has_error || is_error).then(|| fault_code(&frame))
+}
+
+/// Classify a provider fault from its structured code fields. The message is
+/// never read: a fault with no recognized code is `internal`, not a guess from
+/// prose and not an outage worth retrying.
+fn fault_code(frame: &serde_json::Value) -> Code {
+    let error = frame.get("error").filter(|error| error.is_object());
+    [
+        error.and_then(|error| error.get("code")),
+        error.and_then(|error| error.get("status")),
+        error.and_then(|error| error.get("type")),
+        frame.get("code"),
+        frame.get("status"),
+        frame.get("type"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(structured_code)
+    .unwrap_or(Code::Internal)
+}
+
+/// An HTTP status (number or numeric string) or an allowlisted provider token.
+fn structured_code(value: &serde_json::Value) -> Option<Code> {
+    if let Some(status) = value.as_u64() {
+        return u16::try_from(status).ok().and_then(status_code);
+    }
+    let token = value.as_str()?;
+    if let Ok(status) = token.parse() {
+        return status_code(status);
+    }
+    Some(match token.to_ascii_lowercase().as_str() {
+        "rate_limit"
+        | "rate_limited"
+        | "rate_limit_error"
+        | "rate_limit_exceeded"
+        | "too_many_requests"
+        | "insufficient_quota" => Code::RateLimited,
+        "overloaded"
+        | "overloaded_error"
+        | "server_error"
+        | "api_error"
+        | "internal_server_error"
+        | "service_unavailable" => Code::ProviderUnavailable,
+        "timeout" | "timeout_error" | "request_timeout" | "gateway_timeout" => Code::Timeout,
+        "invalid_request"
+        | "invalid_request_error"
+        | "context_length_exceeded"
+        | "model_not_found"
+        | "not_found_error"
+        | "request_too_large" => Code::RequestRejected,
+        _ => return None,
+    })
 }
 
 /// Find the first occurrence of `needle` in `haystack`. Linear scan; for the
@@ -389,20 +439,67 @@ mod tests {
     }
 
     #[test]
-    fn named_error_event_discards_provider_message() {
+    fn named_error_event_is_classified_by_structured_type_only() {
         // BUG 4a49: a provider that reports a mid-stream fault via a named
         // `event: error` SSE frame must reach SseEvent::Error, not be dropped.
         let mut dec = SseDecoder::new();
         dec.feed(
-            b"event: error\ndata: {\"error\":{\"message\":\"rate limit exceeded\",\"type\":\"rate_limit\"}}\n\n",
+            b"event: error\ndata: {\"error\":{\"message\":\"sse-message-canary\",\"type\":\"rate_limit\"}}\n\n",
         );
         assert_eq!(
             dec.next_event(),
-            Some(SseEvent::Error(diagnostic(
-                Code::ProviderUnavailable,
-                INFERENCE
-            )))
+            Some(SseEvent::Error(diagnostic(Code::RateLimited, INFERENCE)))
         );
+    }
+
+    #[test]
+    fn structured_fault_codes_classify_without_reading_the_message() {
+        // Each message contradicts its code: only the code may decide.
+        for (frame, code) in [
+            (
+                r#"{"error":{"code":429,"message":"server exploded"}}"#,
+                Code::RateLimited,
+            ),
+            (
+                r#"{"error":{"code":"429","message":"timed out"}}"#,
+                Code::RateLimited,
+            ),
+            (
+                r#"{"error":{"status":503,"message":"rate limit"}}"#,
+                Code::ProviderUnavailable,
+            ),
+            (
+                r#"{"error":{"code":"rate_limit_exceeded","message":"x"}}"#,
+                Code::RateLimited,
+            ),
+            (
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"rate limit"}}"#,
+                Code::ProviderUnavailable,
+            ),
+            (
+                r#"{"error":{"type":"invalid_request_error","message":"429"}}"#,
+                Code::RequestRejected,
+            ),
+            (
+                r#"{"type":"error","code":408,"message":"rate limit"}"#,
+                Code::Timeout,
+            ),
+            (
+                r#"{"error":{"code":"a-code-this-app-does-not-know","message":"rate limit 429"}}"#,
+                Code::Internal,
+            ),
+            (
+                r#"{"error":{"code":200,"message":"rate limit"}}"#,
+                Code::Internal,
+            ),
+            (r#"{"error":"rate limit exceeded (429)"}"#, Code::Internal),
+            (
+                r#"{"type":"error","message":"too many requests"}"#,
+                Code::Internal,
+            ),
+        ] {
+            assert_eq!(fault_in_data(frame), Some(code), "{frame}");
+        }
     }
 
     #[test]
@@ -414,10 +511,7 @@ mod tests {
         dec.feed(b"data: {\"error\":{\"message\":\"context length exceeded\"}}\n\n");
         assert_eq!(
             dec.next_event(),
-            Some(SseEvent::Error(diagnostic(
-                Code::ProviderUnavailable,
-                INFERENCE
-            )))
+            Some(SseEvent::Error(diagnostic(Code::Internal, INFERENCE)))
         );
     }
 
@@ -427,10 +521,7 @@ mod tests {
         dec.feed(b"event: error\n\n");
         assert_eq!(
             dec.next_event(),
-            Some(SseEvent::Error(diagnostic(
-                Code::ProviderUnavailable,
-                INFERENCE
-            )))
+            Some(SseEvent::Error(diagnostic(Code::Internal, INFERENCE)))
         );
     }
 
@@ -471,9 +562,10 @@ mod tests {
     fn explicit_false_error_field_is_not_misclassified() {
         // Sibling of 4a72: some gateways use `"error": false` as the "no error"
         // sentinel. It must also fall through to Data, not fabricate an error.
-        assert!(!has_error_envelope(
-            r#"{"choices":[{"delta":{"content":"x"}}],"error":false}"#
-        ));
+        assert_eq!(
+            fault_in_data(r#"{"choices":[{"delta":{"content":"x"}}],"error":false}"#),
+            None
+        );
     }
 
     #[test]
@@ -486,10 +578,7 @@ mod tests {
         dec.feed(b"event: error\ndata: {\"error\":\"upstream timeout\"}\n\n");
         assert_eq!(
             dec.next_event(),
-            Some(SseEvent::Error(diagnostic(
-                Code::ProviderUnavailable,
-                INFERENCE
-            )))
+            Some(SseEvent::Error(diagnostic(Code::Internal, INFERENCE)))
         );
     }
 

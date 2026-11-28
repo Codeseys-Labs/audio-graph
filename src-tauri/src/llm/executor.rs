@@ -8,7 +8,9 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
-use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode as Code, RuntimeOperation,
+};
 
 use crate::error::AppError;
 use crate::graph::entities::ExtractionResult;
@@ -24,7 +26,7 @@ use crate::projection_llm::{
 use crate::projections::{ProjectionJob, ProjectionKind, ProjectionPatch, TranscriptLedger};
 use crate::settings::LlmProvider;
 
-use super::http_diag::SchemaRejection;
+use super::http_diag::{SchemaRejection, diagnostic};
 use super::route::{
     AttemptedRouteIdentity, AuthorizedRoute, BlockingBackend, ConstrainedDecodingGrade,
     ModelIdentitySource, RequestOutputForm, RouteRecord, TerminalStatus, WireOutcome,
@@ -242,10 +244,14 @@ impl LlmExecutor {
             mistralrs_engine,
         };
 
-        let _ = std::thread::Builder::new()
+        // The spawn error is OS prose; the failure itself is the whole signal.
+        if std::thread::Builder::new()
             .name("llm-executor".to_string())
             .spawn(move || worker_loop(worker_queue, handles))
-            .map_err(|e| log::error!("Failed to spawn LLM executor thread: {}", e));
+            .is_err()
+        {
+            log::error!("Failed to spawn LLM executor thread");
+        }
 
         Self { queue }
     }
@@ -610,6 +616,15 @@ fn no_blocking_route_error(route: &AuthorizedRoute) -> String {
     )
 }
 
+/// Terminal for a model reply that never became a valid patch, on any route.
+fn unusable_reply() -> String {
+    diagnostic(
+        Code::InvalidResponse,
+        RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
+    )
+    .to_string()
+}
+
 /// One route attempt's content-free result.
 #[derive(Debug)]
 struct ProjectionBackendOutput {
@@ -848,11 +863,10 @@ fn run_projection_patch_on_route(
                 PROJECTION_PATCH_REPAIR_PROMPT_ID,
                 Some("repair"),
             )
-            .map_err(|repair_error| {
-                format!(
-                    "projection patch draft invalid and repair failed: {first_error}; repair: {repair_error}"
-                )
-            })?;
+            // The validator's errors served the repair prompt and stop here:
+            // a parse error can quote the reply and a validation error can
+            // carry a model-chosen operation id.
+            .map_err(|_| unusable_reply())?;
             outcome.tokens_used = output.tokens_used.saturating_add(repair_output.tokens_used);
             Ok(outcome)
         }
@@ -1228,7 +1242,7 @@ fn projection_native(
     let engine = guard
         .as_ref()
         .ok_or_else(|| "Native LLM is not loaded".to_string())?;
-    let outcome = engine.chat(messages, "")?;
+    let outcome = engine.chat(messages, "").map_err(|e| e.to_string())?;
     Ok(ProjectionBackendOutput {
         raw_json: outcome.text,
         route_id: route.id(),
@@ -1277,7 +1291,9 @@ fn projection_mistralrs(
             log::warn!(
                 "mistral.rs structured projection output failed, falling back to chat JSON mode: {e}"
             );
-            let (raw_json, tokens_used) = engine.chat_with_history_usage(messages, "")?;
+            let (raw_json, tokens_used) = engine
+                .chat_with_history_usage(messages, "")
+                .map_err(|e| e.to_string())?;
             (
                 raw_json,
                 tokens_used,
@@ -1404,7 +1420,9 @@ fn chat_native(
         .ok_or_else(|| "Native LLM is not loaded".to_string())?;
     // The native engine's inference loop counts prompt + completion tokens, so
     // this is the one blocking backend that surfaces a real `tokens_used`.
-    engine.chat(messages, graph_context)
+    engine
+        .chat(messages, graph_context)
+        .map_err(|e| e.to_string())
 }
 
 fn chat_api(
@@ -1489,6 +1507,7 @@ fn chat_mistralrs(
     engine
         .chat_with_history_usage(messages, graph_context)
         .map(|(text, tokens_used)| ChatOutcome { text, tokens_used })
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1780,24 +1799,41 @@ mod tests {
     fn projection_patch_fails_after_one_repair_attempt() {
         let (job, ledger) = projection_test_job(ProjectionKind::Notes);
         let call_count = Arc::new(Mutex::new(0usize));
-        let invalid = serde_json::json!({
-            "operations": [{
-                "type": "upsert_graph_node",
-                "id": "person:alice",
-                "name": "Alice",
-                "entity_type": "person",
-                "description": null
-            }]
-        })
+        // Each reply fails to parse, and the parser's error quotes the value.
+        let reply = |value: &str| {
+            serde_json::json!({
+                "operations": [{ "type": value, "id": "validation-id-canary" }]
+            })
+            .to_string()
+        };
+        let draft = reply("validation-value-canary");
+        let repair = reply("repair-value-canary");
+        let private_detail = projection_outcome_from_output(
+            &projection_output(draft.clone(), 3),
+            &job,
+            &ledger,
+            None.into(),
+            4,
+            123,
+            PROJECTION_PATCH_PROMPT_ID,
+            None,
+        )
+        .expect_err("the draft is invalid")
         .to_string();
+        assert!(
+            private_detail.contains("validation-value-canary"),
+            "the validator error must carry the value for this to be a canary: {private_detail}"
+        );
 
+        let logs = crate::llm::http_diag::log_canary::Capture::start();
         let err = run_projection_patch_on_route(
             {
                 let call_count = call_count.clone();
                 move |_messages| {
                     let mut count = call_count.lock().unwrap_or_else(|e| e.into_inner());
                     *count += 1;
-                    Ok(projection_output(invalid.clone(), 3))
+                    let raw = if *count == 1 { &draft } else { &repair };
+                    Ok(projection_output(raw.clone(), 3))
                 }
             },
             &projection_patch_prompt_messages(&job, &ledger, None).expect("initial prompt"),
@@ -1808,10 +1844,18 @@ mod tests {
             123,
         )
         .expect_err("repair remains invalid");
+        let logs = logs.finish();
 
         assert_eq!(*call_count.lock().unwrap_or_else(|e| e.into_inner()), 2);
-        assert!(err.contains("projection patch draft invalid and repair failed"));
-        assert!(err.contains("upsert_graph_node"));
+        assert_eq!(err, "runtime/invalid_response");
+        crate::llm::http_diag::log_canary::assert_absent(
+            &logs,
+            &[
+                "validation-value-canary",
+                "repair-value-canary",
+                "validation-id-canary",
+            ],
+        );
     }
 
     #[test]
@@ -2160,8 +2204,11 @@ mod tests {
             (429, None),
             (502, None),
         ] {
-            let failure =
-                HttpFailure::status(reqwest::StatusCode::from_u16(status).unwrap(), INFERENCE);
+            let failure = HttpFailure::status(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                INFERENCE,
+                true,
+            );
             assert_eq!(failure.schema_rejection, expected, "status {status}");
         }
     }
@@ -2634,10 +2681,7 @@ mod tests {
             2,
             "one draft + one SAME-route repair, and no third attempt"
         );
-        assert!(
-            err.contains("projection patch draft invalid and repair failed"),
-            "got: {err}"
-        );
+        assert_eq!(err, "runtime/invalid_response");
     }
 
     /// ADR-0037 x ADR-0038: a draft rejected for MISSING CLAIM EVIDENCE

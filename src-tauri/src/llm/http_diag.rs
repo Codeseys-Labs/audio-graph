@@ -2,6 +2,9 @@
 
 use std::fmt;
 
+use audio_graph_ipc_contract::credential_contract::{
+    CredentialError, CredentialErrorCode, CredentialSafeRecoveryAction,
+};
 use audio_graph_ipc_contract::runtime_diagnostic::{
     RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode as Code, RuntimeErrorDiagnostic,
     RuntimeOperation, RuntimeSafeRecoveryAction as Action, RuntimeStatusClass, RuntimeTransport,
@@ -44,6 +47,53 @@ pub(super) const fn with_status(
     }
 }
 
+/// Category for an HTTP status, whether it arrived on a response line or as a
+/// structured error code. `None` is not a failure status this module knows.
+pub(super) const fn status_code(status: u16) -> Option<Code> {
+    Some(match status {
+        408 => Code::Timeout,
+        429 => Code::RateLimited,
+        500..=599 => Code::ProviderUnavailable,
+        400..=499 => Code::RequestRejected,
+        _ => return None,
+    })
+}
+
+/// Structural evidence that a provider refused the caller's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AuthFailure {
+    /// HTTP 401 on a request that carried a credential.
+    CredentialRejected,
+    /// HTTP 403, or a modeled access denial.
+    PermissionDenied,
+    /// A modeled expired-credential signal.
+    CredentialExpired,
+}
+
+/// The only place LLM auth evidence becomes a diagnostic; every HTTP and SDK
+/// path routes through it.
+///
+/// The contract has no provider-auth codes yet. `credential/access_denied`
+/// stands in for a rejected credential and the other two remain ordinary
+/// rejections; swap these arms when those codes exist.
+pub(super) fn auth_diagnostic(
+    failure: AuthFailure,
+    context: RuntimeDiagnosticContext,
+) -> RuntimeDiagnostic {
+    match failure {
+        AuthFailure::CredentialRejected => CredentialError {
+            code: CredentialErrorCode::AccessDenied,
+            retryable: false,
+            recovery_action: CredentialSafeRecoveryAction::ReenterCredential,
+            set_id: None,
+        }
+        .into(),
+        AuthFailure::PermissionDenied | AuthFailure::CredentialExpired => {
+            diagnostic(Code::RequestRejected, context)
+        }
+    }
+}
+
 /// Private recovery evidence for the projection schema downgrade. Never
 /// rendered or serialized as part of the public diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,21 +116,27 @@ impl HttpFailure {
         }
     }
 
-    pub(super) fn status(status: StatusCode, context: RuntimeDiagnosticContext) -> Self {
-        let code = match status.as_u16() {
-            408 => Code::Timeout,
-            429 => Code::RateLimited,
-            500..=599 => Code::ProviderUnavailable,
-            400..=499 => Code::RequestRejected,
-            _ => Code::ProtocolError,
+    /// `credential_sent` is whether the request carried a provider credential:
+    /// without one a 401 is an ordinary rejection, not a rejected credential.
+    pub(super) fn status(
+        status: StatusCode,
+        context: RuntimeDiagnosticContext,
+        credential_sent: bool,
+    ) -> Self {
+        let context = with_status(context, status.as_u16());
+        let diagnostic = match status.as_u16() {
+            401 if credential_sent => auth_diagnostic(AuthFailure::CredentialRejected, context),
+            403 => auth_diagnostic(AuthFailure::PermissionDenied, context),
+            other => diagnostic(status_code(other).unwrap_or(Code::ProtocolError), context),
         };
-        let mut failure = Self::new(code, with_status(context, status.as_u16()));
-        failure.schema_rejection = match status.as_u16() {
-            400 | 422 => Some(SchemaRejection::Request),
-            404 => Some(SchemaRejection::Model),
-            _ => None,
-        };
-        failure
+        Self {
+            diagnostic,
+            schema_rejection: match status.as_u16() {
+                400 | 422 => Some(SchemaRejection::Request),
+                404 => Some(SchemaRejection::Model),
+                _ => None,
+            },
+        }
     }
 
     pub(super) fn request(error: &reqwest::Error, context: RuntimeDiagnosticContext) -> Self {
@@ -128,69 +184,57 @@ impl From<HttpFailure> for String {
     }
 }
 
+/// Log capture for canary tests.
+///
+/// A test binary has one global `log` logger, so this reuses the capture
+/// `tts::test_support` installs instead of competing with it; a third harness
+/// must join that logger too. Capture is per thread, which keeps parallel tests
+/// apart: run the code under test on the capturing thread.
 #[cfg(test)]
 pub(super) mod log_canary {
-    use std::cell::RefCell;
-    use std::sync::Once;
+    use crate::tts::test_support::{capture_tts_logs, take_tts_logs};
 
-    thread_local! {
-        static LOG: RefCell<Option<String>> = const { RefCell::new(None) };
-    }
-
-    struct Logger;
-
-    impl log::Log for Logger {
-        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.target().starts_with("audio_graph::llm::")
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            use std::fmt::Write as _;
-            if self.enabled(record.metadata()) {
-                LOG.with_borrow_mut(|buffer| {
-                    if let Some(buffer) = buffer {
-                        writeln!(buffer, "{}", record.args()).unwrap();
-                    }
-                });
-            }
-        }
-
-        fn flush(&self) {}
-    }
-
-    pub(crate) struct Capture;
+    pub(crate) struct Capture(());
 
     impl Capture {
         pub(crate) fn start() -> Self {
-            static INIT: Once = Once::new();
-            INIT.call_once(|| {
-                log::set_logger(&Logger).unwrap();
-                log::set_max_level(log::LevelFilter::Trace);
-            });
-            LOG.with_borrow_mut(|buffer| {
-                assert!(buffer.is_none(), "nested log capture");
-                *buffer = Some(String::new());
-            });
-            Self
+            capture_tts_logs();
+            Self(())
         }
 
-        pub(crate) fn assert_absent(&self, canaries: &[&str]) {
-            LOG.with_borrow(|buffer| {
-                let logs = buffer.as_deref().unwrap();
-                for canary in canaries {
-                    assert!(!logs.contains(canary), "log leaked {canary}: {logs}");
-                }
-            });
-        }
-
-        pub(crate) fn contents(&self) -> String {
-            LOG.with_borrow(|buffer| buffer.as_ref().unwrap().clone())
+        /// End the capture and return every line logged on this thread.
+        pub(crate) fn finish(self) -> String {
+            take_tts_logs().join("\n")
         }
     }
 
-    impl Drop for Capture {
-        fn drop(&mut self) {
-            LOG.with_borrow_mut(|buffer| *buffer = None);
+    /// Assert that no canary reached a returned error, terminal frame, or log.
+    pub(crate) fn assert_absent(output: &str, canaries: &[&str]) {
+        for canary in canaries {
+            assert!(!output.contains(canary), "leaked {canary}: {output}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_401_is_a_credential_failure_only_for_a_credential_that_was_sent() {
+        let token = |status: u16, credential_sent| {
+            HttpFailure::status(
+                StatusCode::from_u16(status).unwrap(),
+                INFERENCE,
+                credential_sent,
+            )
+            .to_string()
+        };
+        assert_eq!(token(401, true), "credential/access_denied");
+        assert_eq!(token(401, false), "runtime/request_rejected");
+        // No provider-auth code exists yet for a denied but valid credential.
+        assert_eq!(token(403, true), "runtime/request_rejected");
+        assert_eq!(token(429, true), "runtime/rate_limited");
+        assert_eq!(token(302, true), "runtime/protocol_error");
     }
 }

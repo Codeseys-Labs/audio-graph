@@ -333,6 +333,38 @@ describe("ProviderReadinessPanel", () => {
     );
   });
 
+  it("recognizes the closed credential-rejected token exactly", () => {
+    // A migrated probe's whole message is the token. Anything that merely
+    // contains it, or a different closed token, is not a rejected credential.
+    expect(
+      isCredentialRejectedReadinessMessage("credential/access_denied"),
+    ).toBe(true);
+    for (const other of [
+      "runtime/request_rejected",
+      "credential/missing",
+      "provider said credential/access_denied",
+      "credential/access_denied_elsewhere",
+    ]) {
+      expect(isCredentialRejectedReadinessMessage(other)).toBe(false);
+    }
+  });
+
+  it("gives the closed credential-rejected token the dedicated recovery copy", () => {
+    const action = providerRecoveryAction(
+      readiness({
+        provider_id: "llm.openrouter",
+        status: "error",
+        message: "credential/access_denied",
+        credentials: [{ key: "openrouter_api_key", present: true }],
+      }),
+      t,
+    );
+    expect(action).toMatch(/rejected \(401\)/i);
+    expect(action).not.toMatch(
+      /replace the saved key or adjust provider settings/i,
+    );
+  });
+
   it("distinguishes a 401 credential rejection from a generic saved-key error", () => {
     // A generic (non-401) error with a saved credential still gets the
     // pre-existing "replace or adjust settings" copy...

@@ -441,8 +441,18 @@ export function credentialSourceLabel(
 // (audio-graph-57cc)
 const CREDENTIAL_REJECTED_PREFIX = "Credential rejected (401):";
 
+// The closed diagnostic token a migrated probe returns as its whole message
+// when the provider answered 401 to a request that carried a key — today the
+// OpenRouter probe (`auth_diagnostic`, src-tauri/src/llm/http_diag.rs). It is
+// a token, so it is matched exactly, never as a prefix or substring. Probes
+// not yet migrated still send the legacy prefix above.
+const CREDENTIAL_REJECTED_TOKEN = "credential/access_denied";
+
 export function isCredentialRejectedReadinessMessage(message: string): boolean {
-  return message.startsWith(CREDENTIAL_REJECTED_PREFIX);
+  return (
+    message === CREDENTIAL_REJECTED_TOKEN ||
+    message.startsWith(CREDENTIAL_REJECTED_PREFIX)
+  );
 }
 
 export function providerRecoveryAction(

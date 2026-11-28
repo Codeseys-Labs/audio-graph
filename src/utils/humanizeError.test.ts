@@ -32,6 +32,13 @@ describe("classifyError", () => {
     expect(classifyError("Invalid API key")).toBe("auth");
   });
 
+  it("classifies the closed credential diagnostic tokens as auth", () => {
+    expect(classifyError("credential/access_denied")).toBe("auth");
+    expect(classifyError("credential/missing")).toBe("auth");
+    // A generic provider rejection is not evidence of a bad credential.
+    expect(classifyError("runtime/request_rejected")).toBe("unknown");
+  });
+
   it("classifies network/timeout shapes as network", () => {
     expect(classifyError("network timeout calling Deepgram")).toBe("network");
     expect(classifyError("Failed to fetch")).toBe("network");

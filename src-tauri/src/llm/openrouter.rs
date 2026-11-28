@@ -97,12 +97,16 @@ impl std::fmt::Debug for OpenRouterConfig {
                 &crate::credentials::redacted_secret_presence(Some(&self.api_key)),
             )
             .field("model", &self.model)
-            .field("base_url", &self.base_url)
+            // Closed facts only: a custom base URL or attribution header can
+            // carry a host, path, or credential.
+            .field("custom_base_url", &(self.base_url != DEFAULT_BASE_URL))
             .field("provider_order", &self.provider_order)
             .field("routing_policy", &self.routing_policy)
             .field("include_usage_in_stream", &self.include_usage_in_stream)
-            .field("http_referer", &self.http_referer)
-            .field("app_title", &self.app_title)
+            .field(
+                "custom_attribution",
+                &(self.http_referer != DEFAULT_HTTP_REFERER || self.app_title != DEFAULT_APP_TITLE),
+            )
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
             .finish()
@@ -1247,7 +1251,13 @@ async fn get_catalog_response(
 ) -> Result<reqwest::Response, RuntimeDiagnostic> {
     let api_key = api_key.trim();
     if api_key.is_empty() {
-        return Err(catalog_credential_error(CredentialErrorCode::Missing));
+        return Err(CredentialError {
+            code: CredentialErrorCode::Missing,
+            retryable: false,
+            recovery_action: CredentialSafeRecoveryAction::ReenterCredential,
+            set_id: None,
+        }
+        .into());
     }
 
     let context = http_context(operation);
@@ -1267,24 +1277,12 @@ async fn get_catalog_response(
         .map_err(|error| HttpFailure::request(&error, context).diagnostic)?;
 
     let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(catalog_credential_error(CredentialErrorCode::AccessDenied));
-    }
     if !status.is_success() {
         capture_openrouter_http_diagnostic();
-        return Err(HttpFailure::status(status, context).diagnostic);
+        // The key is never empty here, so a 401 is about that key.
+        return Err(HttpFailure::status(status, context, true).diagnostic);
     }
     Ok(response)
-}
-
-fn catalog_credential_error(code: CredentialErrorCode) -> RuntimeDiagnostic {
-    CredentialError {
-        code,
-        retryable: false,
-        recovery_action: CredentialSafeRecoveryAction::ReenterCredential,
-        set_id: None,
-    }
-    .into()
 }
 
 fn openrouter_providers_url(base_url: &str) -> Result<reqwest::Url, RuntimeDiagnostic> {
@@ -1361,7 +1359,9 @@ fn split_model_id(model_id: &str) -> Option<(&str, &str)> {
 #[derive(Clone)]
 pub struct OpenRouterClient {
     config: OpenRouterConfig,
-    client: reqwest::blocking::Client,
+    /// `None` when the HTTP client could not be built. Dispatch then fails
+    /// closed rather than retrying construction in a path that panics.
+    client: Option<reqwest::blocking::Client>,
     content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 }
 
@@ -1383,13 +1383,13 @@ impl OpenRouterClient {
             .timeout(HTTP_REQUEST_TIMEOUT)
             .default_headers(headers)
             .build()
-            .unwrap_or_else(|_| {
-                log::warn!(
-                    "OpenRouter HTTP client setup failed: {}",
-                    HttpFailure::new(Code::Internal, INFERENCE)
-                );
-                reqwest::blocking::Client::new()
-            });
+            .ok();
+        if client.is_none() {
+            log::warn!(
+                "OpenRouter HTTP client setup failed: {}",
+                HttpFailure::new(Code::Internal, INFERENCE)
+            );
+        }
 
         Self {
             config,
@@ -1603,6 +1603,10 @@ impl OpenRouterClient {
         self.content_egress_policy
             .check_prompt("llm.openrouter")
             .map_err(|_| HttpFailure::new(Code::PolicyBlocked, INFERENCE))?;
+        let Some(client) = &self.client else {
+            return Err(HttpFailure::new(Code::Internal, INFERENCE));
+        };
+        let credential_sent = !self.config.api_key.trim().is_empty();
 
         let response_format = match form {
             RequestOutputForm::Unconstrained => None,
@@ -1681,8 +1685,7 @@ impl OpenRouterClient {
             // Attempts are 1-based; the request body must be rebuilt each try
             // because `.json()` + `.send()` consume the builder.
             let attempt = attempt_number;
-            let outcome = self
-                .client
+            let outcome = client
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", self.config.api_key))
                 .header("HTTP-Referer", &self.config.http_referer)
@@ -1697,7 +1700,7 @@ impl OpenRouterClient {
                         if is_retryable_chat_status(status) && attempt < CHAT_MAX_ATTEMPTS {
                             log::warn!(
                                 "OpenRouter chat transient HTTP failure (attempt {attempt}/{CHAT_MAX_ATTEMPTS}); retrying: {}",
-                                HttpFailure::status(status, INFERENCE)
+                                HttpFailure::status(status, INFERENCE, credential_sent)
                             );
                             // Honor a server-provided Retry-After (clamped so the
                             // total budget stays bounded); otherwise fall back to
@@ -1714,7 +1717,7 @@ impl OpenRouterClient {
                             continue;
                         }
                         capture_openrouter_http_diagnostic();
-                        return Err(HttpFailure::status(status, INFERENCE));
+                        return Err(HttpFailure::status(status, INFERENCE, credential_sent));
                     }
                     // Success status: capture the sanitized request id from the
                     // headers, then decode the body inside the retry loop. A
@@ -2208,7 +2211,20 @@ mod tests {
         assert!(!debug.contains("sk-openrouter-debug-secret"));
         assert!(debug.contains("<present>"));
         assert!(debug.contains("openai/gpt-5.2"));
-        assert!(debug.contains(DEFAULT_BASE_URL));
+        assert!(debug.contains("custom_base_url: false"));
+        assert!(debug.contains("custom_attribution: false"));
+        assert!(!debug.contains(DEFAULT_BASE_URL) && !debug.contains(DEFAULT_HTTP_REFERER));
+
+        let custom = OpenRouterConfig {
+            base_url: "https://private-proxy-canary.example/v1".into(),
+            http_referer: "https://private-referer-canary.example".into(),
+            ..config
+        };
+        let debug = format!("{custom:?}");
+        assert!(debug.contains("custom_base_url: true"));
+        assert!(debug.contains("custom_attribution: true"));
+        assert!(!debug.contains("private-proxy-canary"));
+        assert!(!debug.contains("private-referer-canary"));
     }
 
     fn test_config(provider_order: Option<Vec<String>>) -> OpenRouterConfig {
@@ -2965,12 +2981,25 @@ mod tests {
             .join()
             .expect("worker thread panic")
             .expect_err("401 must fail immediately with no retry");
-        assert_eq!(err, "runtime/request_rejected");
+        // The request carried a key, so the 401 is about that credential.
+        assert_eq!(err, "credential/access_denied");
         assert_eq!(
             request_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "auth 401 must NOT be retried — exactly one request"
         );
+    }
+
+    #[test]
+    fn a_client_that_failed_to_initialize_fails_closed() {
+        let mut client = OpenRouterClient::new(retry_test_config("http://127.0.0.1:1".into()))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        client.client = None;
+
+        let err = client
+            .chat_completion(vec![("user".into(), "hi".into())], false)
+            .expect_err("there is no HTTP client to dispatch with");
+        assert_eq!(err, "runtime/internal");
     }
 
     #[test]
@@ -3561,15 +3590,16 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_returns_only_the_diagnostic_token() {
-        use crate::llm::http_diag::log_canary::Capture;
+        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
 
         let key = "catalog-credential-canary";
-        let body = "catalog-provider-body-canary";
+        let body = format!("catalog-provider-body-canary{}", "b".repeat(6000));
+        let body_length = body.len().to_string();
         let (base, _) = spawn_scripted_mock(vec![(
             429,
             "Too Many Requests",
             "X-Request-Id: catalog-request-canary\r\n",
-            body.to_owned(),
+            body,
         )])
         .await;
         let logs = Capture::start();
@@ -3580,13 +3610,17 @@ mod tests {
         .await
         .expect_err("catalog HTTP error");
         assert_eq!(err, "runtime/rate_limited");
-        logs.assert_absent(&[
-            key,
-            body,
-            "catalog-request-canary",
-            "catalog-path-canary",
-            "query-canary",
-        ]);
+        assert_absent(
+            &logs.finish(),
+            &[
+                key,
+                "catalog-provider-body-canary",
+                "catalog-request-canary",
+                "catalog-path-canary",
+                "query-canary",
+                &body_length,
+            ],
+        );
     }
 
     #[tokio::test]
@@ -4256,13 +4290,14 @@ mod tests {
 
     #[test]
     fn chat_completion_http_diagnostic_and_retry_logs_are_content_free() {
-        use crate::llm::http_diag::log_canary::Capture;
+        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let key = "openrouter-credential-canary";
         let prompt = format!("openrouter-prompt-canary{}", "x".repeat(2048));
-        let length = prompt.len().to_string();
         let body = format!("private-body-canary {key} {prompt}");
+        // Exact sizes of the prompt and of the response body.
+        let lengths = [prompt.len(), body.len()].map(|len| len.to_string());
         let (base, request_count) = rt.block_on(spawn_scripted_mock(vec![
             (
                 502,
@@ -4272,28 +4307,35 @@ mod tests {
             );
             3
         ]));
-        let err = std::thread::spawn(move || {
+        let (err, logs) = std::thread::spawn(move || {
             let logs = Capture::start();
             let mut config = retry_test_config(format!("{base}/path-canary?private=query-canary"));
             config.api_key = key.to_owned();
             let client = OpenRouterClient::new(config)
                 .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
             let result = client.chat_completion(vec![("user".into(), prompt)], false);
-            assert!(logs.contents().contains("runtime/provider_unavailable"));
-            logs.assert_absent(&[
+            (
+                result.expect_err("502 after exhausting retries"),
+                logs.finish(),
+            )
+        })
+        .join()
+        .unwrap();
+        assert_eq!(err, "runtime/provider_unavailable");
+        // Two retries were logged, by diagnostic token only.
+        assert_eq!(logs.matches("runtime/provider_unavailable").count(), 2);
+        assert_absent(
+            &logs,
+            &[
                 key,
                 "private-body-canary",
                 "openrouter-prompt-canary",
                 "openrouter-request-canary",
                 "path-canary",
                 "query-canary",
-                &length,
-            ]);
-            result.expect_err("502 after exhausting retries")
-        })
-        .join()
-        .unwrap();
-        assert_eq!(err, "runtime/provider_unavailable");
+            ],
+        );
+        assert_absent(&logs, &lengths.each_ref().map(String::as_str));
         assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 

@@ -39,8 +39,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::engine::ChatMessage;
-use crate::llm::http_diag::{diagnostic, with_status};
-use crate::llm::stream_contract::{StreamContextMetadata, StreamTerminalEvent, StreamUsage};
+use crate::llm::http_diag::{AuthFailure, auth_diagnostic, diagnostic, with_status};
+use crate::llm::stream_contract::{
+    FinishReason, StreamContextMetadata, StreamTerminalEvent, StreamUsage,
+};
 use crate::llm::streaming::TokenDelta;
 use crate::settings::AwsCredentialSource;
 
@@ -78,17 +80,13 @@ pub enum BedrockStreamEvent {
 ///
 /// Bedrock reasons (`StopReason`): `end_turn`, `tool_use`, `max_tokens`,
 /// `stop_sequence`, `guardrail_intervened`, `content_filtered`. Anything else
-/// (including future SDK additions) falls back to `"stop"` so the stream still
-/// terminates cleanly rather than surfacing a raw SDK token.
-pub fn map_stop_reason(stop_reason: &str) -> String {
-    match stop_reason.trim().to_ascii_lowercase().as_str() {
-        "max_tokens" => "length",
-        "tool_use" => "tool_calls",
-        "content_filtered" | "guardrail_intervened" => "content_filter",
-        // `end_turn`, `stop_sequence`, and anything unknown -> "stop".
-        _ => "stop",
+/// (including future SDK additions) falls back to `stop` so the stream still
+/// terminates cleanly.
+pub fn map_stop_reason(stop_reason: &str) -> FinishReason {
+    match FinishReason::from_provider(stop_reason) {
+        FinishReason::Unknown | FinishReason::Error => FinishReason::Stop,
+        known => known,
     }
-    .to_string()
 }
 
 /// Build a [`StreamUsage`] from Bedrock metadata token counts.
@@ -206,7 +204,7 @@ async fn drive_bedrock_events<S>(
                     StreamTerminalEvent::done(
                         std::mem::take(&mut full_text),
                         usage.take(),
-                        "stop".to_string(),
+                        FinishReason::Stop,
                         metadata,
                     ),
                 )
@@ -529,26 +527,33 @@ fn converse_start_failure(
 
     sdk_failure(error, |service, response| {
         let status = response.status().as_u16();
+        let context = with_status(INFERENCE, status);
+        let auth = |failure| auth_diagnostic(failure, context);
         let code = match service {
-            AccessDeniedException(_) | ResourceNotFoundException(_) | ValidationException(_) => {
-                Code::RequestRejected
-            }
+            AccessDeniedException(_) => return auth(AuthFailure::PermissionDenied),
+            ResourceNotFoundException(_) | ValidationException(_) => Code::RequestRejected,
             ModelTimeoutException(_) => Code::Timeout,
             ThrottlingException(_) => Code::RateLimited,
             InternalServerException(_)
             | ModelNotReadyException(_)
             | ServiceUnavailableException(_) => Code::ProviderUnavailable,
             ModelErrorException(_) | ModelStreamErrorException(_) => Code::InvalidResponse,
-            // Use recognized HTTP signals, never the unmodeled service text.
-            _ => match status {
-                400 | 401 | 403 | 404 | 422 => Code::RequestRejected,
-                408 | 504 => Code::Timeout,
-                429 => Code::RateLimited,
-                500 | 502 | 503 => Code::ProviderUnavailable,
+            // An unmodeled error: its code and the response status are the only
+            // evidence. The service text is never read.
+            _ => match (service.meta().code(), status) {
+                (Some("ExpiredToken" | "ExpiredTokenException"), _) => {
+                    return auth(AuthFailure::CredentialExpired);
+                }
+                (_, 401) => return auth(AuthFailure::CredentialRejected),
+                (_, 403) => return auth(AuthFailure::PermissionDenied),
+                (_, 400 | 404 | 422) => Code::RequestRejected,
+                (_, 408 | 504) => Code::Timeout,
+                (_, 429) => Code::RateLimited,
+                (_, 500 | 502 | 503) => Code::ProviderUnavailable,
                 _ => Code::Internal,
             },
         };
-        diagnostic(code, with_status(INFERENCE, status))
+        diagnostic(code, context)
     })
 }
 
@@ -733,15 +738,19 @@ mod tests {
 
     #[test]
     fn stop_reason_maps_to_openai_finish_reason() {
-        assert_eq!(map_stop_reason("end_turn"), "stop");
-        assert_eq!(map_stop_reason("stop_sequence"), "stop");
-        assert_eq!(map_stop_reason("max_tokens"), "length");
-        assert_eq!(map_stop_reason("tool_use"), "tool_calls");
-        assert_eq!(map_stop_reason("content_filtered"), "content_filter");
-        assert_eq!(map_stop_reason("guardrail_intervened"), "content_filter");
-        // Case-insensitive + unknown fallback.
-        assert_eq!(map_stop_reason("END_TURN"), "stop");
-        assert_eq!(map_stop_reason("something_new_from_aws"), "stop");
+        for (sdk, expected) in [
+            ("end_turn", "stop"),
+            ("stop_sequence", "stop"),
+            ("max_tokens", "length"),
+            ("tool_use", "tool_calls"),
+            ("content_filtered", "content_filter"),
+            ("guardrail_intervened", "content_filter"),
+            // Case-insensitive + unknown fallback.
+            ("END_TURN", "stop"),
+            ("something_new_from_aws", "stop"),
+        ] {
+            assert_eq!(map_stop_reason(sdk).as_str(), expected, "{sdk}");
+        }
     }
 
     #[test]
@@ -846,7 +855,7 @@ mod tests {
 
     #[test]
     fn classify_construction_timeout_and_response_errors_without_formatting_sources() {
-        use crate::llm::http_diag::log_canary::Capture;
+        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
 
         let logs = Capture::start();
         let source = || std::io::Error::other("sdk-source-canary prompt_bytes=7907");
@@ -858,16 +867,22 @@ mod tests {
                 Code::InvalidResponse,
             ),
         ];
+        let mut observed = String::new();
         for (error, code) in cases {
             let actual = converse_event_failure(&error);
             assert_eq!(actual, diagnostic(code, INFERENCE));
+            observed.push_str(&format!("{actual} {actual:?}\n"));
         }
-        logs.assert_absent(&["sdk-source-canary", "sdk-response-body-canary", "7907"]);
+        observed.push_str(&logs.finish());
+        assert_absent(
+            &observed,
+            &["sdk-source-canary", "sdk-response-body-canary", "7907"],
+        );
     }
 
     #[tokio::test]
     async fn sdk_service_error_messages_and_metadata_never_reach_terminals_or_logs() {
-        use crate::llm::http_diag::log_canary::Capture;
+        use crate::llm::http_diag::log_canary::{Capture, assert_absent};
         use aws_sdk_bedrockruntime::error::ErrorMetadata;
         use aws_sdk_bedrockruntime::types::error::ThrottlingException;
 
@@ -892,6 +907,7 @@ mod tests {
 
         // Unknown modeled names do not become categories via the message.
         // A recognized outer status is still valid classification evidence.
+        let mut observed = format!("{frames:?}\n");
         for (status, code) in [(429u16, Code::RateLimited), (418, Code::Internal)] {
             let mut response =
                 HttpResponse::new(status.try_into().unwrap(), "bedrock-body-canary".into());
@@ -900,19 +916,56 @@ mod tests {
                 .insert("x-amzn-requestid", request_id);
             let error =
                 SdkError::service_error(ConverseStreamError::generic(meta.clone()), response);
-            assert_eq!(
-                converse_start_failure(&error),
-                diagnostic(code, with_status(INFERENCE, status))
-            );
+            let actual = converse_start_failure(&error);
+            assert_eq!(actual, diagnostic(code, with_status(INFERENCE, status)));
+            observed.push_str(&format!("{actual} {actual:?}\n"));
         }
-        logs.assert_absent(&[
-            request_id,
-            "sdk-message-canary",
-            "aws-key-canary",
-            "private-prompt-canary",
-            "bedrock-body-canary",
-            "7919",
-        ]);
+        observed.push_str(&logs.finish());
+        assert_absent(
+            &observed,
+            &[
+                request_id,
+                "sdk-message-canary",
+                "aws-key-canary",
+                "private-prompt-canary",
+                "bedrock-body-canary",
+                "7919",
+            ],
+        );
+    }
+
+    #[test]
+    fn auth_evidence_goes_through_the_shared_auth_mapping() {
+        use aws_sdk_bedrockruntime::error::ErrorMetadata;
+        use aws_sdk_bedrockruntime::types::error::AccessDeniedException;
+
+        let start = |service: ConverseStreamError, status: u16| {
+            let response = HttpResponse::new(status.try_into().unwrap(), "".into());
+            converse_start_failure(&SdkError::service_error(service, response))
+        };
+        let unmodeled =
+            |code: &str| ConverseStreamError::generic(ErrorMetadata::builder().code(code).build());
+        let expected = |failure, status| auth_diagnostic(failure, with_status(INFERENCE, status));
+
+        let denied =
+            ConverseStreamError::AccessDeniedException(AccessDeniedException::builder().build());
+        assert_eq!(
+            start(denied, 403),
+            expected(AuthFailure::PermissionDenied, 403)
+        );
+        // An expired session token arrives unmodeled, as a 403 with this code.
+        assert_eq!(
+            start(unmodeled("ExpiredTokenException"), 403),
+            expected(AuthFailure::CredentialExpired, 403)
+        );
+        assert_eq!(
+            start(unmodeled("AnUnmodeledCode"), 403),
+            expected(AuthFailure::PermissionDenied, 403)
+        );
+        assert_eq!(
+            start(unmodeled("AnUnmodeledCode"), 401),
+            expected(AuthFailure::CredentialRejected, 401)
+        );
     }
 
     #[tokio::test]
