@@ -675,6 +675,11 @@ interface PipelineStages {
 }
 
 export interface PipelineStatus extends PipelineStages {
+  /**
+   * The capture the `capture` stage describes, written with it: together
+   * they are one capture fact (Running or Degraded is running, else ended).
+   */
+  capture_id: CaptureId;
   transcript_not_saving?:
     | "writer_absent"
     | "storage_full"
@@ -749,6 +754,8 @@ export interface CaptureSessionConfig {
 
 // Event payloads
 export interface CaptureErrorPayload {
+  /** The capture the failing source belongs to. */
+  capture_id: CaptureId;
   source_id: string;
   error: string;
   recoverable: boolean;
@@ -2956,7 +2963,16 @@ export type AppErrorPayload =
         reason: CaptureFailureReason;
         source_index: number | null;
         sources: CaptureSourceOutcome[];
+        /** This start's fact: always `ended`. */
+        capture: CaptureFact;
+        /** The backend's current capture fact. */
+        snapshot: CaptureFact;
       };
+    }
+  | {
+      code: "capture_stop_failed";
+      /** Whether the capture still runs is the snapshot's phase. */
+      message: { snapshot: CaptureFact };
     }
   | { code: "unknown"; message: string };
 
@@ -2983,12 +2999,38 @@ export type CaptureSourceOutcome =
   | { status: "not_attempted" };
 
 /**
- * `start_capture`'s acknowledgement: every requested source acknowledged.
- * `sources` are the canonical ids Stop must name, in request order.
+ * Identity of one capture start: the epoch `capture_attach` issued this
+ * renderer, and the renderer's sequence number for the start within it.
+ * Ordered epoch first, then sequence.
  */
-export interface CaptureStartAck {
-  generation: number;
-  sources: string[];
+export interface CaptureId {
+  epoch: number;
+  seq: number;
+}
+
+/** Where a capture is. `running` precedes `ended`. */
+export type CapturePhase = "running" | "ended";
+
+/**
+ * One backend fact about a capture. Facts are ordered by id, then phase, so
+ * the newest capture's latest phase is the maximum whatever order they
+ * arrive in.
+ */
+export interface CaptureFact {
+  id: CaptureId;
+  phase: CapturePhase;
+}
+
+/** A capture command's reply: its fact, and the backend's current fact. */
+export interface CaptureReply {
+  fact: CaptureFact;
+  snapshot: CaptureFact;
+}
+
+/** `capture_attach`'s reply: this renderer's epoch and the current fact. */
+export interface CaptureAttachment {
+  epoch: number;
+  snapshot: CaptureFact;
 }
 
 /**
@@ -3485,15 +3527,26 @@ export interface AudioGraphStore {
   // Capture state
   isCapturing: boolean;
   /**
-   * True from Start until the backend acknowledges the capture or the start
-   * fails. Session loaders and the Sessions browser refuse to load a
-   * historical session meanwhile, so capture never opens over old data.
+   * True from Start until a backend fact for that start arrives. Session
+   * loaders and the Sessions browser refuse to load a historical session
+   * meanwhile, so capture never opens over old data.
    */
   captureStarting: boolean;
-  /** Canonical ids of the running capture's sources, from its acknowledgement. */
-  captureSourceIds: string[];
+  /** True from Stop until an Ended fact at or above that Stop arrives. */
+  captureStopping: boolean;
+  /**
+   * The newest backend capture fact this renderer has seen. `isCapturing`,
+   * `captureStarting` and `captureStopping` derive from it and the two
+   * intents below; nothing else sets them.
+   */
+  captureFact: CaptureFact | null;
+  /** The id of this renderer's latest Start. */
+  captureStartIntent: CaptureId | null;
+  /** The id of this renderer's latest Stop. */
+  captureStopIntent: CaptureId | null;
   captureStartTime: number | null;
-  setIsCapturing: (capturing: boolean) => void;
+  /** Attach to capture control once per realm; starts await it. */
+  attachCapture: () => Promise<number>;
   startCapture: () => Promise<void>;
   stopCapture: () => Promise<void>;
   /**
@@ -3516,7 +3569,11 @@ export interface AudioGraphStore {
 
   // Transcribe state (manual transcription)
   isTranscribing: boolean;
-  startTranscribe: () => Promise<void>;
+  /**
+   * Start transcription for capture `captureId` (default: the running
+   * capture). The backend refuses it unless that capture is the live one.
+   */
+  startTranscribe: (captureId?: CaptureId) => Promise<void>;
   stopTranscribe: () => Promise<void>;
 
   // Error state

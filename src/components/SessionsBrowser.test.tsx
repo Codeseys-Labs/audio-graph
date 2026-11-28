@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
+import { running } from "../test/captureBackend";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
 import NowStrip from "./NowStrip";
 import SessionsBrowser, {
@@ -739,9 +740,12 @@ describe("SessionsBrowser component", () => {
       confidence: 1,
     };
 
+    const LIVE_CAPTURE = { epoch: 1, seq: 1 };
+
     function startLiveCapture(): void {
       useAudioGraphStore.setState({
         isCapturing: true,
+        captureFact: running(LIVE_CAPTURE),
         isTranscribing: true,
         selectedSourceIds: ["system-default"],
         captureStartTime: Date.now(),
@@ -757,6 +761,7 @@ describe("SessionsBrowser component", () => {
 
     afterEach(() => {
       useAudioGraphStore.setState({
+        captureFact: null,
         selectedSourceIds: [],
         captureStartTime: null,
         transcriptSegments: [],
@@ -835,7 +840,7 @@ describe("SessionsBrowser component", () => {
 
       await waitFor(() =>
         expect(mockedInvoke).toHaveBeenCalledWith("stop_capture", {
-          sourceId: "system-default",
+          id: LIVE_CAPTURE,
         }),
       );
     });

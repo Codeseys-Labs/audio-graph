@@ -2,6 +2,7 @@
   "controlBar": {
     "start": "Start",
     "stop": "Stop",
+    "stopping": "Stopping…",
     "recording": "Recording",
     "settings": "Settings",
     "sessions": "Sessions",
@@ -1644,6 +1645,9 @@
     "providerDeferred": "{{provider}} is not available for new sessions in the current MVP. Your saved settings are unchanged.",
     "providerSettingsLoading": "Provider settings are still loading. Try again shortly.",
     "artifactTooLarge": "This artifact is {{sizeMb}} MB, over the {{ceilingMb}} MB limit.",
+    "captureStop": {
+      "incomplete": "Capture did not stop cleanly. Press Stop again; if it still runs, restart AudioGraph."
+    },
     "captureStart": {
       "forSource": "{{source}}: {{reason}}",
       "invalid_source": "This audio source can't be captured. Refresh the source list and choose it again.",

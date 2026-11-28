@@ -46,6 +46,8 @@ export function computeCompositeHealth({
     transcript_not_saving,
     transcript_captions_lost,
     transcript_crash_safety_unverified,
+    // The capture id is the capture stage's identity, not a stage.
+    capture_id: _captureId,
     ...stageStatuses
   } = pipelineStatus;
   if (transcript_not_saving) return "error";

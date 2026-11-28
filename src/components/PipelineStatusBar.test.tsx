@@ -26,6 +26,7 @@ const idle: StageStatus = { type: "Idle" };
 
 function allIdle(): PipelineStatus {
   return {
+    capture_id: { epoch: 0, seq: 0 },
     capture: idle,
     pipeline: idle,
     asr: idle,

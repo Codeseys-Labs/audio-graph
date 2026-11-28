@@ -289,7 +289,69 @@ pub enum TranscriptSavingFailure {
     WriteFailed,
 }
 
+/// Identity of one capture start: the epoch the renderer received from
+/// `capture_attach`, and the renderer's sequence number for the start within
+/// it. Ordered lexicographically, epoch first.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct CaptureId {
+    pub epoch: u64,
+    pub seq: u64,
+}
+
+/// Where one capture is. `Running < Ended`: a capture only moves forward.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturePhase {
+    Running,
+    Ended,
+}
+
+/// One fact about the capture identified by `id`. Facts are ordered by id,
+/// then phase, so the newest capture's latest phase is the maximum, whatever
+/// order the facts arrive in.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct CaptureFact {
+    pub id: CaptureId,
+    pub phase: CapturePhase,
+}
+
+impl CaptureFact {
+    pub fn running(id: CaptureId) -> Self {
+        Self {
+            id,
+            phase: CapturePhase::Running,
+        }
+    }
+
+    pub fn ended(id: CaptureId) -> Self {
+        Self {
+            id,
+            phase: CapturePhase::Ended,
+        }
+    }
+}
+
 /// Overall pipeline status, combining all stages.
+///
+/// The capture stage is private and written only with its capture id
+/// ([`Self::set_capture`]), under the same lock, so every snapshot any thread
+/// clones and emits carries one consistent capture fact.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PipelineStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -304,12 +366,37 @@ pub struct PipelineStatus {
     /// File sync succeeded on storage without a qualified crash-durability tier.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transcript_crash_safety_unverified: bool,
-    pub capture: StageStatus,
+    /// The capture `capture` describes.
+    capture_id: CaptureId,
+    capture: StageStatus,
     pub pipeline: StageStatus,
     pub asr: StageStatus,
     pub diarization: StageStatus,
     pub entity_extraction: StageStatus,
     pub graph: StageStatus,
+}
+
+impl PipelineStatus {
+    pub fn capture(&self) -> &StageStatus {
+        &self.capture
+    }
+
+    /// The capture fact this snapshot states: Running while its capture stage
+    /// runs, Ended otherwise.
+    pub fn capture_fact(&self) -> CaptureFact {
+        match self.capture {
+            StageStatus::Running { .. } | StageStatus::Degraded { .. } => {
+                CaptureFact::running(self.capture_id)
+            }
+            StageStatus::Idle | StageStatus::Error { .. } => CaptureFact::ended(self.capture_id),
+        }
+    }
+
+    /// Set the capture stage and the capture it describes, together.
+    pub fn set_capture(&mut self, id: CaptureId, stage: StageStatus) {
+        self.capture_id = id;
+        self.capture = stage;
+    }
 }
 
 /// Interim ASR hypothesis from streaming providers.
@@ -921,6 +1008,8 @@ pub struct LiveAssistCardRecord {
 /// Payload for capture error events.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CaptureErrorPayload {
+    /// The capture the failing source belongs to.
+    pub capture_id: CaptureId,
     pub source_id: String,
     pub error: String,
     pub recoverable: bool,
@@ -1047,6 +1136,31 @@ pub fn is_storage_full(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_facts_order_by_id_then_phase_and_a_status_states_one() {
+        let older = CaptureId { epoch: 2, seq: 9 };
+        let newer = CaptureId { epoch: 3, seq: 0 };
+        assert!(older < newer, "the epoch compares first");
+        assert!(CaptureFact::running(newer) < CaptureFact::ended(newer));
+        assert!(CaptureFact::ended(older) < CaptureFact::running(newer));
+
+        let mut status = PipelineStatus::default();
+        status.set_capture(newer, StageStatus::Running { processed_count: 0 });
+        assert_eq!(status.capture_fact(), CaptureFact::running(newer));
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            wire["capture_id"],
+            serde_json::json!({"epoch": 3, "seq": 0})
+        );
+        assert_eq!(wire["capture"]["type"], "Running");
+        status.set_capture(newer, StageStatus::Idle);
+        assert_eq!(status.capture_fact(), CaptureFact::ended(newer));
+        assert_eq!(
+            serde_json::to_value(CaptureFact::ended(newer)).unwrap(),
+            serde_json::json!({"id": {"epoch": 3, "seq": 0}, "phase": "ended"})
+        );
+    }
 
     fn test_runtime_diagnostic() -> audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic
     {

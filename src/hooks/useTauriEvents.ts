@@ -63,6 +63,7 @@ import {
 } from "../generated/runtimeDiagnostic";
 import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
+import { compareCaptureIds } from "../store/captureFacts";
 import type {
   AgentProposalEvent,
   AgentStatusEvent,
@@ -435,7 +436,14 @@ export function useTauriEvents(): void {
           console.error("Capture error", {
             recoverable: event.payload.recoverable,
           });
-          setError(event.payload.error);
+          // An error from a capture older than the newest one known is stale.
+          const fact = useAudioGraphStore.getState().captureFact;
+          if (
+            fact === null ||
+            compareCaptureIds(event.payload.capture_id, fact.id) >= 0
+          ) {
+            setError(event.payload.error);
+          }
         }),
         safeListen<CaptureBackpressurePayload>(
           CAPTURE_BACKPRESSURE,
@@ -578,6 +586,16 @@ export function useTauriEvents(): void {
         return;
       }
       unlisten = handles;
+      // Attach to capture control once this realm listens: the snapshot it
+      // returns adopts a capture still running after a reload, and the
+      // attachment cancels any start the previous page left pending. The
+      // store keeps one attachment per realm, so a remount reuses it.
+      useAudioGraphStore
+        .getState()
+        .attachCapture()
+        .catch(() => {
+          // Start attaches again before it sends anything.
+        });
       // The startup storage probe may have finished before the renderer mounted.
       // Subscribe first so a slow initial read cannot overwrite a newer event.
       if (!sawPipelineStatus) {

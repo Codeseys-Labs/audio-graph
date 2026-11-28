@@ -308,17 +308,23 @@ describe("AudioGraph desktop shell (embedded WebdriverIO/Tauri E2E)", () => {
     await listSourcesMock.mockReturnValue([MOCK_SOURCE]);
 
     const startMock = await browser.tauri.mock("start_capture");
-    // A real acknowledgement: the store treats a missing one as a failure.
+    // A real acknowledgement: the store merges its facts. A static mock
+    // cannot echo the request's capture id, so it acknowledges an id above
+    // any this renderer allocates (ids compare epoch first).
+    const acknowledged = { epoch: 1_000_000, seq: 0 };
     await startMock.mockResolvedValueOnce({
-      generation: 1,
-      sources: [MOCK_SOURCE.id],
+      fact: { id: acknowledged, phase: "running" },
+      snapshot: { id: acknowledged, phase: "running" },
     });
     await startMock.mockRejectedValueOnce(
       new Error("e2e-mocked-capture-failure"),
     );
 
     const stopMock = await browser.tauri.mock("stop_capture");
-    await stopMock.mockResolvedValue(null);
+    await stopMock.mockResolvedValue({
+      fact: { id: acknowledged, phase: "ended" },
+      snapshot: { id: acknowledged, phase: "ended" },
+    });
 
     // `AudioSourceSelector` lives in the always-mounted `<aside>` outside the
     // `workspaceView`-switched `<main>` subtree (App.tsx), so hopping tabs

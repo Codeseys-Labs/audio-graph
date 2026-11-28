@@ -125,6 +125,8 @@ function formatAppError(err: AppErrorPayload): string {
       });
     case "capture_start_failed":
       return captureStartFailureMessage(err.message?.reason);
+    case "capture_stop_failed":
+      return i18n.t("errors.captureStop.incomplete");
     case "unknown":
       return err.message;
   }

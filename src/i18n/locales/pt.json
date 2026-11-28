@@ -2,6 +2,7 @@
   "controlBar": {
     "start": "Iniciar",
     "stop": "Parar",
+    "stopping": "Parando…",
     "recording": "Gravando",
     "settings": "Configurações",
     "sessions": "Sessões",
@@ -1644,6 +1645,9 @@
     "providerDeferred": "{{provider}} não está disponível para novas sessões no MVP atual. Suas configurações salvas permanecem inalteradas.",
     "providerSettingsLoading": "As configurações dos provedores ainda estão carregando. Tente novamente em instantes.",
     "artifactTooLarge": "Este artefato tem {{sizeMb}} MB, acima do limite de {{ceilingMb}} MB.",
+    "captureStop": {
+      "incomplete": "A captura não parou de forma limpa. Pressione Parar novamente; se ela continuar, reinicie o AudioGraph."
+    },
     "captureStart": {
       "forSource": "{{source}}: {{reason}}",
       "invalid_source": "Esta fonte de áudio não pode ser capturada. Atualize a lista de fontes e escolha-a novamente.",

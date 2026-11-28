@@ -28,7 +28,7 @@ use tauri::AppHandle;
 use crate::audio::pipeline::AudioPipelineInput;
 use crate::events::{
     CAPTURE_BACKPRESSURE, CAPTURE_ERROR, CaptureBackpressurePayload, CaptureErrorPayload,
-    emit_or_log,
+    CaptureId, emit_or_log,
 };
 use crate::state::{
     AudioChannelProvenanceKind, AudioDeviceKind, AudioFormatInfo, AudioPermissionKind,
@@ -407,6 +407,8 @@ const GATE_ABANDONED: u8 = 2;
 /// Keeping the handoff explicit makes the thread boundary auditable and avoids
 /// a long positional argument list as lifecycle metadata grows.
 struct CaptureThreadContext {
+    /// The capture this worker belongs to; capture-error events carry it.
+    capture_id: CaptureId,
     /// Tags chunks; never logged (ids can carry application names).
     source_id: String,
     target: CaptureTarget,
@@ -553,6 +555,7 @@ fn stop_prepared_workers(
 #[allow(clippy::too_many_arguments)]
 fn spawn_capture_worker(
     hooks: &CaptureWorkerHooks,
+    capture_id: CaptureId,
     index: usize,
     request: CaptureSourceStart,
     commit_timeout: Duration,
@@ -589,6 +592,7 @@ fn spawn_capture_worker(
         }),
     };
     let context = CaptureThreadContext {
+        capture_id,
         source_id: request.source_id.clone(),
         target: request.target,
         stop_signal: Arc::clone(&stop_signal),
@@ -625,6 +629,7 @@ fn spawn_capture_worker(
                         &panic_app,
                         CAPTURE_ERROR,
                         CaptureErrorPayload {
+                            capture_id,
                             source_id: panic_source,
                             error: "capture thread panicked".to_string(),
                             recoverable: false,
@@ -685,6 +690,7 @@ pub(crate) fn prepare_capture_sources(
         } else {
             match spawn_capture_worker(
                 hooks,
+                ticket.id,
                 index,
                 request,
                 commit_timeout,
@@ -1789,25 +1795,24 @@ pub struct AudioCaptureManager {
     /// (nor listed, nor seen by any gate) until
     /// [`Self::commit_prepared_captures`].
     pending_start: Option<PendingCaptureStart>,
-    next_attempt: u64,
-    /// Attempt id of the committed aggregate: the acknowledged generation.
-    generation: u64,
+    /// The epoch the latest `capture_attach` issued.
+    epoch: u64,
+    /// Every capture up to and including this id is ended or refused: a start
+    /// at or below it never registers. Raised by Stop and by attach.
+    cancelled_through: CaptureId,
+    /// The newest start that registered; a start must be newer.
+    last_registered: CaptureId,
+    /// The committed aggregate that owns `sources` (or last owned them).
+    capture_id: CaptureId,
     /// Set by app shutdown; no start may commit afterwards.
     shutting_down: bool,
-    /// Start ids a Stop named before their start registered (bounded): such
-    /// a start is refused before it prepares anything.
-    stopped_start_ids: std::collections::VecDeque<String>,
     /// The session whose CaptureStarted row may or may not be on the ledger
     /// because its append failed. The next start resolves it first.
     uncertain_capture_start: Option<String>,
 }
 
-/// How many Stop-before-registration start ids are remembered.
-const STOPPED_START_IDS_KEPT: usize = 32;
-
 struct PendingCaptureStart {
-    attempt: u64,
-    start_id: String,
+    id: CaptureId,
     /// Dropped to cancel, so a cancel is sticky and wakes the waiting start.
     cancel_tx: Option<crossbeam_channel::Sender<()>>,
 }
@@ -1815,7 +1820,7 @@ struct PendingCaptureStart {
 /// A registered start. Its owner must call
 /// [`AudioCaptureManager::release_capture_start`] on every exit.
 pub(crate) struct CaptureStartTicket {
-    pub(crate) attempt: u64,
+    pub(crate) id: CaptureId,
     cancel_rx: crossbeam_channel::Receiver<()>,
     hooks: CaptureWorkerHooks,
 }
@@ -1863,7 +1868,7 @@ pub(crate) struct CaptureStartRollback {
 /// The committed aggregate a transcription or realtime start may attach to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AcknowledgedCapture {
-    pub(crate) generation: u64,
+    pub(crate) id: CaptureId,
     pub(crate) sources: Vec<String>,
 }
 
@@ -1889,10 +1894,11 @@ impl AudioCaptureManager {
             retired_threads: Vec::new(),
             hooks: CaptureWorkerHooks::default(),
             pending_start: None,
-            next_attempt: 0,
-            generation: 0,
+            epoch: 0,
+            cancelled_through: CaptureId::default(),
+            last_registered: CaptureId::default(),
+            capture_id: CaptureId::default(),
             shutting_down: false,
-            stopped_start_ids: std::collections::VecDeque::new(),
             uncertain_capture_start: None,
         }
     }
@@ -1985,70 +1991,94 @@ impl AudioCaptureManager {
 
     // ----- capture lifecycle -----------------------------------------------
 
-    /// Register a capture start before it waits for the session lifecycle,
-    /// so a Stop or shutdown issued from then on cancels it. Refuses a second
-    /// concurrent start, and a start a Stop already named.
+    /// A renderer attached: issue it a new epoch and fence every start an
+    /// earlier renderer left in flight, pending or not yet sent. A committed
+    /// capture survives and is adopted from the snapshot. Returns the epoch.
+    pub(crate) fn attach(&mut self) -> u64 {
+        self.epoch += 1;
+        self.cancel_through(CaptureId {
+            epoch: self.epoch,
+            seq: 0,
+        });
+        self.epoch
+    }
+
+    /// Register start `id` before it waits for the session lifecycle, so a
+    /// Stop, attach or shutdown from then on cancels it. A start registers
+    /// only if `id` is above both watermarks: newer than every cancelled id
+    /// and every start already registered. Refuses a second concurrent start.
     pub(crate) fn register_capture_start(
         &mut self,
-        start_id: &str,
+        id: CaptureId,
     ) -> Result<CaptureStartTicket, CaptureFailureReason> {
-        if self.shutting_down || self.stopped_start_ids.iter().any(|id| id == start_id) {
+        if self.shutting_down || id <= self.cancelled_through || id <= self.last_registered {
             return Err(CaptureFailureReason::Cancelled);
         }
         if self.pending_start.is_some() {
             return Err(CaptureFailureReason::AlreadyRunning);
         }
-        self.next_attempt += 1;
+        self.last_registered = id;
         let (cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
         self.pending_start = Some(PendingCaptureStart {
-            attempt: self.next_attempt,
-            start_id: start_id.to_string(),
+            id,
             cancel_tx: Some(cancel_tx),
         });
         Ok(CaptureStartTicket {
-            attempt: self.next_attempt,
+            id,
             cancel_rx,
             hooks: self.hooks.clone(),
         })
     }
 
-    /// Clear `attempt`'s registration. Idempotent; called on every exit.
-    pub(crate) fn release_capture_start(&mut self, attempt: u64) {
+    /// Clear `id`'s registration. Idempotent; called on every exit.
+    pub(crate) fn release_capture_start(&mut self, id: CaptureId) {
         if self
             .pending_start
             .as_ref()
-            .is_some_and(|pending| pending.attempt == attempt)
+            .is_some_and(|pending| pending.id == id)
         {
             self.pending_start = None;
         }
     }
 
-    /// Cancel a start on behalf of a Stop. With `start_id`, a pending start of
-    /// that id is cancelled, and an id not yet registered is remembered so
-    /// that start is refused when it arrives: whichever command reaches the
-    /// backend first, the start does not end up capturing. Without it, any
-    /// pending start is cancelled. Returns whether a pending start was.
-    pub(crate) fn cancel_pending_start(&mut self, start_id: Option<&str>) -> bool {
-        if let Some(start_id) = start_id {
-            let pending_matches = self
-                .pending_start
-                .as_ref()
-                .is_some_and(|pending| pending.start_id == start_id);
-            if !pending_matches {
-                if self.stopped_start_ids.len() == STOPPED_START_IDS_KEPT {
-                    self.stopped_start_ids.pop_front();
-                }
-                self.stopped_start_ids.push_back(start_id.to_string());
-                return false;
-            }
-        }
+    /// Every capture up to and including `through` is to end: raise the
+    /// cancel watermark, so no start at or below it registers from now on,
+    /// and cancel a pending start at or below it. Returns whether one was.
+    pub(crate) fn cancel_through(&mut self, through: CaptureId) -> bool {
+        self.cancelled_through = self.cancelled_through.max(through);
         match self.pending_start.as_mut() {
-            Some(pending) => {
+            Some(pending) if pending.id <= through && pending.cancel_tx.is_some() => {
                 pending.cancel_tx = None;
                 true
             }
-            None => false,
+            _ => false,
         }
+    }
+
+    /// The newest capture id the manager knows: what a Stop that names no id
+    /// (shutdown, or a tray without a renderer) ends through.
+    pub(crate) fn newest_capture_id(&self) -> CaptureId {
+        self.last_registered
+            .max(self.capture_id)
+            .max(self.cancelled_through)
+    }
+
+    /// The committed aggregate's id, while it owns sources.
+    pub(crate) fn owned_capture_id(&self) -> Option<CaptureId> {
+        (!self.sources.is_empty()).then_some(self.capture_id)
+    }
+
+    /// Stop every source of the committed aggregate if its id is at or below
+    /// `through`. Returns the stopped aggregate's id.
+    pub(crate) fn stop_committed_through(&mut self, through: CaptureId) -> Option<CaptureId> {
+        let id = self.owned_capture_id().filter(|id| *id <= through)?;
+        let source_ids: Vec<String> = self.sources.keys().cloned().collect();
+        for source_id in source_ids {
+            if let Err(error) = self.stop_capture(&source_id) {
+                log::error!("Failed to stop a capture source: {error}");
+            }
+        }
+        Some(id)
     }
 
     /// Take the session whose CaptureStarted row is uncertain, if any.
@@ -2109,23 +2139,24 @@ impl AudioCaptureManager {
     /// being closed blindly.
     pub(crate) fn commit_prepared_captures<E>(
         &mut self,
-        attempt: u64,
+        id: CaptureId,
         prepared: PreparedCaptures,
         ledger_session: &str,
         record_started: impl FnOnce() -> Result<(), E>,
         record_stopped: impl FnOnce() -> bool,
-    ) -> Result<u64, CaptureCommitError<E>> {
+    ) -> Result<CaptureId, CaptureCommitError<E>> {
         let PreparedCaptures {
             captures,
             mut release,
         } = prepared;
         let count = captures.len();
         let cancelled = self.shutting_down
+            || id <= self.cancelled_through
             || !self
                 .pending_start
                 .as_ref()
-                .is_some_and(|pending| pending.attempt == attempt && pending.cancel_tx.is_some());
-        self.release_capture_start(attempt);
+                .is_some_and(|pending| pending.id == id && pending.cancel_tx.is_some());
+        self.release_capture_start(id);
         let dead_member = |captures: &[PreparedCapture]| {
             captures
                 .iter()
@@ -2210,20 +2241,15 @@ impl AudioCaptureManager {
                 },
             );
         }
-        self.generation = attempt;
+        self.capture_id = id;
         log::info!("Committed a capture of {count} source(s)");
-        Ok(attempt)
+        Ok(id)
     }
 
     fn stop_uncommitted(&mut self, captures: Vec<PreparedCapture>, release: BatchReleaseOwner) {
         let unjoined =
             stop_prepared_workers(captures, release, Instant::now() + self.hooks.join_timeout);
         self.retire_capture_workers(unjoined);
-    }
-
-    /// Whether the manager owns a handle (live or dead) for `source_id`.
-    pub(crate) fn owns_capture(&self, source_id: &str) -> bool {
-        self.sources.contains_key(source_id)
     }
 
     /// Stop capturing audio from the specified source.
@@ -2306,7 +2332,7 @@ impl AudioCaptureManager {
             .map(|(source_id, _)| source_id.clone())
             .collect();
         (!sources.is_empty()).then_some(AcknowledgedCapture {
-            generation: self.generation,
+            id: self.capture_id,
             sources,
         })
     }
@@ -2483,6 +2509,7 @@ impl AudioCaptureManager {
             return false;
         }
         let CaptureThreadContext {
+            capture_id,
             source_id,
             stop_signal,
             pipeline_tx,
@@ -2619,6 +2646,7 @@ impl AudioCaptureManager {
                                 &app_handle,
                                 CAPTURE_ERROR,
                                 CaptureErrorPayload {
+                                    capture_id,
                                     source_id: source_id.clone(),
                                     error: "audio pipeline stopped accepting capture data"
                                         .to_string(),
@@ -2683,6 +2711,7 @@ impl AudioCaptureManager {
                             &app_handle,
                             CAPTURE_ERROR,
                             CaptureErrorPayload {
+                                capture_id,
                                 source_id: source_id.clone(),
                                 error: reason.event_text().to_string(),
                                 // `e.is_fatal()` already proved the stream is
@@ -2725,6 +2754,7 @@ impl AudioCaptureManager {
                             &app_handle,
                             CAPTURE_ERROR,
                             CaptureErrorPayload {
+                                capture_id,
                                 source_id: source_id.clone(),
                                 error: "audio stream ended unexpectedly".to_string(),
                                 recoverable: false,
@@ -3352,40 +3382,61 @@ mod handle_lifecycle_tests {
         // overlay path is still exercised via active_captures tests above.)
     }
 
-    #[test]
-    fn a_stop_naming_a_start_refuses_that_start_and_leaves_any_other_alone() {
-        let mut mgr = AudioCaptureManager::new();
-        // The Stop reaches the manager before its start registers.
-        assert!(!mgr.cancel_pending_start(Some("start-a")));
-        assert_eq!(
-            mgr.register_capture_start("start-a").err(),
-            Some(CaptureFailureReason::Cancelled)
-        );
+    fn id(epoch: u64, seq: u64) -> CaptureId {
+        CaptureId { epoch, seq }
+    }
 
-        let ticket = mgr.register_capture_start("start-b").unwrap();
-        // A late Stop for another start does not cancel this one.
-        assert!(!mgr.cancel_pending_start(Some("start-a")));
-        assert!(matches!(
-            ticket.cancel_rx.try_recv(),
-            Err(crossbeam_channel::TryRecvError::Empty)
-        ));
-        assert!(mgr.cancel_pending_start(Some("start-b")));
-        assert!(matches!(
+    fn cancelled(ticket: &CaptureStartTicket) -> bool {
+        matches!(
             ticket.cancel_rx.try_recv(),
             Err(crossbeam_channel::TryRecvError::Disconnected)
-        ));
-        mgr.release_capture_start(ticket.attempt);
+        )
+    }
 
-        // The remembered ids are bounded; the oldest is forgotten first.
-        for index in 0..STOPPED_START_IDS_KEPT {
-            mgr.cancel_pending_start(Some(&format!("stale-{index}")));
-        }
-        let forgotten = mgr.register_capture_start("start-a").unwrap();
-        mgr.release_capture_start(forgotten.attempt);
+    #[test]
+    fn a_start_registers_only_above_both_watermarks() {
+        let mut mgr = AudioCaptureManager::new();
+        assert_eq!(mgr.attach(), 1);
+        // A Stop that reaches the manager before its start: the start is
+        // refused when it arrives, and a newer one is not.
+        assert!(!mgr.cancel_through(id(1, 1)));
         assert_eq!(
-            mgr.register_capture_start("stale-0").err(),
+            mgr.register_capture_start(id(1, 1)).err(),
             Some(CaptureFailureReason::Cancelled)
         );
+        let ticket = mgr.register_capture_start(id(1, 3)).unwrap();
+        // A stale Stop for an older start leaves this one alone.
+        assert!(!mgr.cancel_through(id(1, 2)));
+        assert!(!cancelled(&ticket));
+        assert!(mgr.cancel_through(id(1, 3)));
+        assert!(cancelled(&ticket));
+        mgr.release_capture_start(ticket.id);
+        // Not newer than the last registered start.
+        assert_eq!(
+            mgr.register_capture_start(id(1, 2)).err(),
+            Some(CaptureFailureReason::Cancelled)
+        );
+        let next = mgr.register_capture_start(id(1, 4)).unwrap();
+        mgr.release_capture_start(next.id);
+    }
+
+    #[test]
+    fn attach_fences_every_start_of_an_earlier_renderer() {
+        let mut mgr = AudioCaptureManager::new();
+        assert_eq!(mgr.attach(), 1);
+        let pending = mgr.register_capture_start(id(1, 1)).unwrap();
+        // A reload: the new renderer attaches while the old start is pending.
+        assert_eq!(mgr.attach(), 2);
+        assert!(cancelled(&pending));
+        mgr.release_capture_start(pending.id);
+        // The old renderer's later starts, sent before it went away.
+        assert_eq!(
+            mgr.register_capture_start(id(1, 7)).err(),
+            Some(CaptureFailureReason::Cancelled)
+        );
+        let fresh = mgr.register_capture_start(id(2, 1)).unwrap();
+        assert!(!cancelled(&fresh));
+        mgr.release_capture_start(fresh.id);
     }
 }
 

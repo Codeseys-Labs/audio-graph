@@ -59,9 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Capture starts as one all-or-nothing aggregate (#141). Every selected source
   must acknowledge before capture reports Running. One failing source stops
   and joins the others, and leaves no movement-ledger row and no capture or
-  transcription state behind. Transcription and the realtime starts attach only
-  to an acknowledged capture, and a Stop or app shutdown cancels a pending
-  start. A failure names the source and a closed reason, without device or
+  transcription state behind. Each start has a capture id, and Stop, every
+  reply and every status event name it, so a late reply or a Stop for an older
+  capture can no longer end or revive another one; a reload adopts a capture
+  that is still running. Transcription attaches only to the capture it
+  follows. A failure names the source and a closed reason, without device or
   driver text. Sessions can't be loaded into the store while a start is
   pending.
 - Transcript recovery retains each complete, verified revision after an interrupted save, including a revision followed by newer speech. A pending save confirmation is shown while the outcome is uncertain. Recovery restores prior sessions before their first historical load (#139, #559).

@@ -77,7 +77,8 @@ import type {
   AsrSpanRevisionEvent,
   AudioGraphStore,
   AudioSourceInfo,
-  CaptureStartAck,
+  CaptureFact,
+  CaptureId,
   ChatMessage,
   ChatResponse,
   ChatStreamEvent,
@@ -132,6 +133,17 @@ import {
 } from "../utils/runtimeDiagnostic";
 import { createAnswerDraftsSlice } from "./answerDrafts";
 import {
+  type CaptureChange,
+  type CaptureState,
+  errorCaptureSnapshot,
+  isCaptureAttachment,
+  isCaptureReply,
+  newestCaptureFact,
+  newestCaptureId,
+  pipelineCaptureFact,
+  reduceCaptureState,
+} from "./captureFacts";
+import {
   CHAT_STREAM_DELTA_THROTTLE_MS,
   createChatStreamCoalescer,
 } from "./chatStream";
@@ -144,66 +156,25 @@ const idleStage: StageStatus = { type: "Idle" };
 let historicalLoadGeneration = 0;
 
 /**
- * The capture start in flight: the id it was sent with, and the
- * capture-status transitions and Stops seen meanwhile. The Running event and
- * a fatal reconciliation's Idle can both reach the store before the start's
- * own response; a success that arrives after its capture already ended, or
- * after a Stop was issued for it, must not mark it running.
+ * This realm's attachment to capture control: the epoch the backend issued
+ * it. Created once per JavaScript realm (not per React mount), so a remount
+ * cannot fence a start the same page just sent; a failed attach may retry.
  */
-let pendingCaptureStart: {
-  startId: string;
-  runningSeen: boolean;
-  ended: boolean;
-  stopRequested: boolean;
-} | null = null;
-
-/** The highest acknowledged generation this renderer has seen. */
-let highestCaptureGeneration = 0;
-let captureStartCount = 0;
-
-/** A start id unique to this renderer, sent with the start and its Stops. */
-function nextCaptureStartId(): string {
-  captureStartCount += 1;
-  return `${Date.now().toString(36)}-${captureStartCount}`;
-}
-
+let captureAttachment: Promise<number> | null = null;
+/** The attachment's epoch once it resolved, so a Start need not wait. */
+let attachedEpoch: number | null = null;
+/** The last sequence number this realm gave a start, within its epoch. */
+let lastCaptureSeq = 0;
 /**
- * A well-formed acknowledgement of exactly the sources requested: one
- * distinct, non-empty id per source, and a generation newer than any this
- * renderer has seen.
+ * Set from Start until its intent is installed: Start waits for the
+ * attachment only before the first one resolved. Single-flight, and session
+ * loaders refuse meanwhile.
  */
-function isCaptureStartAck(
-  value: unknown,
-  sourceCount: number,
-): value is CaptureStartAck {
-  if (typeof value !== "object" || value === null) return false;
-  const ack = value as Partial<CaptureStartAck>;
-  return (
-    typeof ack.generation === "number" &&
-    Number.isSafeInteger(ack.generation) &&
-    ack.generation > highestCaptureGeneration &&
-    Array.isArray(ack.sources) &&
-    ack.sources.length === sourceCount &&
-    ack.sources.every((id) => typeof id === "string" && id.length > 0) &&
-    new Set(ack.sources).size === ack.sources.length
-  );
-}
+let captureStartRequested = false;
 
-/**
- * Stop sources a start may own after the user stopped it or its answer was
- * unusable. Best effort: the start's own outcome is what the user sees.
- */
-async function stopStartedCapture(
-  sourceIds: readonly string[],
-  startId: string,
-): Promise<void> {
-  for (const sourceId of sourceIds) {
-    try {
-      await invoke("stop_capture", { sourceId, startId });
-    } catch {
-      // Keep stopping the rest.
-    }
-  }
+/** Every capture state change in this store goes through the reducer. */
+function capturePatch(state: CaptureState, change: CaptureChange) {
+  return reduceCaptureState(state, change, Date.now());
 }
 
 /**
@@ -239,7 +210,12 @@ function liveCaptureHoldsStore(
     "isCapturing" | "isTranscribing" | "captureStarting"
   >,
 ): boolean {
-  return state.isCapturing || state.isTranscribing || state.captureStarting;
+  return (
+    captureStartRequested ||
+    state.isCapturing ||
+    state.isTranscribing ||
+    state.captureStarting
+  );
 }
 
 const PROVIDER_DESCRIPTOR_BY_ID = new Map(
@@ -1913,11 +1889,9 @@ function sampleSessionPreviewState(language?: string) {
         segment_count: 2,
       },
     ],
-    isCapturing: false,
     isTranscribing: false,
     isGeminiActive: false,
     activeGeminiCommand: null,
-    captureStartTime: null,
     backpressuredSources: [],
     persistenceQueueBackpressure: {},
     rightPanelTab: "transcript" as const,
@@ -2980,6 +2954,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
 
   // ── Pipeline status ──────────────────────────────────────────────────
   pipelineStatus: {
+    capture_id: { epoch: 0, seq: 0 },
     capture: idleStage,
     pipeline: idleStage,
     asr: idleStage,
@@ -2988,23 +2963,19 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     graph: idleStage,
   },
   setPipelineStatus: (status) => {
-    if (pendingCaptureStart) {
-      if (status.capture.type === "Running") {
-        pendingCaptureStart.runningSeen = true;
-      } else if (
-        status.capture.type === "Idle" &&
-        pendingCaptureStart.runningSeen
-      ) {
-        pendingCaptureStart.ended = true;
-      }
-    }
     set((state) => {
-      const captureRunning =
-        status.capture.type === "Running"
-          ? true
-          : status.capture.type === "Idle"
-            ? false
-            : state.isCapturing;
+      // Only the capture pair is a fact; a stale snapshot from a slower
+      // thread never moves it back, here or in the stored status.
+      const incoming = pipelineCaptureFact(status);
+      const stored = pipelineCaptureFact(state.pipelineStatus);
+      const pipelineStatus =
+        newestCaptureFact(stored, incoming) === incoming
+          ? status
+          : {
+              ...status,
+              capture_id: state.pipelineStatus.capture_id,
+              capture: state.pipelineStatus.capture,
+            };
       const transcriptionRunning =
         status.asr.type === "Running"
           ? true
@@ -3012,12 +2983,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             ? false
             : state.isTranscribing;
       return {
-        pipelineStatus: status,
-        isCapturing: captureRunning,
+        ...capturePatch(state, { facts: [incoming] }),
+        pipelineStatus,
         isTranscribing: transcriptionRunning,
-        captureStartTime: captureRunning
-          ? (state.captureStartTime ?? Date.now())
-          : null,
       };
     });
   },
@@ -3072,13 +3040,29 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // ── Capture state ────────────────────────────────────────────────────
   isCapturing: false,
   captureStarting: false,
-  captureSourceIds: [],
+  captureStopping: false,
+  captureFact: null,
+  captureStartIntent: null,
+  captureStopIntent: null,
   captureStartTime: null,
-  setIsCapturing: (capturing) =>
-    set((state) => ({
-      ...(capturing ? exitSamplePreviewState(state.samplePreviewActive) : {}),
-      isCapturing: capturing,
-    })),
+  attachCapture: () => {
+    captureAttachment ??= invoke<unknown>("capture_attach").then(
+      (attachment) => {
+        if (!isCaptureAttachment(attachment)) {
+          throw new Error("capture_attach returned an unusable reply");
+        }
+        set((state) => capturePatch(state, { facts: [attachment.snapshot] }));
+        attachedEpoch = attachment.epoch;
+        return attachment.epoch;
+      },
+    );
+    const attached = captureAttachment;
+    // A failed attach is not cached: the next caller tries again.
+    attached.catch(() => {
+      if (captureAttachment === attached) captureAttachment = null;
+    });
+    return attached;
+  },
   backpressuredSources: [],
   setSourceBackpressure: (sourceId, isBackpressured) =>
     set((state) => {
@@ -3098,15 +3082,36 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       return {};
     }),
   startCapture: async () => {
-    const { selectedSourceIds, audioSources } = get();
-    // One start at a time: a second press (or shortcut) before the backend
-    // answers would be refused anyway, and must not reset the view again.
-    if (get().captureStarting) return;
+    const { selectedSourceIds, audioSources, captureStarting, isCapturing } =
+      get();
+    // One start at a time, and none over a running capture: a second press
+    // (or shortcut) must not reset the view again.
+    if (captureStarting || isCapturing || captureStartRequested) return;
     if (selectedSourceIds.length === 0) {
       set({ error: "No audio source selected" });
       return;
     }
+    captureStartRequested = true;
+    // A historical load in flight at the press must not land.
     historicalLoadGeneration += 1;
+    let epoch = attachedEpoch;
+    if (epoch === null) {
+      try {
+        epoch = await get().attachCapture();
+      } catch {
+        captureStartRequested = false;
+        set({ error: captureStartFailureMessage(undefined) });
+        return;
+      }
+      // The attachment may have adopted a capture that is still running.
+      if (get().isCapturing || get().captureStarting) {
+        captureStartRequested = false;
+        return;
+      }
+    }
+    captureStartRequested = false;
+    lastCaptureSeq += 1;
+    const id: CaptureId = { epoch, seq: lastCaptureSeq };
     set((state) => ({
       ...exitSamplePreviewState(state.samplePreviewActive),
       // Starting a fresh live capture leaves any historical session view, so
@@ -3120,10 +3125,6 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // premise is void — clear the pending row rather than let it outlive
       // the data it described.
       pendingFinalizingSession: null,
-      // Held until the backend acknowledges every source or the start fails:
-      // session loaders refuse meanwhile, so no historical session can land
-      // in the store the capture is about to open into.
-      captureStarting: true,
       // Historical Review and Live currently share one frontend view store.
       // Clear every session-scoped projection before live listeners resume so
       // the first new event cannot append to or overwrite historical data.
@@ -3153,6 +3154,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       sessionTimelineLoading: false,
       transcriptSeekTarget: null,
       graphEdgeFocus: null,
+      // The start's intent, and with it `captureStarting`, in this same
+      // update: session loaders refuse from here until a fact for this start
+      // arrives, so no historical session lands in the store the capture is
+      // about to open into.
+      ...capturePatch(state, { startIntent: id, stopIntent: null }),
     }));
     const sourcesBySelectionId = new Map<string, AudioSourceInfo>();
     for (const source of audioSources) {
@@ -3165,69 +3171,34 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         const source = sourcesBySelectionId.get(sourceId);
         return source ? { sourceId, source } : { sourceId };
       });
-    const watch = {
-      startId: nextCaptureStartId(),
-      runningSeen: false,
-      ended: false,
-      stopRequested: false,
-    };
-    pendingCaptureStart = watch;
-    // The ids the backend resolves them to, so a Stop before the
-    // acknowledgement names what the backend owns, not a selection alias.
-    const requestedSourceIds = sources.map(
-      (entry) => entry.source?.capture_target ?? entry.sourceId,
-    );
-    set({ captureSourceIds: requestedSourceIds });
     try {
       // One aggregate start: the backend acknowledges every source or rolls
       // all of them back, so there is nothing to undo here on failure.
-      const ack = await invoke<unknown>("start_capture", {
-        sources,
-        startId: watch.startId,
-      });
-      if (pendingCaptureStart === watch) pendingCaptureStart = null;
-      if (!isCaptureStartAck(ack, sources.length)) {
-        // An answer this renderer cannot trust: whatever it started is
-        // stopped, under the ids it was asked to start.
-        set({
-          captureStarting: false,
-          captureSourceIds: [],
-          error: captureStartFailureMessage(undefined),
-        });
-        await stopStartedCapture(requestedSourceIds, watch.startId);
+      const reply = await invoke<unknown>("start_capture", { id, sources });
+      if (!isCaptureReply(reply)) {
+        // Nothing to merge: the status events still carry what happened.
+        set({ error: captureStartFailureMessage(undefined) });
         return;
       }
-      highestCaptureGeneration = ack.generation;
-      if (watch.stopRequested) {
-        // The user stopped this start while it was pending, and the backend
-        // committed it first: stop what it acknowledged.
-        set({ captureStarting: false, captureSourceIds: [] });
-        await stopStartedCapture(ack.sources, watch.startId);
-        return;
-      }
-      if (watch.ended) {
-        // Running and then Idle already arrived: the capture ended before
-        // its acknowledgement did.
-        set({ captureStarting: false, captureSourceIds: [] });
-        return;
-      }
-      set({
-        captureStarting: false,
-        isCapturing: true,
-        captureSourceIds: ack.sources,
-        captureStartTime: Date.now(),
+      set((state) => ({
+        ...capturePatch(state, { facts: [reply.fact, reply.snapshot] }),
         error: null,
-      });
+      }));
     } catch (e) {
-      if (pendingCaptureStart === watch) pendingCaptureStart = null;
-      set({
-        captureStarting: false,
-        captureSourceIds: [],
-        error: captureStartErrorMessage(e, (index) => {
-          const id = selectedSourceIds[index];
-          return id === undefined ? undefined : sourcesBySelectionId.get(id);
+      // A rejected start never committed: it is ended.
+      const ended: CaptureFact = { id, phase: "ended" };
+      const snapshot = errorCaptureSnapshot(e);
+      set((state) => ({
+        ...capturePatch(state, {
+          facts: snapshot ? [ended, snapshot] : [ended],
         }),
-      });
+        error: captureStartErrorMessage(e, (index) => {
+          const selectionId = selectedSourceIds[index];
+          return selectionId === undefined
+            ? undefined
+            : sourcesBySelectionId.get(selectionId);
+        }),
+      }));
     }
   },
   // ONE START (SHELL-R3, plan §R3, ADR-0046): the NOW STRIP's Start button
@@ -3262,11 +3233,13 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // replaces this composition behind the same button when it lands.
   startCaptureAndTranscribe: async () => {
     await get().startCapture();
-    const { isCapturing, isTranscribing, settings } = get();
-    if (!isCapturing || isTranscribing) return;
+    const { isCapturing, isTranscribing, settings, captureFact } = get();
+    if (!isCapturing || isTranscribing || !captureFact) return;
     if (!settings) return;
     if (deferredProviderForDurableStart(settings)) return;
-    await get().startTranscribe();
+    // Chained to the capture this start produced: the backend refuses it if
+    // another capture has replaced that one meanwhile.
+    await get().startTranscribe(captureFact.id);
   },
   // SHELL-R2 (plan §R2, ADR-0046): "stop lands you on your own session". Read the
   // active session id BEFORE stopping — once `stop_capture` tears the
@@ -3279,17 +3252,19 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // still degrades to "stay put, stop capture as before" rather than
   // crashing the stop flow.
   stopCapture: async () => {
-    const { selectedSourceIds, captureSourceIds, getSessionId } = get();
-    // A Stop issued while a start is pending names that start, so the
-    // backend cancels it whichever command reaches it first, and its late
-    // success is not taken as Running.
-    const pendingStart = pendingCaptureStart;
-    if (pendingStart) pendingStart.stopRequested = true;
-    // The acknowledged capture's canonical ids, which are what the backend
-    // owns; the selection can name a source by another alias.
-    const sourceIds =
-      captureSourceIds.length > 0 ? captureSourceIds : selectedSourceIds;
-    if (sourceIds.length === 0) return;
+    const {
+      captureFact,
+      captureStartIntent,
+      isCapturing,
+      captureStarting,
+      getSessionId,
+    } = get();
+    if (!isCapturing && !captureStarting) return;
+    // Every capture up to the newest this renderer knows of ends, whether
+    // its start is still pending or it runs; a newer one never does.
+    const stopId = newestCaptureId(captureFact?.id ?? null, captureStartIntent);
+    if (stopId === null) return;
+    set((state) => capturePatch(state, { stopIntent: stopId }));
     let sessionId: string | null = null;
     try {
       const id = await getSessionId();
@@ -3298,21 +3273,18 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       sessionId = null;
     }
     try {
-      for (const sourceId of sourceIds) {
-        await invoke(
-          "stop_capture",
-          pendingStart
-            ? { sourceId, startId: pendingStart.startId }
-            : { sourceId },
-        );
-      }
+      const reply = await invoke<unknown>("stop_capture", { id: stopId });
       set((state) => ({
-        isCapturing: false,
-        captureSourceIds: [],
+        // Without a usable reply, "Stopping…" holds until a status event
+        // states the Ended fact.
+        ...(isCaptureReply(reply)
+          ? capturePatch(state, { facts: [reply.fact, reply.snapshot] })
+          : {}),
         isTranscribing: false,
         isGeminiActive: false,
         activeGeminiCommand: null,
-        captureStartTime: null,
+        // `capturePatch` clears `captureStartTime` once the capture ended;
+        // the pending row below reads the start time from before.
         backpressuredSources: [],
         persistenceQueueBackpressure: {},
         error: null,
@@ -3363,14 +3335,23 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // re-fetches too.
       if (sessionId) void get().listSessions(200);
     } catch (e) {
-      set({ error: errorToMessage(e) });
+      // The Stop may be retried (it is idempotent); what the backend reports
+      // now decides what is shown.
+      const snapshot = errorCaptureSnapshot(e);
+      set((state) => ({
+        ...capturePatch(state, {
+          facts: snapshot ? [snapshot] : [],
+          stopIntent: null,
+        }),
+        error: errorToMessage(e),
+      }));
     }
   },
 
   // ── Transcribe state ────────────────────────────────────────────────────────
   isTranscribing: false,
-  startTranscribe: async () => {
-    const { isCapturing, settings } = get();
+  startTranscribe: async (captureId) => {
+    const { isCapturing, captureFact, settings } = get();
     if (!settings) {
       set({ error: i18n.t("errors.providerSettingsLoading") });
       return;
@@ -3380,12 +3361,16 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       set({ error: providerDeferredMessage(deferredProvider) });
       return;
     }
-    if (!isCapturing) {
+    if (!isCapturing || !captureFact) {
       set({ error: "Cannot start transcription: capture is not running" });
       return;
     }
     try {
-      await invoke("start_transcribe");
+      // The capture this transcription attaches to; the backend refuses it
+      // unless that capture is still the live one.
+      await invoke("start_transcribe", {
+        captureId: captureId ?? captureFact.id,
+      });
       set({
         isTranscribing: true,
         error: null,

@@ -105,6 +105,7 @@ function resetStore(overrides: Partial<StoreState> = {}) {
     modelStatus: null,
     sessionProjectionEvents: [],
     pipelineStatus: {
+      capture_id: { epoch: 0, seq: 0 },
       capture: { type: "Idle" },
       pipeline: { type: "Idle" },
       asr: { type: "Idle" },
@@ -338,6 +339,7 @@ describe("NowStrip", () => {
       selectedSourceIds: ["system-default"],
       captureStartTime: Date.now(),
       pipelineStatus: {
+        capture_id: { epoch: 0, seq: 0 },
         capture: { type: "Idle" },
         pipeline: { type: "Idle" },
         asr: { type: "Idle" },

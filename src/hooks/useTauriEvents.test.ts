@@ -38,6 +38,7 @@ function resetStore() {
       stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
     },
     pipelineStatus: {
+      capture_id: { epoch: 0, seq: 0 },
       capture: { type: "Idle" },
       pipeline: { type: "Idle" },
       asr: { type: "Idle" },
@@ -46,6 +47,12 @@ function resetStore() {
       graph: { type: "Idle" },
     },
     pipelineLatencies: {},
+    captureFact: null,
+    captureStartIntent: null,
+    captureStopIntent: null,
+    isCapturing: false,
+    captureStarting: false,
+    captureStopping: false,
     latestAudioConsumerHealth: null,
     asrPartial: null,
     asrSpanRevisions: [],
@@ -161,7 +168,8 @@ describe("useTauriEvents", () => {
     const started = new Promise<void>((resolve) => {
       readStarted = resolve;
     });
-    vi.mocked(invoke).mockImplementationOnce(async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd !== "get_pipeline_status") return undefined;
       readStarted();
       return new Promise<typeof snapshot>((resolve) => {
         finishRead = resolve;
@@ -560,6 +568,7 @@ describe("useTauriEvents", () => {
 
     const running = { type: "Running" } as const;
     const status = {
+      capture_id: { epoch: 1, seq: 1 },
       capture: running,
       pipeline: running,
       asr: running,
@@ -633,6 +642,7 @@ describe("useTauriEvents", () => {
 
     handlers.get("capture-error")?.(
       makeEvent("capture-error", {
+        capture_id: { epoch: 1, seq: 1 },
         source_id: "mic-1",
         error: "device disconnected",
       }),

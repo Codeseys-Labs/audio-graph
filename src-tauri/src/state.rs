@@ -930,15 +930,13 @@ impl AppState {
         // Spawn transcript writers (best-effort — if base dir is unavailable, None)
         let transcript_writer = TranscriptWriter::spawn(&session_id);
         let transcript_event_writer = TranscriptEventWriter::spawn(&session_id);
-        let pipeline_status = PipelineStatus {
-            transcript_crash_safety_unverified: transcript_event_writer
-                .as_ref()
-                .is_some_and(TranscriptEventWriter::is_unqualified),
-            transcript_not_saving: transcript_event_writer
-                .is_none()
-                .then_some(crate::events::TranscriptSavingFailure::WriterAbsent),
-            ..Default::default()
-        };
+        let mut pipeline_status = PipelineStatus::default();
+        pipeline_status.transcript_crash_safety_unverified = transcript_event_writer
+            .as_ref()
+            .is_some_and(TranscriptEventWriter::is_unqualified);
+        pipeline_status.transcript_not_saving = transcript_event_writer
+            .is_none()
+            .then_some(crate::events::TranscriptSavingFailure::WriterAbsent);
         let projection_event_writer = ProjectionEventWriter::spawn(&session_id);
         let transcript_ledger = TranscriptLedger::new(session_id.clone());
         let speaker_timeline = SpeakerTimeline::new(session_id.clone());
@@ -1290,10 +1288,13 @@ impl AppState {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            *status = PipelineStatus {
-                transcript_crash_safety_unverified: new_transcript_event_writer.is_unqualified(),
-                ..PipelineStatus::default()
-            };
+            // Rotation needs an idle capture; its fact (that capture, Ended)
+            // carries over, so the capture identity never moves backwards.
+            let capture = status.capture_fact().id;
+            *status = PipelineStatus::default();
+            status.transcript_crash_safety_unverified =
+                new_transcript_event_writer.is_unqualified();
+            status.set_capture(capture, crate::events::StageStatus::Idle);
         }
 
         // No producer can enter while `session_lifecycle` is held by the

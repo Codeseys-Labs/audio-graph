@@ -1,24 +1,24 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "../i18n";
+import {
+  captureBackendReply,
+  ended,
+  running,
+  statusFor,
+} from "../test/captureBackend";
 import type {
   AgentProposalEvent,
   AppSettings,
   AsrSpanRevisionEvent,
   AudioGraphStore,
   AudioSourceInfo,
+  CaptureId,
   LiveAssistCardRecord,
   ProjectionPatch,
 } from "../types";
 import { SAFE_INTERNAL_RUNTIME_DIAGNOSTIC } from "../utils/runtimeDiagnostic";
 import { useAudioGraphStore } from "./index";
-
-/** Never reset: the store accepts only ever-newer acknowledged generations. */
-let captureGeneration = 0;
-function captureAck(sources: string[]) {
-  captureGeneration += 1;
-  return { generation: captureGeneration, sources };
-}
 
 const RATE_LIMITED_DIAGNOSTIC = {
   kind: "runtime",
@@ -205,7 +205,11 @@ describe("AudioGraphStore", () => {
       chatReplyTurnId: null,
       isCapturing: false,
       captureStarting: false,
-      captureSourceIds: [],
+      captureStopping: false,
+      captureFact: null,
+      captureStartIntent: null,
+      captureStopIntent: null,
+      pipelineStatus: statusFor(ended({ epoch: 0, seq: 0 })),
       isTranscribing: false,
       captureStartTime: null,
       loadedSessionId: null,
@@ -229,34 +233,43 @@ describe("AudioGraphStore", () => {
   });
 
   it("reconciles frontend lifecycle from authoritative backend pipeline status", () => {
-    useAudioGraphStore.getState().setPipelineStatus({
-      capture: { type: "Running", processed_count: 0 },
-      pipeline: { type: "Running", processed_count: 0 },
-      asr: { type: "Running", processed_count: 0 },
-      diarization: { type: "Running", processed_count: 0 },
-      entity_extraction: { type: "Running", processed_count: 0 },
-      graph: { type: "Running", processed_count: 0 },
-    });
+    const capture = { epoch: 3, seq: 1 };
+    const runningStage = { type: "Running" as const, processed_count: 0 };
+    useAudioGraphStore.getState().setPipelineStatus(
+      statusFor(running(capture), {
+        pipeline: runningStage,
+        asr: runningStage,
+        diarization: runningStage,
+        entity_extraction: runningStage,
+        graph: runningStage,
+      }),
+    );
     expect(useAudioGraphStore.getState().isCapturing).toBe(true);
     expect(useAudioGraphStore.getState().isTranscribing).toBe(true);
     expect(useAudioGraphStore.getState().captureStartTime).not.toBeNull();
 
-    useAudioGraphStore.getState().setPipelineStatus({
-      capture: { type: "Idle" },
-      pipeline: { type: "Idle" },
-      asr: { type: "Idle" },
-      diarization: { type: "Idle" },
-      entity_extraction: { type: "Idle" },
-      graph: { type: "Idle" },
-    });
+    useAudioGraphStore.getState().setPipelineStatus(statusFor(ended(capture)));
     expect(useAudioGraphStore.getState().isCapturing).toBe(false);
     expect(useAudioGraphStore.getState().isTranscribing).toBe(false);
     expect(useAudioGraphStore.getState().captureStartTime).toBeNull();
+
+    // A stale snapshot a slower thread emitted earlier changes nothing,
+    // neither the capture state nor the stored status's capture stage.
+    useAudioGraphStore
+      .getState()
+      .setPipelineStatus(statusFor(running(capture)));
+    expect(useAudioGraphStore.getState().isCapturing).toBe(false);
+    expect(useAudioGraphStore.getState().pipelineStatus.capture.type).toBe(
+      "Idle",
+    );
   });
 
   it("starts transcription for selected MVP-enabled ASR and LLM providers", async () => {
+    const capture = { epoch: 3, seq: 1 };
+    useAudioGraphStore
+      .getState()
+      .setPipelineStatus(statusFor(running(capture)));
     useAudioGraphStore.setState({
-      isCapturing: true,
       isTranscribing: false,
       settings: selectableSettings(),
     });
@@ -264,7 +277,10 @@ describe("AudioGraphStore", () => {
 
     await useAudioGraphStore.getState().startTranscribe();
 
-    expect(invoke).toHaveBeenCalledWith("start_transcribe");
+    // Attached to the capture it follows.
+    expect(invoke).toHaveBeenCalledWith("start_transcribe", {
+      captureId: capture,
+    });
     expect(useAudioGraphStore.getState().isTranscribing).toBe(true);
     expect(useAudioGraphStore.getState().error).toBeNull();
   });
@@ -1183,12 +1199,9 @@ describe("AudioGraphStore", () => {
     const pendingHistorical = new Promise((resolve) => {
       resolveHistorical = resolve;
     });
-    vi.mocked(invoke).mockImplementation(async (command) => {
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
       if (command === "load_session") return pendingHistorical;
-      if (command === "start_capture") {
-        return captureAck(["system-default"]);
-      }
-      return undefined;
+      return captureBackendReply(command, args);
     });
     useAudioGraphStore.setState({ selectedSourceIds: ["system-default"] });
 
@@ -3455,7 +3468,60 @@ describe("AudioGraphStore", () => {
     ]);
   });
 
-  it("starts every selected source in one call and leaves rollback to the backend", async () => {
+  /** The id and sources of the latest `start_capture` call. */
+  function lastStartArgs(): {
+    id: CaptureId;
+    sources: { sourceId: string; source?: AudioSourceInfo }[];
+  } {
+    const call = vi
+      .mocked(invoke)
+      .mock.calls.filter(([cmd]) => cmd === "start_capture")
+      .at(-1);
+    if (!call) throw new Error("start_capture was not invoked");
+    return call[1] as {
+      id: CaptureId;
+      sources: { sourceId: string; source?: AudioSourceInfo }[];
+    };
+  }
+
+  /** A capture command whose reply the test settles. */
+  function deferredCommand(name: string) {
+    const pending: Array<{
+      resolve: (reply: unknown) => void;
+      reject: (error: unknown) => void;
+    }> = [];
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+      if (cmd === name) {
+        return new Promise((resolve, reject) => {
+          pending.push({ resolve, reject });
+        });
+      }
+      return captureBackendReply(cmd, args);
+    });
+    /** The oldest call of `name` still waiting, once it has been sent. */
+    const next = async () => {
+      await vi.waitFor(() => expect(pending.length).toBeGreaterThan(0));
+      const call = pending.shift();
+      if (!call) throw new Error(`${name} was not invoked`);
+      return call;
+    };
+    return {
+      reply: async (value: unknown) => (await next()).resolve(value),
+      fail: async (error: unknown) => (await next()).reject(error),
+    };
+  }
+
+  async function startedCapture(): Promise<CaptureId> {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) =>
+      captureBackendReply(cmd, args),
+    );
+    useAudioGraphStore.setState({ selectedSourceIds: ["system-default"] });
+    await useAudioGraphStore.getState().startCapture();
+    expect(useAudioGraphStore.getState().isCapturing).toBe(true);
+    return lastStartArgs().id;
+  }
+
+  it("starts every selected source in one call, as one capture id, and leaves rollback to the backend", async () => {
     useAudioGraphStore.setState({
       selectedSourceIds: ["system-default", "device:mic"],
       audioSources: [
@@ -3468,8 +3534,9 @@ describe("AudioGraphStore", () => {
         },
       ],
     });
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
       if (cmd === "start_capture") {
+        const { id } = args as { id: CaptureId };
         throw {
           code: "capture_start_failed",
           message: {
@@ -3479,10 +3546,12 @@ describe("AudioGraphStore", () => {
               { status: "rolled_back" },
               { status: "failed", reason: "device_unavailable" },
             ],
+            capture: ended(id),
+            snapshot: ended({ epoch: id.epoch, seq: 0 }),
           },
         };
       }
-      return undefined;
+      return captureBackendReply(cmd, args);
     });
 
     await useAudioGraphStore.getState().startCapture();
@@ -3494,6 +3563,7 @@ describe("AudioGraphStore", () => {
       [
         "start_capture",
         {
+          id: { epoch: expect.any(Number), seq: expect.any(Number) },
           sources: [
             { sourceId: "system-default" },
             {
@@ -3501,7 +3571,6 @@ describe("AudioGraphStore", () => {
               source: useAudioGraphStore.getState().audioSources[0],
             },
           ],
-          startId: expect.any(String),
         },
       ],
     ]);
@@ -3517,24 +3586,25 @@ describe("AudioGraphStore", () => {
     );
   });
 
-  it("holds captureStarting until the acknowledgement, refusing a session load meanwhile", async () => {
-    let acknowledge: (ack: unknown) => void = () => {};
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
-      if (cmd === "start_capture") {
-        return new Promise((resolve) => {
-          acknowledge = resolve;
-        });
-      }
-      return undefined;
-    });
-    useAudioGraphStore.setState({
-      selectedSourceIds: ["mic-row"],
-      captureSourceIds: [],
-    });
+  it("numbers each start above the last within this realm's epoch", async () => {
+    const first = await startedCapture();
+    await useAudioGraphStore.getState().stopCapture();
+    const second = await startedCapture();
+    expect(second.epoch).toBe(first.epoch);
+    expect(second.seq).toBeGreaterThan(first.seq);
+    expect(invoke).toHaveBeenCalledWith("stop_capture", { id: first });
+  });
 
-    const start = useAudioGraphStore.getState().startCapture();
-    expect(useAudioGraphStore.getState().captureStarting).toBe(true);
-    // A second press before the answer does not start or reset again.
+  it("holds captureStarting until a fact for the start arrives, refusing a session load meanwhile", async () => {
+    const start = deferredCommand("start_capture");
+    useAudioGraphStore.setState({ selectedSourceIds: ["mic-row"] });
+
+    const pending = useAudioGraphStore.getState().startCapture();
+    // A second press before the first reached the backend does nothing.
+    await useAudioGraphStore.getState().startCapture();
+    await vi.waitFor(() =>
+      expect(useAudioGraphStore.getState().captureStarting).toBe(true),
+    );
     await useAudioGraphStore.getState().startCapture();
     expect(
       vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "start_capture"),
@@ -3552,46 +3622,40 @@ describe("AudioGraphStore", () => {
       expect.anything(),
     );
 
-    acknowledge(captureAck(["device:mic"]));
-    await start;
+    const { id } = lastStartArgs();
+    await start.reply({ fact: running(id), snapshot: running(id) });
+    await pending;
     let state = useAudioGraphStore.getState();
     expect(state.captureStarting).toBe(false);
     expect(state.isCapturing).toBe(true);
+    expect(state.captureFact).toEqual(running(id));
     expect(state.loadedSessionId).toBeNull();
-    expect(state.captureSourceIds).toEqual(["device:mic"]);
 
-    // Stop names the acknowledged canonical id, not the selection alias.
+    // Stop addresses the capture by its id, never by a source.
     await useAudioGraphStore.getState().stopCapture();
-    expect(invoke).toHaveBeenCalledWith("stop_capture", {
-      sourceId: "device:mic",
-    });
-    expect(invoke).not.toHaveBeenCalledWith("stop_capture", {
-      sourceId: "mic-row",
-    });
+    expect(invoke).toHaveBeenCalledWith("stop_capture", { id });
     state = useAudioGraphStore.getState();
     expect(state.isCapturing).toBe(false);
-    expect(state.captureSourceIds).toEqual([]);
+    expect(state.captureStopping).toBe(false);
+    expect(state.captureFact).toEqual(ended(id));
   });
 
   it("drops a session load that was in flight when Start was pressed", async () => {
     let finishLoad: (loaded: unknown) => void = () => {};
-    let acknowledge: (ack: unknown) => void = () => {};
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
       if (cmd === "load_session") {
         return new Promise((resolve) => {
           finishLoad = resolve;
         });
       }
-      if (cmd === "start_capture") {
-        return new Promise((resolve) => {
-          acknowledge = resolve;
-        });
-      }
-      return undefined;
+      return captureBackendReply(cmd, args);
     });
     useAudioGraphStore.setState({ selectedSourceIds: ["system-default"] });
 
     const load = useAudioGraphStore.getState().loadSession("historical");
+    await vi.waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("load_session", expect.anything()),
+    );
     const start = useAudioGraphStore.getState().startCapture();
     finishLoad({
       transcript: [
@@ -3613,7 +3677,6 @@ describe("AudioGraphStore", () => {
       },
     });
     expect(await load).toBeNull();
-    acknowledge(captureAck(["system-default"]));
     await start;
 
     const state = useAudioGraphStore.getState();
@@ -3623,124 +3686,61 @@ describe("AudioGraphStore", () => {
   });
 
   it("keeps a capture that ended before its acknowledgement arrived stopped", async () => {
-    let acknowledge: (ack: unknown) => void = () => {};
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
-      if (cmd === "start_capture") {
-        return new Promise((resolve) => {
-          acknowledge = resolve;
-        });
-      }
-      return undefined;
-    });
+    const start = deferredCommand("start_capture");
     useAudioGraphStore.setState({ selectedSourceIds: ["system-default"] });
-    const running = useAudioGraphStore.getState().pipelineStatus;
 
-    const start = useAudioGraphStore.getState().startCapture();
+    const pending = useAudioGraphStore.getState().startCapture();
+    await vi.waitFor(() => lastStartArgs());
+    const { id } = lastStartArgs();
     // The start's Running event, then its source's fatal reconciliation,
     // both land before the start's own response.
-    useAudioGraphStore.getState().setPipelineStatus({
-      ...running,
-      capture: { type: "Running", processed_count: 0 },
-    });
-    useAudioGraphStore.getState().setPipelineStatus({
-      ...running,
-      capture: { type: "Idle" },
-    });
-    acknowledge(captureAck(["system-default"]));
-    await start;
+    useAudioGraphStore.getState().setPipelineStatus(statusFor(running(id)));
+    useAudioGraphStore.getState().setPipelineStatus(statusFor(ended(id)));
+    await start.reply({ fact: running(id), snapshot: running(id) });
+    await pending;
 
     const state = useAudioGraphStore.getState();
     expect(state.pipelineStatus.capture.type).toBe("Idle");
     expect(state.isCapturing).toBe(false);
     expect(state.captureStarting).toBe(false);
-    expect(state.captureSourceIds).toEqual([]);
+    expect(state.captureStartTime).toBeNull();
   });
 
-  it("treats a missing, malformed or stale acknowledgement as a failed start and stops what it asked for", async () => {
-    const accepted = captureAck(["device:mic", "system-default"]);
-    vi.mocked(invoke).mockImplementation(async (cmd) =>
-      cmd === "start_capture" ? accepted : undefined,
+  it("treats any rejected start as ended, and an unusable reply as no fact", async () => {
+    const start = deferredCommand("start_capture");
+    useAudioGraphStore.setState({ selectedSourceIds: ["system-default"] });
+
+    // An unstructured rejection: the start never committed.
+    const rejected = useAudioGraphStore.getState().startCapture();
+    await vi.waitFor(() => lastStartArgs());
+    const first = lastStartArgs().id;
+    await start.fail("mocked transport failure");
+    await rejected;
+    let state = useAudioGraphStore.getState();
+    expect(state.captureFact).toEqual(ended(first));
+    expect(state.captureStarting).toBe(false);
+    expect(state.isCapturing).toBe(false);
+
+    // An unusable reply merges nothing: the start stays pending until a
+    // status event states what happened to it.
+    const unusable = useAudioGraphStore.getState().startCapture();
+    await vi.waitFor(() =>
+      expect(lastStartArgs().id.seq).toBeGreaterThan(first.seq),
     );
-    useAudioGraphStore.setState({
-      selectedSourceIds: ["device:mic", "system-default"],
-      isCapturing: false,
-    });
-    await useAudioGraphStore.getState().startCapture();
-    expect(useAudioGraphStore.getState().isCapturing).toBe(true);
-
-    for (const reply of [
-      null,
-      undefined,
-      { sources: ["device:mic", "system-default"] },
-      { generation: accepted.generation + 1, sources: [] },
-      { generation: accepted.generation + 1, sources: ["device:mic", ""] },
-      // One id per source, but the same id for both.
-      {
-        generation: accepted.generation + 1,
-        sources: ["device:mic", "device:mic"],
-      },
-      {
-        generation: accepted.generation + 0.5,
-        sources: ["device:mic", "system-default"],
-      },
-      // Not newer than a generation this renderer already accepted.
-      {
-        generation: accepted.generation,
-        sources: ["device:mic", "system-default"],
-      },
-      { generation: -1, sources: ["device:mic", "system-default"] },
-    ]) {
-      vi.mocked(invoke).mockClear();
-      vi.mocked(invoke).mockImplementation(async (cmd) =>
-        cmd === "start_capture" ? reply : undefined,
-      );
-      useAudioGraphStore.setState({
-        selectedSourceIds: ["device:mic", "system-default"],
-        isCapturing: false,
-        captureSourceIds: [],
-        error: null,
-      });
-
-      await useAudioGraphStore.getState().startCapture();
-
-      const state = useAudioGraphStore.getState();
-      expect(state.isCapturing, JSON.stringify(reply)).toBe(false);
-      expect(state.captureStarting).toBe(false);
-      expect(state.captureSourceIds).toEqual([]);
-      expect(state.error).toBe(
-        i18n.t("errors.captureStart.backend_unavailable"),
-      );
-      const startArgs = vi
-        .mocked(invoke)
-        .mock.calls.find(([cmd]) => cmd === "start_capture")?.[1] as {
-        startId: string;
-      };
-      expect(
-        vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "stop_capture"),
-        JSON.stringify(reply),
-      ).toEqual([
-        [
-          "stop_capture",
-          { sourceId: "device:mic", startId: startArgs.startId },
-        ],
-        [
-          "stop_capture",
-          { sourceId: "system-default", startId: startArgs.startId },
-        ],
-      ]);
-    }
+    const second = lastStartArgs().id;
+    await start.reply({ sources: ["system-default"] });
+    await unusable;
+    state = useAudioGraphStore.getState();
+    expect(state.error).toBe(i18n.t("errors.captureStart.backend_unavailable"));
+    expect(state.captureStarting).toBe(true);
+    useAudioGraphStore.getState().setPipelineStatus(statusFor(running(second)));
+    state = useAudioGraphStore.getState();
+    expect(state.captureStarting).toBe(false);
+    expect(state.isCapturing).toBe(true);
   });
 
-  it("locks the sample preview and the selection while a start is pending, and stops it by canonical id", async () => {
-    let acknowledge: (ack: unknown) => void = () => {};
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
-      if (cmd === "start_capture") {
-        return new Promise((resolve) => {
-          acknowledge = resolve;
-        });
-      }
-      return undefined;
-    });
+  it("locks the sample preview and the selection while a start is pending, and a Stop ends that start", async () => {
+    const start = deferredCommand("start_capture");
     useAudioGraphStore.setState({
       selectedSourceIds: ["mic-row"],
       audioSources: [
@@ -3754,7 +3754,10 @@ describe("AudioGraphStore", () => {
       ],
     });
 
-    const start = useAudioGraphStore.getState().startCapture();
+    const pending = useAudioGraphStore.getState().startCapture();
+    await vi.waitFor(() =>
+      expect(useAudioGraphStore.getState().captureStarting).toBe(true),
+    );
     useAudioGraphStore.getState().loadSampleSessionPreview("en");
     expect(useAudioGraphStore.getState().samplePreviewActive).toBe(false);
     useAudioGraphStore.getState().toggleSourceId("mic-row");
@@ -3762,37 +3765,127 @@ describe("AudioGraphStore", () => {
       "mic-row",
     ]);
 
-    // A Stop before the acknowledgement names what the backend registers,
-    // and the start it was issued during.
+    // A Stop before the start replied names that start's id.
+    const { id } = lastStartArgs();
     await useAudioGraphStore.getState().stopCapture();
-    const stopCalls = vi
-      .mocked(invoke)
-      .mock.calls.filter(([cmd]) => cmd === "stop_capture");
-    const startArgs = vi
-      .mocked(invoke)
-      .mock.calls.find(([cmd]) => cmd === "start_capture")?.[1] as {
-      startId: string;
-    };
-    expect(startArgs.startId).toEqual(expect.any(String));
-    expect(stopCalls).toEqual([
-      ["stop_capture", { sourceId: "device:mic", startId: startArgs.startId }],
-    ]);
+    expect(invoke).toHaveBeenCalledWith("stop_capture", { id });
+    let state = useAudioGraphStore.getState();
+    expect(state.captureStarting).toBe(false);
+    expect(state.captureStopping).toBe(false);
 
-    // The backend committed the start before that Stop reached it: the late
-    // success is stopped by its acknowledged id and never shown as Running.
-    acknowledge(captureAck(["device:mic"]));
-    await start;
-    expect(
-      vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "stop_capture"),
-    ).toEqual([
-      ["stop_capture", { sourceId: "device:mic", startId: startArgs.startId }],
-      ["stop_capture", { sourceId: "device:mic", startId: startArgs.startId }],
-    ]);
-    const state = useAudioGraphStore.getState();
+    // Whatever the start's own reply says afterwards, it is not Running.
+    await start.reply({ fact: running(id), snapshot: ended(id) });
+    await pending;
+    state = useAudioGraphStore.getState();
     expect(state.isCapturing).toBe(false);
     expect(state.captureStarting).toBe(false);
-    expect(state.captureSourceIds).toEqual([]);
     expect(state.captureStartTime).toBeNull();
+    expect(state.captureFact).toEqual(ended(id));
+  });
+
+  it("keeps showing a Stop that never replies as stopping, with the capture still shown, until an Ended fact arrives", async () => {
+    const id = await startedCapture();
+    const stop = deferredCommand("stop_capture");
+
+    const pending = useAudioGraphStore.getState().stopCapture();
+    await vi.waitFor(() =>
+      expect(useAudioGraphStore.getState().captureStopping).toBe(true),
+    );
+    expect(useAudioGraphStore.getState().isCapturing).toBe(true);
+
+    useAudioGraphStore.getState().setPipelineStatus(statusFor(ended(id)));
+    let state = useAudioGraphStore.getState();
+    expect(state.isCapturing).toBe(false);
+    expect(state.captureStopping).toBe(false);
+
+    await stop.reply({ fact: ended(id), snapshot: ended(id) });
+    await pending;
+    state = useAudioGraphStore.getState();
+    expect(state.isCapturing).toBe(false);
+    expect(state.captureFact).toEqual(ended(id));
+  });
+
+  it("clears the stop intent of a rejected Stop and shows what its snapshot says", async () => {
+    const id = await startedCapture();
+    const stop = deferredCommand("stop_capture");
+
+    const stillRunning = useAudioGraphStore.getState().stopCapture();
+    await vi.waitFor(() =>
+      expect(useAudioGraphStore.getState().captureStopping).toBe(true),
+    );
+    await stop.fail({
+      code: "capture_stop_failed",
+      message: { snapshot: running(id) },
+    });
+    await stillRunning;
+    let state = useAudioGraphStore.getState();
+    expect(state.captureStopping).toBe(false);
+    expect(state.isCapturing).toBe(true);
+    expect(state.error).toBe(i18n.t("errors.captureStop.incomplete"));
+
+    // Stop stays available, and a rejection whose snapshot says the capture
+    // ended shows it ended.
+    const endedStop = useAudioGraphStore.getState().stopCapture();
+    await vi.waitFor(() =>
+      expect(useAudioGraphStore.getState().captureStopping).toBe(true),
+    );
+    await stop.fail({
+      code: "capture_stop_failed",
+      message: { snapshot: ended(id) },
+    });
+    await endedStop;
+    state = useAudioGraphStore.getState();
+    expect(state.captureStopping).toBe(false);
+    expect(state.isCapturing).toBe(false);
+  });
+
+  it("never lets a stale Stop reply end a newer capture", async () => {
+    const first = await startedCapture();
+    const stop = deferredCommand("stop_capture");
+    const pending = useAudioGraphStore.getState().stopCapture();
+    await vi.waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("stop_capture", { id: first }),
+    );
+    // The first capture's Idle arrives before its Stop's reply.
+    useAudioGraphStore.getState().setPipelineStatus(statusFor(ended(first)));
+    const second = await startedCapture();
+
+    await stop.reply({ fact: ended(first), snapshot: running(second) });
+    await pending;
+    const state = useAudioGraphStore.getState();
+    expect(state.isCapturing).toBe(true);
+    expect(state.captureFact).toEqual(running(second));
+  });
+
+  it("adopts a capture still running after a reload, and stops it by its id", async () => {
+    // A reload is a new realm: a fresh store module with no attachment yet.
+    vi.resetModules();
+    const core = await import("@tauri-apps/api/core");
+    const { useAudioGraphStore: reloaded } = await import("./index");
+    const adopted: CaptureId = { epoch: 4, seq: 7 };
+    vi.mocked(core.invoke).mockImplementation(async (cmd, args) =>
+      cmd === "capture_attach"
+        ? { epoch: 5, snapshot: running(adopted) }
+        : captureBackendReply(cmd, args),
+    );
+
+    expect(await reloaded.getState().attachCapture()).toBe(5);
+    let state = reloaded.getState();
+    expect(state.isCapturing).toBe(true);
+    expect(state.captureStarting).toBe(false);
+    // One attachment per realm, however many times it is asked for.
+    await reloaded.getState().attachCapture();
+    expect(
+      vi
+        .mocked(core.invoke)
+        .mock.calls.filter(([cmd]) => cmd === "capture_attach"),
+    ).toHaveLength(1);
+
+    await reloaded.getState().stopCapture();
+    expect(core.invoke).toHaveBeenCalledWith("stop_capture", { id: adopted });
+    state = reloaded.getState();
+    expect(state.isCapturing).toBe(false);
+    expect(state.captureFact).toEqual(ended(adopted));
   });
 
   it("passes the selected backend source descriptor when starting capture", async () => {
@@ -3829,7 +3922,9 @@ describe("AudioGraphStore", () => {
       },
       is_active: false,
     };
-    vi.mocked(invoke).mockResolvedValue(undefined);
+    vi.mocked(invoke).mockImplementation(async (cmd, args) =>
+      captureBackendReply(cmd, args),
+    );
     useAudioGraphStore.setState({
       selectedSourceIds: ["device:mic-1"],
       audioSources: [source],
@@ -3838,13 +3933,15 @@ describe("AudioGraphStore", () => {
     await useAudioGraphStore.getState().startCapture();
 
     expect(invoke).toHaveBeenCalledWith("start_capture", {
+      id: expect.objectContaining({ seq: expect.any(Number) }),
       sources: [{ sourceId: "device:mic-1", source }],
-      startId: expect.any(String),
     });
   });
 
   it("clears historical Review projections before accepting new live events", async () => {
-    vi.mocked(invoke).mockResolvedValue(undefined);
+    vi.mocked(invoke).mockImplementation(async (cmd, args) =>
+      captureBackendReply(cmd, args),
+    );
     useAudioGraphStore.setState({
       selectedSourceIds: ["system-default"],
       loadedSessionId: "historical-session",
@@ -3901,7 +3998,9 @@ describe("AudioGraphStore", () => {
   });
 
   it("clears a stale pendingFinalizingSession when a fresh capture starts (R2 adversary finding #1: a prior stop's resident-data premise is void once a new capture overwrites the store)", async () => {
-    vi.mocked(invoke).mockResolvedValue(undefined);
+    vi.mocked(invoke).mockImplementation(async (cmd, args) =>
+      captureBackendReply(cmd, args),
+    );
     useAudioGraphStore.setState({
       selectedSourceIds: ["system-default"],
       pendingFinalizingSession: {
@@ -3928,7 +4027,9 @@ describe("AudioGraphStore", () => {
   });
 
   it("keeps legacy start_capture arguments when no descriptor matches", async () => {
-    vi.mocked(invoke).mockResolvedValue(undefined);
+    vi.mocked(invoke).mockImplementation(async (cmd, args) =>
+      captureBackendReply(cmd, args),
+    );
     useAudioGraphStore.setState({
       selectedSourceIds: ["device:stale"],
       audioSources: [
@@ -3945,8 +4046,8 @@ describe("AudioGraphStore", () => {
     await useAudioGraphStore.getState().startCapture();
 
     expect(invoke).toHaveBeenCalledWith("start_capture", {
+      id: expect.objectContaining({ seq: expect.any(Number) }),
       sources: [{ sourceId: "device:stale" }],
-      startId: expect.any(String),
     });
   });
 
@@ -5739,7 +5840,13 @@ describe("stopCapture — SHELL-R2 session routing", () => {
     vi.clearAllMocks();
     useAudioGraphStore.setState({
       selectedSourceIds: ["system-default"],
+      // A running capture, as its backend fact made it.
+      captureFact: running({ epoch: 9, seq: 1 }),
+      captureStartIntent: null,
+      captureStopIntent: null,
       isCapturing: true,
+      captureStarting: false,
+      captureStopping: false,
       isTranscribing: true,
       captureStartTime: 1_700_000_000_000,
       transcriptSegments: [],
@@ -5757,9 +5864,9 @@ describe("stopCapture — SHELL-R2 session routing", () => {
   });
 
   it("routes nav to the Sessions destination on the just-ended session, Notes lens", async () => {
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
       if (cmd === "get_session_id") return "session-abc";
-      if (cmd === "stop_capture") return null;
+      if (cmd === "stop_capture") return captureBackendReply(cmd, args);
       if (cmd === "list_sessions") return [];
       return undefined;
     });
@@ -5799,9 +5906,9 @@ describe("stopCapture — SHELL-R2 session routing", () => {
       ],
     });
     let listSessionsCalls = 0;
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
       if (cmd === "get_session_id") return "session-abc";
-      if (cmd === "stop_capture") return null;
+      if (cmd === "stop_capture") return captureBackendReply(cmd, args);
       if (cmd === "list_sessions") {
         listSessionsCalls += 1;
         // The 1d92 gap: the index hasn't caught up yet.
@@ -5824,9 +5931,9 @@ describe("stopCapture — SHELL-R2 session routing", () => {
   });
 
   it("does not route or write an optimistic row when the session id read fails, but still stops capture", async () => {
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
       if (cmd === "get_session_id") throw new Error("no active session");
-      if (cmd === "stop_capture") return null;
+      if (cmd === "stop_capture") return captureBackendReply(cmd, args);
       return undefined;
     });
 
@@ -5860,9 +5967,9 @@ describe("stopCapture — SHELL-R2 session routing", () => {
         optimistic: true,
       },
     });
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
       if (cmd === "get_session_id") throw new Error("no active session");
-      if (cmd === "stop_capture") return null;
+      if (cmd === "stop_capture") return captureBackendReply(cmd, args);
       return undefined;
     });
 
@@ -5873,13 +5980,13 @@ describe("stopCapture — SHELL-R2 session routing", () => {
 
   it("does not route to or create a pending row for the sample-preview sentinel id (getSessionId degrades to the truthy SAMPLE_SESSION_ID during sample preview rather than throwing — R2 adversary finding #4)", async () => {
     useAudioGraphStore.getState().loadSampleSessionPreview();
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
       if (cmd === "get_session_id") {
         throw new Error(
           "getSessionId() should short-circuit on samplePreviewActive and never invoke the backend",
         );
       }
-      if (cmd === "stop_capture") return null;
+      if (cmd === "stop_capture") return captureBackendReply(cmd, args);
       if (cmd === "list_sessions") return [];
       return undefined;
     });
@@ -5934,18 +6041,24 @@ describe("startCaptureAndTranscribe — SHELL-R3 merged Start (ADR-0046)", () =>
       selectedSourceIds: ["system-default"],
       isCapturing: false,
       captureStarting: false,
-      captureSourceIds: [],
+      captureStopping: false,
+      captureFact: null,
+      captureStartIntent: null,
+      captureStopIntent: null,
       isTranscribing: false,
       error: null,
     });
   });
 
+  /** Commands sent, leaving out this realm's one-time capture attach. */
+  const sent = (invoked: string[]) =>
+    invoked.filter((cmd) => cmd !== "capture_attach");
+
   it("issues EXACTLY start_capture — never start_transcribe — when no durable route is configured (the real CI default)", async () => {
     const invoked: string[] = [];
-    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args) => {
       invoked.push(cmd);
-      if (cmd === "start_capture") return captureAck(["system-default"]);
-      return undefined;
+      return captureBackendReply(cmd, args);
     });
     useAudioGraphStore.setState({
       settings: selectableSettings({
@@ -5976,27 +6089,34 @@ describe("startCaptureAndTranscribe — SHELL-R3 merged Start (ADR-0046)", () =>
 
   it("composes start_transcribe when the durable route IS configured and capture starts", async () => {
     const invoked: string[] = [];
-    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args) => {
       invoked.push(cmd);
-      if (cmd === "start_capture") return captureAck(["system-default"]);
       if (cmd === "start_transcribe") return null;
-      return undefined;
+      return captureBackendReply(cmd, args);
     });
     useAudioGraphStore.setState({ settings: selectableSettings() });
 
     await useAudioGraphStore.getState().startCaptureAndTranscribe();
 
-    expect(invoked).toEqual(["start_capture", "start_transcribe"]);
+    expect(sent(invoked)).toEqual(["start_capture", "start_transcribe"]);
+    // Chained to the capture this start produced.
+    const started = vi
+      .mocked(invoke)
+      .mock.calls.find(([cmd]) => cmd === "start_capture")?.[1] as {
+      id: CaptureId;
+    };
+    expect(invoke).toHaveBeenCalledWith("start_transcribe", {
+      captureId: started.id,
+    });
     expect(useAudioGraphStore.getState().isCapturing).toBe(true);
     expect(useAudioGraphStore.getState().isTranscribing).toBe(true);
   });
 
   it("skips the transcribe leg when settings have not hydrated yet (mirrors the old canTranscribe's settings !== null facet)", async () => {
     const invoked: string[] = [];
-    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args) => {
       invoked.push(cmd);
-      if (cmd === "start_capture") return captureAck(["system-default"]);
-      return undefined;
+      return captureBackendReply(cmd, args);
     });
     // Reachable pre-hydration window: App's credential probe can resolve
     // before `load_settings_cmd`, leaving `settings` null at Start-click
@@ -6018,10 +6138,10 @@ describe("startCaptureAndTranscribe — SHELL-R3 merged Start (ADR-0046)", () =>
 
   it("skips the transcribe leg when startCapture itself fails (no atomicity claim — re-reads state, not a pre-await snapshot)", async () => {
     const invoked: string[] = [];
-    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args) => {
       invoked.push(cmd);
       if (cmd === "start_capture") throw new Error("mocked-capture-failure");
-      return undefined;
+      return captureBackendReply(cmd, args);
     });
     useAudioGraphStore.setState({ settings: selectableSettings() });
 

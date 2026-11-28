@@ -20,6 +20,7 @@ import i18n from "../i18n";
 import { useReviewStore } from "../session/reviewStore";
 import { loadedSession, segment } from "../session/reviewTestUtils";
 import { useAudioGraphStore } from "../store";
+import { captureBackendReply, running } from "../test/captureBackend";
 import { preloadGraphLens } from "../test/lazyChunks";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
 import NowStrip from "./NowStrip";
@@ -162,7 +163,7 @@ function mockBackend(): void {
     if (cmd === "load_session_notes_artifacts_cmd")
       return { notes: null, projection_events: [] };
     if (cmd === "load_session_graph_artifact_cmd") return null;
-    return null;
+    return captureBackendReply(cmd, args) ?? null;
   });
 }
 
@@ -179,6 +180,8 @@ describe("SessionsBrowser: the just-stopped session's resident data", () => {
     useAudioGraphStore.setState({
       sessions: [],
       isCapturing: false,
+      captureFact: null,
+      captureStopIntent: null,
       isTranscribing: false,
       selectedSourceIds: [],
       captureStartTime: null,
@@ -194,6 +197,7 @@ describe("SessionsBrowser: the just-stopped session's resident data", () => {
       sessions: [],
       sessionsLoading: false,
       isCapturing: true,
+      captureFact: running({ epoch: 1, seq: 1 }),
       isTranscribing: true,
       selectedSourceIds: ["system-default"],
       captureStartTime: Date.now(),

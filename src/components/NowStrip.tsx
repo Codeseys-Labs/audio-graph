@@ -103,6 +103,10 @@ const HEALTH_TONE: Record<"healthy" | "degraded" | "error", string> = {
 function NowStrip() {
   const { t } = useTranslation();
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
+  // A pending Start can be stopped, and a Stop that has not been confirmed
+  // stays "Stopping…" with Stop still enabled (it is idempotent).
+  const captureStarting = useAudioGraphStore((s) => s.captureStarting);
+  const captureStopping = useAudioGraphStore((s) => s.captureStopping);
   // SHELL-R4 (plan §R4, ADR-0046): read alongside `isCapturing` so the
   // relocated `.workspace-switcher__state` region below can reproduce the
   // exact 4-way ternary the destination bar used to render.
@@ -168,10 +172,11 @@ function NowStrip() {
       ? null
       : Math.max(0, Math.floor((nowMs - lastNotesSavedAtMs) / 1000));
 
+  const showStop = isCapturing || captureStarting;
   const handleToggleCapture = useCallback(async () => {
     setCapturePending(true);
     try {
-      if (isCapturing) {
+      if (showStop) {
         await stopCapture();
       } else {
         await startCaptureAndTranscribe();
@@ -179,7 +184,7 @@ function NowStrip() {
     } finally {
       setCapturePending(false);
     }
-  }, [isCapturing, startCaptureAndTranscribe, stopCapture]);
+  }, [showStop, startCaptureAndTranscribe, stopCapture]);
 
   const canStart = selectedSourceIds.length > 0 && !isCapturing;
 
@@ -237,25 +242,32 @@ function NowStrip() {
       <div className="now-strip__center flex items-center gap-(--space-4) flex-1 justify-center">
         <button
           type="button"
-          className={`py-(--space-3) px-(--space-8) rounded-md text-base font-semibold cursor-pointer transition-[background-color,border-color,opacity] duration-(--motion-base) ease-(--ease-standard) border-2 border-transparent leading-[1.4] ${isCapturing ? "bg-accent-red text-(--on-accent-red) border-accent-red hover:bg-(--accent-red-hover) hover:border-(--accent-red-hover)" : "bg-accent-green text-(--on-accent-green) border-accent-green enabled:hover:bg-(--accent-green-hover) enabled:hover:border-(--accent-green-hover) disabled:opacity-40 disabled:cursor-not-allowed"}`}
+          className={`py-(--space-3) px-(--space-8) rounded-md text-base font-semibold cursor-pointer transition-[background-color,border-color,opacity] duration-(--motion-base) ease-(--ease-standard) border-2 border-transparent leading-[1.4] ${showStop ? "bg-accent-red text-(--on-accent-red) border-accent-red hover:bg-(--accent-red-hover) hover:border-(--accent-red-hover)" : "bg-accent-green text-(--on-accent-green) border-accent-green enabled:hover:bg-(--accent-green-hover) enabled:hover:border-(--accent-green-hover) disabled:opacity-40 disabled:cursor-not-allowed"}`}
           onClick={handleToggleCapture}
-          disabled={(!canStart && !isCapturing) || capturePending}
+          disabled={!showStop && (!canStart || capturePending)}
           aria-label={
-            isCapturing ? t("controlBar.stop") : t("controlBar.start")
+            showStop
+              ? captureStopping
+                ? t("controlBar.stopping")
+                : t("controlBar.stop")
+              : t("controlBar.start")
           }
-          aria-pressed={isCapturing}
-          aria-busy={capturePending}
+          aria-pressed={showStop}
+          aria-busy={capturePending || captureStarting || captureStopping}
         >
-          {isCapturing ? (
+          {showStop ? (
             <>
-              <Icon name="stop" size={16} /> {t("controlBar.stop")}
+              <Icon name="stop" size={16} />{" "}
+              {captureStopping
+                ? t("controlBar.stopping")
+                : t("controlBar.stop")}
             </>
           ) : (
             <>
               <Icon name="start" size={16} /> {t("controlBar.start")}
             </>
           )}
-          {capturePending && (
+          {(capturePending || captureStarting) && !captureStopping && (
             <span className="ml-(--space-2) opacity-70" aria-hidden="true">
               …
             </span>

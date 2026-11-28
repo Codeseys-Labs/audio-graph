@@ -17,7 +17,8 @@ import {
   segment,
 } from "../session/reviewTestUtils";
 import { useAudioGraphStore } from "../store";
-import type { SessionMetadata } from "../types";
+import { captureBackendReply, running } from "../test/captureBackend";
+import type { CaptureId, SessionMetadata } from "../types";
 import { downloadAsFile } from "../utils/download";
 import NowStrip from "./NowStrip";
 import SessionsBrowser from "./SessionsBrowser";
@@ -45,11 +46,14 @@ vi.mock("../utils/download", async (importOriginal) => ({
 
 const mockedInvoke = vi.mocked(invoke);
 const mockedDownload = vi.mocked(downloadAsFile);
-/** Never reset: the store accepts only ever-newer acknowledged generations. */
-let captureGeneration = 0;
-function captureAck(sources: string[]) {
-  captureGeneration += 1;
-  return { generation: captureGeneration, sources };
+/** The backend's acknowledgement of the latest `start_capture` call. */
+function acknowledgeStart(): unknown {
+  const call = mockedInvoke.mock.calls
+    .filter(([cmd]) => cmd === "start_capture")
+    .at(-1);
+  if (!call) throw new Error("start_capture was not invoked");
+  const { id } = call[1] as { id: CaptureId };
+  return { fact: running(id), snapshot: running(id) };
 }
 
 /**
@@ -252,7 +256,9 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
       sessions: [],
       isCapturing: false,
       captureStarting: false,
-      captureSourceIds: [],
+      captureFact: null,
+      captureStartIntent: null,
+      captureStopIntent: null,
       isTranscribing: false,
       selectedSourceIds: [],
       captureStartTime: null,
@@ -362,12 +368,12 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
   it("does not reload history into the Live store when Start is pressed on a hydrated A", async () => {
     mockBackend();
     const startAck = deferred<unknown>();
-    mockedInvoke.mockImplementation(async (cmd: string) => {
+    mockedInvoke.mockImplementation(async (cmd: string, args) => {
       if (cmd === "list_sessions") return [SESSION_A];
       if (cmd === "load_session") return payloadA();
       if (cmd === "start_capture") return startAck.promise;
       if (cmd === "purge_expired_sessions") return [];
-      return null;
+      return captureBackendReply(cmd, args) ?? null;
     });
     useAudioGraphStore.setState({
       sessions: [SESSION_A],
@@ -413,7 +419,7 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
 
     // Acknowledged: Capture would mount with none of A's data resident.
     await act(async () => {
-      startAck.resolve(captureAck(["system-default"]));
+      startAck.resolve(acknowledgeStart());
     });
     await waitFor(() =>
       expect(useAudioGraphStore.getState().isCapturing).toBe(true),
@@ -429,12 +435,12 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
   it("keeps a row click during an unacknowledged Start from loading history", async () => {
     mockBackend();
     const startAck = deferred<unknown>();
-    mockedInvoke.mockImplementation(async (cmd: string) => {
+    mockedInvoke.mockImplementation(async (cmd: string, args) => {
       if (cmd === "list_sessions") return [SESSION_A];
       if (cmd === "load_session") return payloadA();
       if (cmd === "start_capture") return startAck.promise;
       if (cmd === "purge_expired_sessions") return [];
-      return null;
+      return captureBackendReply(cmd, args) ?? null;
     });
     useAudioGraphStore.setState({
       sessions: [SESSION_A],
@@ -464,7 +470,7 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
     expect(useAudioGraphStore.getState().transcriptSegments).toEqual([]);
 
     await act(async () => {
-      startAck.resolve(captureAck(["system-default"]));
+      startAck.resolve(acknowledgeStart());
     });
     await waitFor(() =>
       expect(useAudioGraphStore.getState().isCapturing).toBe(true),

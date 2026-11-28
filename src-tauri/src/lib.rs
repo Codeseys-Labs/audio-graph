@@ -688,6 +688,7 @@ pub(crate) fn app_invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) ->
 {
     tauri::generate_handler![
         commands::list_audio_sources,
+        commands::capture_attach,
         commands::start_capture,
         commands::stop_capture,
         commands::update_tray_capturing,

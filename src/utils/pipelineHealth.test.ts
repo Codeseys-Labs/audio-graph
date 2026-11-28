@@ -17,6 +17,7 @@ const diagnostic: RuntimeDiagnostic = {
 };
 
 const idle: PipelineStatus = {
+  capture_id: { epoch: 0, seq: 0 },
   capture: { type: "Idle" },
   pipeline: { type: "Idle" },
   asr: { type: "Idle" },

@@ -137,9 +137,29 @@ pub enum AppError {
     },
     /// A capture start was refused or failed and nothing was left running.
     /// Closed and content-free: sources are identified by request position.
-    CaptureStartFailed(crate::audio::capture::CaptureStartFailure),
+    CaptureStartFailed(Box<CaptureStartRefusal>),
+    /// A capture Stop did not complete cleanly. The snapshot says whether the
+    /// capture still runs.
+    CaptureStopFailed(CaptureStopFailure),
     /// Catch-all for errors not yet migrated to a typed variant.
     Unknown(String),
+}
+
+/// A refused capture start as the renderer receives it: the closed failure,
+/// the fact that this start ended, and the backend's current capture fact.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CaptureStartRefusal {
+    #[serde(flatten)]
+    pub failure: crate::audio::capture::CaptureStartFailure,
+    pub capture: crate::events::CaptureFact,
+    pub snapshot: crate::events::CaptureFact,
+}
+
+/// A capture Stop that did not complete cleanly, with the backend's current
+/// capture fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct CaptureStopFailure {
+    pub snapshot: crate::events::CaptureFact,
 }
 
 /// Borrowed mirror of the pre-ec13 wire contract. Keeping the legacy mapping
@@ -173,7 +193,8 @@ enum LegacyAppErrorWire<'a> {
         size_bytes: u64,
         ceiling_bytes: u64,
     },
-    CaptureStartFailed(&'a crate::audio::capture::CaptureStartFailure),
+    CaptureStartFailed(&'a CaptureStartRefusal),
+    CaptureStopFailed(&'a CaptureStopFailure),
     PrivacyPolicyBlocked {
         mode: &'a str,
         action: &'a str,
@@ -240,7 +261,8 @@ impl serde::Serialize for AppError {
                 size_bytes: *size_bytes,
                 ceiling_bytes: *ceiling_bytes,
             },
-            Self::CaptureStartFailed(failure) => LegacyAppErrorWire::CaptureStartFailed(failure),
+            Self::CaptureStartFailed(refusal) => LegacyAppErrorWire::CaptureStartFailed(refusal),
+            Self::CaptureStopFailed(failure) => LegacyAppErrorWire::CaptureStopFailed(failure),
             Self::PrivacyPolicyBlocked {
                 mode,
                 action,
@@ -323,15 +345,16 @@ impl fmt::Display for AppError {
                 "{} artifact is {} bytes, exceeding the {}-byte ceiling; this session predates the artifact-size fix",
                 artifact_class, size_bytes, ceiling_bytes
             ),
-            AppError::CaptureStartFailed(failure) => match failure.source_index {
+            AppError::CaptureStartFailed(refusal) => match refusal.failure.source_index {
                 Some(index) => write!(
                     f,
                     "Capture start failed: {} (source {})",
-                    failure.reason,
+                    refusal.failure.reason,
                     index + 1
                 ),
-                None => write!(f, "Capture start failed: {}", failure.reason),
+                None => write!(f, "Capture start failed: {}", refusal.failure.reason),
             },
+            AppError::CaptureStopFailed(_) => write!(f, "Capture stop did not complete cleanly"),
             AppError::Unknown(msg) => write!(f, "{}", msg),
         }
     }

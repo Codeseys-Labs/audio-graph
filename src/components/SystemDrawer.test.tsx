@@ -18,6 +18,7 @@ vi.mock("./ProjectionRuntimeStatusPanel", () => ({
 function resetStore() {
   useAudioGraphStore.setState({
     pipelineStatus: {
+      capture_id: { epoch: 0, seq: 0 },
       capture: { type: "Idle" },
       pipeline: { type: "Idle" },
       asr: { type: "Idle" },
