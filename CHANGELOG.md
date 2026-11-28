@@ -56,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A panic inside one LLM executor job no longer leaves other jobs waiting
+  forever. That job and the jobs queued behind it end at once (notes synthesis
+  and projection with an error, entity extraction with its rule-based
+  fallback), and the next job starts a new worker (#539).
 - Soniox duration rollovers reconnect without showing a transcription error.
   Deepgram and OpenAI report a stalled audio backlog as a timeout. Aura uses
   request and protocol diagnostics for text and WebSocket size limits.
