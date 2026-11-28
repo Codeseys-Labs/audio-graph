@@ -39,6 +39,12 @@
 
 use crate::credentials::CredentialStore;
 use async_trait::async_trait;
+use audio_graph_ipc_contract::credential_contract::{
+    CredentialError, CredentialErrorCode, CredentialSafeRecoveryAction,
+};
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnosticContext, RuntimeErrorCode as Code, RuntimeOperation, RuntimeTransport,
+};
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -51,8 +57,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio_tungstenite::tungstenite::{self, Message};
 
 use super::{
-    TtsConfig, TtsError, TtsErrorKind, TtsEvent, TtsHttpErrorDiagnostic, TtsProvider, TtsSession,
-    TtsStatus, tts_http_diagnostic_path,
+    TtsConfig, TtsError, TtsErrorKind as Kind, TtsEvent, TtsProvider, TtsSession, TtsStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -60,8 +65,6 @@ use super::{
 // ---------------------------------------------------------------------------
 
 const AURA_POLICY_PROVIDER: &str = "tts.deepgram_aura";
-const AURA_HTTP_PROVIDER: &str = "deepgram";
-const AURA_HTTP_SERVICE: &str = "aura";
 const EXPLICIT_POLICY_REQUIRED: &str = "explicit_policy_required";
 
 /// Aura idle-disconnect window is around 10s; the ADR mandates 8s for the
@@ -106,8 +109,7 @@ impl std::fmt::Debug for DeepgramAuraProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeepgramAuraProvider")
             .field("api_key", &"<redacted>")
-            .field("content_egress_policy", &self.content_egress_policy)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -136,8 +138,14 @@ impl DeepgramAuraProvider {
     pub fn from_store(store: &CredentialStore) -> Result<Self, TtsError> {
         match store.deepgram_api_key.as_deref().map(str::trim) {
             Some(key) if !key.is_empty() => Ok(Self::new(key.to_string())),
-            _ => Err(TtsError::Auth(
-                "deepgram_api_key not configured (used for both STT and TTS)".into(),
+            _ => Err(TtsError::new(
+                Kind::Auth,
+                CredentialError {
+                    code: CredentialErrorCode::Missing,
+                    retryable: false,
+                    recovery_action: CredentialSafeRecoveryAction::ReenterCredential,
+                    set_id: None,
+                },
             )),
         }
     }
@@ -163,7 +171,6 @@ impl TtsProvider for DeepgramAuraProvider {
 /// Internal message passed from the sync `TtsSession` methods into the async
 /// session task. Matches the audio command pattern from
 /// `asr/deepgram.rs::AudioCmd` but specialized for TTS.
-#[derive(Debug)]
 enum SessionCmd {
     /// `{"type":"Speak","text":"<text>"}`
     Speak(String),
@@ -314,11 +321,11 @@ impl AuraSession {
 
     fn send_cmd(&self, cmd: SessionCmd) -> Result<(), TtsError> {
         if self.closed.load(Ordering::SeqCst) {
-            return Err(TtsError::Network("session is closed".into()));
+            return Err(aura_error(Kind::Network, Code::NetworkUnreachable));
         }
         self.cmd_tx
             .send(cmd)
-            .map_err(|_| TtsError::Network("session command channel closed".into()))
+            .map_err(|_| aura_error(Kind::Network, Code::NetworkUnreachable))
     }
 }
 
@@ -330,13 +337,9 @@ impl TtsSession for AuraSession {
         }
         self.content_egress_policy
             .check_text(AURA_POLICY_PROVIDER)
-            .map_err(TtsError::BadRequest)?;
+            .map_err(|_| aura_error(Kind::BadRequest, Code::PolicyBlocked))?;
         if text.len() > MAX_SPEAK_CHARS {
-            return Err(TtsError::BadRequest(format!(
-                "Speak frame text length {} exceeds Aura cap of {}",
-                text.len(),
-                MAX_SPEAK_CHARS
-            )));
+            return Err(aura_error(Kind::BadRequest, Code::RequestRejected));
         }
         self.send_cmd(SessionCmd::Speak(text.to_string()))
     }
@@ -444,7 +447,7 @@ pub(crate) async fn open_ws(url: &str, api_key: &str) -> Result<(WsWriter, WsRea
         .header("Upgrade", "websocket")
         .header("Host", host)
         .body(())
-        .map_err(|e| TtsError::Unknown(format!("Failed to build WebSocket request: {e}")))?;
+        .map_err(|_| aura_error(Kind::BadRequest, Code::RequestRejected))?;
 
     // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
     // ordinary transport error (routed through `classify_tungstenite_error`
@@ -453,23 +456,12 @@ pub(crate) async fn open_ws(url: &str, api_key: &str) -> Result<(WsWriter, WsRea
         Ok((ws_stream, response)) => {
             let status = response.status().as_u16();
             // Tungstenite only returns Ok on a 101 upgrade, but be defensive.
-            if status >= 400 {
-                return Err(TtsError::from_http_status_diagnostic(
-                    status,
-                    aura_http_error_diagnostic(url, response.headers(), None, api_key),
-                ));
+            if status != 101 {
+                return Err(TtsError::from_http_status(status));
             }
             Ok(ws_stream.split())
         }
-        Err(tungstenite::Error::Http(resp)) => {
-            let status = resp.status().as_u16();
-            let body = resp.body().as_deref();
-            Err(TtsError::from_http_status_diagnostic(
-                status,
-                aura_http_error_diagnostic(url, resp.headers(), body, api_key),
-            ))
-        }
-        Err(e) => Err(classify_tungstenite_error(&e, api_key)),
+        Err(e) => Err(classify_tungstenite_error(&e)),
     }
 }
 
@@ -481,72 +473,30 @@ fn extract_host(url: &str) -> Option<String> {
     Some(stripped[..end].to_string())
 }
 
-fn aura_http_error_diagnostic(
-    url: &str,
-    headers: &tungstenite::http::HeaderMap,
-    body: Option<&[u8]>,
-    api_key: &str,
-) -> TtsHttpErrorDiagnostic {
-    let request_id = response_request_id(headers)
-        .or_else(|| body.and_then(response_body_request_id))
-        .map(|id| crate::error::redacted_provider_diagnostic(&id, [api_key]));
-    let diagnostic = TtsHttpErrorDiagnostic::new(
-        AURA_HTTP_PROVIDER,
-        AURA_HTTP_SERVICE,
-        tts_http_diagnostic_path(url),
+fn aura_error(kind: Kind, code: Code) -> TtsError {
+    TtsError::runtime(
+        kind,
+        code,
+        RuntimeDiagnosticContext::new(RuntimeOperation::SpeechSynthesis)
+            .with_transport(RuntimeTransport::Websocket),
     )
-    .with_request_id(request_id);
-
-    match body {
-        Some(body) => diagnostic.with_body_bytes(body),
-        None => diagnostic,
-    }
 }
 
-fn response_request_id(headers: &tungstenite::http::HeaderMap) -> Option<String> {
-    for name in ["x-request-id", "request-id", "dg-request-id", "cf-ray"] {
-        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
-            continue;
-        };
-        if let Some(request_id) = sanitize_request_id(value) {
-            return Some(request_id);
+fn classify_tungstenite_error(error: &tungstenite::Error) -> TtsError {
+    use tungstenite::Error;
+
+    match error {
+        Error::Http(response) => TtsError::from_http_status(response.status().as_u16()),
+        Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => {
+            aura_error(Kind::Network, Code::Timeout)
         }
-    }
-    None
-}
-
-fn response_body_request_id(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|parsed| string_field(&parsed, &["request_id", "requestId", "id"]))
-        .and_then(|request_id| sanitize_request_id(&request_id))
-}
-
-fn sanitize_request_id(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty()
-        || !trimmed
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
-    {
-        return None;
-    }
-
-    let sanitized: String = trimmed.chars().take(128).collect();
-    Some(sanitized)
-}
-
-fn classify_tungstenite_error(e: &tungstenite::Error, api_key: &str) -> TtsError {
-    let safe = |message: String| crate::error::redacted_provider_diagnostic(&message, [api_key]);
-    match e {
-        tungstenite::Error::Io(io) => TtsError::Network(safe(format!("io: {io}"))),
-        tungstenite::Error::Tls(tls) => TtsError::Network(safe(format!("tls: {tls}"))),
-        tungstenite::Error::Url(u) => TtsError::BadRequest(safe(format!("url: {u}"))),
-        tungstenite::Error::Protocol(p) => TtsError::Protocol(safe(format!("protocol: {p}"))),
-        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
-            TtsError::Network("connection closed".into())
+        Error::Io(_) | Error::Tls(_) | Error::ConnectionClosed | Error::AlreadyClosed => {
+            aura_error(Kind::Network, Code::NetworkUnreachable)
         }
-        _ => TtsError::Unknown(safe(format!("websocket error: {e}"))),
+        Error::Url(_) | Error::HttpFormat(_) => aura_error(Kind::BadRequest, Code::RequestRejected),
+        Error::Protocol(_) => aura_error(Kind::Protocol, Code::ProtocolError),
+        Error::Capacity(_) => aura_error(Kind::Protocol, Code::CapacityExhausted),
+        _ => aura_error(Kind::Unknown, Code::Internal),
     }
 }
 
@@ -592,20 +542,11 @@ struct SessionCtx {
 }
 
 #[derive(Debug)]
-// The `String` payloads are diagnostic detail surfaced only through the
-// derived `Debug` impl (reconnect logging). Dead-code analysis ignores
-// `Debug` usage, so allow the otherwise-"unread" fields rather than
-// dropping the diagnostic context.
-#[allow(dead_code)]
 enum DisconnectKind {
     /// User asked to close. No reconnect.
     UserRequested,
-    /// Server sent a Close frame. May reconnect unless user closed.
-    ServerClose(String),
-    /// Transport-level error (TLS, TCP reset, DNS flap).
-    NetworkError(String),
-    /// Protocol violation -- malformed frame, invalid sequence.
-    ProtocolError(String),
+    /// Provider close or transport failure. May reconnect unless user closed.
+    Disconnected(TtsError),
     /// Command channel ran dry -- the session struct was dropped.
     CmdChannelEnded,
 }
@@ -641,7 +582,6 @@ async fn session_task(ctx: SessionCtx) {
             &user_closed,
             &clearing,
             sample_rate,
-            &api_key,
             content_egress_policy,
         )
         .await;
@@ -651,20 +591,18 @@ async fn session_task(ctx: SessionCtx) {
                 let _ = event_tx.send(TtsEvent::Status(TtsStatus::Disconnected));
                 break;
             }
-            other => {
+            DisconnectKind::Disconnected(error) => {
                 if user_closed.load(Ordering::SeqCst) {
                     let _ = event_tx.send(TtsEvent::Status(TtsStatus::Disconnected));
                     break;
                 }
-                log::warn!("Aura session disconnected: {other:?}");
+                log::warn!("Aura session disconnected: {error}");
                 let _ = event_tx.send(TtsEvent::Status(TtsStatus::Disconnected));
 
                 reconnect_attempts += 1;
                 let Some(backoff_secs) = backoff_for_attempt(reconnect_attempts) else {
-                    let _ = event_tx.send(TtsEvent::Error {
-                        kind: TtsErrorKind::Exhausted,
-                        message: "Aura reconnect attempts exhausted".into(),
-                    });
+                    let _ =
+                        event_tx.send(aura_error(Kind::Exhausted, Code::CapacityExhausted).into());
                     break;
                 };
 
@@ -712,13 +650,7 @@ async fn session_task(ctx: SessionCtx) {
                         reconnect_attempts = 0;
                     }
                     Err(e) => {
-                        let _ = event_tx.send(TtsEvent::Error {
-                            kind: e.kind(),
-                            message: format!(
-                                "Reconnect attempt {reconnect_attempts} failed: {}",
-                                e.message()
-                            ),
-                        });
+                        let _ = event_tx.send(e.into());
                         // Don't run_io with broken halves; loop directly to
                         // increment the backoff ladder.
                         continue;
@@ -743,7 +675,6 @@ async fn run_io(
     user_closed: &Arc<AtomicBool>,
     clearing: &Arc<AtomicBool>,
     sample_rate: u32,
-    api_key: &str,
     content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 ) -> DisconnectKind {
     let mut keep_alive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
@@ -758,11 +689,7 @@ async fn run_io(
             _ = keep_alive.tick() => {
                 if last_outbound.elapsed() >= Duration::from_secs(KEEPALIVE_INTERVAL_SECS) {
                     if let Err(e) = writer.send(Message::Text(KEEPALIVE_PAYLOAD.into())).await {
-                        let message = crate::error::redacted_provider_diagnostic(
-                            &format!("keepalive failed: {e}"),
-                            [api_key],
-                        );
-                        return DisconnectKind::NetworkError(message);
+                        return DisconnectKind::Disconnected(classify_tungstenite_error(&e));
                     }
                     last_outbound = tokio::time::Instant::now();
                 }
@@ -788,21 +715,13 @@ async fn run_io(
                         }
                         let payload = serde_json::json!({"type": "Speak", "text": text}).to_string();
                         if let Err(e) = writer.send(Message::Text(payload.into())).await {
-                            let message = crate::error::redacted_provider_diagnostic(
-                                &format!("speak send failed: {e}"),
-                                [api_key],
-                            );
-                            return DisconnectKind::NetworkError(message);
+                            return DisconnectKind::Disconnected(classify_tungstenite_error(&e));
                         }
                         last_outbound = tokio::time::Instant::now();
                     }
                     Some(SessionCmd::Flush(sequence)) => {
                         if let Err(e) = writer.send(Message::Text(FRAME_FLUSH.into())).await {
-                            let message = crate::error::redacted_provider_diagnostic(
-                                &format!("flush send failed: {e}"),
-                                [api_key],
-                            );
-                            return DisconnectKind::NetworkError(message);
+                            return DisconnectKind::Disconnected(classify_tungstenite_error(&e));
                         }
                         pending_flushes.push_back(sequence);
                         last_outbound = tokio::time::Instant::now();
@@ -813,11 +732,7 @@ async fn run_io(
                         // before the server processes the Clear is suppressed.
                         clearing.store(true, Ordering::SeqCst);
                         if let Err(e) = writer.send(Message::Text(FRAME_CLEAR.into())).await {
-                            let message = crate::error::redacted_provider_diagnostic(
-                                &format!("clear send failed: {e}"),
-                                [api_key],
-                            );
-                            return DisconnectKind::NetworkError(message);
+                            return DisconnectKind::Disconnected(classify_tungstenite_error(&e));
                         }
                         last_outbound = tokio::time::Instant::now();
                     }
@@ -838,7 +753,6 @@ async fn run_io(
                             &mut pending_flushes,
                             clearing,
                             sample_rate,
-                            api_key,
                         )
                         .await;
                         let _ = writer.close().await;
@@ -853,7 +767,9 @@ async fn run_io(
 
             frame = reader.next() => {
                 let Some(frame) = frame else {
-                    return DisconnectKind::NetworkError("reader stream ended".into());
+                    return DisconnectKind::Disconnected(aura_error(
+                        Kind::Network, Code::NetworkUnreachable,
+                    ));
                 };
                 match frame {
                     Ok(Message::Binary(bytes)) => {
@@ -873,43 +789,17 @@ async fn run_io(
                         }
                     }
                     Ok(Message::Text(text)) => {
-                        handle_server_text_with_key(
-                            &text,
-                            event_tx,
-                            &mut pending_flushes,
-                            clearing,
-                            api_key,
-                        );
+                        handle_server_text(&text, event_tx, &mut pending_flushes, clearing);
                     }
                     Ok(Message::Close(frame)) => {
                         if user_closed.load(Ordering::SeqCst) {
                             return DisconnectKind::UserRequested;
                         }
-                        let reason = frame
-                            .map(|f| {
-                                let code: u16 = f.code.into();
-                                close_frame_diagnostic(code, f.reason.as_ref())
-                            })
-                            .unwrap_or_else(|| "no_frame".into());
-                        return DisconnectKind::ServerClose(reason);
+                        let code = frame.map(|frame| u16::from(frame.code));
+                        return DisconnectKind::Disconnected(classify_close(code));
                     }
                     Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
-                    Err(tungstenite::Error::ConnectionClosed)
-                    | Err(tungstenite::Error::AlreadyClosed) => {
-                        return DisconnectKind::NetworkError("connection closed".into());
-                    }
-                    Err(tungstenite::Error::Protocol(p)) => {
-                        let message =
-                            crate::error::redacted_provider_diagnostic(&p.to_string(), [api_key]);
-                        return DisconnectKind::ProtocolError(message);
-                    }
-                    Err(e) => {
-                        let message = crate::error::redacted_provider_diagnostic(
-                            &format!("read error: {e}"),
-                            [api_key],
-                        );
-                        return DisconnectKind::NetworkError(message);
-                    }
+                    Err(e) => return DisconnectKind::Disconnected(classify_tungstenite_error(&e)),
                 }
             }
         }
@@ -932,7 +822,6 @@ async fn drain_until_flushed(
     pending_flushes: &mut VecDeque<u64>,
     clearing: &Arc<AtomicBool>,
     sample_rate: u32,
-    api_key: &str,
 ) {
     let deadline = tokio::time::Instant::now() + CLOSE_DRAIN_TIMEOUT;
     loop {
@@ -959,7 +848,7 @@ async fn drain_until_flushed(
             }
             Ok(Some(Ok(Message::Text(text)))) => {
                 let is_flushed = is_flushed_frame(&text);
-                handle_server_text_with_key(&text, event_tx, pending_flushes, clearing, api_key);
+                handle_server_text(&text, event_tx, pending_flushes, clearing);
                 if is_flushed {
                     // Final flush rendered; the tail audio has been forwarded.
                     return;
@@ -990,162 +879,77 @@ fn is_flushed_frame(text: &str) -> bool {
 // Server message parsing
 // ---------------------------------------------------------------------------
 
-/// Parse a single server JSON text frame and emit the corresponding
-/// [`TtsEvent`]. Public for unit tests.
-#[cfg(test)]
+/// Parse a single server JSON text frame into a closed control-plane event.
 pub(crate) fn handle_server_text(
     text: &str,
     event_tx: &tokio_mpsc::UnboundedSender<TtsEvent>,
     pending_flushes: &mut VecDeque<u64>,
     clearing: &Arc<AtomicBool>,
 ) {
-    handle_server_text_with_key(text, event_tx, pending_flushes, clearing, "");
-}
+    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+        let _ = event_tx.send(aura_error(Kind::Protocol, Code::InvalidResponse).into());
+        return;
+    };
 
-fn handle_server_text_with_key(
-    text: &str,
-    event_tx: &tokio_mpsc::UnboundedSender<TtsEvent>,
-    pending_flushes: &mut VecDeque<u64>,
-    clearing: &Arc<AtomicBool>,
-    api_key: &str,
-) {
-    let parsed: Value = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(e) => {
-            // Defense-in-depth on the UI-visible `TtsEvent::Error`:
-            // `serde_json::Error`'s `Display` reports only the failure position
-            // (line/column), not the frame bytes, so `{e}` does not itself echo
-            // the provider text frame. Still route the detail through the shared
-            // redaction/safe-excerpt helper (api_key registered as a known
-            // secret, pattern scrub for the rest) so this branch stays leak-safe
-            // if it is ever changed to interpolate the raw `text` frame.
-            let detail = crate::error::redacted_error_excerpt(&e.to_string(), [api_key], 200);
-            let _ = event_tx.send(TtsEvent::Error {
-                kind: TtsErrorKind::Protocol,
-                message: format!("Invalid JSON from Aura: {detail}"),
-            });
+    let event = match parsed.get("type").and_then(Value::as_str) {
+        Some("Metadata") => TtsEvent::Status(TtsStatus::Metadata),
+        Some("Flushed") => {
+            // The server leaves the sequence untagged. Zero marks an unsolicited ack.
+            let sequence = pending_flushes.pop_front().unwrap_or(0);
+            TtsEvent::Status(TtsStatus::Flushed { sequence })
+        }
+        Some("Cleared") => {
+            clearing.store(false, Ordering::SeqCst);
+            TtsEvent::Status(TtsStatus::Cleared)
+        }
+        Some("Warning") => {
+            let (_, code) = classify_aura_code(&parsed);
+            aura_error(Kind::Unknown, code).into()
+        }
+        Some("Error") => {
+            let (kind, code) = classify_aura_code(&parsed);
+            aura_error(kind, code).into()
+        }
+        _ => {
+            let error = aura_error(Kind::Protocol, Code::InvalidResponse);
+            log::debug!("Aura unhandled text frame: {error}");
             return;
         }
     };
+    let _ = event_tx.send(event);
+}
 
-    let msg_type = parsed
-        .get("type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    match msg_type.as_str() {
-        "Metadata" => {
-            let _ = event_tx.send(TtsEvent::Status(TtsStatus::Metadata {
-                request_id: string_field(&parsed, &["request_id", "requestId"]),
-                model: string_field(&parsed, &["model", "model_name", "modelName"]),
-                field_count: object_field_count(&parsed),
-            }));
+fn classify_aura_code(frame: &Value) -> (Kind, Code) {
+    let code = ["code", "error_code", "err_code", "warn_code"]
+        .into_iter()
+        .find_map(|key| frame.get(key).and_then(Value::as_str));
+    // Exact tokens from Deepgram's API and TTS WebSocket references.
+    // Descriptions and unknown code strings never participate in diagnostics.
+    match code {
+        Some("INVALID_AUTH" | "INSUFFICIENT_PERMISSIONS") => (Kind::Auth, Code::RequestRejected),
+        Some("MESSAGE-0000" | "DATA-0000" | "BIG-0000" | "BIG-0001") => {
+            (Kind::BadRequest, Code::RequestRejected)
         }
-        "Flushed" => {
-            // Server doesn't tag the flush with a sequence; pop the oldest
-            // dispatch-time sequence from the commands this socket sent.
-            // `0` means the server produced an unsolicited ack.
-            let sequence = pending_flushes.pop_front().unwrap_or(0);
-            let _ = event_tx.send(TtsEvent::Status(TtsStatus::Flushed { sequence }));
-        }
-        "Cleared" => {
-            // Reset the suppression flag so subsequent AudioChunks (from a
-            // new utterance after barge-in) flow through to consumers.
-            clearing.store(false, Ordering::SeqCst);
-            let _ = event_tx.send(TtsEvent::Status(TtsStatus::Cleared));
-        }
-        "Warning" => {
-            let message = aura_error_diagnostic(&parsed);
-            let message = crate::error::redacted_provider_diagnostic(&message, [api_key]);
-            let _ = event_tx.send(TtsEvent::Error {
-                kind: TtsErrorKind::Unknown,
-                message: format!("Aura warning: {message}"),
-            });
-        }
-        "Error" => {
-            let raw_message = parsed
-                .get("description")
-                .and_then(|v| v.as_str())
-                .or_else(|| parsed.get("message").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let message = aura_error_diagnostic(&parsed);
-            let message = crate::error::redacted_provider_diagnostic(&message, [api_key]);
-            // Server-classified errors land here regardless of HTTP status --
-            // map common phrases to the right `TtsErrorKind` for UI surfaces.
-            let kind = if raw_message.to_ascii_lowercase().contains("auth") {
-                TtsErrorKind::Auth
-            } else if raw_message.to_ascii_lowercase().contains("rate") {
-                TtsErrorKind::RateLimit
-            } else {
-                TtsErrorKind::Server
-            };
-            let _ = event_tx.send(TtsEvent::Error { kind, message });
-        }
-        _ => {
-            let request_id = string_field(&parsed, &["request_id", "requestId"])
-                .and_then(|value| sanitize_request_id(&value))
-                .unwrap_or_else(|| "none".to_string());
-            let safe_msg_type =
-                sanitize_request_id(&msg_type).unwrap_or_else(|| "unknown".to_string());
-            log::debug!(
-                "Aura: unhandled message type='{safe_msg_type}' request_id={request_id} fields={}",
-                object_field_count(&parsed)
-            );
-        }
+        Some("TEXT_LENGTH_WARNING") => (Kind::BadRequest, Code::CapacityExhausted),
+        Some("DATA-0001" | "TOO_MANY_REQUESTS") => (Kind::RateLimit, Code::RateLimited),
+        Some("NET-0000") => (Kind::Server, Code::ProviderUnavailable),
+        Some("NET-0001" | "NET-0002") => (Kind::Network, Code::NetworkUnreachable),
+        Some("NET-0003") => (Kind::Network, Code::Timeout),
+        // An unclassified Error still has the terminal behavior of a server error.
+        _ => (Kind::Server, Code::Internal),
     }
 }
 
-fn string_field(parsed: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| parsed.get(*key).and_then(|value| value.as_str()))
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn object_field_count(parsed: &Value) -> usize {
-    parsed.as_object().map_or(0, serde_json::Map::len)
-}
-
-fn close_frame_diagnostic(code: u16, reason: &str) -> String {
-    format!("code={code} reason_len={}", reason.chars().count())
-}
-
-fn aura_error_diagnostic(parsed: &Value) -> String {
-    let message_len = parsed
-        .get("description")
-        .or_else(|| parsed.get("message"))
-        .and_then(|value| value.as_str())
-        .map(|value| value.chars().count());
-    let code = diagnostic_token_field(parsed, &["code", "error_code", "status"]);
-    let request_id = diagnostic_token_field(parsed, &["request_id", "requestId"]);
-
-    match (code, request_id, message_len) {
-        (Some(code), Some(request_id), Some(message_len)) => {
-            format!("Aura error code={code} request_id={request_id} message_len={message_len}")
-        }
-        (Some(code), None, Some(message_len)) => {
-            format!("Aura error code={code} message_len={message_len}")
-        }
-        (None, Some(request_id), Some(message_len)) => {
-            format!("Aura error request_id={request_id} message_len={message_len}")
-        }
-        (Some(code), Some(request_id), None) => {
-            format!("Aura error code={code} request_id={request_id}")
-        }
-        (Some(code), None, None) => format!("Aura error code={code}"),
-        (None, Some(request_id), None) => format!("Aura error request_id={request_id}"),
-        (None, None, Some(message_len)) => format!("Aura error message_len={message_len}"),
-        (None, None, None) => format!(
-            "Aura error type={} fields={}",
-            diagnostic_token_field(parsed, &["type"]).unwrap_or_else(|| "unknown".into()),
-            object_field_count(parsed)
-        ),
-    }
-}
-
-fn diagnostic_token_field(parsed: &Value, keys: &[&str]) -> Option<String> {
-    string_field(parsed, keys).and_then(|value| sanitize_request_id(&value))
+fn classify_close(code: Option<u16>) -> TtsError {
+    let (kind, code) = match code {
+        None | Some(1000 | 1001 | 1006) => (Kind::Network, Code::NetworkUnreachable),
+        Some(1002 | 1007 | 1010) => (Kind::Protocol, Code::ProtocolError),
+        Some(1003 | 1008 | 1009) => (Kind::BadRequest, Code::RequestRejected),
+        Some(1011 | 1012) => (Kind::Server, Code::ProviderUnavailable),
+        Some(1013) => (Kind::RateLimit, Code::RateLimited),
+        _ => (Kind::Unknown, Code::Internal),
+    };
+    aura_error(kind, code)
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,7 +974,10 @@ fn i16_le_bytes_to_samples(bytes: &[u8]) -> Vec<i16> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{assert_no_canaries, capture_tts_logs, take_tts_logs};
     use super::*;
+    use audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic;
+    use tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
     // SinkExt / StreamExt imports are required for `.send()` / `.next()` method
     // resolution on tokio_tungstenite WebSocketStream halves; rustc's
     // `unused_imports` lint flags them under the `as _` alias even though they
@@ -1231,15 +1038,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn open_ws_http_rejection_uses_metadata_only_diagnostic() {
+    async fn open_ws_http_rejection_discards_route_headers_and_body() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
-        let url =
-            format!("ws://{addr}/v1/speak?api_key=query-secret-12345&model=aura-generated-test");
+        capture_tts_logs();
+        let route = "/v1/speak?api_key=query-secret-12345&model=aura-generated-test";
+        let url = format!("ws://{addr}{route}");
         let api_key = "dg-http-test-key";
-        let body = r#"{"error":"provider body text","description":"generated speech text","api_key":"body-secret-12345","request_id":"dg-body-req"}"#;
-        let expected_body_bytes = body.len();
-        let expected_body_chars = body.chars().count();
+        let body = r#"{"error":"provider body text","description":"generated speech text 音声","api_key":"body-secret-12345","request_id":"dg-body-req"}"#;
         let body_for_server = body.to_string();
 
         let server = tokio::spawn(async move {
@@ -1261,6 +1067,7 @@ mod tests {
                  Content-Type: application/json\r\n\
                  Content-Length: {}\r\n\
                  X-Request-Id: dg-header-req_7\r\n\
+                 Dg-Request-Id: dg-header-req_9\r\n\
                  Connection: close\r\n\
                  \r\n\
                  {}",
@@ -1281,155 +1088,236 @@ mod tests {
             .await
             .expect("server timeout")
             .expect("server task");
-        let message = err.message();
-
-        assert_eq!(err.kind(), TtsErrorKind::Auth);
-        assert!(message.contains("status=401"));
-        assert!(message.contains("provider=deepgram"));
-        assert!(message.contains("service=aura"));
-        assert!(message.contains("path=/v1/speak"));
-        assert!(message.contains("request_id=dg-header-req_7"));
-        assert!(message.contains(&format!("body_bytes={expected_body_bytes}")));
-        assert!(message.contains(&format!("body_chars={expected_body_chars}")));
-        for leaked in [
-            "query-secret-12345",
-            "aura-generated-test",
-            "provider body text",
-            "generated speech text",
-            "body-secret-12345",
-            api_key,
-            "api_key=",
-        ] {
-            assert!(
-                !message.contains(leaked),
-                "Aura HTTP diagnostic leaked {leaked}: {message}"
-            );
-        }
+        assert_eq!(err.kind(), Kind::Auth);
+        assert_eq!(
+            err.diagnostic(),
+            TtsError::from_http_status(401).diagnostic()
+        );
+        assert_eq!(err.to_string(), "runtime/request_rejected");
+        let event: TtsEvent = err.clone().into();
+        let exported = format!(
+            "{err} {err:?} {event:?} {} {} {:?}",
+            serde_json::to_string(&err).unwrap(),
+            serde_json::to_string(&event).unwrap(),
+            take_tts_logs(),
+        );
+        assert_no_canaries(
+            &exported,
+            &[
+                route,
+                "/v1/speak",
+                "401",
+                "dg-header-req_7",
+                "dg-header-req_9",
+                "dg-body-req",
+                "query-secret-12345",
+                "aura-generated-test",
+                "provider body text",
+                "generated speech text",
+                "body-secret-12345",
+                api_key,
+                &body.len().to_string(),
+                &body.chars().count().to_string(),
+            ],
+        );
     }
 
     #[test]
-    fn tungstenite_error_classifier_redacts_provider_credentials() {
-        let api_key = "dg-aura-websocket-secret";
-        // userinfo assembled at runtime so no scheme://user:pass@host literal
-        // sits in source for a secret scanner to flag; runtime string identical.
-        let userinfo = format!("{}:{}", "user", "pass");
-        let err = tungstenite::Error::Io(std::io::Error::other(format!(
-            "bad token {api_key} Authorization: Bearer bearer-aura-secret-12345 wss://{userinfo}@example.com/v1?api_key=url-aura-secret-12345 AKIA1234567890ABCDEF"
-        )));
+    fn tungstenite_error_classifier_discards_native_prose() {
+        let native = "native-websocket-error-canary /v1/speak?token=native-secret";
+        let err = tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, native));
+        let classified = classify_tungstenite_error(&err);
 
-        let classified = classify_tungstenite_error(&err, api_key);
-        let message = classified.message();
-
-        for leaked in [
-            api_key,
-            "bearer-aura-secret-12345",
-            "user:pass",
-            "url-aura-secret-12345",
-            "AKIA1234567890ABCDEF",
-        ] {
-            assert!(
-                !message.contains(leaked),
-                "classified Aura WebSocket error leaked {leaked}: {message}"
-            );
-        }
-        assert!(message.contains("<redacted>"));
-    }
-
-    #[test]
-    fn server_error_message_uses_metadata_only_diagnostic() {
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let mut pending_flushes = VecDeque::new();
-        let clearing = Arc::new(AtomicBool::new(false));
-        let api_key = "dg-aura-server-secret";
-        // userinfo assembled at runtime — see note in the tungstenite test above.
-        let userinfo = format!("{}:{}", "user", "pass");
-
-        handle_server_text_with_key(
+        assert_eq!(classified.kind(), Kind::Network);
+        assert_eq!(classified.to_string(), "runtime/timeout");
+        assert_no_canaries(
             &format!(
-                r#"{{"type":"Error","description":"provider body text generated speech text auth failed {api_key} Authorization: Bearer bearer-aura-server-secret-12345 wss://{userinfo}@example.com?api_key=url-aura-server-secret-12345 AKIA1234567890ABCDEF","request_id":"dg-runtime-req_1"}}"#
+                "{classified} {classified:?} {}",
+                serde_json::to_string(&classified).unwrap()
             ),
-            &tx,
-            &mut pending_flushes,
-            &clearing,
-            api_key,
+            &[
+                native,
+                "native-websocket-error-canary",
+                "/v1/speak",
+                "native-secret",
+            ],
         );
-
-        match rx.try_recv().expect("error event") {
-            TtsEvent::Error { message, .. } => {
-                for leaked in [
-                    api_key,
-                    "bearer-aura-server-secret-12345",
-                    "user:pass",
-                    "url-aura-server-secret-12345",
-                    "AKIA1234567890ABCDEF",
-                    "provider body text",
-                    "generated speech text",
-                    "auth failed",
-                    "Authorization",
-                ] {
-                    assert!(
-                        !message.contains(leaked),
-                        "Aura server error leaked {leaked}: {message}"
-                    );
-                }
-                assert!(message.contains("request_id=dg-runtime-req_1"));
-                assert!(message.contains("message_len="));
-            }
-            other => panic!("expected error event, got {other:?}"),
-        }
     }
 
-    /// Contract guard for the invalid-JSON branch: the UI-visible
-    /// `TtsEvent::Error` must never carry a credential shape. `serde_json::Error`
-    /// Displays only line/column today (so `{e}` does not echo the frame), but
-    /// this locks the redaction path in so a future change interpolating the raw
-    /// `text` frame — which may embed an echoed api_key / bearer token / AWS key /
-    /// URL credential — stays scrubbed before surfacing.
     #[test]
-    fn invalid_json_text_frame_redacts_before_surfacing() {
+    fn server_frames_discard_provider_content() {
+        capture_tts_logs();
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         let mut pending_flushes = VecDeque::new();
         let clearing = Arc::new(AtomicBool::new(false));
-        let api_key = "dg-aura-parse-secret-12345";
+        let unknown_type = "aura-unknown-frame-canary";
+        let unknown_code = "aura-unknown-code-canary";
+        let request_id = "aura-frame-request-id-canary";
+        let secret = "aura-frame-secret-canary";
+        let description =
+            format!("authentication rate limit text 音声 {secret} /v1/speak?test=private")
+                .repeat(11);
+        let malformed = format!(r#"{{"secret":"{secret}",{description}"#);
 
-        // NOT valid JSON (leading garbage) but crammed with credential shapes so
-        // the serde error's echoed snippet must be scrubbed before surfacing.
-        // userinfo assembled at runtime — see note in the tungstenite test above.
-        let userinfo = format!("{}:{}", "user", "pass");
-        let bad_frame = format!(
-            concat!(
-                "not-json {api_key} ",
-                "Authorization: Bearer bearer-aura-parse-secret-12345 ",
-                "wss://{userinfo}@example.com?api_key=url-aura-parse-secret-12345 ",
-                "AKIA1234567890ABCDEF }}",
-            ),
-            api_key = api_key,
-            userinfo = userinfo,
+        for (frame, kind, code) in [
+            ("Warning", Kind::Unknown, Code::ProviderUnavailable),
+            ("Error", Kind::Server, Code::Internal),
+            (unknown_type, Kind::Unknown, Code::Internal),
+        ] {
+            let wire_code = if frame == "Warning" {
+                "NET-0000"
+            } else {
+                unknown_code
+            };
+            handle_server_text(
+                &serde_json::json!({
+                    "type": frame,
+                    "code": wire_code,
+                    "request_id": request_id,
+                    "description": description,
+                    "message": description,
+                })
+                .to_string(),
+                &tx,
+                &mut pending_flushes,
+                &clearing,
+            );
+            if frame == unknown_type {
+                assert!(rx.try_recv().is_err());
+            } else {
+                let event = rx.try_recv().expect("diagnostic event");
+                assert_error_event(&event, kind, code);
+                assert_no_canaries(
+                    &format!("{event:?} {}", serde_json::to_string(&event).unwrap()),
+                    &[
+                        secret,
+                        request_id,
+                        unknown_code,
+                        "/v1/speak",
+                        &description.len().to_string(),
+                        &description.chars().count().to_string(),
+                    ],
+                );
+            }
+        }
+
+        handle_server_text(&malformed, &tx, &mut pending_flushes, &clearing);
+        let event = rx.try_recv().expect("malformed frame diagnostic");
+        assert_error_event(&event, Kind::Protocol, Code::InvalidResponse);
+        assert_no_canaries(
+            &format!("{event:?} {}", serde_json::to_string(&event).unwrap()),
+            &[
+                secret,
+                "/v1/speak",
+                &description.len().to_string(),
+                "column",
+            ],
         );
 
-        handle_server_text_with_key(&bad_frame, &tx, &mut pending_flushes, &clearing, api_key);
+        let logs = take_tts_logs().join("\n");
+        assert!(logs.contains("Aura unhandled text frame: runtime/invalid_response"));
+        assert_no_canaries(
+            &logs,
+            &[unknown_type, unknown_code, request_id, secret, "/v1/speak"],
+        );
+    }
 
-        match rx.try_recv().expect("error event") {
-            TtsEvent::Error { kind, message } => {
-                assert_eq!(kind, TtsErrorKind::Protocol);
-                assert!(
-                    message.contains("Invalid JSON from Aura"),
-                    "parse error must name the invalid-JSON failure, got: {message}"
-                );
-                for leaked in [
-                    api_key,
-                    "bearer-aura-parse-secret-12345",
-                    "user:pass",
-                    "url-aura-parse-secret-12345",
-                    "AKIA1234567890ABCDEF",
-                ] {
-                    assert!(
-                        !message.contains(leaked),
-                        "Aura invalid-JSON error leaked {leaked}: {message}"
-                    );
+    fn assert_error_event(event: &TtsEvent, expected_kind: Kind, expected_code: Code) {
+        let TtsEvent::Error {
+            kind,
+            diagnostic: RuntimeDiagnostic::Runtime(diagnostic),
+        } = event
+        else {
+            panic!("expected a runtime error event");
+        };
+        assert_eq!(*kind, expected_kind);
+        assert_eq!(diagnostic.code, expected_code);
+        assert_eq!(
+            diagnostic.context.operation,
+            RuntimeOperation::SpeechSynthesis
+        );
+        assert_eq!(
+            diagnostic.context.transport,
+            Some(RuntimeTransport::Websocket)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_and_audio_diagnostics_discard_reason_and_exact_lengths() {
+        capture_tts_logs();
+        let (listener, url) = bind_keep().await;
+        let reason = "close-reason-canary 音声 /v1/speak?key=close-secret";
+        const SAMPLE_COUNT: usize = 1317;
+        const SAMPLE_VALUE: i16 = -26173;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let bytes = SAMPLE_VALUE.to_le_bytes().repeat(SAMPLE_COUNT);
+            ws.send(Message::Binary(bytes.into())).await.unwrap();
+            ws.close(Some(CloseFrame {
+                code: CloseCode::Error,
+                reason: reason.into(),
+            }))
+            .await
+            .unwrap();
+        });
+
+        let mut session = start_allowed_session(url).await.unwrap();
+        let mut events = session.take_events().unwrap();
+        let audio_debug = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut audio_debug = None;
+            while let Some(event) = events.next().await {
+                match event {
+                    TtsEvent::AudioChunk { ref samples, .. } => {
+                        assert_eq!(samples.len(), SAMPLE_COUNT);
+                        assert!(samples.iter().all(|sample| *sample == SAMPLE_VALUE));
+                        audio_debug = Some(format!("{event:?}"));
+                    }
+                    TtsEvent::Status(TtsStatus::Disconnected) => break,
+                    _ => {}
                 }
             }
-            other => panic!("expected protocol error event, got {other:?}"),
+            audio_debug.expect("audio before close")
+        })
+        .await
+        .expect("disconnect before timeout");
+        session.close().unwrap();
+        server.await.unwrap();
+
+        let logs = take_tts_logs().join("\n");
+        assert!(logs.contains("Aura session disconnected: runtime/provider_unavailable"));
+        assert!(audio_debug.contains("AudioChunk"));
+        assert_no_canaries(
+            &format!("{logs} {audio_debug}"),
+            &[
+                reason,
+                "close-reason-canary",
+                "close-secret",
+                "/v1/speak",
+                "reason_len",
+                &reason.len().to_string(),
+                &reason.chars().count().to_string(),
+                &SAMPLE_COUNT.to_string(),
+                &(SAMPLE_COUNT * 2).to_string(),
+                &SAMPLE_VALUE.to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn websocket_close_classification_uses_closed_codes() {
+        for (code, kind, token) in [
+            (None, Kind::Network, "runtime/network_unreachable"),
+            (Some(1000), Kind::Network, "runtime/network_unreachable"),
+            (Some(1002), Kind::Protocol, "runtime/protocol_error"),
+            (Some(1008), Kind::BadRequest, "runtime/request_rejected"),
+            (Some(1011), Kind::Server, "runtime/provider_unavailable"),
+            (Some(1013), Kind::RateLimit, "runtime/rate_limited"),
+            (Some(4337), Kind::Unknown, "runtime/internal"),
+        ] {
+            let error = classify_close(code);
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), token);
         }
     }
 
@@ -1463,11 +1351,11 @@ mod tests {
 
         match cmd_rx.try_recv().expect("first command") {
             SessionCmd::Flush(sequence) => assert_eq!(sequence, 1),
-            other => panic!("expected first flush command, got {other:?}"),
+            _ => panic!("expected first flush command"),
         }
         match cmd_rx.try_recv().expect("second command") {
             SessionCmd::Flush(sequence) => assert_eq!(sequence, 2),
-            other => panic!("expected second flush command, got {other:?}"),
+            _ => panic!("expected second flush command"),
         }
     }
 
@@ -1487,7 +1375,7 @@ mod tests {
 
         match cmd_rx.try_recv().expect("speak command") {
             SessionCmd::Speak(text) => assert_eq!(text, "hello world"),
-            other => panic!("expected speak command, got {other:?}"),
+            _ => panic!("expected speak command"),
         }
     }
 
@@ -1508,19 +1396,11 @@ mod tests {
         let err = session
             .speak(&generated_text)
             .expect_err("blocked policy rejects speak");
-        let message = err.message();
-
-        assert_eq!(err.kind(), TtsErrorKind::BadRequest);
-        assert!(message.contains("Privacy policy blocked text egress"));
-        assert!(message.contains(AURA_POLICY_PROVIDER));
-        assert!(message.contains("local_only"));
-        assert!(
-            !message.contains(&generated_text),
-            "policy error must not echo generated text: {message}"
-        );
-        assert!(
-            !message.contains(api_key),
-            "policy error must not leak API key-like text: {message}"
+        assert_eq!(err.kind(), Kind::BadRequest);
+        assert_eq!(err.to_string(), "runtime/policy_blocked");
+        assert_no_canaries(
+            &format!("{err} {err:?}"),
+            &[&generated_text, api_key, AURA_POLICY_PROVIDER, "local_only"],
         );
         assert!(
             cmd_rx.try_recv().is_err(),
@@ -1549,27 +1429,23 @@ mod tests {
     }
 
     #[test]
-    fn handle_server_text_emits_metadata_status() {
+    fn handle_server_text_emits_metadata_without_provider_fields() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let mut pending_flushes = VecDeque::new();
-        let clearing = Arc::new(AtomicBool::new(false));
         handle_server_text(
-            r#"{"type":"Metadata","request_id":"abc"}"#,
+            r#"{"type":"Metadata","request_id":"metadata-request-canary","model":"metadata-model-canary"}"#,
             &tx,
-            &mut pending_flushes,
-            &clearing,
+            &mut VecDeque::new(),
+            &Arc::new(AtomicBool::new(false)),
         );
-        match rx.try_recv().expect("event") {
-            TtsEvent::Status(TtsStatus::Metadata {
-                request_id,
-                field_count,
-                ..
-            }) => {
-                assert_eq!(request_id.as_deref(), Some("abc"));
-                assert_eq!(field_count, 2);
-            }
-            other => panic!("expected metadata, got {other:?}"),
-        }
+        let event = rx.try_recv().expect("metadata event");
+        assert!(matches!(event, TtsEvent::Status(TtsStatus::Metadata)));
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::json!({
+                "type": "status",
+                "kind": "metadata",
+            })
+        );
     }
 
     #[test]
@@ -1585,7 +1461,7 @@ mod tests {
         );
         match rx.try_recv().expect("event") {
             TtsEvent::Status(TtsStatus::Flushed { sequence }) => assert_eq!(sequence, 3),
-            other => panic!("expected flushed, got {other:?}"),
+            _ => panic!("expected flushed"),
         }
     }
 
@@ -1610,11 +1486,11 @@ mod tests {
 
         match rx.try_recv().expect("first event") {
             TtsEvent::Status(TtsStatus::Flushed { sequence }) => assert_eq!(sequence, 1),
-            other => panic!("expected first flushed, got {other:?}"),
+            _ => panic!("expected first flushed"),
         }
         match rx.try_recv().expect("second event") {
             TtsEvent::Status(TtsStatus::Flushed { sequence }) => assert_eq!(sequence, 2),
-            other => panic!("expected second flushed, got {other:?}"),
+            _ => panic!("expected second flushed"),
         }
         assert!(pending_flushes.is_empty());
     }
@@ -1632,7 +1508,7 @@ mod tests {
         );
         match rx.try_recv().expect("event") {
             TtsEvent::Status(TtsStatus::Cleared) => {}
-            other => panic!("expected cleared, got {other:?}"),
+            _ => panic!("expected cleared"),
         }
         assert!(
             !clearing.load(Ordering::SeqCst),
@@ -1641,77 +1517,28 @@ mod tests {
     }
 
     #[test]
-    fn handle_server_text_classifies_auth_error() {
+    fn handle_server_text_classifies_allowlisted_codes_without_prose() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let mut pending_flushes = VecDeque::new();
-        let clearing = Arc::new(AtomicBool::new(false));
-        handle_server_text(
-            r#"{"type":"Error","description":"authentication failed"}"#,
-            &tx,
-            &mut pending_flushes,
-            &clearing,
-        );
-        match rx.try_recv().expect("event") {
-            TtsEvent::Error {
-                kind: TtsErrorKind::Auth,
-                ..
-            } => {}
-            other => panic!("expected auth error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn handle_server_text_classifies_rate_limit_error() {
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let mut pending_flushes = VecDeque::new();
-        let clearing = Arc::new(AtomicBool::new(false));
-        handle_server_text(
-            r#"{"type":"Error","description":"rate limit exceeded"}"#,
-            &tx,
-            &mut pending_flushes,
-            &clearing,
-        );
-        match rx.try_recv().expect("event") {
-            TtsEvent::Error {
-                kind: TtsErrorKind::RateLimit,
-                ..
-            } => {}
-            other => panic!("expected rate-limit error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn handle_server_text_classifies_generic_error_as_server() {
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let mut pending_flushes = VecDeque::new();
-        let clearing = Arc::new(AtomicBool::new(false));
-        handle_server_text(
-            r#"{"type":"Error","description":"internal pipeline failure"}"#,
-            &tx,
-            &mut pending_flushes,
-            &clearing,
-        );
-        match rx.try_recv().expect("event") {
-            TtsEvent::Error {
-                kind: TtsErrorKind::Server,
-                ..
-            } => {}
-            other => panic!("expected server error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn handle_server_text_invalid_json_emits_protocol_error() {
-        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let mut pending_flushes = VecDeque::new();
-        let clearing = Arc::new(AtomicBool::new(false));
-        handle_server_text("not-json", &tx, &mut pending_flushes, &clearing);
-        match rx.try_recv().expect("event") {
-            TtsEvent::Error {
-                kind: TtsErrorKind::Protocol,
-                ..
-            } => {}
-            other => panic!("expected protocol error, got {other:?}"),
+        for (wire_code, kind, code) in [
+            ("INVALID_AUTH", Kind::Auth, Code::RequestRejected),
+            ("DATA-0001", Kind::RateLimit, Code::RateLimited),
+            ("BIG-0001", Kind::BadRequest, Code::RequestRejected),
+            ("NET-0000", Kind::Server, Code::ProviderUnavailable),
+            ("NET-0003", Kind::Network, Code::Timeout),
+            ("DATA-0001-extra", Kind::Server, Code::Internal),
+        ] {
+            handle_server_text(
+                &serde_json::json!({
+                    "type": "Error",
+                    "code": wire_code,
+                    "description": "authentication failed",
+                })
+                .to_string(),
+                &tx,
+                &mut VecDeque::new(),
+                &Arc::new(AtomicBool::new(false)),
+            );
+            assert_error_event(&rx.try_recv().unwrap(), kind, code);
         }
     }
 
@@ -1747,7 +1574,7 @@ mod tests {
     async fn provider_reports_auth_when_credential_store_empty() {
         let store = CredentialStore::default();
         let err = DeepgramAuraProvider::from_store(&store).expect_err("must error");
-        assert_eq!(err.kind(), TtsErrorKind::Auth);
+        assert_eq!(err.kind(), Kind::Auth);
     }
 
     #[test]
@@ -1790,13 +1617,16 @@ mod tests {
         let err = session
             .speak("private synthesis text")
             .expect_err("default policy rejects speak");
-        let message = err.message();
-
-        assert_eq!(err.kind(), TtsErrorKind::BadRequest);
-        assert!(message.contains("Privacy policy blocked text egress"));
-        assert!(message.contains(AURA_POLICY_PROVIDER));
-        assert!(message.contains(EXPLICIT_POLICY_REQUIRED));
-        assert!(!message.contains("private synthesis text"));
+        assert_eq!(err.kind(), Kind::BadRequest);
+        assert_eq!(err.to_string(), "runtime/policy_blocked");
+        assert_no_canaries(
+            &format!("{err} {err:?}"),
+            &[
+                AURA_POLICY_PROVIDER,
+                EXPLICIT_POLICY_REQUIRED,
+                "private synthesis text",
+            ],
+        );
         drop(session);
         let saw_speak = tokio::time::timeout(Duration::from_secs(1), server)
             .await
@@ -1855,7 +1685,6 @@ mod tests {
             &user_closed,
             &clearing,
             24000,
-            "test-key",
             crate::asr::ProviderContentEgressPolicy::block("local_only"),
         )
         .await;
@@ -1875,7 +1704,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn speak_rejects_text_over_2000_chars() {
+    async fn oversized_speak_discards_utterance_and_exact_length() {
         let (listener, url) = bind_keep().await;
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -1886,9 +1715,14 @@ mod tests {
             let _ = ws.close(None).await;
         });
         let session = start_allowed_session(url).await.expect("connect");
-        let too_long = "x".repeat(MAX_SPEAK_CHARS + 1);
+        let too_long = "utterance-secret-canary".repeat(137);
         let err = session.speak(&too_long).expect_err("must reject");
-        assert_eq!(err.kind(), TtsErrorKind::BadRequest);
+        assert_eq!(err.kind(), Kind::BadRequest);
+        assert_eq!(err.to_string(), "runtime/request_rejected");
+        assert_no_canaries(
+            &format!("{err} {err:?} {}", serde_json::to_string(&err).unwrap()),
+            &["utterance-secret-canary", &too_long.len().to_string()],
+        );
         drop(session);
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
     }
@@ -1933,7 +1767,7 @@ mod tests {
             let next = tokio::time::timeout(Duration::from_millis(200), events.next()).await;
             match next {
                 Ok(Some(TtsEvent::Status(TtsStatus::Connected))) => got_connected = true,
-                Ok(Some(TtsEvent::Status(TtsStatus::Metadata { .. }))) => got_metadata = true,
+                Ok(Some(TtsEvent::Status(TtsStatus::Metadata))) => got_metadata = true,
                 Ok(Some(TtsEvent::AudioChunk {
                     samples,
                     sample_rate,
@@ -2209,24 +2043,6 @@ mod tests {
 
         assert!(got_disconnected, "must observe Disconnected on socket loss");
         assert!(got_reconnecting, "must enter Reconnecting state");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn error_classification_for_4xx_vs_5xx() {
-        // Tokio-tungstenite's local mock can't easily produce HTTP errors;
-        // exercise the classifier path the WS connect uses on real 4xx/5xx
-        // responses. This is the same code path open_ws hits on rejection.
-        let auth = TtsError::from_http_status(401, "{\"error\":\"unauthorized\"}");
-        assert_eq!(auth.kind(), TtsErrorKind::Auth);
-
-        let rate = TtsError::from_http_status(429, "Too Many Requests");
-        assert_eq!(rate.kind(), TtsErrorKind::RateLimit);
-
-        let bad = TtsError::from_http_status(400, "bad request body");
-        assert_eq!(bad.kind(), TtsErrorKind::BadRequest);
-
-        let server = TtsError::from_http_status(503, "service unavailable");
-        assert_eq!(server.kind(), TtsErrorKind::Server);
     }
 
     #[test]
