@@ -2401,6 +2401,7 @@ export interface MaterializedNote {
 /** Read-only diagnostics from this lens's verified projection generation. */
 interface ProjectionReadStatus {
   projection_recovery?: "recompute_required";
+  basis_unavailable?: ProjectionBasisSummary;
   transcript_coverage?: "behind_transcript";
 }
 
@@ -2880,8 +2881,30 @@ export interface ProjectionReplayLatencyMetrics
   graph: ProjectionReplayKindLatencyMetrics;
 }
 
+/** Inclusive canonical projection positions. Later individually verified frames
+ * are evidence only and cannot be applied across the missing basis. */
+export interface ProjectionBasisSummary {
+  first_sequence: number;
+  last_sequence: number;
+  verified_sequences?: number[];
+}
+
+export interface ProjectionBasisUnavailable {
+  first_sequence: number;
+  last_sequence: number;
+  verified_frames?: {
+    sequence: number;
+    basis_heads: Record<
+      string,
+      { sequence: number; event_id: string; record_hash: string }
+    >;
+    patch: ProjectionPatch;
+  }[];
+}
+
 /** Non-secret replay parity report from `get_projection_replay_report_cmd`. */
 export interface ProjectionReplayReport {
+  basis_unavailable?: ProjectionBasisSummary;
   session_id: string;
   transcript_event_count: number;
   transcript_replay_error?: string | null;
@@ -2934,6 +2957,7 @@ export interface LoadedSession {
  * `noteRevisionCounts` from. Fetched only when the Notes lens activates.
  */
 export interface SessionNotesArtifacts {
+  basis_unavailable?: ProjectionBasisUnavailable;
   notes: MaterializedNotes | null;
   projection_events: ProjectionPatch[];
 }
@@ -2971,6 +2995,8 @@ export type SessionLensArtifactStatus =
  * ADR-0027 typed-manifest migration.
  */
 export interface SessionExportBundle {
+  basis_unavailable?: ProjectionBasisUnavailable;
+  projection_notice?: { en: string; pt: string };
   /** Bundle schema version; bump when the bundle shape changes. */
   schema_version: number;
   session_id: string;

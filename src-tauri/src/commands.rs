@@ -98,6 +98,8 @@ pub struct SessionTimelineFold {
 /// when the Notes lens activates — `load_session` no longer carries either.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionNotesArtifacts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basis_unavailable: Option<crate::projections::ProjectionBasisUnavailable>,
     #[serde(
         default,
         skip_serializing_if = "crate::persistence::canonical_log::StreamReceiptEvidence::is_empty"
@@ -384,6 +386,8 @@ pub struct ProjectionReplayStageLatencyMetrics {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProjectionReplayReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basis_unavailable: Option<crate::projections::ProjectionBasisSummary>,
     pub session_id: String,
     pub transcript_event_count: usize,
     pub transcript_replay_error: Option<String>,
@@ -10499,11 +10503,12 @@ fn projection_replay_report_for_admitted_session(
     session_id: &str,
 ) -> AppResult<ProjectionReplayReport> {
     let repository = FileMemoryRepository::user_data();
-    let (history, _) = repository.read_projection_history(session_id, false)?;
+    let (mut history, _) = repository.read_projection_history(session_id, false)?;
     let transcript_source = repository.load_transcript_event_stream(session_id)?;
     let speaker_source = repository.load_speaker_revision_stream(session_id)?;
-    history.verify_source("transcript_revisions", transcript_source.records())?;
-    history.verify_source("speaker_revisions", speaker_source.records())?;
+    history.observe_source("transcript_revisions", transcript_source.records());
+    let projection_event_count = history.patches.len();
+    history.select_verified_prefix(speaker_source.records());
     let transcript_events = transcript_source.into_payloads();
     let speaker_events = speaker_source.speaker_history(session_id)?;
     let projection_events = &history.patches;
@@ -10516,11 +10521,13 @@ fn projection_replay_report_for_admitted_session(
         Err(error) => (Some(format!("{error:?}")), 0),
     };
 
+    let (replay_transcript, replay_speakers) =
+        history.replay_sources(&transcript_events, speaker_events);
     let (projection_replay_error, projection_history_validation, mut replayed_state) =
         match crate::projections::MaterializedProjectionState::replay_accepted_patches_with_history(
             session_id,
-            transcript_events.clone(),
-            speaker_events,
+            replay_transcript,
+            replay_speakers,
             projection_events.clone(),
         ) {
             Ok(replay) => (
@@ -10543,19 +10550,31 @@ fn projection_replay_report_for_admitted_session(
     // Gap/coverage are read-time observations. Cache equality concerns only
     // persisted head and contents, just as it does for the historical lenses.
     if let Some(cache) = &mut stored_notes {
+        cache
+            .basis_unavailable
+            .clone_from(&replayed_state.notes.basis_unavailable);
         cache.projection_recovery = replayed_state.notes.projection_recovery;
         cache.transcript_coverage = replayed_state.notes.transcript_coverage;
     }
     if let Some(cache) = &mut stored_graph {
+        cache
+            .basis_unavailable
+            .clone_from(&replayed_state.graph.basis_unavailable);
         cache.projection_recovery = replayed_state.graph.projection_recovery;
         cache.transcript_coverage = replayed_state.graph.transcript_coverage;
     }
 
     let replayed = materialized_status_from_state(&replayed_state);
+    let withheld = projection_event_count - projection_events.len();
+    let missing_basis = history
+        .basis_unavailable
+        .as_ref()
+        .map_or(0, |loss| withheld - loss.verified_frames.len());
+    let invalid_basis_count = projection_history_validation.invalid_patch_count + missing_basis;
     let evaluation = projection_replay_evaluation_metrics(
         projection_events,
         &replayed_state,
-        projection_history_validation.invalid_patch_count,
+        invalid_basis_count,
     );
     let latency = projection_replay_latency_metrics(&transcript_events, projection_events);
     let stored_notes_last_sequence = stored_notes
@@ -10576,13 +10595,18 @@ fn projection_replay_report_for_admitted_session(
         .unwrap_or_default();
 
     Ok(ProjectionReplayReport {
+        basis_unavailable: history
+            .basis_unavailable
+            .as_ref()
+            .map(crate::projections::ProjectionBasisUnavailable::summary),
         session_id: session_id.to_string(),
         transcript_event_count: transcript_events.len(),
         transcript_replay_error,
         transcript_span_count,
-        projection_event_count: projection_events.len(),
-        projection_checked_patch_count: projection_history_validation.checked_patch_count,
-        projection_invalid_basis_count: projection_history_validation.invalid_patch_count,
+        projection_event_count,
+        projection_checked_patch_count: projection_history_validation.checked_patch_count
+            + withheld,
+        projection_invalid_basis_count: invalid_basis_count,
         projection_replay_error,
         replayed,
         notes_artifact: ProjectionReplayArtifactReport {
@@ -10777,15 +10801,15 @@ impl AdmittedTranscriptBytes {
     fn verify_for_projection(
         self,
         session_id: &str,
-        history: Option<&crate::persistence::ProjectionHistory>,
+        history: Option<&mut crate::persistence::ProjectionHistory>,
     ) -> Result<SessionTranscriptSnapshot, String> {
         match self {
             Self::Legacy(bytes) => {
                 if let Some(history) = history {
-                    history.verify_source::<crate::projections::TranscriptEvent>(
+                    history.observe_source::<crate::projections::TranscriptEvent>(
                         "transcript_revisions",
                         &[],
-                    )?;
+                    );
                 }
                 Ok(SessionTranscriptSnapshot {
                     receipt_evidence: Default::default(),
@@ -10796,7 +10820,7 @@ impl AdmittedTranscriptBytes {
             Self::Canonical(bytes) => {
                 let snapshot = bytes.verify(session_id).map_err(|e| e.to_string())?;
                 if let Some(history) = history {
-                    history.verify_source("transcript_revisions", &snapshot.records)?;
+                    history.observe_source("transcript_revisions", &snapshot.records);
                 }
                 let receipt_evidence = crate::persistence::canonical_log::receipt_evidence(
                     &crate::user_data::resolve_transcript_events_path(session_id)?,
@@ -11008,6 +11032,11 @@ fn choose_materialized_notes(
     replayed: Option<&crate::projections::MaterializedProjectionState>,
     canonical: bool,
 ) -> Option<crate::projections::MaterializedNotes> {
+    if let Some(view) = replayed
+        && view.notes.basis_unavailable.is_some()
+    {
+        return Some(view.notes.clone());
+    }
     if let (Some(loaded), Some(replayed)) = (&mut loaded, replayed) {
         loaded.projection_recovery = replayed.notes.projection_recovery;
         loaded.transcript_coverage = replayed.notes.transcript_coverage;
@@ -11027,6 +11056,11 @@ fn choose_materialized_graph(
     replayed: Option<&crate::projections::MaterializedProjectionState>,
     canonical: bool,
 ) -> Option<crate::projections::MaterializedGraph> {
+    if let Some(view) = replayed
+        && view.graph.basis_unavailable.is_some()
+    {
+        return Some(view.graph.clone());
+    }
     if let (Some(loaded), Some(replayed)) = (&mut loaded, replayed) {
         loaded.projection_recovery = replayed.graph.projection_recovery;
         loaded.transcript_coverage = replayed.graph.transcript_coverage;
@@ -11271,14 +11305,14 @@ fn gather_projection_lens_state(
         MAX_PROJECTION_EVENTS_BYTES,
         "projection_events",
     )?;
-    let (history, _) = repository.read_projection_history(session_id, false)?;
+    let (mut history, _) = repository.read_projection_history(session_id, false)?;
     enforce_artifact_ceiling(
         &crate::user_data::resolve_transcript_events_path(session_id)?,
         MAX_TRANSCRIPT_EVENTS_BYTES,
         "transcript_events",
     )?;
     let transcript = repository.load_transcript_event_stream(session_id)?;
-    history.verify_source("transcript_revisions", transcript.records())?;
+    history.observe_source("transcript_revisions", transcript.records());
     let transcript = transcript.into_payloads();
     let speakers = if history.present {
         enforce_artifact_ceiling(
@@ -11288,7 +11322,7 @@ fn gather_projection_lens_state(
         )?;
         {
             let source = repository.load_speaker_revision_stream(session_id)?;
-            history.verify_source("speaker_revisions", source.records())?;
+            history.select_verified_prefix(source.records());
             source.speaker_history(session_id)?
         }
     } else {
@@ -11311,9 +11345,10 @@ fn rebuild_projection_view(
         .map_err(|_| AppError::SessionInvalid {
             reason: "Projection transcript basis is invalid".into(),
         })?;
+    let (transcript, speakers) = history.replay_sources(transcript, speakers);
     let mut view = replay_projection_state_or_invalid(
         session_id,
-        transcript.to_vec(),
+        transcript,
         speakers,
         history.patches.clone(),
     )?;
@@ -11393,10 +11428,14 @@ fn load_session_notes_artifacts_for_admitted_session(
     let (history, view) = gather_projection_lens_state(session_id)?;
     let notes = choose_materialized_notes(loaded_notes, Some(&view), history.present);
     let artifacts = SessionNotesArtifacts {
+        basis_unavailable: history.basis_unavailable,
         notes,
         projection_events: history.patches,
         projection_receipt_evidence: history.receipt_evidence,
     };
+    if artifacts.basis_unavailable.is_some() {
+        return Ok(artifacts);
+    }
     let response_bytes = response_len_for_log(&artifacts);
     let elapsed_ms = read_start.elapsed().as_millis();
     let log_line = format!(
@@ -11469,6 +11508,9 @@ fn load_session_graph_artifact_for_admitted_session(
     let loaded_graph = repository.load_materialized_graph(session_id)?;
     let (history, view) = gather_projection_lens_state(session_id)?;
     let materialized_graph = choose_materialized_graph(loaded_graph, Some(&view), history.present);
+    if history.basis_unavailable.is_some() {
+        return Ok(materialized_graph);
+    }
     let response_bytes = response_len_for_log(&materialized_graph);
     let elapsed_ms = read_start.elapsed().as_millis();
     let log_line = format!(
@@ -11486,6 +11528,8 @@ fn load_session_graph_artifact_for_admitted_session(
 /// admitted session has control-plane or transcript recovery evidence to report.
 #[derive(Debug, serde::Serialize)]
 pub struct SessionExportWithControlPlane {
+    #[serde(flatten)]
+    projection_loss: Option<crate::persistence::ExportProjectionBasisLoss>,
     #[serde(
         default,
         skip_serializing_if = "crate::persistence::canonical_log::StreamReceiptEvidence::is_empty"
@@ -11519,6 +11563,7 @@ impl std::ops::Deref for SessionExportWithControlPlane {
 const CONTROL_PLANE_EXPORT_SCHEMA_VERSION: u32 = 2;
 const TRANSCRIPT_RECOVERY_EXPORT_SCHEMA_VERSION: u32 = 3;
 const STREAM_EVIDENCE_EXPORT_SCHEMA_VERSION: u32 = 4;
+const PROJECTION_BASIS_LOSS_EXPORT_SCHEMA_VERSION: u32 = 5;
 
 /// Assemble the portable session bundle, including available control evidence.
 /// Usage, scheduler, live-assist audit, and data-movement records remain outside
@@ -11588,7 +11633,8 @@ fn session_export_for_admitted_session(
         MAX_PROJECTION_EVENTS_BYTES,
         "projection_events",
     )?;
-    let (history, projection_recovery) = repository.read_projection_history(session_id, true)?;
+    let (mut history, projection_recovery) =
+        repository.read_projection_history(session_id, true)?;
     let (transcript_snapshot, transcript_recovery) =
         crate::persistence::canonical_log::transcript_export::read_for_export(
             &crate::user_data::resolve_transcript_events_path(session_id)?,
@@ -11596,7 +11642,7 @@ fn session_export_for_admitted_session(
             || capture_admitted_transcript(&repository, session_id),
         )?;
     let transcript_snapshot =
-        transcript_snapshot.verify_for_projection(session_id, Some(&history))?;
+        transcript_snapshot.verify_for_projection(session_id, Some(&mut history))?;
     let transcript = transcript_snapshot.transcript;
     let transcript_events = transcript_snapshot.events;
 
@@ -11616,7 +11662,7 @@ fn session_export_for_admitted_session(
         "diarization_events",
     )?;
     let speaker_source = repository.load_speaker_revision_stream(session_id)?;
-    history.verify_source("speaker_revisions", speaker_source.records())?;
+    history.select_verified_prefix(speaker_source.records());
     let speaker_history = speaker_source.speaker_history(session_id)?;
     let view = rebuild_projection_view(
         session_id,
@@ -11630,7 +11676,7 @@ fn session_export_for_admitted_session(
         MAX_MATERIALIZED_NOTES_BYTES,
         "materialized_notes",
     )?;
-    let notes = choose_materialized_notes(
+    let mut notes = choose_materialized_notes(
         repository.load_materialized_notes(session_id)?,
         Some(&view),
         history.present,
@@ -11640,15 +11686,18 @@ fn session_export_for_admitted_session(
         MAX_MATERIALIZED_GRAPH_BYTES,
         "materialized_graph",
     )?;
-    let materialized_graph = choose_materialized_graph(
+    let mut materialized_graph = choose_materialized_graph(
         repository.load_materialized_graph(session_id)?,
         Some(&view),
         history.present,
     );
 
+    let projection_loss = history.take_export_loss(&mut notes, &mut materialized_graph);
     let bundle = SessionExportWithControlPlane {
         core: SessionExportBundle {
-            schema_version: if projection_recovery.is_some()
+            schema_version: if projection_loss.is_some() {
+                PROJECTION_BASIS_LOSS_EXPORT_SCHEMA_VERSION
+            } else if projection_recovery.is_some()
                 || transcript_recovery
                     .as_ref()
                     .is_some_and(|r| r.unqualified_attempt_id.is_some())
@@ -11675,10 +11724,14 @@ fn session_export_for_admitted_session(
         },
         transcript_receipt_evidence: transcript_snapshot.receipt_evidence,
         projection_receipt_evidence: history.receipt_evidence,
+        projection_loss,
         control_plane,
         transcript_recovery,
         projection_recovery,
     };
+    if bundle.projection_loss.is_some() {
+        return Ok(bundle);
+    }
     if bundle.transcript_recovery.is_some() || bundle.projection_recovery.is_some() {
         if bundle.transcript_recovery.is_some() {
             log::info!("session_export_bundle transcript_recovery_evidence_included");
@@ -17046,8 +17099,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    include!("commands/historical_projection_tests.rs");
+
     #[test]
-    fn projection_history_refuses_an_equal_height_source_fork_with_identical_payloads() {
+    fn historical_projection_marks_an_equal_height_source_fork_with_identical_payloads() {
         use crate::persistence::canonical_log::{
             CanonicalAppendOutcome, CanonicalAppender, CanonicalBasisHead, CanonicalEventMetadata,
             CanonicalTailRecovery,
@@ -17134,18 +17189,35 @@ mod tests {
                 CanonicalAppendOutcome::Accepted(_)
             ));
             drop(fork);
-            for result in [
-                load_session_notes_artifacts_impl(session.into()).map(|_| ()),
-                session_export_bundle(session).map(|_| ()),
-                projection_replay_report_for_session(session).map(|_| ()),
-            ] {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("Projection basis does not match its verified source")
-                );
-            }
+            let notes = load_session_notes_artifacts_impl(session.into()).unwrap();
+            assert_eq!(
+                notes
+                    .notes
+                    .unwrap()
+                    .basis_unavailable
+                    .unwrap()
+                    .first_sequence,
+                1
+            );
+            assert!(notes.projection_events.is_empty());
+            assert_eq!(
+                session_export_bundle(session)
+                    .unwrap()
+                    .projection_loss
+                    .unwrap()
+                    .basis_unavailable
+                    .first_sequence,
+                1
+            );
+            assert_eq!(
+                projection_replay_report_for_session(session)
+                    .unwrap()
+                    .basis_unavailable
+                    .unwrap()
+                    .first_sequence,
+                1
+            );
+            assert!(repo.projection_capture_coverage(session).is_err());
             assert_eq!(std::fs::read(&projection_path).unwrap(), projection_bytes);
             std::fs::write(path, original).unwrap();
         }

@@ -2548,6 +2548,47 @@ impl TranscriptLedger {
     }
 }
 
+/// Read-time evidence for the contiguous range withheld from materialization.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct ProjectionBasisUnavailable {
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    /// These later frames have independently verified physical bases. Their
+    /// operations may still depend on a withheld patch, so keep them as evidence.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub verified_frames: Vec<VerifiedProjectionFrame>,
+}
+
+/// Content-free positions for a materialized view or a diagnostic report.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ProjectionBasisSummary {
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub verified_sequences: Vec<u64>,
+}
+
+impl ProjectionBasisUnavailable {
+    pub(crate) fn summary(&self) -> ProjectionBasisSummary {
+        ProjectionBasisSummary {
+            first_sequence: self.first_sequence,
+            last_sequence: self.last_sequence,
+            verified_sequences: self
+                .verified_frames
+                .iter()
+                .map(|frame| frame.sequence)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct VerifiedProjectionFrame {
+    pub sequence: u64,
+    pub basis_heads: crate::persistence::canonical_log::CanonicalBasisHeadVector,
+    pub patch: ProjectionPatch,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct MaterializedNotes {
     pub schema_version: u32,
@@ -2559,6 +2600,8 @@ pub struct MaterializedNotes {
     /// Calculated from the canonical gap evidence and its receipted repairs.
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub projection_recovery: Option<ProjectionRecoveryStatus>,
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub basis_unavailable: Option<ProjectionBasisSummary>,
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub transcript_coverage: Option<ProjectionCoverageStatus>,
     pub notes: Vec<MaterializedNote>,
@@ -2587,6 +2630,7 @@ impl MaterializedNotes {
             last_sequence: 0,
             projection_log_head: None,
             projection_recovery: None,
+            basis_unavailable: None,
             transcript_coverage: None,
             notes: Vec::new(),
         }
@@ -3063,6 +3107,8 @@ pub struct MaterializedGraph {
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub projection_recovery: Option<ProjectionRecoveryStatus>,
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub basis_unavailable: Option<ProjectionBasisSummary>,
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub transcript_coverage: Option<ProjectionCoverageStatus>,
     pub nodes: Vec<MaterializedGraphNode>,
     pub edges: Vec<MaterializedGraphEdge>,
@@ -3110,6 +3156,7 @@ impl MaterializedGraph {
             last_sequence: 0,
             projection_log_head: None,
             projection_recovery: None,
+            basis_unavailable: None,
             transcript_coverage: None,
             nodes: Vec::new(),
             edges: Vec::new(),
