@@ -29,9 +29,13 @@
 
 // Keep v2 dormant until the Tauri composition in #157.
 #[allow(dead_code)]
+pub(crate) mod adapters;
+#[allow(dead_code)]
 pub(crate) mod domain;
 #[cfg(test)]
 mod fake;
+#[allow(dead_code)]
+pub(crate) mod filesystem_policy;
 #[allow(dead_code)]
 pub(crate) mod runtime;
 #[allow(dead_code)]
