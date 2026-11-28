@@ -1581,13 +1581,9 @@ impl From<LlmClientSyncError> for AppError {
     fn from(error: LlmClientSyncError) -> Self {
         let context = RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference);
         match error {
-            LlmClientSyncError::NonFiniteConfig => RuntimeErrorDiagnostic::new(
-                RuntimeErrorCode::RequestRejected,
-                false,
-                RuntimeSafeRecoveryAction::ReviewConfiguration,
-                context,
-            )
-            .into(),
+            LlmClientSyncError::NonFiniteConfig => {
+                RuntimeErrorDiagnostic::invalid_configuration(context).into()
+            }
             LlmClientSyncError::SettingsLock | LlmClientSyncError::ClientBuild => {
                 RuntimeErrorDiagnostic::internal(context).into()
             }
@@ -22462,6 +22458,18 @@ mod tests {
             );
             assert!(!populated(), "{template}: the rejected slot kept a client");
         }
+        let wire = serde_json::to_value(AppError::from(LlmClientSyncError::NonFiniteConfig))
+            .expect("serialize the rejection");
+        assert_eq!(
+            (
+                &wire["diagnostic"]["detail"]["code"],
+                &wire["diagnostic"]["detail"]["recovery_action"],
+            ),
+            (
+                &serde_json::json!("invalid_configuration"),
+                &serde_json::json!("review_configuration")
+            )
+        );
     }
 
     #[test]
