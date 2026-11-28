@@ -8,6 +8,7 @@ use std::{collections::VecDeque, sync::Mutex, time::Instant};
 struct Retired {
     resolve: Box<dyn FnMut() -> Result<(), TranscriptCommitError> + Send>,
     retry: RecoveryBackoff,
+    remaining_io_retries: u8,
 }
 
 #[derive(Default)]
@@ -21,48 +22,47 @@ fn queue() -> &'static Mutex<Queue> {
     QUEUE.get_or_init(Default::default)
 }
 
-// A missing or invalid admission proof requires a fresh open. Preserve
-// the descriptor and the log for startup or explicit session deletion.
-fn retryable(error: &TranscriptCommitError) -> bool {
+// A retained lease cannot fix corrupt data or an unsupported floor. If the
+// probe instead failed to observe the filesystem, allow seven backed-off
+// retries (eight failed probes in total) before releasing the lease.
+const AMBIGUOUS_RETRIES: u8 = 7;
+
+fn retryable(error: &TranscriptCommitError, remaining: &mut u8) -> bool {
+    use CanonicalCoordinationError as Coordination;
+    use CanonicalFilesystemQualificationError as Qualification;
     use TranscriptCommitError as Error;
-    let (kind, code) = match error {
-        Error::Coordination(CanonicalCoordinationError::Contended)
-        | Error::ConflictingAttempt
+    match error {
+        // A cooperating owner can finish independently of this job.
+        Error::Coordination(Coordination::Contended) | Error::ConflictingAttempt => true,
+        Error::Io { .. }
+        | Error::Indeterminate(_)
         | Error::FrameWriteStorageFull
-        | Error::StorageFullConfirmationPending => return true,
-        Error::Io { kind, code, .. }
-        | Error::Coordination(CanonicalCoordinationError::Io {
-            kind,
-            raw_os_error: code,
-            ..
-        })
-        | Error::Rejected(CanonicalDurabilityRejection::IoFailedBeforeMutation {
-            kind,
-            raw_os_error: code,
-            ..
-        })
-        | Error::Qualification(CanonicalFilesystemQualificationError::Io {
-            kind,
-            raw_os_error: code,
-            ..
-        }) => (*kind, *code),
-        Error::Indeterminate(e) => (e.kind, e.raw_os_error),
-        _ => return false,
-    };
-    if kind == io::ErrorKind::PermissionDenied {
-        // Windows sharing and lock violations can clear as another handle closes.
-        return cfg!(windows) && matches!(code, Some(32 | 33));
+        | Error::StorageFullConfirmationPending
+        | Error::Coordination(
+            Coordination::Io { .. } | Coordination::IdentityUnavailable | Coordination::Missing,
+        )
+        | Error::Qualification(
+            Qualification::Io { .. }
+            | Qualification::IdentityUnavailable
+            | Qualification::NoMatchingMount,
+        )
+        | Error::Coordination(Coordination::QualificationRefused(
+            Qualification::Io { .. }
+            | Qualification::IdentityUnavailable
+            | Qualification::NoMatchingMount,
+        ))
+        | Error::Rejected(
+            CanonicalDurabilityRejection::IoFailedBeforeMutation { .. }
+            | CanonicalDurabilityRejection::QualifiedDescendantVolumeUnavailable,
+        ) => {
+            if *remaining == 0 {
+                return false;
+            }
+            *remaining -= 1;
+            true
+        }
+        _ => false,
     }
-    !matches!(
-        kind,
-        io::ErrorKind::InvalidInput
-            | io::ErrorKind::InvalidData
-            | io::ErrorKind::NotFound
-            | io::ErrorKind::Unsupported
-            | io::ErrorKind::NotADirectory
-            | io::ErrorKind::IsADirectory
-            | io::ErrorKind::ReadOnlyFilesystem
-    )
 }
 
 struct Running<'a>(Option<&'a Mutex<Queue>>);
@@ -85,7 +85,7 @@ fn run(queue: &Mutex<Queue>) {
             drop(queue_guard);
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut job.resolve)) {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) if retryable(&error) => {
+                Ok(Err(error)) if retryable(&error, &mut job.remaining_io_retries) => {
                     job.retry.record(Instant::now(), false);
                     queue
                         .lock()
@@ -165,6 +165,7 @@ impl<E: CommitPayload> PreparedStorage<E> {
         Some(Retired {
             resolve: Box::new(resolve),
             retry: RecoveryBackoff::new(),
+            remaining_io_retries: AMBIGUOUS_RETRIES,
         })
     }
 
@@ -197,6 +198,111 @@ mod tests {
         canonical_durability::lock_transcript_removal, shutdown_tests::transcript_event,
     };
     use crate::test_log_capture::{self, ThreadLogCapture};
+
+    #[test]
+    fn ambiguous_retirement_errors_share_one_retry_budget_per_lease() {
+        let errors = [
+            TranscriptCommitError::Io {
+                phase: CanonicalAppendPhase::RecoveryRead,
+                kind: io::ErrorKind::PermissionDenied,
+                code: Some(5),
+            },
+            TranscriptCommitError::Rejected(
+                CanonicalDurabilityRejection::QualifiedDescendantVolumeUnavailable,
+            ),
+            TranscriptCommitError::Coordination(CanonicalCoordinationError::IdentityUnavailable),
+        ];
+        let mut remaining = AMBIGUOUS_RETRIES;
+        for error in errors.iter().cycle().take(usize::from(AMBIGUOUS_RETRIES)) {
+            assert!(retryable(error, &mut remaining));
+        }
+        for error in &errors {
+            assert!(!retryable(error, &mut remaining));
+        }
+    }
+
+    #[test]
+    fn transient_manifest_read_retries_before_settling_the_dependent_projection() {
+        exercise_transient_manifest(false);
+        #[cfg(windows)]
+        exercise_transient_manifest(true);
+    }
+
+    fn exercise_transient_manifest(sharing_violation: bool) {
+        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let session = "orchard";
+        let path = |dir: &str| root.join(dir).join("orchard.events.jsonl");
+        let transcript = PreparedTranscriptStorage::open(&path("transcripts"), session).unwrap();
+        let projection = PreparedProjectionStorage::open(&path("projections"), session).unwrap();
+        let first = transcript_event("seed", "leaf");
+        transcript.commit_after(&first, Some(0)).unwrap();
+        let mut patch = super::super::projection_tests::projection_patch(1, "fern");
+        patch.basis = crate::projections::ProjectionBasis::from_transcript_events(&[first]);
+        CUT.set(Some(Cut::Sync));
+        assert!(projection.commit_after(&patch, Some(1)).is_err());
+        CUT.set(Some(Cut::Sync));
+        assert!(
+            transcript
+                .commit_after(&transcript_event("twig", "reed"), Some(1))
+                .is_err()
+        );
+        let manifest = root.join(transcript.store.control_identities().manifest.as_str());
+        fs::write(&manifest, b"birch").unwrap();
+        #[cfg(windows)]
+        let mut held = sharing_violation.then(|| {
+            use std::os::windows::fs::OpenOptionsExt;
+            File::options()
+                .read(true)
+                .share_mode(0)
+                .open(&manifest)
+                .unwrap()
+        });
+        if !sharing_violation {
+            let changing = manifest.clone();
+            crate::persistence::session_artifact_manifest::AFTER_MANIFEST_OPEN.set(Some(Box::new(
+                move || {
+                    fs::write(changing, b"willow").unwrap();
+                },
+            )));
+        }
+        let mut job = transcript.retired_job().unwrap();
+        let mut step = job.resolve;
+        let mut first_probe = true;
+        job.resolve = Box::new(move || {
+            let result = step();
+            if std::mem::take(&mut first_probe) {
+                if sharing_violation {
+                    assert!(matches!(
+                        result,
+                        Err(TranscriptCommitError::Io { code: Some(32), .. })
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(TranscriptCommitError::Io {
+                            kind: io::ErrorKind::WouldBlock,
+                            ..
+                        })
+                    ));
+                }
+                #[cfg(windows)]
+                drop(held.take());
+                fs::remove_file(&manifest).unwrap();
+            }
+            result
+        });
+        let queue = Mutex::new(Queue {
+            jobs: [job, projection.retired_job().unwrap()].into(),
+            running: true,
+        });
+        run(&queue);
+        for (dir, count) in [("transcripts", 2), ("projections", 1)] {
+            let source = path(dir);
+            assert!(!source.with_added_extension("attempt").exists());
+            assert_eq!(fs::read_to_string(source).unwrap().lines().count(), count);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn terminal_retirement_preserves_artifacts_and_releases_the_deletion_lock() {
@@ -284,6 +390,7 @@ mod tests {
                 Retired {
                     resolve: Box::new(|| panic!("reed")),
                     retry: RecoveryBackoff::new(),
+                    remaining_io_retries: AMBIGUOUS_RETRIES,
                 },
                 Retired {
                     resolve: Box::new(move || {
@@ -291,6 +398,7 @@ mod tests {
                         Ok(())
                     }),
                     retry: RecoveryBackoff::new(),
+                    remaining_io_retries: AMBIGUOUS_RETRIES,
                 },
             ]
             .into(),

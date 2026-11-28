@@ -1354,7 +1354,30 @@ fn provision_directory(path: &Path) -> Result<Option<QualifiedStorage>, Transcri
     Ok(None)
 }
 
-use super::super::session_artifact_manifest::{ManifestLoadOutcome, SessionArtifactManifestStore};
+use super::super::session_artifact_manifest::{
+    ManifestLoadError, ManifestLoadOutcome, SessionArtifactManifestStore,
+};
+
+fn floor_read_error(error: ManifestLoadError) -> TranscriptCommitError {
+    match error {
+        ManifestLoadError::Io { kind, raw_os_error } => TranscriptCommitError::Io {
+            phase: CanonicalAppendPhase::RecoveryRead,
+            kind,
+            code: raw_os_error,
+        },
+        ManifestLoadError::ChangedDuringRead => TranscriptCommitError::Io {
+            phase: CanonicalAppendPhase::RecoveryRead,
+            kind: io::ErrorKind::WouldBlock,
+            code: None,
+        },
+        ManifestLoadError::Coordination(error) => TranscriptCommitError::Coordination(error),
+        ManifestLoadError::SessionMismatch
+        | ManifestLoadError::NonRegularManifest
+        | ManifestLoadError::TooLarge { .. }
+        | ManifestLoadError::Malformed
+        | ManifestLoadError::Validation(_) => TranscriptCommitError::SessionFloorUnavailable,
+    }
+}
 
 /// Global shared floor admission precedes the per-session transcript lock.
 /// Its writer peer is the unchanged, qualified manifest CAS.
@@ -1371,7 +1394,8 @@ fn with_writable_v1<T>(
             for id in [&ids.manifest, &ids.temporary, &ids.provenance] {
                 match fs::symlink_metadata(root.join(id.as_str())) {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    _ => return Err(TranscriptCommitError::SessionFloorUnavailable),
+                    Err(e) => return Err(io_failure(CanonicalAppendPhase::RecoveryRead, e)),
+                    Ok(_) => return Err(TranscriptCommitError::SessionFloorUnavailable),
                 }
             }
             transcript_floor_lock(root, true)
@@ -1379,10 +1403,7 @@ fn with_writable_v1<T>(
         result => result,
     }
     .map_err(TranscriptCommitError::Coordination)?;
-    match store
-        .load_selected_manifest()
-        .map_err(|_| TranscriptCommitError::SessionFloorUnavailable)?
-    {
+    match store.load_selected_manifest().map_err(floor_read_error)? {
         ManifestLoadOutcome::Absent => operation(),
         ManifestLoadOutcome::Present(manifest) => {
             checked_session_open(&manifest, SessionSemanticsVersion::V1, || Ok::<_, ()>(()))
