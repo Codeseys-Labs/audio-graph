@@ -450,6 +450,13 @@ fn engine_loop(
         }
     };
 
+    // llama-cpp-2 asserts in debug builds that the path exists, and that panic
+    // message carries the path. A missing file is an ordinary load failure.
+    if !std::path::Path::new(model_path).is_file() {
+        let _ = ready.send(Err(engine_not_loaded()));
+        return;
+    }
+
     let model = match LlamaModel::load_from_file(backend, model_path, &LlamaModelParams::default())
     {
         Ok(m) => m,
@@ -991,15 +998,23 @@ mod model_backed_tests {
         );
     }
 
-    /// Needs no model. llama.cpp's own log would print this path to stderr,
-    /// which no Rust-side capture can observe, so it is voided before any load.
+    /// Needs no model: a path with no file, then a file that is not a GGUF.
+    /// llama.cpp's own log would print the second path to stderr, which no
+    /// Rust-side capture can observe, so it is voided before any load.
     #[test]
     fn a_failed_load_returns_only_the_closed_token() {
-        let path = std::env::temp_dir().join("marmot-private-model.gguf");
-        let error = LlmEngine::new(&path.to_string_lossy())
-            .err()
-            .expect("there is no such model");
-        assert_eq!(error, "runtime/provider_unavailable");
+        let missing = std::env::temp_dir().join("marmot-missing-model.gguf");
+        let invalid =
+            std::env::temp_dir().join(format!("marmot-invalid-model-{}.gguf", std::process::id()));
+        std::fs::write(&invalid, b"not a gguf").expect("write the invalid model file");
+
+        for path in [&missing, &invalid] {
+            let error = LlmEngine::new(&path.to_string_lossy())
+                .err()
+                .expect("the model cannot load");
+            assert_eq!(error, "runtime/provider_unavailable");
+        }
+        let _ = std::fs::remove_file(&invalid);
     }
 }
 

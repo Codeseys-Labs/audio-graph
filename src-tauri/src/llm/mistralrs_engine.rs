@@ -676,6 +676,17 @@ mod tests {
         assert_eq!(usage_total_to_u32(usize::MAX), u32::MAX);
     }
 
+    /// Needs no model: the directory does not exist.
+    #[cfg(feature = "llm-mistralrs")]
+    #[test]
+    fn a_failed_load_returns_only_the_closed_token() {
+        let directory = std::env::temp_dir().join("marmot-missing-models");
+        let error = super::MistralRsEngine::new(&directory.to_string_lossy(), "marmot.gguf")
+            .err()
+            .expect("the model cannot load");
+        assert_eq!(error, "runtime/provider_unavailable");
+    }
+
     // ------------------------------------------------------------------
     // Streaming response-mapping seam (model-free)
     //
