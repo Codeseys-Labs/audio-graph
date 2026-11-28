@@ -3789,22 +3789,13 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                         job.kind,
                         result.outcome
                     );
-                    // audio-graph-a6b5 W2: counts only (ADR-0025), never
-                    // note/section content — makes the no-op filter (§1.5b)
-                    // and the document-order outline replacing the old
-                    // recency-sorted notes snapshot (§2.3) verifiable from
-                    // logs without needing a log-capture harness (this repo
-                    // has none — see the audio-graph-fa56 precedent for why
-                    // source-text inspection is the mutation-proof for a
-                    // logging-only change). `notes_outline_*` is 0 for a
-                    // Graph-kind job (the outline is Notes-kind only).
+                    // The outline entry count is zero for graph jobs.
                     log::debug!(
                         "Projection job movement counts job_id={} kind={:?} \
-                         no_op_filtered={} notes_outline_chars={} notes_outline_entries={}",
+                         no_op_filtered={} notes_outline_entries={}",
                         job.id,
                         job.kind,
                         movement_facts.no_op_filtered_count,
-                        movement_facts.notes_snapshot_chars,
                         movement_facts.notes_snapshot_entries
                     );
                     // audio-graph-caad / audio-graph-f3d4: the gate now applies a
@@ -12444,6 +12435,122 @@ mod tests_status {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "Tao needs the main thread on macOS")]
+    fn deepgram_receiver_updates_stage_across_disconnects_and_recovery() {
+        use crate::asr::deepgram::DeepgramEvent as Event;
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorDiagnostic;
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("deepgram-stage-transitions");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        app.projection_lane_stopping.store(true, Ordering::SeqCst);
+        let run = |events: Vec<Event>| {
+            set_asr_status(
+                &app.pipeline_status,
+                StageStatus::Running { processed_count: 0 },
+            );
+            let (tx, rx) = crossbeam_channel::unbounded();
+            for event in events {
+                tx.send(event).unwrap();
+            }
+            drop(tx);
+            super::run_deepgram_event_receiver(
+                rx,
+                moonshine_shared_for_app(&app, super::shared_test_app_handle()),
+                moonshine_speech_config(dir.clone()),
+                Arc::new(RwLock::new(None)),
+                0,
+                false,
+            );
+            app.pipeline_status.read().unwrap().asr.clone()
+        };
+        let context = RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+            .with_transport(RuntimeTransport::Websocket);
+        let disconnected: RuntimeDiagnostic = RuntimeErrorDiagnostic::new(
+            RuntimeErrorCode::NetworkUnreachable,
+            true,
+            RuntimeSafeRecoveryAction::CheckNetwork,
+            context,
+        )
+        .into();
+        let unavailable: RuntimeDiagnostic = RuntimeErrorDiagnostic::new(
+            RuntimeErrorCode::ProviderUnavailable,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+            context,
+        )
+        .into();
+        let reconnecting = || Event::Reconnecting {
+            attempt: 1,
+            backoff_secs: 2,
+        };
+        let final_transcript = |start| Event::Transcript {
+            text: "hello".into(),
+            confidence: 1.0,
+            is_final: true,
+            speech_final: true,
+            start,
+            duration: 0.5,
+            words: vec![],
+        };
+        let error_after = |events| match run(events) {
+            StageStatus::Error { diagnostic } => diagnostic,
+            other => panic!("expected an ASR error, got {other:?}"),
+        };
+
+        assert_eq!(error_after(vec![Event::Disconnected]), disconnected);
+        assert_eq!(
+            error_after(vec![reconnecting()]),
+            RuntimeErrorDiagnostic::new(
+                RuntimeErrorCode::NetworkUnreachable,
+                true,
+                RuntimeSafeRecoveryAction::RetryAfterDelay,
+                context.with_retry_delay(
+                    audio_graph_ipc_contract::runtime_diagnostic::RuntimeRetryDelayBucket::Short
+                ),
+            )
+            .into()
+        );
+        assert_eq!(
+            error_after(vec![reconnecting(), Event::Disconnected]),
+            disconnected
+        );
+        assert!(matches!(
+            run(vec![
+                final_transcript(0.0),
+                Event::Disconnected,
+                reconnecting(),
+                Event::Reconnected
+            ]),
+            StageStatus::Running { processed_count: 1 }
+        ));
+        assert_eq!(
+            error_after(vec![
+                Event::Error {
+                    message: unavailable.clone()
+                },
+                Event::Disconnected
+            ]),
+            unavailable
+        );
+        assert!(matches!(
+            run(vec![
+                Event::Error {
+                    message: unavailable
+                },
+                final_transcript(1.0)
+            ]),
+            StageStatus::Running { processed_count: 1 }
+        ));
+        drain_app_writers(&app);
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn connect_failure_preserves_typed_diagnostic_and_closes_untyped_errors() {
         let expected: RuntimeDiagnostic = audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorDiagnostic::credential_rejected(
             RuntimeDiagnosticContext::new(RuntimeOperation::Transcription).with_transport(RuntimeTransport::Websocket)
@@ -15211,19 +15318,7 @@ mod tests_status {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// audio-graph-a6b5 W2: pins that the movement-counts `log::debug!` line
-    /// inside `run_projection_job`'s apply-success branch still exists and
-    /// still carries all three ADR-0025-safe counts (`no_op_filtered_count`,
-    /// `notes_snapshot_chars`, `notes_snapshot_entries`). This repo has no
-    /// log-capture test harness (see the audio-graph-fa56 precedent,
-    /// `commands.rs`'s
-    /// `log_abandoned_deferred_retries_after_stop_emits_the_documented_warn_key`,
-    /// for the same technique applied to a different WARN), so source-text
-    /// inspection is the cheapest mutation-proof available for a
-    /// logging-only change: a mutant that deletes this `log::debug!` call
-    /// (or swaps an argument for a hardcoded `0`) would make every OTHER
-    /// test in this suite pass, since none of them observe emitted log
-    /// output — this is the ONE thing that catches that mutant.
+    /// Pin the movement counts that operators use and exclude the exact notes length.
     #[test]
     fn run_projection_job_movement_counts_log_line_still_carries_the_no_op_filter_and_outline_counts()
      {
@@ -15246,8 +15341,8 @@ mod tests_status {
             "the log line must still carry the no-op-filtered count"
         );
         assert!(
-            body.contains("movement_facts.notes_snapshot_chars"),
-            "the log line must still carry the notes-outline char count"
+            !body.contains("movement_facts.notes_snapshot_chars"),
+            "the log must omit the exact notes-outline length"
         );
         assert!(
             body.contains("movement_facts.notes_snapshot_entries"),

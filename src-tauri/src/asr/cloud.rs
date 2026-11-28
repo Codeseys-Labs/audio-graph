@@ -269,7 +269,9 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
             http_status: Some(status.as_u16()),
             recoverable: None,
         });
-        // HTTP clients strip Authorization on cross-origin redirects.
+        // reqwest exposes the final URL here, not the redirect chain. If a redirect
+        // leaves the original host and returns, Authorization may already have been
+        // stripped even though these origins match.
         let sent_to_origin = credential_sent
             && reqwest::Url::parse(&url)
                 .is_ok_and(|original| original.origin() == response.url().origin());
