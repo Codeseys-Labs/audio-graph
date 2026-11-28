@@ -16,6 +16,16 @@ const CHILD_TEST: &str =
     "persistence::canonical_log::transcript_commit::tests::interrupted_writer_child";
 const HANG_LIMIT: Duration = Duration::from_secs(60);
 
+thread_local! {
+    pub(super) static BEFORE_FRAME_SYNC: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn pause_before_frame_sync_if_armed() {
+    if let Some(pause) = BEFORE_FRAME_SYNC.take() {
+        pause();
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     path: PathBuf,
@@ -70,7 +80,7 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn writer_boundary_errors_withhold_acknowledgement_and_require_the_exact_live_attempt() {
+fn writer_boundary_errors_withhold_acknowledgement_and_retry_keeps_only_verified_frames() {
     use CanonicalAppendPhase::{Flush, Sync, Write};
 
     let capture = test_log_capture::ThreadLogCapture::start();
@@ -95,10 +105,14 @@ fn writer_boundary_errors_withhold_acknowledgement_and_require_the_exact_live_at
         let error = commit_transcript(&fixture.path, SESSION, &second).unwrap_err();
         assert_eq!(
             error,
-            TranscriptCommitError::Io {
-                phase,
-                kind,
-                code: None
+            if cut == Cut::Full {
+                TranscriptCommitError::FrameWriteStorageFull
+            } else {
+                TranscriptCommitError::Io {
+                    phase,
+                    kind,
+                    code: None,
+                }
             }
         );
         let diagnostic = format!("{error:?}");
@@ -106,27 +120,18 @@ fn writer_boundary_errors_withhold_acknowledgement_and_require_the_exact_live_at
             assert!(!diagnostic.contains(private));
         }
 
-        let uncertain_bytes = fs::read(&fixture.path).unwrap();
         fixture.assert_only_first_is_visible();
-        assert_eq!(
-            commit_transcript(&fixture.path, SESSION, &transcript_event(SPAN, "different")),
-            Err(TranscriptCommitError::ConflictingAttempt)
-        );
-        assert_eq!(fs::read(&fixture.path).unwrap(), uncertain_bytes);
-        // A cached matching prefix (even a complete frame after failed sync)
-        // cannot satisfy exact retry. A short rewrite from the original offset
-        // still refuses and does not extend the old partial suffix.
-        CUT.set(Some(Cut::Short));
-        assert_eq!(
-            commit_transcript(&fixture.path, SESSION, &second),
-            Err(TranscriptCommitError::Io {
-                phase: Write,
-                kind: io::ErrorKind::WriteZero,
-                code: None
-            })
-        );
-        if cut != Cut::Full {
-            assert_eq!(fs::read(&fixture.path).unwrap(), uncertain_bytes);
+        let complete = matches!(cut, Cut::Flush | Cut::Sync);
+        if complete {
+            // A matching cached frame still requires a rewrite and fresh barrier.
+            let uncertain = fs::read(&fixture.path).unwrap();
+            CUT.set(Some(Cut::Short));
+            assert_eq!(
+                commit_transcript(&fixture.path, SESSION, &second),
+                Err(io_failure(Write, io::ErrorKind::WriteZero.into()))
+            );
+            assert_eq!(fs::read(&fixture.path).unwrap(), uncertain);
+            fixture.assert_only_first_is_visible();
         }
 
         let receipt = commit_transcript(&fixture.path, SESSION, &second).unwrap();
@@ -144,7 +149,10 @@ fn writer_boundary_errors_withhold_acknowledgement_and_require_the_exact_live_at
         assert!(retry.already_accepted);
         assert_eq!(retry.sequence, receipt.sequence);
         assert_eq!(fs::read(&fixture.path).unwrap(), durable_bytes);
-        assert!(transcript_gaps(&fixture.path).unwrap().is_empty());
+        assert_eq!(
+            transcript_gaps(&fixture.path).unwrap().len(),
+            usize::from(!complete)
+        );
         assert_eq!(
             commit_transcript(&fixture.path, SESSION, &next)
                 .unwrap()
@@ -202,7 +210,11 @@ fn interrupted_writer_child() {
     let Some(path) = std::env::var_os(CHILD_PATH) else {
         return;
     };
-    let cut = match std::env::var(CHILD_CUT).unwrap().as_str() {
+    let checkpoint = std::env::var(CHILD_CUT).unwrap();
+    if let Some(projection_cut) = checkpoint.strip_prefix("projection-") {
+        super::projection_tests::interrupt_patch(Path::new(&path), projection_cut);
+    }
+    let cut = match checkpoint.as_str() {
         "group-torn" => Cut::KillGroupTorn,
         "group-member" => Cut::KillGroupMember,
         "group-complete" => Cut::KillComplete,
@@ -211,7 +223,7 @@ fn interrupted_writer_child() {
         "idle" => Cut::Short,
         "intent" => Cut::KillIntent,
         "retire-failed" => Cut::Retire,
-        "supersede" => Cut::Sync,
+        "resolve-torn" => Cut::Short,
         "recover-truncate" => Cut::KillTruncated,
         "recover-gap" => Cut::KillGap,
         "recover-retire" => Cut::KillRetired,
@@ -231,11 +243,11 @@ fn interrupted_writer_child() {
     }
     let event = transcript_event(SPAN, CONTENT);
     let outcome = commit_transcript(Path::new(&path), SESSION, &event);
-    if cut == Cut::Sync {
+    if std::env::var(CHILD_CUT).as_deref() == Ok("resolve-torn") {
         assert!(matches!(
             outcome,
             Err(TranscriptCommitError::Io {
-                phase: CanonicalAppendPhase::Sync,
+                phase: CanonicalAppendPhase::Write,
                 ..
             })
         ));
@@ -271,7 +283,7 @@ fn interrupted_writer_child() {
 
 /// The child signals from between the write and its durability barrier. The
 /// deadline bounds a broken handshake; scheduling never selects a crash cut.
-fn kill_at_writer_checkpoint(path: &Path, checkpoint: &str, while_alive: impl FnOnce()) {
+pub(super) fn kill_at_writer_checkpoint(path: &Path, checkpoint: &str, while_alive: impl FnOnce()) {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
         .env(CHILD_PATH, path)
@@ -319,6 +331,16 @@ fn kill_at_writer_checkpoint(path: &Path, checkpoint: &str, while_alive: impl Fn
     if let Err(payload) = observation {
         std::panic::resume_unwind(payload);
     }
+}
+
+/// Leave a complete first frame on disk at the subprocess's pre-sync cut.
+pub(crate) fn interrupted_historical_caption(root: &Path) -> (&'static str, TranscriptEvent) {
+    let directory = root.join("transcripts");
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("{SESSION}.events.jsonl"));
+    kill_at_writer_checkpoint(&path, "complete", || {});
+    assert!(path.with_added_extension("attempt").is_file());
+    (SESSION, transcript_event(SPAN, CONTENT))
 }
 
 fn group_events() -> [TranscriptEvent; 3] {
@@ -435,20 +457,27 @@ fn an_individual_group_member_retry_cannot_duplicate_or_change_the_live_owners_f
             ..
         })
     ));
-    let before = fs::read(&fixture.path).unwrap();
+    // The first member is complete, the second torn. Redelivering the second
+    // can re-use the discarded attempt's sequence but never the first one's.
+    let member = storage.commit_after(&events[1], None).unwrap();
+    assert_eq!(member.sequence, 3);
+    assert!(!member.already_accepted);
+    assert_eq!(fixture.replay().records.len(), 3);
+    let recovered = storage.take_recovered();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].event, events[0]);
+    assert_eq!(recovered[0].receipt.sequence, 2);
+    let gaps = transcript_gaps(&fixture.path).unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].after.as_ref().unwrap().sequence, 2);
     let mut changed = events[1].clone();
     changed.text = "changed".into();
     assert_eq!(
         storage.commit_after(&changed, None),
-        Err(TranscriptCommitError::ConflictingAttempt)
+        Err(TranscriptCommitError::Frame(
+            CanonicalAppendRejection::EventIdConflict
+        ))
     );
-    assert_eq!(fs::read(&fixture.path).unwrap(), before);
-    fixture.assert_only_first_is_visible();
-    let member = storage.commit_after(&events[1], None).unwrap();
-    assert_eq!(member.sequence, 3);
-    assert!(member.already_accepted);
-    assert_eq!(fixture.replay().records.len(), 4);
-    assert!(transcript_gaps(&fixture.path).unwrap().is_empty());
 }
 
 #[test]
@@ -538,6 +567,33 @@ fn another_process_cannot_abandon_an_idle_live_writers_uncertain_frame() {
 }
 
 #[test]
+fn repeat_recovery_keeps_a_member_even_if_its_last_byte_equals_the_quarantined_suffix() {
+    let fixture = Fixture::new();
+    commit_transcript(&fixture.path, SESSION, &transcript_event("leaf", "first")).unwrap();
+    kill_at_writer_checkpoint(&fixture.path, "group-member", || {});
+    let through_first_member = fs::read(&fixture.path).unwrap();
+    assert!(through_first_member.ends_with(b"\n"));
+    OpenOptions::new()
+        .append(true)
+        .open(&fixture.path)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
+    kill_at_writer_checkpoint(&fixture.path, "recover-truncate", || {});
+    assert_eq!(fs::read(&fixture.path).unwrap(), through_first_member);
+    let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+    storage.resolve_pending().unwrap();
+    let saved = storage.take_recovered();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].event, group_events()[0]);
+    assert_eq!(saved[0].receipt.sequence, 2);
+    let gaps = transcript_gaps(&fixture.path).unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert!(gaps[0].suffix_quarantined);
+    assert_eq!(gaps[0].after.as_ref().unwrap().sequence, 2);
+}
+
+#[test]
 fn a_new_live_revision_resolves_an_uncertain_predecessor_before_committing() {
     for cut in [Cut::Full, Cut::Short, Cut::Flush, Cut::Sync] {
         let fixture = Fixture::new();
@@ -555,13 +611,21 @@ fn a_new_live_revision_resolves_an_uncertain_predecessor_before_committing() {
         assert_eq!(error.is_storage_full(), cut == Cut::Full);
         let unresolved = fs::read(&fixture.path).unwrap();
         let suffix = unresolved.strip_prefix(prefix.as_slice()).unwrap();
-        let next = commit_after(
-            &fixture.path,
-            SESSION,
-            &transcript_event("stem", "next"),
-            Some(1),
-        )
-        .unwrap();
+        let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+        let next = transcript_event("stem", "next");
+        let result = storage.commit_after(&next, Some(1));
+        if matches!(cut, Cut::Flush | Cut::Sync) {
+            assert_eq!(result, Err(TranscriptCommitError::LiveHeadChanged));
+            let kept = storage.take_recovered();
+            assert_eq!(kept.len(), 1);
+            assert_eq!(kept[0].receipt.sequence, 2);
+            assert_eq!(kept[0].event, transcript_event(SPAN, CONTENT));
+            assert_eq!(storage.commit_after(&next, Some(2)).unwrap().sequence, 3);
+            assert!(transcript_gaps(&fixture.path).unwrap().is_empty());
+            continue;
+        }
+        assert!(storage.take_recovered().is_empty());
+        let next = result.unwrap();
         assert_eq!(next.sequence, 2);
         let replay = fixture.replay();
         assert_eq!(replay.records.len(), 2);
@@ -623,12 +687,11 @@ fn process_kills_during_gap_recovery_keep_one_quarantine_one_gap_and_the_verifie
     commit_transcript(&fixture.path, SESSION, &transcript_event("leaf", "first")).unwrap();
     let prefix = fs::read(&fixture.path).unwrap();
     let head = fixture.replay().head.unwrap();
-    // The old sync failed but its full matching frame remains in cache.
-    // A new live revision chooses to abandon, then dies after evidence publish.
-    kill_at_writer_checkpoint(&fixture.path, "supersede", || {});
+    // A torn member is quarantined, then recovery dies after evidence publication.
+    kill_at_writer_checkpoint(&fixture.path, "resolve-torn", || {});
     let interrupted = fs::read(&fixture.path).unwrap();
     let suffix = interrupted.strip_prefix(prefix.as_slice()).unwrap();
-    assert!(suffix.ends_with(b"\n"));
+    assert!(!suffix.ends_with(b"\n"));
     fixture.assert_only_first_is_visible();
     kill_at_writer_checkpoint(&fixture.path, "recover-truncate", || {});
     assert_eq!(fs::read(&fixture.path).unwrap(), prefix);
@@ -672,6 +735,7 @@ fn process_kill_with_only_a_durable_intent_records_an_empty_suffix_and_restores_
     assert_eq!(
         transcript_gaps(&fixture.path).unwrap(),
         vec![TranscriptGap {
+            projection_lanes: Vec::new(),
             stream: GapStream::TranscriptRevisions,
             after: None,
             suffix_quarantined: false
@@ -742,13 +806,21 @@ fn interrupted_first_revision_preserves_the_legacy_display_and_leaves_sequence_o
     assert_legacy_visible();
     let interrupted = fs::read(&fixture.path).unwrap();
     assert!(!interrupted.is_empty());
-    let fresh_writer = fixture.writer_for(&Uuid::new_v4().to_string());
+    let fresh_session = Uuid::new_v4().to_string();
+    let fresh_writer = fixture.writer_for(&fresh_session);
+    crate::persistence::transcript_startup::recover_in_directory(
+        fixture.path.parent().unwrap(),
+        &fresh_session,
+        |_, _, _| panic!("a torn first member cannot yield a receipt"),
+    )
+    .unwrap();
     assert!(!fixture.path.exists());
     assert_legacy_visible();
     let gaps = transcript_gaps(&fixture.path).unwrap();
     assert_eq!(
         gaps,
         vec![TranscriptGap {
+            projection_lanes: Vec::new(),
             stream: GapStream::TranscriptRevisions,
             after: None,
             suffix_quarantined: true,
@@ -787,10 +859,16 @@ fn startup_for_a_fresh_session_recovers_a_torn_frame_and_records_a_gap_at_the_ol
     assert!(!suffix.is_empty() && !suffix.ends_with(b"\n"));
     fixture.assert_only_first_is_visible();
 
-    // Production chooses a new session at startup. Opening only its writer
-    // must reconcile the previous session without any input from its provider.
+    // Startup reconciles the previous session before the first historical
+    // load even when the new session receives no speech.
     let fresh_session = Uuid::new_v4().to_string();
     let fresh_writer = fixture.writer_for(&fresh_session);
+    crate::persistence::transcript_startup::recover_in_directory(
+        fixture.path.parent().unwrap(),
+        &fresh_session,
+        |_, _, _| panic!("a torn first member cannot yield a receipt"),
+    )
+    .unwrap();
     assert!(
         !fixture
             .path
@@ -803,6 +881,7 @@ fn startup_for_a_fresh_session_recovers_a_torn_frame_and_records_a_gap_at_the_ol
     assert_eq!(
         gaps,
         vec![TranscriptGap {
+            projection_lanes: Vec::new(),
             stream: GapStream::TranscriptRevisions,
             after: Some(VerifiedTranscriptHead {
                 sequence: first_receipt.sequence,
@@ -838,6 +917,32 @@ fn startup_for_a_fresh_session_recovers_a_torn_frame_and_records_a_gap_at_the_ol
     assert_eq!(transcript_gaps(&fixture.path).unwrap(), gaps);
     assert_eq!(fs::read(&quarantines[0]).unwrap(), suffix);
     assert!(reopened.shutdown_with_timeout(HANG_LIMIT));
+}
+
+#[test]
+fn startup_delivers_a_kept_group_in_order_without_new_speech_or_a_second_notification() {
+    let fixture = Fixture::new();
+    commit_transcript(&fixture.path, SESSION, &transcript_event("leaf", "first")).unwrap();
+    kill_at_writer_checkpoint(&fixture.path, "group-complete", || {});
+    let mut confirmations = Vec::new();
+    for _ in 0..2 {
+        crate::persistence::transcript_startup::recover_in_directory(
+            fixture.path.parent().unwrap(),
+            "fresh-session",
+            |session, event, receipt| {
+                assert_eq!(session, SESSION);
+                confirmations.push((event.clone(), receipt.sequence));
+            },
+        )
+        .unwrap();
+    }
+    let expected: Vec<_> = group_events().into_iter().zip(2_u64..).collect();
+    assert_eq!(confirmations, expected);
+    let read =
+        crate::persistence::canonical_reader::load_transcript_revisions(&fixture.path, SESSION)
+            .unwrap()
+            .into_payloads();
+    assert_eq!(read[1..], group_events());
 }
 
 #[test]
@@ -888,9 +993,24 @@ fn restart_syncs_a_complete_frame_then_replays_it_once_and_never_reuses_its_sequ
 
 #[test]
 fn retry_fences_an_uncertain_intent_publication_before_touching_the_source() {
-    for grouped in [false, true] {
+    use crate::persistence::canonical_durability::{
+        completed_parent_flushes, sync_unqualified_transcript_parent,
+    };
+    for (grouped, force_weak) in [(false, false), (true, false), (false, true), (true, true)] {
         let fixture = Fixture::new();
-        let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+        let mut storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+        if force_weak {
+            storage.tier = None;
+        }
+        let expected_parent_flushes = if storage.is_unqualified() {
+            // Some weak-tier filesystems cannot flush a directory. Match the
+            // actual capability of this fixture's directory.
+            let before = completed_parent_flushes();
+            sync_unqualified_transcript_parent(fixture.path.parent().unwrap()).unwrap();
+            completed_parent_flushes() - before
+        } else {
+            1
+        };
         storage
             .commit_after(&transcript_event("seed", CONTENT), Some(0))
             .unwrap();
@@ -915,6 +1035,7 @@ fn retry_fences_an_uncertain_intent_publication_before_touching_the_source() {
                 })
         ));
         assert!(fixture.path.with_added_extension("attempt").is_file());
+        LAST_INTENT_PARENT_FLUSHES.set(None);
         CUT.set(Some(Cut::IntentResync));
         assert_eq!(
             append(),
@@ -924,8 +1045,151 @@ fn retry_fences_an_uncertain_intent_publication_before_touching_the_source() {
             ))
         );
         assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(LAST_INTENT_PARENT_FLUSHES.get(), None);
         assert_eq!(append().unwrap(), if grouped { events.len() } else { 1 });
+        assert_eq!(
+            LAST_INTENT_PARENT_FLUSHES.take(),
+            Some(expected_parent_flushes)
+        );
     }
+}
+
+/// Keep an entire unacknowledged frame on disk and its descriptor visible.
+fn stopped_after_second_frame(fixture: &Fixture) -> PreparedTranscriptStorage {
+    let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+    storage
+        .commit_after(&transcript_event("seed", CONTENT), Some(0))
+        .unwrap();
+    CUT.set(Some(Cut::Sync));
+    assert!(matches!(
+        storage.commit_after(&transcript_event("leaf", CONTENT), Some(1)),
+        Err(TranscriptCommitError::Io {
+            phase: CanonicalAppendPhase::Sync,
+            ..
+        })
+    ));
+    storage
+}
+
+#[test]
+fn startup_leaves_the_active_sessions_pending_lease_and_receipt_with_its_writer() {
+    let fixture = Fixture::new();
+    let active = stopped_after_second_frame(&fixture);
+    let descriptor = fixture.path.with_added_extension("attempt");
+    let before = fs::read(&descriptor).unwrap();
+    crate::persistence::transcript_startup::recover_in_directory(
+        fixture.path.parent().unwrap(),
+        SESSION,
+        |_, _, _| panic!("the active writer owns this receipt"),
+    )
+    .unwrap();
+    assert_eq!(fs::read(descriptor).unwrap(), before);
+    assert!(active.has_pending_attempt());
+    active.resolve_pending().unwrap();
+    let kept = active.take_recovered();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].receipt.sequence, 2);
+    assert_eq!(kept[0].event, transcript_event("leaf", CONTENT));
+}
+
+#[test]
+fn contended_reader_with_unchanged_attempt_returns_its_verified_prefix() {
+    use crate::persistence::canonical_durability::{
+        transcript_coordination_path, wait_for_transcript_lock,
+    };
+    let fixture = Fixture::new();
+    let storage = stopped_after_second_frame(&fixture);
+    let lock = transcript_coordination_path(&fixture.path);
+    let held = wait_for_transcript_lock(&lock, false, true).unwrap();
+    let read = read_committed::<TranscriptEvent>(&fixture.path, SESSION).unwrap();
+    assert_eq!(read.head.unwrap().sequence, 1);
+    assert_eq!(read.records.len(), 1);
+    assert_eq!(read.records[0].payload.span_id, "seed");
+    drop(held);
+    storage.resolve_pending().unwrap();
+}
+
+#[derive(Clone, Copy)]
+enum AfterContendedCopy {
+    CommitTwoMore,
+    ReplaceAttempt,
+}
+
+fn check_contended_recapture(change: AfterContendedCopy) {
+    use crate::persistence::canonical_durability::{
+        observe_next_transcript_lock_wait, transcript_coordination_path, wait_for_transcript_lock,
+    };
+    let fixture = Fixture::new();
+    let storage = stopped_after_second_frame(&fixture);
+    let lock = transcript_coordination_path(&fixture.path);
+    let held = wait_for_transcript_lock(&lock, false, true).unwrap();
+    let (copied_tx, copied_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let (waiting_tx, waiting_rx) = mpsc::channel();
+    let descriptor = fixture.path.with_added_extension("attempt");
+    let attempt_id = || {
+        serde_json::from_slice::<Intent>(&fs::read(&descriptor).unwrap())
+            .unwrap()
+            .attempt
+    };
+    let original_id = attempt_id();
+    std::thread::scope(|scope| {
+        let path = &fixture.path;
+        let reader = scope.spawn(move || {
+            observe_next_transcript_lock_wait(waiting_tx);
+            AFTER_SOURCE_READ.set(Some(Box::new(move || {
+                copied_tx.send(()).unwrap();
+                resume_rx.recv_timeout(HANG_LIMIT).unwrap();
+            })));
+            read_committed::<TranscriptEvent>(path, SESSION).unwrap()
+        });
+        copied_rx.recv_timeout(HANG_LIMIT).unwrap();
+        drop(held);
+        storage.resolve_pending().unwrap();
+        let third = transcript_event("stem", CONTENT);
+        let expected = match change {
+            AfterContendedCopy::CommitTwoMore => {
+                storage.commit_after(&third, Some(2)).unwrap();
+                storage
+                    .commit_after(&transcript_event("root", CONTENT), Some(3))
+                    .unwrap();
+                assert!(!descriptor.try_exists().unwrap());
+                4
+            }
+            AfterContendedCopy::ReplaceAttempt => {
+                CUT.set(Some(Cut::Sync));
+                assert!(matches!(
+                    storage.commit_after(&third, Some(2)),
+                    Err(TranscriptCommitError::Io {
+                        phase: CanonicalAppendPhase::Sync,
+                        ..
+                    })
+                ));
+                assert_ne!(attempt_id(), original_id);
+                2
+            }
+        };
+        let held = wait_for_transcript_lock(&lock, false, true).unwrap();
+        resume_tx.send(()).unwrap();
+        waiting_rx
+            .recv_timeout(HANG_LIMIT)
+            .expect("reader requested a coordinated recapture");
+        drop(held);
+        let read = reader.join().unwrap();
+        assert_eq!(read.head.unwrap().sequence, expected);
+        assert_eq!(read.records.len() as u64, expected);
+    });
+    storage.resolve_pending().unwrap();
+}
+
+#[test]
+fn contended_reader_waits_and_recaptures_when_the_descriptor_retires_after_copy() {
+    check_contended_recapture(AfterContendedCopy::CommitTwoMore);
+}
+
+#[test]
+fn contended_reader_waits_and_recaptures_when_a_different_attempt_replaces_the_first() {
+    check_contended_recapture(AfterContendedCopy::ReplaceAttempt);
 }
 
 #[test]
@@ -1145,6 +1409,198 @@ fn release_transcript_receipt_latency() {
 }
 
 #[test]
+fn descriptor_staging_write_fault_refuses_before_the_log_and_next_revision_can_commit() {
+    use crate::persistence::canonical_durability::CanonicalDurabilityStage;
+
+    for force_weak in [false, true] {
+        let fixture = Fixture::new();
+        let mut storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+        if force_weak {
+            storage.tier = None;
+        }
+        let seed = transcript_event("seed", "first");
+        storage.commit_after(&seed, Some(0)).unwrap();
+        let prefix = fs::read(&fixture.path).unwrap();
+        CUT.set(Some(Cut::IntentStageWrite));
+        let error = storage
+            .commit_after(&transcript_event("twig", "second"), Some(1))
+            .unwrap_err();
+        if storage.is_unqualified() {
+            assert_eq!(
+                error,
+                io_failure(CanonicalAppendPhase::Write, io::ErrorKind::WriteZero.into())
+            );
+        } else {
+            assert!(
+                matches!(error, TranscriptCommitError::Indeterminate(e) if e.stage == CanonicalDurabilityStage::Write)
+            );
+        }
+        let staging = fixture.path.with_added_extension("attempt-stage");
+        let torn_descriptor = fs::read(&staging).unwrap();
+        assert!(!torn_descriptor.is_empty());
+        assert!(serde_json::from_slice::<serde_json::Value>(&torn_descriptor).is_err());
+        assert!(
+            !fixture
+                .path
+                .with_added_extension("attempt")
+                .try_exists()
+                .unwrap()
+        );
+        assert!(!storage.has_pending_attempt());
+        assert_eq!(fs::read(&fixture.path).unwrap(), prefix);
+
+        let next = transcript_event("leaf", "third");
+        assert_eq!(storage.commit_after(&next, Some(1)).unwrap().sequence, 2);
+        assert!(!staging.try_exists().unwrap());
+        let events: Vec<_> = fixture
+            .replay()
+            .records
+            .into_iter()
+            .map(|row| row.payload)
+            .collect();
+        assert_eq!(events, [seed, next]);
+    }
+}
+
+#[test]
+fn shutdown_refuses_queued_live_replies_and_releases_the_abandoned_owner() {
+    use crate::persistence::{TranscriptEventWriteMsg as Message, live_receipt, transcript_batch};
+    use crate::projections::TranscriptLedger;
+    use std::sync::{Mutex, atomic::AtomicBool};
+
+    let fixture = Fixture::new();
+    let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+    let (tx, rx) = mpsc::sync_channel(3);
+    tx.send(Message::Shutdown).unwrap();
+    let ledger = Arc::new(Mutex::new(TranscriptLedger::new(SESSION)));
+    let (result, late) = mpsc::channel();
+    let owner: live_receipt::LatePublication = Arc::new(move |reply| result.send(reply).unwrap());
+    let retained = Arc::downgrade(&owner);
+    let (reply, waiting) = live_receipt::channel(HANG_LIMIT, None);
+    tx.send(Message::Live(
+        transcript_event("stem", "green"),
+        ledger.clone(),
+        reply,
+    ))
+    .unwrap();
+    let (reply, abandoned) = live_receipt::channel(Duration::ZERO, Some(owner));
+    tx.send(Message::Live(
+        transcript_event("fern", "leaf"),
+        ledger.clone(),
+        reply,
+    ))
+    .unwrap();
+    assert_eq!(abandoned.wait(), Err(TranscriptCommitError::AckTimeout));
+
+    transcript_batch::run(
+        rx,
+        &storage,
+        &fixture.path,
+        SESSION,
+        &AtomicBool::new(false),
+    );
+    assert_eq!(
+        waiting.wait(),
+        Err(TranscriptCommitError::UncommittedAttempt)
+    );
+    assert_eq!(
+        late.try_recv().unwrap(),
+        Err(TranscriptCommitError::UncommittedAttempt)
+    );
+    assert!(retained.upgrade().is_none());
+    assert!(!fixture.path.try_exists().unwrap());
+    assert_eq!(ledger.lock().unwrap().accepted_event_count, 0);
+}
+
+#[test]
+fn a_failed_recovered_ledger_install_allows_the_next_revision_to_rebuild() {
+    use crate::projections::TranscriptLedger;
+    let fixture = Fixture::new();
+    let writer = fixture.writer();
+    let client = writer.client();
+    let ledger = Arc::new(std::sync::Mutex::new(TranscriptLedger::new(SESSION)));
+    let seed = transcript_event("oak", "first");
+    let submit = |event: &TranscriptEvent| {
+        client
+            .submit_live_observed(event, ledger.clone(), HANG_LIMIT, None)
+            .unwrap()
+    };
+    submit(&seed).wait().unwrap();
+    let mut second = transcript_event("oak", "second");
+    second.revision_number = seed.revision_number + 1;
+    let (begin, cut, resume) = writer.pause_recovery_after_next_sync_failure();
+    let pending = submit(&second);
+    begin.send(()).unwrap();
+    cut.recv_timeout(HANG_LIMIT).unwrap();
+    assert_eq!(
+        pending.wait(),
+        Err(TranscriptCommitError::ConfirmationPending)
+    );
+    // The display row now conflicts with the kept frame at the next sequence.
+    ledger.lock().unwrap().latest_spans[0].revision_number = second.revision_number + 1;
+    let next = transcript_event("fern", "third");
+    let ticket = submit(&next);
+    resume.send(()).unwrap();
+    assert_eq!(ticket.wait().unwrap().1.sequence, 3);
+    assert_eq!(
+        *ledger.lock().unwrap(),
+        TranscriptLedger::replay(SESSION, [seed, second, next]).unwrap()
+    );
+    assert_eq!(fixture.replay().records.len(), 3);
+    assert!(writer.shutdown_with_timeout(HANG_LIMIT));
+}
+
+#[test]
+fn grouped_worker_replies_remain_pending_until_the_frame_sync_completes() {
+    use crate::persistence::{TranscriptEventWriteMsg as Message, live_receipt, transcript_batch};
+    use crate::projections::TranscriptLedger;
+    use std::sync::{Mutex, atomic::AtomicBool};
+
+    let fixture = Fixture::new();
+    let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+    let seed = transcript_event("seed", "first");
+    storage.commit_after(&seed, Some(0)).unwrap();
+    let ledger = Arc::new(Mutex::new(
+        TranscriptLedger::replay(SESSION, [seed]).unwrap(),
+    ));
+    // Queue the entire group and its fence before starting the real worker.
+    let (tx, rx) = mpsc::sync_channel(8);
+    let mut tickets = Vec::new();
+    for event in group_events() {
+        let (reply, ticket) = live_receipt::channel(HANG_LIMIT, None);
+        tx.send(Message::Live(event, ledger.clone(), reply))
+            .unwrap();
+        tickets.push(ticket);
+    }
+    let (counts, groups) = mpsc::channel();
+    tx.send(Message::GroupCounts(counts)).unwrap();
+    tx.send(Message::Shutdown).unwrap();
+    let (entered, at_sync) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let path = fixture.path.clone();
+    let worker = std::thread::spawn(move || {
+        BEFORE_FRAME_SYNC.set(Some(Box::new(move || {
+            entered.send(()).unwrap();
+            resume.recv_timeout(HANG_LIMIT).unwrap();
+        })));
+        transcript_batch::run(rx, &storage, &path, SESSION, &AtomicBool::new(false));
+    });
+    at_sync.recv_timeout(HANG_LIMIT).unwrap();
+    assert!(tickets.iter().all(|ticket| ticket.is_waiting()));
+    assert_eq!(ledger.lock().unwrap().accepted_event_count, 1);
+    release.send(()).unwrap();
+    for (index, ticket) in tickets.into_iter().enumerate() {
+        let (published, receipt) = ticket.wait().unwrap();
+        assert!(published);
+        assert_eq!(receipt.sequence, 2 + index as u64);
+    }
+    assert_eq!(groups.recv_timeout(HANG_LIMIT).unwrap().unwrap(), (1, 3));
+    worker.join().unwrap();
+    assert_eq!(fixture.replay().records.len(), 4);
+    assert_eq!(ledger.lock().unwrap().accepted_event_count, 4);
+}
+
+#[test]
 fn queued_live_revisions_share_a_receipt_barrier_and_publish_in_order() {
     use crate::projections::TranscriptLedger;
     let fixture = Fixture::new();
@@ -1191,27 +1647,29 @@ fn queued_live_revisions_share_a_receipt_barrier_and_publish_in_order() {
 }
 
 #[test]
-fn late_receipt_after_bounded_wait_commits_before_the_next_live_revision() {
-    use crate::persistence::TranscriptEventWriteMsg;
+fn a_late_commit_delivers_its_own_receipt_without_another_revision() {
     use crate::projections::TranscriptLedger;
     let fixture = Fixture::new();
     let writer = fixture.writer();
     let client = writer.client();
     let live = Arc::new(std::sync::Mutex::new(TranscriptLedger::new(SESSION)));
     let held = live.lock().unwrap();
-    // Hold the publication target so the queued worker cannot finish before
-    // the injected zero budget. Returning to the caller leaves it ownership.
-    let outcome = client.request_with_timeout(Duration::ZERO, |reply| {
-        TranscriptEventWriteMsg::Live(transcript_event("elm", "first"), live.clone(), reply)
-    });
-    assert_eq!(outcome, Err(TranscriptCommitError::AckTimeout));
-    drop(held);
-    let (_, receipt) = client
-        .append_live(&transcript_event("fern", "next"), live.clone())
+    let (late, observed) = mpsc::channel();
+    let ticket = client
+        .submit_live_observed(
+            &transcript_event("elm", "first"),
+            live.clone(),
+            Duration::ZERO,
+            Some(Arc::new(move |result| late.send(result).unwrap())),
+        )
         .unwrap();
-    assert_eq!(receipt.sequence, 2);
-    assert_eq!(live.lock().unwrap().accepted_event_count, 2);
-    assert_eq!(fixture.replay().records.len(), 2);
+    assert_eq!(ticket.wait(), Err(TranscriptCommitError::AckTimeout));
+    drop(held);
+    let (published, receipt) = observed.recv_timeout(HANG_LIMIT).unwrap().unwrap();
+    assert!(published);
+    assert_eq!(receipt.sequence, 1);
+    assert_eq!(live.lock().unwrap().accepted_event_count, 1);
+    assert_eq!(fixture.replay().records.len(), 1);
     assert!(writer.shutdown_with_timeout(HANG_LIMIT));
 }
 
@@ -1355,4 +1813,229 @@ fn exact_first_create_retry_keeps_its_namespace_receipt() {
         CanonicalDurabilityBarrier::FileAndParentNamespace
     };
     assert_eq!(receipt.barrier, expected);
+}
+
+#[test]
+fn a_failed_tier_witness_keeps_the_receipt_and_retries_the_verified_head() {
+    for force_weak in [false, true] {
+        let fixture = Fixture::new();
+        let mut storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+        if force_weak {
+            storage.tier = None;
+        }
+        CUT.set(Some(Cut::WitnessWrite));
+        let first = storage
+            .commit_after(&transcript_event("seed", CONTENT), Some(0))
+            .unwrap();
+        assert_eq!(first.sequence, 1);
+        assert!(!storage.has_pending_attempt());
+        assert!(
+            !fixture
+                .path
+                .with_added_extension("attempt")
+                .try_exists()
+                .unwrap()
+        );
+        let records = fixture.replay().records;
+        assert_eq!(records.len(), 1);
+        assert!(tier::receipt_evidence(&fixture.path, &records).is_empty());
+        let next = storage
+            .commit_after(&transcript_event("leaf", CONTENT), Some(1))
+            .unwrap();
+        assert_eq!(next.sequence, 2);
+        let evidence = tier::receipt_evidence(&fixture.path, &fixture.replay().records);
+        let witnessed = if storage.is_unqualified() {
+            evidence.synced_unqualified
+        } else {
+            evidence.qualified
+        };
+        assert_eq!(
+            witnessed.unwrap(),
+            VerifiedTranscriptHead {
+                sequence: 1,
+                record_hash: records[0].record_hash.clone()
+            }
+        );
+    }
+}
+
+#[test]
+fn tier_witness_distinguishes_a_kept_weak_origin_from_a_successful_weak_sync() {
+    let f = Fixture::new();
+    let first = transcript_event("leaf", CONTENT);
+    let second = transcript_event("root", CONTENT);
+    let s = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    let originally_qualified = !s.is_unqualified();
+    s.commit_after(&first, Some(0)).unwrap();
+    let initial = f.replay();
+    let mut weak = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    weak.tier = None;
+    CUT.set(Some(Cut::Sync));
+    assert!(weak.commit_after(&second, Some(1)).is_err());
+    let prefix_evidence = tier::receipt_evidence(&f.path, &initial.records);
+    if originally_qualified {
+        assert!(prefix_evidence.synced_unqualified.is_none());
+        assert_eq!(prefix_evidence.qualified.as_ref().unwrap().sequence, 1);
+    }
+    let descriptor = f.path.with_added_extension("attempt");
+    let origin = f.path.with_added_extension("attempt-origin");
+    let bytes = fs::read(&descriptor).unwrap();
+    let intent: Intent = serde_json::from_slice(&bytes).unwrap();
+    // Old floor-v1 readers reject unknown descriptor fields.
+    let old_keys = [
+        "attempt",
+        "owner",
+        "after",
+        "base_len",
+        "source_was_absent",
+        "frame_len",
+        "frame_hash",
+        "members",
+    ];
+    let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        wire.as_object()
+            .unwrap()
+            .keys()
+            .all(|k| old_keys.contains(&k.as_str()))
+    );
+    if originally_qualified {
+        assert_eq!(fs::read(&origin).unwrap(), intent.attempt.as_bytes());
+        let (_, ongoing) =
+            super::super::transcript_export::read_for_export(&f.path, 65536, || Ok(())).unwrap();
+        assert_eq!(
+            ongoing.unwrap().unqualified_attempt_id.as_deref(),
+            Some(intent.attempt.as_str())
+        );
+    }
+    let resumed = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    resumed.resolve_pending().unwrap();
+    let rows = f.replay().records;
+    let evidence = tier::receipt_evidence(&f.path, &rows);
+    if originally_qualified {
+        let kept = evidence.recovered_from_unqualified_attempt.unwrap();
+        assert_eq!(kept.sequence, 2);
+        assert_eq!(kept.record_hash, rows[1].record_hash);
+        assert!(evidence.synced_unqualified.is_none());
+    } else {
+        assert_eq!(evidence.synced_unqualified.unwrap().sequence, 1);
+        assert!(evidence.recovered_from_unqualified_attempt.is_none());
+    }
+    assert!(!origin.exists() && !descriptor.exists());
+}
+
+#[test]
+fn abandoned_weak_witness_is_replaced_and_subsequent_receipts_reuse_verified_evidence() {
+    let f = Fixture::new();
+    let mut s = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    s.tier = None;
+    CUT.set(Some(Cut::Short));
+    assert!(
+        s.commit_after(&transcript_event("seed", CONTENT), Some(0))
+            .is_err()
+    );
+    assert!(tier::receipt_evidence::<TranscriptEvent>(&f.path, &[]).is_empty());
+    s.resolve_pending().unwrap();
+    s.commit_after(&transcript_event("twig", CONTENT), Some(0))
+        .unwrap();
+    let marker = f.path.with_added_extension("unqualified-receipt");
+    let observed = fs::read(&marker).unwrap();
+    let first = f.replay().records;
+    assert_eq!(
+        tier::receipt_evidence(&f.path, &first)
+            .synced_unqualified
+            .unwrap()
+            .record_hash,
+        first[0].record_hash
+    );
+    for (prior, span) in [(1, "root"), (2, "stem")] {
+        s.commit_after(&transcript_event(span, CONTENT), Some(prior))
+            .unwrap();
+    }
+    assert_eq!(fs::read(&marker).unwrap(), observed);
+    let inventory = transcript_recovery_artifacts(&f.path).unwrap();
+    assert!(inventory.contains(&marker));
+}
+
+#[test]
+fn legacy_frames_and_unreadable_evidence_make_no_positive_qualification_claim() {
+    let f = Fixture::new();
+    let original = transcript_event("seed", CONTENT);
+    fs::write(&f.path, serde_json::to_vec(&original).unwrap()).unwrap();
+    let records = f.replay().records;
+    assert!(tier::receipt_evidence(&f.path, &records).is_empty());
+    fs::write(f.path.with_added_extension("qualified-receipt"), b"plum").unwrap();
+    let evidence = tier::receipt_evidence(&f.path, &records);
+    assert!(evidence.evidence_unavailable);
+    assert!(evidence.qualified.is_none() && evidence.synced_unqualified.is_none());
+}
+
+#[test]
+fn identical_redelivery_after_a_torn_or_empty_weak_attempt_never_claims_a_weak_sync() {
+    for cut in [Cut::Short, Cut::Full] {
+        let f = Fixture::new();
+        let qualified = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+        if qualified.is_unqualified() {
+            return;
+        }
+        let mut weak = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+        weak.tier = None;
+        let event = transcript_event("twig", CONTENT);
+        CUT.set(Some(cut));
+        assert!(weak.commit_after(&event, Some(0)).is_err());
+        let intent: Intent =
+            serde_json::from_slice(&fs::read(f.path.with_added_extension("attempt")).unwrap())
+                .unwrap();
+        let origin = f.path.with_added_extension("attempt-origin");
+        assert_eq!(fs::read(&origin).unwrap(), intent.attempt.as_bytes());
+        assert!(!f.path.with_added_extension("unqualified-receipt").exists());
+        let receipt = qualified.commit_after(&event, Some(0)).unwrap();
+        assert_eq!(receipt.sequence, 1);
+        assert_eq!(digest(&fs::read(&f.path).unwrap()), intent.frame_hash);
+        let evidence = tier::receipt_evidence(&f.path, &f.replay().records);
+        assert_eq!(evidence.qualified.unwrap().sequence, 1);
+        assert!(
+            evidence.synced_unqualified.is_none()
+                && evidence.recovered_from_unqualified_attempt.is_none()
+        );
+        assert!(!origin.exists());
+    }
+}
+
+#[test]
+fn exact_retry_records_the_new_barrier_and_stale_origin_ids_cannot_label_recovery() {
+    let f = Fixture::new();
+    let native = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    let origin = f.path.with_added_extension("attempt-origin");
+    fs::write(&origin, Uuid::new_v4().to_string()).unwrap();
+    native.ready().unwrap();
+    assert!(!origin.exists());
+    if native.is_unqualified() {
+        return;
+    }
+    let mut weak = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    weak.tier = None;
+    let first = transcript_event("leaf", CONTENT);
+    native.commit_after(&first, Some(0)).unwrap();
+    let retried = weak.commit_after(&first, Some(0)).unwrap();
+    assert!(retried.already_accepted);
+    let evidence = tier::receipt_evidence(&f.path, &f.replay().records);
+    assert_eq!(evidence.qualified, evidence.synced_unqualified);
+    assert!(evidence.qualified.is_some() && evidence.recovered_from_unqualified_attempt.is_none());
+    // A previous weak receipt already witnesses the stream. Another weak
+    // attempt must not add a per-event origin publication.
+    CUT.set(Some(Cut::Sync));
+    assert!(
+        weak.commit_after(&transcript_event("stem", CONTENT), Some(1))
+            .is_err()
+    );
+    assert!(!origin.exists());
+    fs::write(&origin, Uuid::new_v4().to_string()).unwrap();
+    let (_, ongoing) =
+        super::super::transcript_export::read_for_export(&f.path, 65536, || Ok(())).unwrap();
+    assert!(ongoing.unwrap().unqualified_attempt_id.is_none());
+    native.resolve_pending().unwrap();
+    let evidence = tier::receipt_evidence(&f.path, &f.replay().records);
+    assert!(evidence.recovered_from_unqualified_attempt.is_none());
+    assert!(!origin.exists());
 }

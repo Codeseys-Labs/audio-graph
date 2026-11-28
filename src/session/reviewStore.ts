@@ -85,10 +85,22 @@ export interface ArtifactSlot<T> {
   refusal: ArtifactRefusal | null;
 }
 
+/** Statuses admitted at the read boundary of one historical lens round. */
+export type ReviewProjectionStatus = "behind_transcript" | "recompute_required";
+type ReviewProjectionInfo = {
+  reviewProjectionStatuses?: ReviewProjectionStatus[];
+};
+type ReviewNotesArtifacts = Omit<SessionNotesArtifacts, "notes"> & {
+  notes:
+    | (NonNullable<SessionNotesArtifacts["notes"]> & ReviewProjectionInfo)
+    | null;
+};
+type ReviewGraphArtifact = MaterializedGraph & ReviewProjectionInfo;
+
 export interface ReviewArtifacts {
-  notes: ArtifactSlot<SessionNotesArtifacts>;
+  notes: ArtifactSlot<ReviewNotesArtifacts>;
   /** `data: null` with `status: "ready"` means the session has no graph. */
-  graph: ArtifactSlot<MaterializedGraph | null>;
+  graph: ArtifactSlot<ReviewGraphArtifact | null>;
   timeline: ArtifactSlot<SessionTimelineFold>;
 }
 
@@ -124,7 +136,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function parseNotes(raw: unknown): SessionNotesArtifacts {
+function parseProjectionStatus(raw: Record<string, unknown>) {
+  const {
+    projection_recovery,
+    transcript_coverage,
+    reviewProjectionStatuses: _incoming,
+    ...materialized
+  } = raw;
+  const statuses: ReviewProjectionStatus[] = [];
+  if (transcript_coverage === "behind_transcript")
+    statuses.push(transcript_coverage);
+  if (projection_recovery === "recompute_required")
+    statuses.push(projection_recovery);
+  return statuses.length > 0
+    ? { ...materialized, reviewProjectionStatuses: statuses }
+    : materialized;
+}
+
+function parseNotes(raw: unknown): ReviewNotesArtifacts {
   if (!isRecord(raw) || !Array.isArray(raw.projection_events)) {
     throw new Error("malformed notes artifact");
   }
@@ -132,18 +161,22 @@ function parseNotes(raw: unknown): SessionNotesArtifacts {
     throw new Error("malformed notes artifact");
   }
   return {
-    notes: (raw.notes ?? null) as SessionNotesArtifacts["notes"],
+    notes: isRecord(raw.notes)
+      ? (parseProjectionStatus(
+          raw.notes,
+        ) as unknown as ReviewNotesArtifacts["notes"])
+      : null,
     projection_events:
       raw.projection_events as SessionNotesArtifacts["projection_events"],
   };
 }
 
-function parseGraph(raw: unknown): MaterializedGraph | null {
+function parseGraph(raw: unknown): ReviewGraphArtifact | null {
   if (raw === null || raw === undefined) return null;
   if (!isRecord(raw) || !Array.isArray(raw.nodes)) {
     throw new Error("malformed graph artifact");
   }
-  return raw as unknown as MaterializedGraph;
+  return parseProjectionStatus(raw) as unknown as ReviewGraphArtifact;
 }
 
 function parseTimeline(raw: unknown): SessionTimelineFold {

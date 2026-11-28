@@ -873,6 +873,8 @@
       "needsLoad": "Esta visualização precisa que a sessão seja carregada primeiro.",
       "loadSession": "Carregar sessão",
       "staleView": "Esta visualização pode estar desatualizada: a última atualização falhou. Mostrando a última cópia carregada.",
+      "projectionBehindTranscript": "Esta visualização ainda não inclui todas as revisões salvas da transcrição.",
+      "projectionGap": "Não foi possível recuperar uma alteração da projeção. Esta visualização mostra as últimas alterações verificadas.",
       "emptyNotes": "Esta sessão não tem notas.",
       "viewUnavailable": "Não foi possível carregar esta sessão.",
       "emptyTranscript": "Esta sessão não tem transcrição."
@@ -1484,9 +1486,10 @@
     "stageCapture": "Captura",
     "stageResample": "Reamostragem",
     "stageAsr": "ASR",
+    "transcriptCaptionsLost": "Não foi possível salvar algumas legendas desta sessão.",
     "transcriptCrashSafetyUnverified": "Transcrição salva. A recuperação após uma falha não foi verificada neste armazenamento.",
     "transcriptNotSaving": {
-      "confirmation_delayed": "Aguardando confirmação de que a transcrição foi salva",
+      "confirmation_delayed": "Aguardando confirmação do salvamento da transcrição",
       "writer_absent": "A transcrição não está sendo salva",
       "storage_full": "A transcrição não está sendo salva porque o armazenamento está cheio",
       "write_failed": "A transcrição não está sendo salva porque houve uma falha na gravação"

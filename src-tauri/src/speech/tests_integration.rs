@@ -1012,6 +1012,9 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
     );
     let pending_agent_proposals = Arc::new(Mutex::new(HashMap::new()));
     let active_session_id = Arc::new(RwLock::new(session_id.to_string()));
+    // This provider-finalization fixture uses real storage. Bound a hang while
+    // allowing for a saturated disk; the production deadline has dedicated tests.
+    let _bound = crate::persistence::TestLiveAckBound::set(std::time::Duration::from_secs(60));
     let transcript_event_writer = Arc::new(Mutex::new(TranscriptEventWriter::spawn(session_id)));
     assert!(
         transcript_event_writer.lock().unwrap().is_some(),
@@ -1095,6 +1098,8 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
     normalize_assemblyai_v3_revision_for_side_effects(&mut partial);
     assert!(emit_provider_span_revision_payload(
         partial.payload,
+        None,
+        None,
         &ctx,
         0,
         &extraction_count,
@@ -1113,6 +1118,8 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
     );
     assert!(emit_provider_span_revision_payload(
         unformatted_final.payload,
+        None,
+        None,
         &ctx,
         0,
         &extraction_count,
@@ -1147,6 +1154,8 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
     normalize_assemblyai_v3_revision_for_side_effects(&mut formatted_final);
     assert!(emit_provider_span_revision_payload(
         formatted_final.payload,
+        None,
+        None,
         &ctx,
         1,
         &extraction_count,
