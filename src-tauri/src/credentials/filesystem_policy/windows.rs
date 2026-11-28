@@ -29,8 +29,9 @@ struct VolumeSample {
 enum RemoteProtocolCall {
     Remote,
     NoRemoteProtocol,
-    /// The file system does not implement the remote-protocol information
-    /// class at all, which is what a local file system answers.
+    /// The file system answered that it does not support the remote-protocol
+    /// information class. That is no evidence of locality either way; the
+    /// drive-type probe decides it.
     NotSupportedByFileSystem,
 }
 
@@ -45,13 +46,15 @@ fn remote_protocol_call_from_protocol(protocol: u32) -> RemoteProtocolCall {
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_PARAMETER)`.
 const INVALID_PARAMETER_HRESULT: i32 = 0x8007_0057_u32 as i32;
 
-/// [MS-FSCC] §2.4, "File Information Classes": "If a file system does not
-/// support a specific file information class, STATUS_INVALID_PARAMETER MUST be
-/// returned." Local NTFS does not implement `FileRemoteProtocolInformation`
-/// (only redirectors do), and Win32 surfaces that status as
-/// `ERROR_INVALID_PARAMETER`. Only that exact code means "not a redirected file
-/// system"; every other failure stays a refusal. The drive-type probe must
-/// still independently report a fixed or removable drive for `local == Yes`.
+/// Win32 documents `FileRemoteProtocolInfo` as usable "for any handles", yet
+/// local NTFS on Windows 11 answers it with `ERROR_INVALID_PARAMETER`
+/// (measured for #521). [MS-FSCC] §2.4, "File Information Classes", gives that
+/// status its meaning: "If a file system does not support a specific file
+/// information class, STATUS_INVALID_PARAMETER MUST be returned." So only that
+/// exact code reads as "class unsupported", and it is not treated as favorable:
+/// `local == Yes` still needs the drive-type probe to report a fixed or
+/// removable drive, and `DRIVE_REMOTE` still makes it `No`. Every other
+/// failure stays a refusal.
 /// <https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/4718fc40-e539-4014-8e33-b675af74e3e1>
 fn remote_protocol_call_from_failure(hresult: i32) -> Result<RemoteProtocolCall, ApiFault> {
     if hresult == INVALID_PARAMETER_HRESULT {
