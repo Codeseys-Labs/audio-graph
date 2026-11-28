@@ -1758,6 +1758,7 @@ impl OpenRouterClient {
             // same-origin redirect hop included.
             let outcome = send_admitted(
                 &url,
+                HTTP_REQUEST_TIMEOUT,
                 || self.admit_attempt(),
                 |url| {
                     client

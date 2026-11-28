@@ -495,6 +495,7 @@ impl ApiClient {
         // hop included, so only the send itself follows the answer.
         let response = send_admitted(
             &url,
+            API_REQUEST_TIMEOUT,
             || self.admit_attempt(),
             |url| {
                 let builder = client.post(url).json(&request);

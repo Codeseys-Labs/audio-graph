@@ -74,6 +74,8 @@ pub(super) enum SendError {
     InvalidUrl,
     /// More same-origin redirects than one chain may hold.
     TooManyRedirects,
+    /// The chain's time ran out between two hops.
+    DeadlineExceeded,
 }
 
 impl SendError {
@@ -83,26 +85,50 @@ impl SendError {
             Self::Transport(error) => HttpFailure::request(&error, INFERENCE),
             Self::InvalidUrl => HttpFailure::new(Code::RequestRejected, INFERENCE),
             Self::TooManyRedirects => HttpFailure::new(Code::ProtocolError, INFERENCE),
+            Self::DeadlineExceeded => HttpFailure::new(Code::Timeout, INFERENCE),
         }
     }
 }
 
 /// Send `request(url)` once leave is given, and follow a same-origin 307 or
 /// 308 by sending again to its `Location`, asking leave again first: a
-/// redirect hop is a new transport attempt. Any other response, a redirect
-/// that leaves the origin included, is returned to the caller, which reports
-/// a non-success status as a rejected request. Other redirects are not
-/// followed: they turn a POST into a GET without its body.
+/// redirect hop is a new transport attempt.
+///
+/// A hop is followed only to the same origin and the same userinfo (user
+/// name and password) as `url`: reqwest turns userinfo into an
+/// `Authorization` header, so a `Location` that adds, changes or removes it
+/// would change the credentials the request carries. A redirect that fails
+/// either test, like any other response, is returned to the caller, which
+/// reports a non-success status as a rejected request. 301, 302 and 303 are
+/// not followed: they turn a POST into a GET without its body.
+///
+/// The whole chain, connection to the last response body, shares one
+/// `budget`: each hop is given the time that remains, as the client's
+/// request timeout bounded the chain when reqwest followed redirects itself.
+/// A retry by the caller starts a new chain. As under reqwest's policy, at
+/// most `MAX_REDIRECTS` requests are sent, the first and nine hops; a tenth
+/// redirect ends the chain as too many.
 pub(super) fn send_admitted(
     url: &str,
+    budget: std::time::Duration,
     leave: impl Fn() -> Result<(), crate::llm::admission::SendRefused>,
     request: impl Fn(&str) -> reqwest::blocking::RequestBuilder,
 ) -> Result<reqwest::blocking::Response, SendError> {
+    let deadline = std::time::Instant::now() + budget;
     let mut current = url::Url::parse(url).map_err(|_| SendError::InvalidUrl)?;
     let origin = current.origin();
-    for _ in 0..=MAX_REDIRECTS {
+    let userinfo = (
+        current.username().to_owned(),
+        current.password().map(str::to_owned),
+    );
+    for _ in 0..MAX_REDIRECTS {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(SendError::DeadlineExceeded);
+        }
         leave().map_err(SendError::Refused)?;
         let response = request(current.as_str())
+            .timeout(remaining)
             .send()
             .map_err(SendError::Transport)?;
         if !matches!(response.status().as_u16(), 307 | 308) {
@@ -114,7 +140,13 @@ pub(super) fn send_admitted(
             .and_then(|location| location.to_str().ok())
             .and_then(|location| current.join(location).ok());
         match next {
-            Some(next) if next.origin() == origin => current = next,
+            Some(next)
+                if next.origin() == origin
+                    && next.username() == userinfo.0
+                    && next.password() == userinfo.1.as_deref() =>
+            {
+                current = next;
+            }
             _ => return Ok(response),
         }
     }
@@ -387,6 +419,7 @@ mod tests {
         let client = job_client_builder().build().expect("build client");
         let result = send_admitted(
             "http://127.0.0.1:9/v1/chat/completions",
+            std::time::Duration::from_secs(5),
             || {
                 asked.fetch_add(1, SeqCst);
                 Err(crate::llm::admission::SendRefused::Replaced)
@@ -400,5 +433,146 @@ mod tests {
             ))
         ));
         assert_eq!(asked.load(SeqCst), 1);
+    }
+
+    /// An HTTP/1.1 server that answers each connection with the next
+    /// `(status, Location)` of `script` after `delay`, and keeps each
+    /// request's head. `{addr}` in a location is replaced by its own address.
+    async fn spawn_redirect_mock(
+        script: Vec<(u16, Option<&'static str>)>,
+        delay: std::time::Duration,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect mock");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = heads.clone();
+        let own = addr.clone();
+        tokio::spawn(async move {
+            for (status, location) in script {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                kept.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&head).into_owned());
+                tokio::time::sleep(delay).await;
+                let location = location
+                    .map(|location| format!("Location: {}\r\n", location.replace("{addr}", &own)))
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 {status} Scripted\r\n{location}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (addr, heads)
+    }
+
+    /// Send `url` through [`send_admitted`] from a keyless job client, on a
+    /// thread of its own (a blocking client cannot run on the mock's runtime).
+    fn send_chain(url: String, budget: std::time::Duration) -> Result<u16, SendError> {
+        std::thread::spawn(move || {
+            let client = job_client_builder().build().expect("build client");
+            send_admitted(&url, budget, || Ok(()), |url| client.post(url).body("{}"))
+                .map(|response| response.status().as_u16())
+        })
+        .join()
+        .expect("client thread")
+    }
+
+    fn authorization_values(head: &str) -> Vec<&str> {
+        head.lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .collect()
+    }
+
+    #[test]
+    fn a_redirect_that_changes_the_userinfo_is_not_followed() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let budget = std::time::Duration::from_secs(10);
+        for (base_userinfo, location) in [
+            // Adds userinfo.
+            ("", "http://plainuser:plainword@{addr}/moved"),
+            // Changes it.
+            (
+                "plainuser:plainword@",
+                "http://otheruser:otherword@{addr}/moved",
+            ),
+            // Changes only the password.
+            (
+                "plainuser:plainword@",
+                "http://plainuser:otherword@{addr}/moved",
+            ),
+            // Removes it.
+            ("plainuser:plainword@", "http://{addr}/moved"),
+        ] {
+            let (addr, heads) = rt.block_on(spawn_redirect_mock(
+                vec![(307, Some(location)), (200, None)],
+                std::time::Duration::ZERO,
+            ));
+            let url = format!("http://{base_userinfo}{addr}/v1/chat/completions");
+            let status = send_chain(url, budget).expect("the 307 is returned");
+            assert_eq!(status, 307, "{location}");
+            assert_eq!(heads.lock().unwrap().len(), 1, "{location}");
+        }
+    }
+
+    #[test]
+    fn a_relative_redirect_on_a_userinfo_base_keeps_the_same_headers() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (addr, heads) = rt.block_on(spawn_redirect_mock(
+            vec![(307, Some("/moved/chat/completions")), (200, None)],
+            std::time::Duration::ZERO,
+        ));
+        let url = format!("http://plainuser:plainword@{addr}/v1/chat/completions");
+        let status = send_chain(url, std::time::Duration::from_secs(10)).expect("followed");
+        assert_eq!(status, 200);
+        let heads = heads.lock().unwrap();
+        assert_eq!(heads.len(), 2);
+        let first = authorization_values(&heads[0]);
+        assert_eq!(first.len(), 1, "{}", heads[0]);
+        assert_eq!(authorization_values(&heads[1]), first);
+    }
+
+    #[test]
+    fn a_redirect_chain_shares_one_deadline() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (addr, heads) = rt.block_on(spawn_redirect_mock(
+            vec![(307, Some("/moved/chat/completions")), (200, None)],
+            std::time::Duration::from_millis(650),
+        ));
+        let url = format!("http://{addr}/v1/chat/completions");
+        let error = send_chain(url, std::time::Duration::from_secs(1))
+            .expect_err("two 650 ms answers do not fit one second");
+        assert_eq!(error.into_failure().to_string(), "runtime/timeout");
+        assert!(heads.lock().unwrap().len() <= 2);
+    }
+
+    #[test]
+    fn a_redirect_chain_sends_at_most_ten_requests() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (addr, heads) = rt.block_on(spawn_redirect_mock(
+            vec![(307, Some("/again")); MAX_REDIRECTS + 2],
+            std::time::Duration::ZERO,
+        ));
+        let url = format!("http://{addr}/v1/chat/completions");
+        let error =
+            send_chain(url, std::time::Duration::from_secs(10)).expect_err("too many redirects");
+        assert!(matches!(error, SendError::TooManyRedirects));
+        // The first request and nine hops, as reqwest's policy allowed.
+        assert_eq!(heads.lock().unwrap().len(), 10);
     }
 }
