@@ -284,12 +284,22 @@ pub struct AppState {
     /// Priority executor for LLM-backed chat and background entity extraction.
     pub llm_executor: LlmExecutor,
 
+    /// Blocking executor calls outstanding from the commands, timed-out ones
+    /// still parked included; capped so repeated timeouts cannot pile up work
+    /// (#550).
+    pub blocking_llm_calls: Arc<std::sync::atomic::AtomicUsize>,
+
     /// Registry of in-flight streaming-chat requests keyed by `request_id`.
     /// `start_streaming_chat` inserts a `(request_id, CancellationToken)`
     /// pair; the stream task removes it on completion;
     /// `cancel_streaming_chat` removes-and-fires-the-token in one step
     /// (plan A3 / ADR-0006).
     pub stream_registry: StreamRegistry,
+
+    /// The cancellation tokens of the chat requests in flight, from both chat
+    /// commands, which clearing the chat cancels (#550). Card answers are not
+    /// chat requests and are not here.
+    pub chat_requests: StreamRegistry,
 
     /// TTS audio playback (Wave B / audio-graph-8d75 / ADR-0004 consumer).
     /// Owns a dedicated `std::thread` running the cpal `Stream`. Exposed as
@@ -967,7 +977,9 @@ impl AppState {
             openrouter_client,
             mistralrs_engine,
             llm_executor,
+            blocking_llm_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             stream_registry: StreamRegistry::new(),
+            chat_requests: StreamRegistry::new(),
             audio_player: crate::playback::AudioPlayer::new(),
             chat_history: Arc::new(RwLock::new(ChatHistory::default())),
             pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),

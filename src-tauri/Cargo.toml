@@ -441,6 +441,8 @@ sentry = { version = "0.48.3", default-features = false, features = [
 
 [dev-dependencies]
 tauri = { version = "2.11.0", features = ["test"] }
+# Paused time for deterministic timeout tests.
+tokio = { version = "1.50.0", features = ["test-util"] }
 serde-saphyr = "0.0.28"
 
 # Run the same crypto known-answer tests on hosts without D-Bus.
