@@ -1098,6 +1098,8 @@ fn projection_api(
             Ok(result) => result,
             // A missing model (404) is not a refused schema; only OpenRouter
             // reads a 404 as "no provider for this model takes the schema".
+            // Any 400 or 422 still resends once, for the reason given at the
+            // extraction downgrade in `api_client.rs`.
             Err(error) if error.schema_rejection == Some(SchemaRejection::Request) => {
                 // A MODE downgrade on the SAME route, recorded rather than only
                 // logged: the returned `WireOutcome` carries `Unconstrained`.

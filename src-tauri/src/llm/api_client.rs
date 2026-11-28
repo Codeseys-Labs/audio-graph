@@ -533,6 +533,12 @@ impl ApiClient {
                 // Resending after any other failure would repeat a timeout's
                 // unknown remote effect, bury a rate limit under the retry, or
                 // ask a missing model twice.
+                //
+                // The evidence is the status alone, so a 400 or 422 for an
+                // unrelated parameter also resends once. Reading the body to
+                // tell them apart was rejected: only its message prose differs,
+                // and nothing here classifies on prose. The resend goes to the
+                // origin that already received this prompt.
                 Err(error) if error.schema_rejection == Some(SchemaRejection::Request) => {
                     log::warn!("vLLM structured output failed; falling back to JSON mode: {error}");
                     self.chat_completion_with_wire_outcome(messages, RequestOutputForm::JsonObject)?
