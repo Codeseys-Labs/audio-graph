@@ -1544,7 +1544,7 @@ impl CachedLlmClient for ApiClient {
         config: &ApiConfig,
         policy: crate::asr::ProviderContentEgressPolicy,
     ) -> bool {
-        self.config() == config && self.content_egress_policy() == policy
+        self.sends_as(config, policy)
     }
 }
 
@@ -1565,7 +1565,7 @@ impl CachedLlmClient for OpenRouterClient {
         config: &OpenRouterConfig,
         policy: crate::asr::ProviderContentEgressPolicy,
     ) -> bool {
-        self.config() == config && self.content_egress_policy() == policy
+        self.sends_as(config, policy)
     }
 }
 
@@ -1724,6 +1724,15 @@ impl LlmClientTargets {
             Err(LlmClientSyncError::NonFiniteConfig)
         } else {
             Ok(())
+        }
+    }
+
+    /// These targets as what a command's gate approved for an executor chat:
+    /// the clients the cache would hold for the settings that gate read.
+    fn admitted(self) -> crate::llm::executor::AdmittedClients {
+        crate::llm::executor::AdmittedClients {
+            api: self.api,
+            openrouter: self.openrouter,
         }
     }
 }
@@ -4318,9 +4327,12 @@ pub async fn send_chat_message(
     // blocking path (Bedrock via ApiClient, OpenRouter blocking, mistral.rs)
     // report 0 because their `chat_with_history` signatures don't carry usage
     // yet — never fabricated.
+    // The executor takes its client inside this call, later than the gate
+    // above. It is told the client that gate approved, and refuses any other.
     let executor = state.llm_executor.clone();
+    let admitted = LlmClientTargets::from_settings(&settings).admitted();
     let outcome = bounded_blocking_llm_call(BLOCKING_LLM_CALL_TIMEOUT, move || {
-        executor.chat_with_history(messages, graph_context, llm_provider)
+        executor.chat_with_history(messages, graph_context, llm_provider, admitted)
     })
     .await
     .map_err(|diagnostic| {
@@ -4353,7 +4365,7 @@ pub async fn synthesize_notes(
     let settings = read_settings_for_session_content(state.inner(), "notes_synthesis")?;
     crate::provider_registry::ensure_llm_provider_start_enabled(&settings.llm_provider)?;
 
-    let llm_provider = settings.llm_provider.clone();
+    let llm_provider = &settings.llm_provider;
 
     enforce_session_content_policy(
         &app,
@@ -4364,7 +4376,21 @@ pub async fn synthesize_notes(
         &["transcript", "graph_context", "prompt"],
         llm_provider.requires_cloud_content_transfer(),
     )?;
-    sync_llm_clients(state.inner()).await?;
+    synthesize_notes_admitted(state.inner(), &settings).await
+}
+
+/// [`synthesize_notes`] once its gate has passed for `settings`.
+///
+/// The executor takes its client inside this call, later than that gate, and a
+/// settings save in between can have replaced it with one for another
+/// destination, model or policy. `settings` is the gate's own snapshot. The
+/// client the cache would hold for it is what the executor is told to expect,
+/// and the executor refuses the chat for any other.
+async fn synthesize_notes_admitted(
+    state: &AppState,
+    settings: &crate::settings::AppSettings,
+) -> AppResult<String> {
+    sync_llm_clients(state).await?;
 
     let snapshot = {
         let kg = state
@@ -4411,8 +4437,10 @@ pub async fn synthesize_notes(
     }];
 
     let executor = state.llm_executor.clone();
+    let llm_provider = settings.llm_provider.clone();
+    let admitted = LlmClientTargets::from_settings(settings).admitted();
     let outcome = bounded_blocking_llm_call(BLOCKING_LLM_CALL_TIMEOUT, move || {
-        executor.chat_with_history(messages, graph_context, llm_provider)
+        executor.chat_with_history(messages, graph_context, llm_provider, admitted)
     })
     .await
     .map_err(|diagnostic| {
@@ -28322,6 +28350,60 @@ mod tests {
             }
         });
         (format!("http://{addr}"), contacted)
+    }
+
+    fn loopback_llm_settings(endpoint: &str) -> crate::settings::AppSettings {
+        crate::settings::AppSettings {
+            llm_provider: crate::settings::LlmProvider::Api {
+                endpoint: endpoint.to_string(),
+                api_key: "fixture".to_string(),
+                model: "fixture-model".to_string(),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn notes_synthesis_gated_on_one_endpoint_is_not_sent_to_one_saved_afterwards() {
+        let reply = {
+            let body = r#"{"choices":[{"message":{"content":"notes"},"finish_reason":"stop"}]}"#;
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (gated_endpoint, gated_contacted) =
+            rt.block_on(spawn_contact_recording_http_mock(reply.clone()));
+        let (saved_endpoint, saved_contacted) =
+            rt.block_on(spawn_contact_recording_http_mock(reply));
+        let contacted = |flag: &std::sync::atomic::AtomicBool| flag.load(Ordering::SeqCst);
+
+        let state = AppState::new();
+        *state.app_settings.write().unwrap() = loopback_llm_settings(&gated_endpoint);
+        // The command's gate reads its settings: the first endpoint.
+        let gated =
+            read_settings_for_session_content(&state, "notes_synthesis").expect("gated settings");
+        // A save lands after that gate and before the command synchronizes
+        // its client: the second endpoint, same provider id, same policy.
+        *state.app_settings.write().unwrap() = loopback_llm_settings(&saved_endpoint);
+        sync_with_watchdog(&state).expect("the save publishes its client");
+
+        let refused = rt
+            .block_on(synthesize_notes_admitted(&state, &gated))
+            .expect_err("the saved endpoint was never gated");
+        assert_eq!(refused.to_string(), "runtime/policy_blocked");
+        assert!(!contacted(&saved_contacted) && !contacted(&gated_contacted));
+
+        // A request gated after the save is sent, to the endpoint it gated on.
+        let gated =
+            read_settings_for_session_content(&state, "notes_synthesis").expect("gated settings");
+        assert_eq!(
+            rt.block_on(synthesize_notes_admitted(&state, &gated))
+                .expect("the gated endpoint answers"),
+            "notes"
+        );
+        assert!(contacted(&saved_contacted) && !contacted(&gated_contacted));
     }
 
     /// The provider fails before sending a single token.
