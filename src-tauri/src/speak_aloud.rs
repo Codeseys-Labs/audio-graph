@@ -24,6 +24,7 @@
 //! drops the in-flight utterance) AND `AudioPlayer::cancel()` (device
 //! callback drains its ringbuf + emits silence).
 
+use audio_graph_ipc_contract::runtime_diagnostic::RuntimeOperation;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
@@ -98,10 +99,13 @@ impl SpeakAloudPipe {
                 // pitch-shift. cpal Stream open is sync-on-thread so this
                 // returns quickly.
                 player
-                    .open_default(PlaybackConfig {
-                        source_sample_rate: *sample_rate,
-                        source_channels: 1,
-                    })
+                    .open_default_for(
+                        PlaybackConfig {
+                            source_sample_rate: *sample_rate,
+                            source_channels: 1,
+                        },
+                        RuntimeOperation::SpeechSynthesis,
+                    )
                     .map_err(|_| "playback_device_unavailable".to_owned())?;
 
                 // Spawn the audio-pump task: drain TtsEventStream, push

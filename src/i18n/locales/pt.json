@@ -1580,6 +1580,10 @@
       "commit_unknown": "O aplicativo não conseguiu confirmar se a alteração na credencial foi salva.",
       "internal": "A operação com a credencial falhou inesperadamente."
     },
+    "native": {
+      "invalid_configuration": "Verifique as configurações de saída de áudio e escolha um dispositivo compatível.",
+      "provider_unavailable": "Nenhum dispositivo de saída de áudio está disponível. Conecte ou ative um dispositivo e tente novamente."
+    },
     "runtime": {
       "rate_limited": "O provedor está limitando as solicitações. Tente novamente mais tarde.",
       "network_unreachable": "O aplicativo não conseguiu acessar o provedor. Verifique sua conexão.",

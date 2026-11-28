@@ -1,3 +1,4 @@
+import i18next from "i18next";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import { CREDENTIAL_CONTRACT } from "../generated/credentialContract";
 import {
@@ -7,8 +8,8 @@ import {
   type RuntimeErrorCode,
   type RuntimeSafeRecoveryAction,
 } from "../generated/runtimeDiagnostic";
-import type en from "../i18n/locales/en.json";
-import type pt from "../i18n/locales/pt.json";
+import en from "../i18n/locales/en.json";
+import pt from "../i18n/locales/pt.json";
 import {
   normalizeRuntimeDiagnostic,
   parseRuntimeDiagnostic,
@@ -76,6 +77,7 @@ describe("generated runtime diagnostic contract", () => {
     expectTypeOf<RuntimeDiagnosticTranslationKey>().toEqualTypeOf<
       | `runtimeDiagnostics.credential.${(typeof CREDENTIAL_CONTRACT.vocabulary.error_codes)[number]}`
       | `runtimeDiagnostics.runtime.${(typeof RUNTIME_DIAGNOSTIC_CONTRACT.error_codes)[number]}`
+      | `runtimeDiagnostics.native.${keyof typeof en.runtimeDiagnostics.native}`
     >();
   });
 
@@ -86,6 +88,9 @@ describe("generated runtime diagnostic contract", () => {
     expectTypeOf<
       keyof typeof pt.runtimeDiagnostics.runtime
     >().toEqualTypeOf<RuntimeErrorCode>();
+    expectTypeOf<keyof typeof pt.runtimeDiagnostics.native>().toEqualTypeOf<
+      keyof typeof en.runtimeDiagnostics.native
+    >();
     expectTypeOf<RuntimeRecoveryTranslationKey>().toEqualTypeOf<`runtimeDiagnostics.recovery.${keyof typeof en.runtimeDiagnostics.recovery}`>();
     expectTypeOf<RuntimeRecoveryTranslationKey>().toEqualTypeOf<`runtimeDiagnostics.recovery.${keyof typeof pt.runtimeDiagnostics.recovery}`>();
   });
@@ -314,6 +319,96 @@ describe("runtime diagnostic trust boundary", () => {
     });
     for (const canary of CANARIES) {
       expect(JSON.stringify(presentation)).not.toContain(canary);
+    }
+  });
+
+  it("localizes playback command errors and fails closed on malformed detail", async () => {
+    const i18n = i18next.createInstance();
+    await i18n.init({
+      lng: "en",
+      resources: {
+        en: { translation: en },
+        pt: { translation: pt },
+      },
+    });
+    const error = (
+      code: string,
+      recovery_action: RuntimeSafeRecoveryAction,
+      retryable = false,
+      transport = "native",
+    ) => ({
+      code: "runtime_diagnostic",
+      diagnostic: {
+        kind: "runtime",
+        detail: {
+          code,
+          retryable,
+          recovery_action,
+          context: { operation: "provider_request", transport },
+        },
+      },
+    });
+    const driverProse = "driver says device no longer available in violet room";
+    for (const [
+      payload,
+      translationKey,
+      english,
+      portuguese,
+      recoveryAction,
+      retryable,
+    ] of [
+      [
+        error("invalid_configuration", "review_configuration"),
+        "runtimeDiagnostics.native.invalid_configuration",
+        en.runtimeDiagnostics.native.invalid_configuration,
+        pt.runtimeDiagnostics.native.invalid_configuration,
+        "review_configuration",
+        false,
+      ],
+      [
+        error("provider_unavailable", "retry", true),
+        "runtimeDiagnostics.native.provider_unavailable",
+        en.runtimeDiagnostics.native.provider_unavailable,
+        pt.runtimeDiagnostics.native.provider_unavailable,
+        "retry",
+        true,
+      ],
+      [
+        error("provider_unavailable", "retry", true, "websocket"),
+        "runtimeDiagnostics.runtime.provider_unavailable",
+        en.runtimeDiagnostics.runtime.provider_unavailable,
+        pt.runtimeDiagnostics.runtime.provider_unavailable,
+        "retry",
+        true,
+      ],
+      [
+        error("internal", "none"),
+        "runtimeDiagnostics.runtime.internal",
+        en.runtimeDiagnostics.runtime.internal,
+        pt.runtimeDiagnostics.runtime.internal,
+        "none",
+        false,
+      ],
+      [
+        error(driverProse, "none"),
+        "runtimeDiagnostics.runtime.internal",
+        en.runtimeDiagnostics.runtime.internal,
+        pt.runtimeDiagnostics.runtime.internal,
+        "none",
+        false,
+      ],
+    ] as const) {
+      const presentation = runtimeDiagnosticPresentation(payload);
+      expect(presentation).toMatchObject({
+        translationKey,
+        retryable,
+        recoveryAction,
+      });
+      expect(i18n.t(presentation.translationKey, { lng: "en" })).toBe(english);
+      expect(i18n.t(presentation.translationKey, { lng: "pt" })).toBe(
+        portuguese,
+      );
+      expect(JSON.stringify(presentation)).not.toContain(driverProse);
     }
   });
 });
