@@ -7,7 +7,8 @@
 
 use super::{
     BuiltInCredentialSetId, asr_diagnostic, is_terminal_reconnect_error, required_api_key,
-    websocket_close, websocket_diagnostic, websocket_error, websocket_write_error,
+    websocket_close, websocket_diagnostic, websocket_error, websocket_upgrade_error,
+    websocket_write_error,
 };
 use crate::error::AppError;
 use audio_graph_ipc_contract::runtime_diagnostic::{
@@ -653,13 +654,22 @@ async fn open_ws_url(
     config: &SonioxConfig,
     url_str: &str,
 ) -> Result<(AsrWsWriter, AsrWsReader), RuntimeDiagnostic> {
-    required_api_key(&config.api_key, BuiltInCredentialSetId::Soniox)?;
+    let api_key = required_api_key(&config.api_key, BuiltInCredentialSetId::Soniox)?;
+    let mut authorization = tungstenite::http::HeaderValue::from_str(&format!("Bearer {api_key}"))
+        .map_err(|_| websocket_diagnostic(Code::InvalidConfiguration))?;
+    authorization.set_sensitive(true);
+    let request = crate::ws_request::build_ws_upgrade_request(
+        url_str,
+        [(tungstenite::http::header::AUTHORIZATION, authorization)],
+    )
+    .map_err(|_| websocket_diagnostic(Code::RequestRejected))?;
     // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
     // ordinary connect error instead of hanging the reconnect ladder forever.
-    // This adapter sends the key in the first config frame, after the upgrade.
-    let (ws_stream, _response) = crate::ws_request::connect_async_bounded(url_str)
+    // Soniox still reports credential failures as frames after upgrading.
+    // https://docs.soniox.com/authentication/migrate-websocket-authentication
+    let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
         .await
-        .map_err(|error| websocket_error(&error))?;
+        .map_err(|error| websocket_upgrade_error(&error, true))?;
     let (mut writer, reader) = ws_stream.split();
     let payload = soniox_session_config_payload(config);
     AsrWsWriteGuard::new("asr.soniox", config.content_egress_policy)
@@ -1126,7 +1136,6 @@ fn handle_server_message_with_acceptance(
 
 fn soniox_session_config_payload(config: &SonioxConfig) -> Value {
     let mut payload = json!({
-        "api_key": config.api_key.trim(),
         "model": config.model,
         "audio_format": "pcm_s16le",
         "sample_rate": 16_000,
@@ -1295,7 +1304,7 @@ mod tests {
                 ws_fixture::ServerStep::send_text(r#"{"tokens":[],"total_audio_proc_ms":0}"#),
                 ws_fixture::ServerStep::send_close(),
             ],
-            false,
+            true,
         )
         .await;
         let (recovery, rejections) = (script.recovery, script.rejections);
@@ -1454,7 +1463,7 @@ mod tests {
             let (writer, reader) = ws_fixture::connect_client(&url).await.split();
             let (reconnect_url, upgrade_server) = reject_upgrades(
                 statuses.iter().map(|&status| (status, None)).collect(),
-                false,
+                true,
             )
             .await;
             let attempts = Arc::new(AtomicUsize::new(0));
@@ -1569,9 +1578,9 @@ mod tests {
             ),
             (
                 401,
-                Code::RequestRejected,
+                Code::CredentialRejected,
                 false,
-                Action::ReviewConfiguration,
+                Action::ReenterCredential,
                 Some(ClientError),
             ),
             (
@@ -1597,7 +1606,7 @@ mod tests {
                 Some(ServerError),
             ),
         ] {
-            let (url, server) = reject_upgrade(status, false).await;
+            let (url, server) = reject_upgrade(status, true).await;
             let diagnostic = open_ws_url(&config, &url).await.unwrap_err();
             server.await.unwrap();
             assert_outcome(&diagnostic, (code, retryable, action, status_class));
@@ -1862,9 +1871,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn open_ws_sends_config_as_first_frame() {
+    #[allow(
+        clippy::result_large_err,
+        reason = "tungstenite's server callback returns an HTTP response on rejection"
+    )]
+    async fn open_ws_authenticates_on_upgrade_and_sends_keyless_config() {
+        use tungstenite::handshake::server::{Request, Response};
+
         let (config_tx, config_rx) = tokio::sync::oneshot::channel();
-        let (url, server) = ws_fixture::spawn_server(move |mut websocket| async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://{}/transcribe-websocket",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &Request, response: Response| {
+                    assert!(
+                        request
+                            .headers()
+                            .get("authorization")
+                            .is_some_and(
+                                |header| header.as_bytes() == b"Bearer example wire phrase"
+                            )
+                    );
+                    assert!(!request.headers().contains_key("sec-websocket-protocol"));
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
             let first = websocket
                 .next()
                 .await
@@ -1876,10 +1914,11 @@ mod tests {
             let parsed: Value = serde_json::from_str(&text).expect("config json");
             let _ = config_tx.send(parsed);
             let _ = websocket.close(None).await;
-        })
-        .await;
+        });
 
-        let (mut writer, _reader) = open_ws_url(&test_config(), &url)
+        let mut client_config = test_config();
+        client_config.api_key = "\nexample wire phrase\r\n".into();
+        let (mut writer, _reader) = open_ws_url(&client_config, &url)
             .await
             .expect("connect to fake Soniox server");
         let _ = writer.close().await;
@@ -1888,10 +1927,7 @@ mod tests {
             .await
             .expect("server should receive config")
             .expect("config channel should not drop");
-        assert_eq!(
-            config.get("api_key").and_then(Value::as_str),
-            Some("soniox-test-key")
-        );
+        assert!(config.get("api_key").is_none());
         assert_eq!(
             config.get("model").and_then(Value::as_str),
             Some(DEFAULT_MODEL)
