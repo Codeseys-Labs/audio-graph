@@ -52,7 +52,43 @@ Expose `dormant`, `opening`, `uninitialized`, `ready`, `recovery_required`,
 never enqueues work. Ordinary operations must not prompt. Explicit diagnosis
 or unlock is the only interactive path; successful recovery is followed by a
 noninteractive reopen. A recovery-required or unavailable authority does not
-fall back to v1 or to a plaintext store.
+fall back to v1 or to a plaintext store. One explicit, noninteractive repair
+request takes ownership of refused authority state where the platform allows
+it and removes native records the authority journal does not track; it
+reopens only after it changed an owner or when such a record closed the
+runtime, and no ordinary operation runs any part of it. It changes only
+objects whose ownership refusal this process recorded, while their paths
+still reach the same objects. Every reopen, whichever route starts it, keeps
+what the runtime adopted: a service bound to another authority, or over a
+journal older than the highest epoch the runtime observed, is refused as
+recovery-required. The floor lives only in memory, so a restarted process
+accepts an older valid journal of the same authority; durable ordering
+evidence outside the journal is owed before any consumer cutover (#521).
+
+The store's file state is built against one adversary: another local
+principal who can create, rename or replace entries in the store's
+directories or in one of their ancestors while the app runs, trying to make
+the app change, delete or publish over an object it did not qualify. The
+rule that follows: every mutation acts on an object qualified through a
+handle, and nothing can change which object that is between the
+qualification and the act. The one act by path is resolving a root's path
+when the store opens; what it reaches is qualified on its handle before
+anything changes. Inside a held root, which is owner-only once held, names
+are resolved relative to its handle, and only this user can change what
+they name. Two gaps in that argument stay named and undecided, owed under
+#521 before the store is enabled:
+
+- The ancestor gap: an ancestor writable by another principal can choose
+  which of this user's directories the path resolution reaches.
+- The in-place gap (Windows): a handle keeps the access it was opened with,
+  so a principal who owned a root before an ownership repair, or whom the
+  root's old DACL granted `WRITE_DAC` or `WRITE_OWNER`, can keep a handle
+  that later makes the root writable again, and sharing modes cannot detect
+  it. The owner-only argument holds for a root the store created, owner-only
+  from the moment it exists, but not for one repaired or hardened in place.
+  The options are to have the repair build a fresh root and move the
+  qualified entries into it, to refuse a root whose previous owner or DACL
+  was untrusted, or to accept the residual here; none is chosen yet.
 
 Atomic admission allows one live operation, not a backlog of mutations. An
 async deadline limits only the caller's wait: it neither cancels nor retries

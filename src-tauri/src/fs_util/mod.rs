@@ -38,7 +38,8 @@ pub(crate) fn try_set_owner_only_file(file: &std::fs::File) -> std::io::Result<(
 /// Apply the current user's protected DACL to a directory through a handle
 /// that was opened with `WRITE_DAC`, without reopening it, which
 /// [`try_set_owner_only_file`] cannot do for a directory. The one owner ACE is
-/// inherited by the directory's existing and future children.
+/// inherited by children created afterwards; existing children are not
+/// changed.
 #[cfg(windows)]
 pub(crate) fn try_set_owner_only_directory_handle(
     directory: &std::fs::File,
@@ -46,13 +47,16 @@ pub(crate) fn try_set_owner_only_directory_handle(
     windows_owner_only_acl::set_directory_handle_dacl(directory)
 }
 
-/// Create `path` as a directory that carries the current user's protected,
-/// inheritable owner-only DACL from the moment it exists, so no other
-/// principal can open it before it is hardened. Fails with `AlreadyExists` if
-/// something is already at `path`.
+/// Runs `create` with a security descriptor carrying the current user's
+/// protected, inheritable owner-only DACL, for the directory `create` makes,
+/// so that directory is owner-only from the moment it exists and no other
+/// principal can open it before it is hardened. The descriptor lives only
+/// for the call.
 #[cfg(windows)]
-pub(crate) fn create_owner_only_directory(path: &Path) -> std::io::Result<()> {
-    windows_owner_only_acl::create_owner_only_directory(path)
+pub(crate) fn with_owner_only_directory_descriptor<T>(
+    create: impl FnOnce(*const std::ffi::c_void) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    windows_owner_only_acl::with_owner_only_directory_descriptor(create)
 }
 
 /// Whether a trusted principal owns the open object: the current user,
@@ -359,15 +363,28 @@ mod windows_owner_only_acl {
 
     /// Applies an owner-only DACL whose one ACE is inherited by files and
     /// subdirectories (`OICI`) through `directory` itself, which must already
-    /// carry `WRITE_DAC`. `ReOpenFile` refuses directory handles. Applying a
-    /// DACL to a directory rewrites the inherited ACEs of its existing
-    /// children, so they keep owner access and lose every other principal.
+    /// carry `WRITE_DAC`. `ReOpenFile` refuses directory handles. The DACL is
+    /// set on the handle's object alone (`SetKernelObjectSecurity`), so the
+    /// ACEs of existing children are left as they are: only the Win32
+    /// `Set*SecurityInfo` functions rewrite those, and they would reach a
+    /// child that is also another file's name. Children created afterwards
+    /// inherit the owner ACE.
     pub(super) fn set_directory_handle_dacl(directory: &std::fs::File) -> std::io::Result<()> {
         use std::os::windows::io::AsRawHandle;
-        let (_descriptor, dacl) =
+        use windows::Win32::Security::SetKernelObjectSecurity;
+        let (descriptor, _dacl) =
             build_owner_only_dacl_with_ace_flags(Path::new("open directory"), "OICI")
                 .map_err(std::io::Error::other)?;
-        apply_protected_dacl(HANDLE(directory.as_raw_handle()), dacl)
+        // SAFETY: the handle stays open and carries `WRITE_DAC`; `descriptor`
+        // owns the security descriptor for the duration of the call.
+        unsafe {
+            SetKernelObjectSecurity(
+                HANDLE(directory.as_raw_handle()),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor.0,
+            )
+        }
+        .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
     }
 
     fn apply_protected_dacl(
@@ -393,26 +410,13 @@ mod windows_owner_only_acl {
         Ok(())
     }
 
-    pub(super) fn create_owner_only_directory(path: &Path) -> std::io::Result<()> {
-        use windows::Win32::Security::SECURITY_ATTRIBUTES;
-        use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+    pub(super) fn with_owner_only_directory_descriptor<T>(
+        create: impl FnOnce(*const std::ffi::c_void) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
         let (descriptor, _dacl) =
             build_owner_only_dacl_with_ace_flags(Path::new("new directory"), "OICI")
                 .map_err(std::io::Error::other)?;
-        let attributes = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor.0.0,
-            bInheritHandle: false.into(),
-        };
-        let path_wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        // SAFETY: `path_wide` is NUL-terminated and `attributes` points to the
-        // descriptor owned by `descriptor`; both outlive the call.
-        unsafe { CreateDirectoryW(PCWSTR(path_wide.as_ptr()), Some(&attributes)) }
-            .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
+        create(descriptor.0.0.cast_const())
     }
 
     const ADMINISTRATORS_SID: &str = "S-1-5-32-544";

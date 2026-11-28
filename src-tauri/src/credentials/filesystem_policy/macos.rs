@@ -279,6 +279,13 @@ mod native {
             let directory = open_directory(path).map_err(|_| DetectorFault::TargetUnavailable)?;
             Ok(Self { directory })
         }
+
+        /// Inspects the directory behind `directory`, an already held
+        /// descriptor, so the observation is bound to that object rather than
+        /// to a path resolved again.
+        pub(crate) fn from_held_descriptor(directory: OwnedFd) -> Self {
+            Self { directory }
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
