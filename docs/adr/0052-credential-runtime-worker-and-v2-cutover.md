@@ -75,9 +75,20 @@ qualification and the act. The one act by path is resolving a root's path
 when the store opens; what it reaches is qualified on its handle before
 anything changes. Inside a held root, which is owner-only once held, names
 are resolved relative to its handle, and only this user can change what
-they name. An ancestor writable by another principal can still choose
-which of this user's directories the path resolution reaches, which stays
-owed under #521 before the store is enabled.
+they name. Two gaps in that argument stay named and undecided, owed under
+#521 before the store is enabled:
+
+- The ancestor gap: an ancestor writable by another principal can choose
+  which of this user's directories the path resolution reaches.
+- The in-place gap (Windows): a handle keeps the access it was opened with,
+  so a principal who owned a root before an ownership repair, or whom the
+  root's old DACL granted `WRITE_DAC` or `WRITE_OWNER`, can keep a handle
+  that later makes the root writable again, and sharing modes cannot detect
+  it. The owner-only argument holds for a root the store created, owner-only
+  from the moment it exists, but not for one repaired or hardened in place.
+  The options are to have the repair build a fresh root and move the
+  qualified entries into it, to refuse a root whose previous owner or DACL
+  was untrusted, or to accept the residual here; none is chosen yet.
 
 Atomic admission allows one live operation, not a backlog of mutations. An
 async deadline limits only the caller's wait: it neither cancels nor retries

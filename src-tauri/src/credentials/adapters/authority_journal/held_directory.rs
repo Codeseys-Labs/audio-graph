@@ -90,18 +90,25 @@ pub(in crate::credentials::adapters) mod faults {
 
     #[cfg(unix)]
     thread_local! {
-        static PARENT_SYNCS: Cell<usize> = const { Cell::new(0) };
+        static PARENT_SYNCS: std::cell::RefCell<Vec<(u64, u64)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
+    /// Records the device and inode of a directory a parent sync is about
+    /// to flush.
     #[cfg(unix)]
-    pub(super) fn count_parent_sync() {
-        PARENT_SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
+    pub(super) fn record_parent_sync(parent: &rustix::fd::OwnedFd) {
+        use std::os::unix::fs::MetadataExt;
+        let directory = std::fs::File::from(parent.try_clone().expect("duplicate the parent"));
+        let metadata = directory.metadata().expect("inspect the parent");
+        PARENT_SYNCS.with(|syncs| syncs.borrow_mut().push((metadata.dev(), metadata.ino())));
     }
 
-    /// How many parent syncs this thread has attempted.
+    /// The device and inode of every directory this thread's parent syncs
+    /// flushed, in order.
     #[cfg(unix)]
-    pub(in crate::credentials::adapters) fn parent_syncs() -> usize {
-        PARENT_SYNCS.with(Cell::get)
+    pub(in crate::credentials::adapters) fn parent_syncs() -> Vec<(u64, u64)> {
+        PARENT_SYNCS.with(|syncs| syncs.borrow().clone())
     }
 
     /// Points between two steps of this module where a test can act, as a
@@ -316,7 +323,7 @@ mod unix_held {
 
     fn sync_verified_parent(parent: &OwnedFd) -> Result<(), CredentialStoreFailure> {
         #[cfg(test)]
-        super::faults::count_parent_sync();
+        super::faults::record_parent_sync(parent);
         #[cfg(test)]
         if super::faults::fires(super::faults::Fault::ParentSync) {
             return Err(CredentialStoreFailure::Unavailable);
@@ -528,10 +535,12 @@ mod unix_held {
         /// mutation lock, so no other writer's staged file is in flight.
         /// Eligibility is by name (see [`is_staged_name`]), and only a regular
         /// file with no other name is unlinked. The entry is checked and then
-        /// unlinked by its name, which Unix cannot do through a handle; the
-        /// held root is owner-only, so only this user can change what that
-        /// name designates in between. Anything that does not qualify, or
-        /// cannot be removed, fails closed as `Unavailable` and stays.
+        /// unlinked by its name, which Unix cannot do through a handle. The
+        /// held root is 0700 and this user's, and Unix checks an unlink
+        /// against the directory's mode at the time of the call, so only this
+        /// user can change what that name designates in between, whatever
+        /// descriptors others opened earlier. Anything that does not qualify,
+        /// or cannot be removed, fails closed as `Unavailable` and stays.
         pub(in crate::credentials::adapters) fn sweep_staged(
             &self,
             name: &str,
@@ -615,8 +624,11 @@ mod unix_held {
         /// the object it named; it goes ahead only if that entry is absent or
         /// a regular file with no other name, checked just before, and a
         /// directory, a link or a file with another name there refuses the
-        /// publication before any effect. The held root is owner-only, so
-        /// only this user can change that entry between the check and the
+        /// publication before any effect. Both names, the staged source and
+        /// the target, are looked up in the held directory at the rename.
+        /// The held root is 0700 and this user's, and Unix checks a rename
+        /// against the directory's mode at the time of the call, so only this
+        /// user can change either entry between the check and the
         /// rename. POSIX `rename` leaves the target unaffected on every
         /// failure except `EIO`, so only that error and a failed directory
         /// sync leave the outcome open. After `EIO` the staged name is
@@ -656,6 +668,10 @@ mod unix_held {
         }
     }
 
+    /// An unpublished staged file is unlinked by its staged name, with no
+    /// recheck of what the name designates: Unix cannot unlink through a
+    /// descriptor, and in the 0700 root, whose mode Unix checks at the call,
+    /// only this user can have changed it.
     impl Drop for StagedFile<'_> {
         fn drop(&mut self) {
             if !self.published {
@@ -1548,9 +1564,15 @@ mod windows_held {
     /// rename replaces that entry only and never writes the object it
     /// names; this refuses, before any effect, a directory (which the
     /// kernel refuses to replace too), a reparse point, and a file with
-    /// another name, whose other name would keep the old journal. The held
-    /// root is owner-only, so only this user can change the entry between
-    /// this check and the rename.
+    /// another name, whose other name would keep the old journal. The check
+    /// releases its handle before the rename, which selects the target by
+    /// name, so the window between them is closed only by the held root's
+    /// DACL. That depends on no other principal holding a handle to the
+    /// root that was granted before the root was repaired or hardened in
+    /// place: a handle keeps the access it was opened with, and sharing
+    /// modes cannot detect it. It holds for a root the store created, which
+    /// is owner-only from the moment it exists. For a root repaired or
+    /// hardened in place it is owed under #521 (ADR-0052).
     fn target_may_be_replaced(root: &File, name: &str) -> bool {
         match open_relative_entry(root, OsStr::new(name)) {
             Ok(target) => {
@@ -1753,21 +1775,23 @@ mod windows_held {
 
         /// Opens `name` relative to the held directory handle, refuses it
         /// unless it is a regular file that a trusted principal owns, and
-        /// hardens it through the handle before returning it. A child this
-        /// open created is deleted through its handle if it is refused.
+        /// hardens it through the handle before returning it. The handle
+        /// shares no delete and carries read, write or delete access, so the
+        /// object qualified cannot be renamed or deleted before it is
+        /// hardened. A child this open created is deleted through its handle
+        /// if it is refused.
         fn open_child(
             &self,
             name: &str,
             access: u32,
             open: ChildOpen,
-            share: FILE_SHARE_MODE,
         ) -> Result<Option<File>, CredentialStoreFailure> {
-            let file = match open_relative(&self.handle, name, access, open, share) {
+            let file = match open_relative(&self.handle, name, access, open, NO_DELETE_SHARE) {
                 Ok(file) => file,
                 Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(open_failure(error.kind())),
             };
-            match self.verify_and_harden_child(name, &file) {
+            match self.qualify_child(name, &file).and_then(|()| harden(&file)) {
                 Ok(()) => Ok(Some(file)),
                 Err(failure) => {
                     if open == ChildOpen::CreateNew {
@@ -1778,11 +1802,10 @@ mod windows_held {
             }
         }
 
-        fn verify_and_harden_child(
-            &self,
-            name: &str,
-            file: &File,
-        ) -> Result<(), CredentialStoreFailure> {
+        /// Refuses `file`, the child `name` of the held directory, unless it
+        /// is a regular file in the held directory with no other name that a
+        /// trusted principal owns. Qualifying changes nothing.
+        fn qualify_child(&self, name: &str, file: &File) -> Result<(), CredentialStoreFailure> {
             require_kind(file, false)?;
             // Redundant with the handle-relative open; kept so a resolution
             // outside the held directory can never pass silently.
@@ -1792,8 +1815,7 @@ mod windows_held {
                 return Err(CredentialStoreFailure::PermissionHardeningFailed);
             }
             require_single_name(file)?;
-            require_trusted_owner(&self.path, Some(name), file)?;
-            harden(file)
+            require_trusted_owner(&self.path, Some(name), file)
         }
 
         pub(in crate::credentials::adapters) fn open_lock_file(
@@ -1804,7 +1826,6 @@ mod windows_held {
                 name,
                 FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
                 ChildOpen::OpenOrCreate,
-                NO_DELETE_SHARE,
             )?
             .ok_or(CredentialStoreFailure::Unavailable)
         }
@@ -1829,20 +1850,30 @@ mod windows_held {
             }
         }
 
+        /// Reads at most `limit` bytes of the child `name` once it qualifies
+        /// (see [`Self::qualify_child`]). A read changes nothing: its handle
+        /// shares delete, so a concurrent publication is never refused for
+        /// it, and an object held that way is not pinned, so the read leaves
+        /// hardening to the paths that hold what they change. The journal is
+        /// hardened when it is staged, before its first byte.
         pub(in crate::credentials::adapters) fn read_capped(
             &self,
             name: &str,
             limit: usize,
         ) -> Result<Option<Vec<u8>>, CredentialStoreFailure> {
-            match self.open_child(
+            let file = match open_relative(
+                &self.handle,
                 name,
                 FILE_GENERIC_READ.0,
                 ChildOpen::OpenExisting,
                 CHILD_SHARE,
-            )? {
-                Some(file) => read_at_most(file, limit).map(Some),
-                None => Ok(None),
-            }
+            ) {
+                Ok(file) => file,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(open_failure(error.kind())),
+            };
+            self.qualify_child(name, &file)?;
+            read_at_most(file, limit).map(Some)
         }
 
         /// Deletes every staged file a failed discard left for `name`, each
@@ -1899,7 +1930,6 @@ mod windows_held {
                     // this handle.
                     FILE_GENERIC_WRITE.0 | DELETE.0,
                     ChildOpen::CreateNew,
-                    CHILD_SHARE,
                 )?
                 .ok_or(CredentialStoreFailure::Unavailable)?;
             Ok(StagedFile {
@@ -1999,7 +2029,8 @@ mod windows_held {
     }
 
     /// An unpublished staged file is deleted through its own handle, never by
-    /// a name that might now resolve elsewhere.
+    /// a name that might now resolve elsewhere. That handle shares no delete,
+    /// so the file it deletes is the one this staging created and hardened.
     impl Drop for StagedFile<'_> {
         fn drop(&mut self) {
             if !self.published

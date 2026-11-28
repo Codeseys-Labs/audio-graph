@@ -1417,27 +1417,37 @@ pub(super) mod tests {
     /// The deepest directory found present on the way to a missing root is
     /// synced in the directory that holds it, reached through its own
     /// descriptor, also when the path reached it through a symlink: a link
-    /// is never a reason to skip the identity check or the barrier.
+    /// is never a reason to skip the identity check or the barrier. The
+    /// link and its target sit under different parents, so the directories
+    /// flushed show which parent the sync reached: the target's, never the
+    /// link's.
     #[cfg(unix)]
     #[test]
     fn unix_a_symlinked_ancestor_is_synced_where_it_lives() {
         use super::held_directory::faults::parent_syncs;
+        use std::os::unix::fs::MetadataExt;
 
         let base = scratch("unix-symlinked-ancestor");
-        std::fs::create_dir_all(base.join("real")).expect("create the real ancestor");
-        std::os::unix::fs::symlink(base.join("real"), base.join("link"))
-            .expect("link the ancestor");
-        let before = parent_syncs();
+        let real = base.join("elsewhere").join("real");
+        std::fs::create_dir_all(&real).expect("create the real ancestor");
+        std::fs::create_dir_all(base.join("links")).expect("create the link's parent");
+        let link = base.join("links").join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("link the ancestor");
+        let identity = |path: &Path| {
+            let metadata = std::fs::metadata(path).expect("inspect a directory");
+            (metadata.dev(), metadata.ino())
+        };
+        let before = parent_syncs().len();
 
-        let held = HeldDirectory::open_or_create(&base.join("link").join("journal"))
-            .expect("open through the link");
+        let held =
+            HeldDirectory::open_or_create(&link.join("journal")).expect("open through the link");
 
         assert_eq!(
-            parent_syncs() - before,
-            2,
-            "the ancestor's entry and the new root's entry are both synced"
+            parent_syncs()[before..],
+            [identity(&base.join("elsewhere")), identity(&real)],
+            "the target's parent holds the ancestor's entry, the target the new root's"
         );
-        assert!(base.join("real").join("journal").is_dir());
+        assert!(real.join("journal").is_dir());
         drop(held);
         std::fs::remove_dir_all(&base).expect("remove isolated symlinked-ancestor directory");
     }
@@ -2746,6 +2756,35 @@ pub(super) mod tests {
         assert_eq!(windows_dacl(&planted, &base), planted_dacl);
         drop(journal);
         std::fs::remove_dir_all(&base).expect("remove isolated no-propagation directory");
+    }
+
+    /// A journal read qualifies the journal and changes nothing: its handle
+    /// shares delete, so it does not pin the file, and a read never changes
+    /// an object it has not pinned. A journal whose DACL another grant
+    /// widened is read as it is, and its DACL stays as it was; the next
+    /// publication replaces it with a journal hardened when it was staged.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_journal_read_changes_nothing() {
+        let base = scratch("windows-read-changes-nothing");
+        let journal = boundary(&base, "journal", "namespace").expect("open boundary");
+        journal.replace(b"journal").expect("publish a journal");
+        let target = base.join("journal").join(JOURNAL_FILE_NAME);
+        windows_command(
+            "icacls.exe",
+            &[target.as_os_str(), "/grant".as_ref(), "*S-1-1-0:R".as_ref()],
+            &base,
+        );
+        let widened = windows_dacl(&target, &base);
+        assert!(widened.contains(";;;WD)"), "fixture grant missing");
+
+        assert_eq!(journal.read(), Ok(Some(b"journal".to_vec())));
+
+        assert_eq!(windows_dacl(&target, &base), widened);
+        journal.replace(b"next").expect("publish the next journal");
+        assert_protected_owner_only(&windows_dacl(&target, &base));
+        drop(journal);
+        std::fs::remove_dir_all(&base).expect("remove isolated read-changes-nothing directory");
     }
 
     /// An ownership repair of a refused root qualifies every entry on its
