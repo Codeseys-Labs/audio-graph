@@ -819,6 +819,8 @@ pub(crate) fn emit_and_dispatch_speaker_relabel_batch(
 
 #[derive(Default)]
 struct AsrRevisionMeta {
+    /// The segment was finalized locally from retained provider interim data.
+    promoted_interim: bool,
     span_id: Option<String>,
     provider_item_id: Option<String>,
     speaker_id: Option<String>,
@@ -4239,9 +4241,13 @@ fn emit_transcript_and_extract_with_meta(
 
     // 4. Update pipeline status counts.
     if let Ok(mut status) = ctx.pipeline_status.write() {
-        status.asr = StageStatus::Running {
-            processed_count: asr_count,
-        };
+        // A local promotion advances a healthy count, but provides no evidence
+        // that a disconnected or failed provider has recovered.
+        if !asr_meta.promoted_interim || matches!(status.asr, StageStatus::Running { .. }) {
+            status.asr = StageStatus::Running {
+                processed_count: asr_count,
+            };
+        }
         // audio-graph-586b: a `Degraded` diarization status (set once, at
         // worker startup, by `apply_diarization_degradation`) must persist
         // for the whole session — this per-segment count update must never
@@ -4389,6 +4395,7 @@ fn moonshine_final_transcript_segment(
 fn moonshine_revision_meta(revision: &MoonshineSpanRevision) -> AsrRevisionMeta {
     let payload = &revision.payload;
     AsrRevisionMeta {
+        promoted_interim: false,
         span_id: Some(payload.span_id.clone()),
         provider_item_id: payload.provider_item_id.clone(),
         speaker_id: payload.speaker_id.clone(),
@@ -4477,6 +4484,7 @@ fn final_transcript_segment_from_asr_payload(
 
 fn asr_payload_revision_meta(payload: &events::AsrSpanRevisionPayload) -> AsrRevisionMeta {
     AsrRevisionMeta {
+        promoted_interim: false,
         span_id: Some(payload.span_id.clone()),
         provider_item_id: payload.provider_item_id.clone(),
         speaker_id: payload.speaker_id.clone(),
@@ -7259,6 +7267,7 @@ fn promote_pending_interim(
                 revision_number: Some(revision_number),
                 supersedes,
                 raw_event_ref: Some("deepgram.results.interim-promoted".to_string()),
+                promoted_interim: true,
                 ..AsrRevisionMeta::default()
             },
         );
@@ -7350,6 +7359,7 @@ fn promote_pending_interim(
                 revision_number: Some(run_revision_number),
                 supersedes: run_supersedes,
                 raw_event_ref: Some(format!("deepgram.results.interim-promoted:run{run_index}")),
+                promoted_interim: true,
                 ..AsrRevisionMeta::default()
             },
         );
@@ -12545,6 +12555,45 @@ mod tests_status {
             ]),
             StageStatus::Running { processed_count: 1 }
         ));
+        // Draining a retained interim at channel close still publishes a final
+        // transcript, even though the provider never recovered.
+        let app_handle = super::shared_test_app_handle();
+        let (updates, received) = std::sync::mpsc::channel();
+        let listener = app_handle.listen_any(events::TRANSCRIPT_UPDATE, move |event| {
+            let segment: TranscriptSegment = serde_json::from_str(event.payload()).unwrap();
+            if segment.text == "retained words" {
+                updates.send(segment).unwrap();
+            }
+        });
+        let rejected: RuntimeDiagnostic =
+            RuntimeErrorDiagnostic::credential_rejected(context).into();
+        let terminal = error_after(vec![
+            Event::Transcript {
+                text: "retained words".into(),
+                confidence: 1.0,
+                is_final: false,
+                speech_final: false,
+                start: 3.0,
+                duration: 0.5,
+                words: vec![],
+            },
+            Event::Error {
+                message: rejected.clone(),
+            },
+            Event::Disconnected,
+        ]);
+        app_handle.unlisten(listener);
+        assert_eq!(terminal, rejected);
+        let promoted = received
+            .try_recv()
+            .expect("promoted interim emitted TRANSCRIPT_UPDATE");
+        assert!(
+            app.transcript_buffer
+                .read()
+                .unwrap()
+                .iter()
+                .any(|segment| segment.id == promoted.id)
+        );
         drain_app_writers(&app);
         drop(app);
         let _ = std::fs::remove_dir_all(dir);

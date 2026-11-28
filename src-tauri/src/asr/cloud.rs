@@ -235,13 +235,26 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
         .text("response_format", "verbose_json")
         .text("language", config.language().to_string());
 
-    let client = reqwest::blocking::Client::builder()
+    let credential_sent = !config.api_key().is_empty();
+    let mut client = reqwest::blocking::Client::builder();
+    if credential_sent {
+        let origin = reqwest::Url::parse(&url)
+            .map_err(|_| RuntimeErrorDiagnostic::invalid_configuration(ctx))?
+            .origin();
+        client = client.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.url().origin() != origin {
+                attempt.stop()
+            } else {
+                reqwest::redirect::Policy::default().redirect(attempt)
+            }
+        }));
+    }
+    let client = client
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|_| RuntimeDiagnostic::internal(ctx))?;
 
     let mut request = client.post(&url).multipart(form);
-    let credential_sent = !config.api_key().is_empty();
     if credential_sent {
         request = request.bearer_auth(config.api_key());
     }
@@ -269,15 +282,12 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
             http_status: Some(status.as_u16()),
             recoverable: None,
         });
-        // reqwest exposes the final URL here, not the redirect chain. If a redirect
-        // leaves the original host and returns, Authorization may already have been
-        // stripped even though these origins match.
-        let sent_to_origin = credential_sent
-            && reqwest::Url::parse(&url)
-                .is_ok_and(|original| original.origin() == response.url().origin());
-        return Err(
-            RuntimeErrorDiagnostic::from_http_status(status.as_u16(), sent_to_origin, ctx).into(),
-        );
+        return Err(RuntimeErrorDiagnostic::from_http_status(
+            status.as_u16(),
+            credential_sent,
+            ctx,
+        )
+        .into());
     }
     let whisper_resp: WhisperResponse = response.json().map_err(|error| {
         if error.is_timeout() {
@@ -474,6 +484,8 @@ mod tests_mapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::time::Duration;
 
     fn le_u32(b: &[u8]) -> u32 {
@@ -662,12 +674,36 @@ mod tests {
         }
     }
 
+    /// Consume the request body before replying so the client sees the response
+    /// even on platforms that reset sockets closed with unread bytes.
+    fn receive_request(stream: &mut TcpStream) -> (String, bool, usize) {
+        let mut request = BufReader::new(stream);
+        let mut lines = request.by_ref().lines().map(Result::unwrap);
+        let path = lines
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
+        let mut authorized = false;
+        let mut length = 0;
+        for line in lines.take_while(|line| !line.is_empty()) {
+            let (name, value) = line.split_once(':').unwrap();
+            if name.eq_ignore_ascii_case("authorization") {
+                authorized = true;
+            } else if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        request.read_exact(&mut vec![0; length]).unwrap();
+        (path, authorized, length)
+    }
+
     #[test]
     fn http_responses_produce_closed_diagnostics() {
         use RuntimeErrorCode as Code;
         use RuntimeSafeRecoveryAction as Action;
-        use std::io::{BufRead, BufReader, Read, Write};
-        use std::net::TcpListener;
         for (status, key, code, retryable, recovery) in [
             (
                 401,
@@ -699,23 +735,9 @@ mod tests {
             config.api_key = key.into();
             let worker = std::thread::spawn(move || {
                 let (mut stream, _) = server.accept().unwrap();
-                let mut request = BufReader::new(&mut stream);
-                let headers: Vec<_> = request
-                    .by_ref()
-                    .lines()
-                    .map(Result::unwrap)
-                    .take_while(|line| !line.is_empty())
-                    .collect();
-                let header = |name: &str| {
-                    headers
-                        .iter()
-                        .filter_map(|h| h.split_once(':'))
-                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                        .map(|(_, value)| value.trim())
-                };
-                assert_eq!(header("authorization").is_some(), !key.is_empty());
-                let length = header("content-length").unwrap().parse::<usize>().unwrap();
-                request.read_exact(&mut vec![0; length]).unwrap();
+                let (_, authorized, length) = receive_request(&mut stream);
+                assert_eq!(authorized, !key.is_empty());
+                assert!(length > 0);
                 let body = "private provider prose";
                 write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             });
@@ -733,6 +755,84 @@ mod tests {
                 diagnostic,
                 RuntimeErrorDiagnostic::new(code, retryable, recovery, ctx).into()
             );
+        }
+    }
+
+    #[test]
+    fn credentialed_redirects_only_reach_the_original_origin() {
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeStatusClass;
+        let original = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let foreign = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let origin = format!("http://{}", original.local_addr().unwrap());
+        let other = format!("http://{}", foreign.local_addr().unwrap());
+        for listener in [&original, &foreign] {
+            listener.set_nonblocking(true).unwrap();
+        }
+        for route in ["same-origin", "cross-origin", "round-trip"] {
+            let mut config = test_config();
+            config.endpoint = format!("{origin}/{route}");
+            let config = config.with_content_egress_policy(ProviderContentEgressPolicy::allow());
+            let client = std::thread::spawn(move || {
+                transcribe_segment(&config, &speech_segment(vec![0.5])).unwrap_err()
+            });
+            let mut requests = Vec::new();
+            while !client.is_finished() {
+                for (is_original, listener) in [(true, &original), (false, &foreign)] {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(e) => panic!("accept failed: {e}"),
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let (path, authorized, length) = receive_request(&mut stream);
+                    let response = match path.as_str() {
+                        "/same-origin/audio/transcriptions" | "/return" => {
+                            format!("302 Found\r\nLocation: {origin}/final")
+                        }
+                        "/cross-origin/audio/transcriptions" => {
+                            format!("307 Temporary Redirect\r\nLocation: {other}/final")
+                        }
+                        "/round-trip/audio/transcriptions" => {
+                            format!("302 Found\r\nLocation: {other}/return")
+                        }
+                        "/final" => "401 Unauthorized".into(),
+                        _ => panic!("unexpected route"),
+                    };
+                    requests.push((is_original, path, authorized, length));
+                    write!(
+                        stream,
+                        "HTTP/1.1 {response}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let diagnostic = client.join().unwrap();
+            let ctx = RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                .with_transport(RuntimeTransport::Http);
+            assert_eq!(requests[0].1, format!("/{route}/audio/transcriptions"));
+            assert!(requests[0].2 && requests[0].3 > 0);
+            assert!(
+                requests.iter().all(|(is_original, ..)| *is_original),
+                "{route} reached the foreign listener"
+            );
+            let expected = if route == "same-origin" {
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[1].1, "/final");
+                assert!(requests[1].2);
+                RuntimeErrorDiagnostic::credential_rejected(
+                    ctx.with_status_class(RuntimeStatusClass::ClientError),
+                )
+            } else {
+                assert_eq!(requests.len(), 1);
+                RuntimeErrorDiagnostic::new(
+                    RuntimeErrorCode::RequestRejected,
+                    false,
+                    RuntimeSafeRecoveryAction::ReviewConfiguration,
+                    ctx.with_status_class(RuntimeStatusClass::Redirect),
+                )
+            };
+            assert_eq!(diagnostic, expected.into(), "{route}");
         }
     }
 
