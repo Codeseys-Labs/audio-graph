@@ -357,28 +357,21 @@ impl BasisCache {
         let lock_path = transcript_coordination_path(path);
         let attempt = path.with_added_extension("attempt");
         let has_attempt = || attempt.try_exists().map_err(|_| Error::InvalidHistory);
-        let mut guard = try_shared_transcript_lock(&lock_path);
-        if matches!(guard, Err(CanonicalCoordinationError::Contended)) {
-            // A live append commonly holds the lock for a few syncs. Retry its
-            // incremental path first. A stopped writer with a descriptor still
-            // exposes the immutable base via the strict double-check below.
-            let until = std::time::Instant::now() + std::time::Duration::from_millis(25);
-            while has_attempt()? && std::time::Instant::now() < until {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                guard = try_shared_transcript_lock(&lock_path);
-                if !matches!(guard, Err(CanonicalCoordinationError::Contended)) {
-                    break;
-                }
-            }
-            if matches!(guard, Err(CanonicalCoordinationError::Contended)) && !has_attempt()? {
-                guard = crate::persistence::canonical_durability::wait_for_transcript_lock(
+        // Ordinary appends keep the incremental path even when a flush lasts
+        // longer than a scheduling slice. Only a truly stalled writer with a
+        // published intent needs the strict, double-checked base snapshot.
+        let guard = match try_shared_transcript_lock(&lock_path) {
+            Err(CanonicalCoordinationError::Contended) => {
+                let result = crate::persistence::canonical_durability::wait_for_transcript_lock(
                     &lock_path, true, false,
                 );
-                if matches!(guard, Err(CanonicalCoordinationError::Contended)) && !has_attempt()? {
+                if matches!(result, Err(CanonicalCoordinationError::Contended)) && !has_attempt()? {
                     return Err(Error::ConflictingAttempt);
                 }
+                result
             }
-        }
+            result => result,
+        };
         if let Ok(guard) = guard
             && !has_attempt()?
             && let Ok(file) = File::open(path)

@@ -17,7 +17,7 @@ const CHILD_TEST: &str =
 const HANG_LIMIT: Duration = Duration::from_secs(60);
 
 thread_local! {
-    static BEFORE_FRAME_SYNC: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+    pub(super) static BEFORE_FRAME_SYNC: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
 }
 
 pub(super) fn pause_before_frame_sync_if_armed() {

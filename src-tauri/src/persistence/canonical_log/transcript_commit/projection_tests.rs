@@ -326,6 +326,40 @@ fn an_invalid_semantic_tail_cannot_pollute_a_later_shorter_dependency_fold() {
 }
 
 #[test]
+fn an_overlapping_append_keeps_incremental_dependency_verification() {
+    use super::tests::BEFORE_FRAME_SYNC;
+    use crate::persistence::canonical_durability::observe_next_transcript_lock_wait;
+    use std::{sync::mpsc, time::Duration};
+    let f = Fixture::new();
+    let patch = f.seeded_patch();
+    f.projection.live_basis(&patch, 1).unwrap();
+    let before = f.projection.source_basis.borrow().source_work();
+    let path = f.transcript.path.clone();
+    let (at_barrier, descriptor_visible) = mpsc::channel();
+    let (reader_waits, can_sync) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        BEFORE_FRAME_SYNC.set(Some(Box::new(move || {
+            at_barrier.send(()).unwrap();
+            can_sync.recv_timeout(Duration::from_secs(30)).unwrap();
+        })));
+        PreparedTranscriptStorage::open(&path, SESSION)
+            .unwrap()
+            .commit_after(&transcript_event("twig", "leaf"), Some(1))
+            .unwrap();
+    });
+    descriptor_visible
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap();
+    assert!(f.transcript.path.with_added_extension("attempt").exists());
+    observe_next_transcript_lock_wait(reader_waits);
+    let proof = f.projection.live_basis(&patch, 2).unwrap();
+    writer.join().unwrap();
+    assert_eq!(proof.heads()[STREAM].sequence, 2);
+    let after = f.projection.source_basis.borrow().source_work();
+    assert_eq!(after[0], (before[0].0, before[0].1 + 1));
+}
+
+#[test]
 fn a_dependency_lock_still_held_after_the_wait_reports_contention() {
     use crate::persistence::canonical_durability::{
         transcript_coordination_path, wait_for_transcript_lock,
