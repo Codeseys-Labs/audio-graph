@@ -616,12 +616,12 @@ impl ApiClient {
         &self,
         messages: &[crate::llm::engine::ChatMessage],
         graph_context: &str,
-    ) -> Result<(String, u32, WireOutcome), String> {
+    ) -> Result<(String, u32, WireOutcome), RuntimeDiagnostic> {
         self.chat_completion_with_wire_outcome(
             self.history_messages(messages, graph_context),
             RequestOutputForm::Unconstrained,
         )
-        .map_err(String::from)
+        .map_err(|failure| failure.diagnostic)
     }
 
     /// Build the `(role, content)` message list for the history chat paths:

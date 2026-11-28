@@ -839,9 +839,12 @@ mod tests {
         // First the partial delta, then exactly one Error terminal frame.
         assert!(matches!(frames.first(), Some(TokenDelta::Delta { .. })));
         match frames.last().expect("terminal frame") {
-            TokenDelta::Error { message, full_text } => {
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
                 assert_eq!(full_text, "partial");
-                assert_eq!(message, "runtime/network_unreachable");
+                assert_eq!(diagnostic.to_string(), "runtime/network_unreachable");
             }
             other => panic!("expected Error terminal, got {other:?}"),
         }
@@ -899,8 +902,8 @@ mod tests {
             SdkError::service_error(ConverseStreamOutputError::ThrottlingException(service), ());
         let frames = drain(vec![Err(converse_event_failure(&event))]).await;
         assert!(
-            matches!(frames.as_slice(), [TokenDelta::Error { message, full_text }]
-            if message == "runtime/rate_limited" && full_text.is_empty())
+            matches!(frames.as_slice(), [TokenDelta::Error { diagnostic, full_text }]
+            if diagnostic.to_string() == "runtime/rate_limited" && full_text.is_empty())
         );
 
         // An unmodeled error is classified by its response status alone, never
@@ -1223,9 +1226,12 @@ mod tests {
 
         let frame = rx.recv().await.expect("terminal frame");
         match &frame {
-            TokenDelta::Error { message, full_text } => {
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
                 assert!(full_text.is_empty(), "no partial text before any AWS call");
-                assert_eq!(message, "runtime/policy_blocked");
+                assert_eq!(diagnostic.to_string(), "runtime/policy_blocked");
             }
             other => panic!("expected Error terminal, got {other:?}"),
         }
@@ -1248,8 +1254,8 @@ mod tests {
             .await;
 
         match rx.recv().await.expect("terminal frame") {
-            TokenDelta::Error { message, .. } => {
-                assert_eq!(message, "runtime/policy_blocked");
+            TokenDelta::Error { diagnostic, .. } => {
+                assert_eq!(diagnostic.to_string(), "runtime/policy_blocked");
             }
             other => panic!("expected fail-closed Error terminal, got {other:?}"),
         }

@@ -14,7 +14,7 @@ use audio_graph_ipc_contract::runtime_diagnostic::{
 
 use crate::error::AppError;
 use crate::graph::entities::ExtractionResult;
-use crate::llm::engine::{ChatMessage, ChatOutcome};
+use crate::llm::engine::{ChatMessage, ChatOutcome, engine_not_loaded};
 use crate::llm::{ApiClient, LlmEngine, MistralRsEngine, OpenRouterClient};
 use crate::projection_llm::{
     PROJECTION_PATCH_PROMPT_ID, PROJECTION_PATCH_REPAIR_PROMPT_ID, ProjectionContext,
@@ -183,7 +183,7 @@ enum LlmJob {
 #[allow(clippy::large_enum_variant)]
 enum LlmJobResult {
     Extraction(Option<ExtractionResult>),
-    Chat(Result<ChatOutcome, String>),
+    Chat(Result<ChatOutcome, RuntimeDiagnostic>),
     ProjectionPatch(ProjectionPatchAttempt),
 }
 
@@ -305,7 +305,7 @@ impl LlmExecutor {
         messages: Vec<ChatMessage>,
         graph_context: String,
         provider: LlmProvider,
-    ) -> Result<ChatOutcome, String> {
+    ) -> Result<ChatOutcome, RuntimeDiagnostic> {
         let (response_tx, response_rx) = mpsc::channel();
         self.enqueue(
             LlmPriority::Interactive,
@@ -319,11 +319,9 @@ impl LlmExecutor {
 
         match response_rx.recv() {
             Ok(LlmJobResult::Chat(result)) => result,
-            Ok(LlmJobResult::Extraction(_)) => {
-                Err("LLM executor returned extraction result for chat request".to_string())
-            }
-            Ok(LlmJobResult::ProjectionPatch(_)) => {
-                Err("LLM executor returned projection result for chat request".to_string())
+            // The worker answered a chat job with another job's result.
+            Ok(LlmJobResult::Extraction(_) | LlmJobResult::ProjectionPatch(_)) => {
+                Err(executor_failure(Code::Internal))
             }
             Err(_) => Err(no_worker_reply()),
         }
@@ -379,7 +377,7 @@ impl LlmExecutor {
                 attempted_route: None,
             },
             Err(_) => ProjectionPatchAttempt {
-                outcome: Err(no_worker_reply()),
+                outcome: Err(no_worker_reply().to_string()),
                 attempted_route: None,
             },
         }
@@ -596,9 +594,8 @@ fn run_chat(
     provider: &LlmProvider,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<ChatOutcome, String> {
-    let route = authorize_and_budget_route_dispatch(handles, provider)
-        .map_err(|error| error.to_string())?;
+) -> Result<ChatOutcome, RuntimeDiagnostic> {
+    let route = authorize_and_budget_route_dispatch(handles, provider).map_err(route_refusal)?;
     match route.descriptor().blocking_backend {
         Some(BlockingBackend::NativeLlama) => chat_native(handles, messages, graph_context),
         Some(BlockingBackend::OpenAiCompatible) => {
@@ -608,7 +605,29 @@ fn run_chat(
             chat_openrouter(handles, &route, messages, graph_context)
         }
         Some(BlockingBackend::MistralRs) => chat_mistralrs(handles, messages, graph_context),
-        None => Err(no_blocking_route_error(&route)),
+        // This provider serves streaming chat only.
+        None => Err(executor_failure(Code::Unsupported)),
+    }
+}
+
+/// A closed diagnostic for a failure the executor detects itself, outside any
+/// backend call.
+fn executor_failure(code: Code) -> RuntimeDiagnostic {
+    diagnostic(
+        code,
+        RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
+    )
+}
+
+/// The closed diagnostic for a chat dispatch the route layer refused before
+/// any backend was reached.
+fn route_refusal(error: AppError) -> RuntimeDiagnostic {
+    match error {
+        AppError::RuntimeDiagnostic(diagnostic) => diagnostic,
+        // The provider is compiled out of this build.
+        AppError::ProviderUnavailable { .. } => executor_failure(Code::Unsupported),
+        // The start gate, the privacy mode, or a wire skin not admitted.
+        _ => executor_failure(Code::PolicyBlocked),
     }
 }
 
@@ -626,21 +645,13 @@ fn no_blocking_route_error(route: &AuthorizedRoute) -> String {
 
 /// Terminal for a model reply that never became a valid patch, on any route.
 fn unusable_reply() -> String {
-    diagnostic(
-        Code::InvalidResponse,
-        RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
-    )
-    .to_string()
+    executor_failure(Code::InvalidResponse).to_string()
 }
 
 /// Terminal for a job no worker answered: the worker thread never started, or
 /// it dropped the reply channel.
-fn no_worker_reply() -> String {
-    diagnostic(
-        Code::Internal,
-        RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
-    )
-    .to_string()
+fn no_worker_reply() -> RuntimeDiagnostic {
+    executor_failure(Code::Internal)
 }
 
 /// One route attempt's content-free result.
@@ -1433,16 +1444,15 @@ fn chat_native(
     handles: &BackendHandles,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<ChatOutcome, String> {
-    let guard = handles.llm_engine.lock().map_err(|e| e.to_string())?;
-    let engine = guard
-        .as_ref()
-        .ok_or_else(|| "Native LLM is not loaded".to_string())?;
+) -> Result<ChatOutcome, RuntimeDiagnostic> {
+    let guard = handles
+        .llm_engine
+        .lock()
+        .map_err(|_| executor_failure(Code::Internal))?;
+    let engine = guard.as_ref().ok_or_else(engine_not_loaded)?;
     // The native engine's inference loop counts prompt + completion tokens, so
     // this is the one blocking backend that surfaces a real `tokens_used`.
-    engine
-        .chat(messages, graph_context)
-        .map_err(|e| e.to_string())
+    engine.chat(messages, graph_context)
 }
 
 fn chat_api(
@@ -1450,16 +1460,21 @@ fn chat_api(
     route: &AuthorizedRoute,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<ChatOutcome, String> {
+) -> Result<ChatOutcome, RuntimeDiagnostic> {
     // Clone + drop the guard before the blocking HTTP request (see extract_api).
     let client = {
-        let guard = handles.api_client.lock().map_err(|e| e.to_string())?;
+        let guard = handles
+            .api_client
+            .lock()
+            .map_err(|_| executor_failure(Code::Internal))?;
         guard
             .as_ref()
-            .ok_or_else(|| "API LLM client is not configured".to_string())?
+            .ok_or_else(|| executor_failure(Code::InvalidConfiguration))?
             .clone()
     };
-    let live = api_route_for_client(route, &client)?;
+    // A client repointed outside the authorized provider is refused.
+    let live =
+        api_route_for_client(route, &client).map_err(|_| executor_failure(Code::PolicyBlocked))?;
     // `ApiClient::chat_with_history_with_usage` (and the Bedrock requests routed
     // through it) surfaces the OpenAI `usage.total_tokens` from the response.
     // A provider that omits the `usage` block reports 0 — never fabricated
@@ -1475,19 +1490,20 @@ fn chat_openrouter(
     route: &AuthorizedRoute,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<ChatOutcome, String> {
+) -> Result<ChatOutcome, RuntimeDiagnostic> {
     // Clone + drop the guard before the blocking HTTP request (see extract_api).
     let client = {
         let guard = handles
             .openrouter_client
             .lock()
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| executor_failure(Code::Internal))?;
         guard
             .as_ref()
-            .ok_or_else(|| "OpenRouter client is not configured".to_string())?
+            .ok_or_else(|| executor_failure(Code::InvalidConfiguration))?
             .clone()
     };
-    let live = openrouter_route_for_client(route, &client)?;
+    let live = openrouter_route_for_client(route, &client)
+        .map_err(|_| executor_failure(Code::PolicyBlocked))?;
     // OpenRouter is OpenAI-compatible: the non-streaming response carries
     // `usage.total_tokens`. It is 0 only when the upstream provider omits the
     // usage block — never fabricated (FA-7c).
@@ -1517,17 +1533,17 @@ fn chat_mistralrs(
     handles: &BackendHandles,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<ChatOutcome, String> {
-    let guard = handles.mistralrs_engine.lock().map_err(|e| e.to_string())?;
-    let engine = guard
-        .as_ref()
-        .ok_or_else(|| "mistral.rs LLM is not loaded".to_string())?;
+) -> Result<ChatOutcome, RuntimeDiagnostic> {
+    let guard = handles
+        .mistralrs_engine
+        .lock()
+        .map_err(|_| executor_failure(Code::Internal))?;
+    let engine = guard.as_ref().ok_or_else(engine_not_loaded)?;
     // `MistralRsEngine::chat_with_history_usage` surfaces the real token count
     // from mistral.rs's `ChatCompletionResponse.usage.total_tokens` (FA-7c).
     engine
         .chat_with_history_usage(messages, graph_context)
         .map(|(text, tokens_used)| ChatOutcome { text, tokens_used })
-        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -2371,11 +2387,8 @@ mod tests {
         // error that can surface is the native engine's.
         let err =
             run_chat(&handles, &LlmProvider::LocalLlama, &[], "ctx").expect_err("no backend → Err");
-        assert_eq!(err, "Native LLM is not loaded");
-        assert!(
-            !err.contains("mistral.rs") && !err.contains("OpenRouter") && !err.contains("API LLM"),
-            "a single-route dispatch must not mention any other provider, got: {err}"
-        );
+        // Only the native engine's own diagnostic: no other route was tried.
+        assert_eq!(err, engine_not_loaded());
     }
 
     #[test]
@@ -2401,11 +2414,8 @@ mod tests {
             "ctx",
         )
         .expect_err("no OpenRouter client → Err");
-        assert_eq!(err, "OpenRouter client is not configured");
-        assert!(
-            !err.contains("mistral.rs") && !err.contains("Native LLM"),
-            "the OpenRouter route must never reach a local engine, got: {err}"
-        );
+        // The missing client, not a local engine's "not loaded".
+        assert_eq!(err, executor_failure(Code::InvalidConfiguration));
     }
 
     #[test]
@@ -2424,12 +2434,8 @@ mod tests {
             "ctx",
         )
         .expect_err("bedrock has no blocking route");
-        assert!(err.contains("route.aws_bedrock"), "got: {err}");
-        assert!(err.contains("streaming chat only"), "got: {err}");
-        assert!(
-            !err.contains("API LLM client is not configured"),
-            "the old misleading diagnostic must be gone, got: {err}"
-        );
+        // Not "client is not configured", which named the wrong client.
+        assert_eq!(err, executor_failure(Code::Unsupported));
     }
 
     #[test]
@@ -3261,7 +3267,7 @@ mod tests {
         let (chat, patch) = outcome
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("a job nobody will run must not wait for a reply");
-        assert_eq!(chat, Err("runtime/internal".to_string()));
+        assert_eq!(chat, Err(executor_failure(Code::Internal)));
         assert_eq!(patch, Err("runtime/internal".to_string()));
     }
 

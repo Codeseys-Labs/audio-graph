@@ -61,7 +61,8 @@ pub enum TokenDelta {
     /// Final terminator on success. `usage` is populated when the provider
     /// honoured `stream_options.include_usage`. `finish_reason` is always a
     /// [`FinishReason`] token (`"stop"`, `"length"`, `"content_filter"`,
-    /// `"tool_calls"`, `"error"`, `"unknown"`), never the provider's raw value.
+    /// `"tool_calls"`, `"unknown"`), never the provider's raw value. A turn the
+    /// provider finished with `"error"` is an [`Self::Error`], not a `Done`.
     /// Defaults to `"stop"` if the stream ends without the provider declaring
     /// one (some providers omit it on `[DONE]`).
     Done {
@@ -70,10 +71,13 @@ pub enum TokenDelta {
         finish_reason: String,
     },
     /// Stream failed (network drop, HTTP non-2xx, provider fault, engine
-    /// failure). `message` is a closed diagnostic token. `full_text` is
+    /// failure). `diagnostic` is the closed, typed failure. `full_text` is
     /// whatever was accumulated before the failure so the caller can show a
     /// partial reply rather than nothing.
-    Error { message: String, full_text: String },
+    Error {
+        diagnostic: RuntimeDiagnostic,
+        full_text: String,
+    },
     /// Caller invoked the cancel token. The stream task drops the HTTP
     /// connection and emits this as its terminal frame so the consumer
     /// can finalize the chat message with `finish_reason: "cancelled"`.
@@ -92,7 +96,7 @@ impl TokenDelta {
                 finish_reason: finish_reason.as_str().to_string(),
             },
             StreamTerminalReason::Diagnostic(diagnostic) => Self::Error {
-                message: diagnostic.to_string(),
+                diagnostic,
                 full_text: event.full_text,
             },
             StreamTerminalReason::Cancelled => Self::Cancelled {
@@ -1036,9 +1040,11 @@ pub enum ChatStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         finish_reason: Option<String>,
     },
-    /// Terminal frame, sent exactly once per stream (normal stop / error /
-    /// cancel), carrying the authoritative `full_text` + optional `usage`.
-    /// Mirrors the legacy `chat-token-done` payload.
+    /// Terminal frame, sent exactly once per stream, carrying the
+    /// authoritative `full_text` + optional `usage`. `finish_reason` is the
+    /// closed [`FinishReason`] token of a completed turn, `"cancelled"` for a
+    /// cancelled one, and `"error: runtime/<code>"` for a failed one. Mirrors
+    /// the legacy `chat-token-done` payload.
     #[serde(rename = "done")]
     Done {
         request_id: String,
@@ -1243,8 +1249,8 @@ mod tests {
                     );
                     break;
                 }
-                TokenDelta::Error { message, .. } => {
-                    panic!("unexpected error: {message}");
+                TokenDelta::Error { diagnostic, .. } => {
+                    panic!("unexpected error: {diagnostic}");
                 }
                 TokenDelta::Cancelled { .. } => panic!("unexpected cancel"),
             }
@@ -1283,8 +1289,8 @@ mod tests {
             .expect("terminal frame")
         {
             // The request carried a key, so the 401 is about that credential.
-            TokenDelta::Error { message, .. } => {
-                assert_eq!(message, "runtime/credential_rejected")
+            TokenDelta::Error { diagnostic, .. } => {
+                assert_eq!(diagnostic.to_string(), "runtime/credential_rejected")
             }
             other => panic!("expected HTTP error terminal frame, got {other:?}"),
         }
@@ -1339,8 +1345,8 @@ mod tests {
             assert!(rx.recv().await.is_none());
             let logs = render(&capture.finish());
             assert!(
-                matches!(&terminal, TokenDelta::Error { message, full_text }
-                    if message == expected && full_text.is_empty()),
+                matches!(&terminal, TokenDelta::Error { diagnostic, full_text }
+                    if diagnostic.to_string() == expected && full_text.is_empty()),
                 "{terminal:?}"
             );
             // The malformed chunk was logged, by diagnostic token only.
@@ -1439,8 +1445,10 @@ mod tests {
         assert!(
             matches!(&frames[..], [
                 TokenDelta::Delta { content, .. },
-                TokenDelta::Error { message, full_text },
-            ] if content == "partial" && message == "runtime/internal" && full_text == "partial"),
+                TokenDelta::Error { diagnostic, full_text },
+            ] if content == "partial"
+                && diagnostic.to_string() == "runtime/internal"
+                && full_text == "partial"),
             "{frames:?}"
         );
     }
@@ -1464,7 +1472,8 @@ mod tests {
             ));
             let terminal = rx.recv().await.expect("terminal frame");
             assert!(
-                matches!(&terminal, TokenDelta::Error { message, .. } if message == expected),
+                matches!(&terminal, TokenDelta::Error { diagnostic, .. }
+                    if diagnostic.to_string() == expected),
                 "key {api_key:?}: {terminal:?}"
             );
         }
@@ -1505,8 +1514,8 @@ mod tests {
         ));
         let terminal = rx.recv().await.expect("terminal frame");
         assert!(
-            matches!(&terminal, TokenDelta::Error { message, .. }
-                if message == "runtime/request_rejected"),
+            matches!(&terminal, TokenDelta::Error { diagnostic, .. }
+                if diagnostic.to_string() == "runtime/request_rejected"),
             "{terminal:?}"
         );
         probe.await.expect("connection probe task should finish");
@@ -1551,9 +1560,12 @@ mod tests {
                 .expect("blocked policy terminal frame should arrive")
                 .expect("terminal frame")
             {
-                TokenDelta::Error { message, full_text } => {
+                TokenDelta::Error {
+                    diagnostic,
+                    full_text,
+                } => {
                     assert!(full_text.is_empty());
-                    assert_eq!(message, "runtime/policy_blocked");
+                    assert_eq!(diagnostic.to_string(), "runtime/policy_blocked");
                 }
                 other => panic!("expected blocked policy Error frame, got {other:?}"),
             }
@@ -1670,7 +1682,9 @@ mod tests {
             stream_chat(provider, vec![], String::new(), StreamParams::default());
         let frame = rx.recv().await.expect("at least one terminal frame");
         match frame {
-            TokenDelta::Error { message, .. } => assert_eq!(message, "runtime/internal"),
+            TokenDelta::Error { diagnostic, .. } => {
+                assert_eq!(diagnostic.to_string(), "runtime/internal")
+            }
             other => panic!("expected Error for LocalLlama, got {other:?}"),
         }
         assert!(
@@ -1698,8 +1712,8 @@ mod tests {
         let (mut rx, _cancel) = stream_chat_with_request(request);
         let frame = rx.recv().await.expect("at least one terminal frame");
         match frame {
-            TokenDelta::Error { message, .. } => {
-                assert_eq!(message, "runtime/provider_unavailable");
+            TokenDelta::Error { diagnostic, .. } => {
+                assert_eq!(diagnostic.to_string(), "runtime/provider_unavailable");
             }
             other => panic!("expected Error for unloaded LocalLlama, got {other:?}"),
         }
@@ -1761,7 +1775,9 @@ mod tests {
                     done = Some((full_text, usage, finish_reason));
                     break;
                 }
-                TokenDelta::Error { message, .. } => panic!("unexpected local error: {message}"),
+                TokenDelta::Error { diagnostic, .. } => {
+                    panic!("unexpected local error: {diagnostic}")
+                }
                 TokenDelta::Cancelled { .. } => panic!("unexpected local cancel"),
             }
         }
@@ -1841,8 +1857,8 @@ mod tests {
                     break;
                 }
                 TokenDelta::Done { .. } => panic!("cancelled stream must not finish as done"),
-                TokenDelta::Error { message, .. } => {
-                    panic!("cancelled stream must not error: {message}")
+                TokenDelta::Error { diagnostic, .. } => {
+                    panic!("cancelled stream must not error: {diagnostic}")
                 }
             }
         }
@@ -1865,8 +1881,8 @@ mod tests {
                     break;
                 }
                 TokenDelta::Cancelled { .. } => panic!("second stream should complete"),
-                TokenDelta::Error { message, .. } => {
-                    panic!("second stream should not error: {message}")
+                TokenDelta::Error { diagnostic, .. } => {
+                    panic!("second stream should not error: {diagnostic}")
                 }
             }
         }
@@ -1883,8 +1899,11 @@ mod tests {
 
         let (mut rx, _cancel) = stream_chat_with_request(request);
         match rx.recv().await.expect("error frame") {
-            TokenDelta::Error { message, full_text } => {
-                assert_eq!(message, "runtime/invalid_response");
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
+                assert_eq!(diagnostic.to_string(), "runtime/invalid_response");
                 assert!(full_text.is_empty());
             }
             other => panic!("expected local Error frame, got {other:?}"),
@@ -1931,7 +1950,9 @@ mod tests {
         let request = mistralrs_request(StreamBackendHandles::empty());
         let (mut rx, _cancel) = stream_chat_with_request(request);
         match rx.recv().await.expect("at least one terminal frame") {
-            TokenDelta::Error { message, .. } => assert_eq!(message, "runtime/internal"),
+            TokenDelta::Error { diagnostic, .. } => {
+                assert_eq!(diagnostic.to_string(), "runtime/internal")
+            }
             other => panic!("expected Error for MistralRs, got {other:?}"),
         }
         assert!(
@@ -1953,8 +1974,8 @@ mod tests {
         });
         let (mut rx, _cancel) = stream_chat_with_request(request);
         match rx.recv().await.expect("at least one terminal frame") {
-            TokenDelta::Error { message, .. } => {
-                assert_eq!(message, "runtime/provider_unavailable")
+            TokenDelta::Error { diagnostic, .. } => {
+                assert_eq!(diagnostic.to_string(), "runtime/provider_unavailable")
             }
             other => panic!("expected Error for unloaded MistralRs, got {other:?}"),
         }
@@ -2128,8 +2149,11 @@ mod tests {
         drop(event_tx);
 
         match rx.recv().await.expect("error frame") {
-            TokenDelta::Error { message, full_text } => {
-                assert_eq!(message, "runtime/internal");
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
+                assert_eq!(diagnostic, engine_failure(Code::Internal));
                 assert_eq!(full_text, "so far");
             }
             other => panic!("expected Error terminal, got {other:?}"),
@@ -2179,8 +2203,8 @@ mod tests {
             }
             drain.await.unwrap();
             assert!(
-                matches!(frames.last(), Some(TokenDelta::Error { message, full_text })
-                    if message == "runtime/internal" && full_text == forwarded),
+                matches!(frames.last(), Some(TokenDelta::Error { diagnostic, full_text })
+                    if *diagnostic == engine_failure(Code::Internal) && full_text == forwarded),
                 "forwarded {forwarded:?}, engine reported {engine_reports_failure}: {frames:?}"
             );
             assert_eq!(
@@ -2365,9 +2389,12 @@ mod tests {
             .expect("blocked Bedrock terminal frame should arrive")
             .expect("terminal frame")
         {
-            TokenDelta::Error { message, full_text } => {
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
                 assert!(full_text.is_empty());
-                assert_eq!(message, "runtime/policy_blocked");
+                assert_eq!(diagnostic.to_string(), "runtime/policy_blocked");
             }
             other => panic!("expected blocked-egress Error frame, got {other:?}"),
         }
@@ -2416,8 +2443,11 @@ mod tests {
             "partial".to_string(),
             metadata.clone(),
         )) {
-            TokenDelta::Error { message, full_text } => {
-                assert_eq!(message, "runtime/provider_unavailable");
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
+                assert_eq!(diagnostic.to_string(), "runtime/provider_unavailable");
                 assert_eq!(full_text, "partial");
             }
             other => panic!("expected Error terminal mapping, got {other:?}"),
@@ -2722,7 +2752,7 @@ mod tests {
                     done_usage = usage;
                     break;
                 }
-                TokenDelta::Error { message, .. } => panic!("unexpected error: {message}"),
+                TokenDelta::Error { diagnostic, .. } => panic!("unexpected error: {diagnostic}"),
                 TokenDelta::Cancelled { .. } => panic!("unexpected cancel"),
             }
         }
@@ -2806,7 +2836,8 @@ mod tests {
             .expect("SSE error terminal frame should arrive")
             .expect("terminal frame")
         {
-            TokenDelta::Error { message, .. } => {
+            TokenDelta::Error { diagnostic, .. } => {
+                let message = diagnostic.to_string();
                 assert_eq!(message, "runtime/protocol_error");
                 for leaked in [
                     api_key,
@@ -2852,7 +2883,11 @@ mod tests {
             .expect("transport error terminal frame should arrive")
             .expect("terminal frame")
         {
-            TokenDelta::Error { message, full_text } => {
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
+                let message = diagnostic.to_string();
                 assert!(full_text.is_empty(), "transport error has no partial text");
                 assert_eq!(message, "runtime/network_unreachable");
                 for leaked in [api_key, "svc-user", "transport-query-secret-12345"] {
@@ -2928,7 +2963,8 @@ mod tests {
         {
             match frame {
                 TokenDelta::Delta { .. } => continue,
-                TokenDelta::Error { message, .. } => {
+                TokenDelta::Error { diagnostic, .. } => {
+                    let message = diagnostic.to_string();
                     assert_eq!(message, "runtime/invalid_response");
                     for leaked in [api_key, "svc-user", "readerr-query-secret-12345"] {
                         assert!(

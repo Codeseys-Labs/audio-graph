@@ -1930,7 +1930,7 @@ impl OpenRouterClient {
         &self,
         messages: &[crate::llm::engine::ChatMessage],
         graph_context: &str,
-    ) -> Result<(String, u32, WireOutcome), String> {
+    ) -> Result<(String, u32, WireOutcome), RuntimeDiagnostic> {
         let system_prompt = format!(
             "You are a knowledge graph assistant analyzing a live audio conversation. \
              Here is the current knowledge graph context:\n\n{}\n\n\
@@ -1943,11 +1943,8 @@ impl OpenRouterClient {
             api_messages.push((msg.role.clone(), msg.content.clone()));
         }
 
-        self.chat_completion_with_wire_outcome(
-            api_messages,
-            &RequestOutputForm::Unconstrained,
-            None,
-        )
+        self.chat_completion_diagnostic(api_messages, &RequestOutputForm::Unconstrained, None)
+            .map_err(|failure| failure.diagnostic)
     }
 }
 

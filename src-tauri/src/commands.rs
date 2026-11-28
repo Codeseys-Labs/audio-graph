@@ -3896,7 +3896,11 @@ fn spawn_stream_task(
                     registry.finish(&request_id_for_task);
                     break;
                 }
-                TokenDelta::Error { message, full_text } => {
+                TokenDelta::Error {
+                    diagnostic,
+                    full_text,
+                } => {
+                    let message = diagnostic.to_string();
                     log::warn!("Streaming chat error: {}", message);
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
@@ -4146,9 +4150,10 @@ pub async fn send_chat_message(
                     break;
                 }
                 TokenDelta::Error {
-                    message,
+                    diagnostic,
                     full_text: partial,
                 } => {
+                    let message = diagnostic.to_string();
                     log::warn!("send_chat_message streaming error: {}", message);
                     let fallback = if partial.is_empty() {
                         format!(
@@ -6199,7 +6204,11 @@ fn spawn_card_answer_stream_task(
                     );
                     return;
                 }
-                TokenDelta::Error { message, full_text } => {
+                TokenDelta::Error {
+                    diagnostic,
+                    full_text,
+                } => {
+                    let message = diagnostic.to_string();
                     // Fix-round finding (scope-honesty review, minor,
                     // declined as a functional change): `message` here is
                     // already `crate::error::redacted_error_excerpt`'d at
