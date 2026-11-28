@@ -1360,45 +1360,60 @@ pub(in crate::persistence) fn capture_committed(
             .map_err(|_| CanonicalReaderError::TranscriptAttemptUnreadable)
     };
     validate_stream_context(session, STREAM, 1)?;
-    let before = pending()?;
     use super::super::canonical_durability::{
-        transcript_coordination_path, wait_for_transcript_lock,
+        transcript_coordination_path, try_shared_transcript_lock, wait_for_transcript_lock,
     };
     let lock_path = transcript_coordination_path(path);
-    let acquire = || wait_for_transcript_lock(&lock_path, true, false);
-    // The first attempt can create a source and later restore absence. A
-    // before/after check of the intent alone cannot distinguish that ABA.
-    // Hold the existing namespace lock for an ordinary published snapshot.
-    let guard = if before.is_none() {
-        match acquire() {
-            Ok(guard) => Some(guard),
-            Err(CanonicalCoordinationError::Missing) => None,
-            Err(_) => return Err(CanonicalReaderError::TranscriptAttemptUnreadable),
+    let copy_source = || {
+        let bytes = fs::read(path);
+        #[cfg(test)]
+        if let Some(hook) = AFTER_SOURCE_READ.take() {
+            hook();
         }
-    } else {
-        None
+        bytes
     };
-    let started_without_lock = before.is_none() && guard.is_none();
-    let mut bytes = fs::read(path);
-    #[cfg(test)]
-    if let Some(hook) = AFTER_SOURCE_READ.take() {
-        hook();
-    }
-    let mut intent = before.or(pending()?);
-    if started_without_lock {
-        // A first writer may have created the stable lock, published a frame,
-        // and retired its descriptor during our unlocked read. Discard those
-        // bytes and take one coordinated snapshot in that case.
-        match acquire() {
-            Ok(_new_guard) => {
-                bytes = fs::read(path);
-                intent = pending()?;
+    let coordinated = |guard: File| {
+        let bytes = copy_source();
+        let intent = pending()?;
+        drop(guard);
+        Ok::<_, CanonicalReaderError>((bytes, intent))
+    };
+    let wait_and_copy = || {
+        let guard = wait_for_transcript_lock(&lock_path, true, false)
+            .map_err(|_| CanonicalReaderError::TranscriptAttemptUnreadable)?;
+        coordinated(guard)
+    };
+    let (bytes, intent) = match try_shared_transcript_lock(&lock_path) {
+        Ok(guard) => coordinated(guard)?,
+        Err(CanonicalCoordinationError::Contended) => {
+            // A stopped writer can still own the lock. Its published intent
+            // identifies the immutable prefix while that same attempt remains
+            // visible on both sides of the copy. A concurrent rename/unlink can
+            // also make the descriptor temporarily unreadable on Windows.
+            let observed = pending().ok().flatten().and_then(|before| {
+                let bytes = copy_source();
+                let after = pending().ok().flatten()?;
+                (before.attempt == after.attempt).then_some((bytes, Some(before)))
+            });
+            match observed {
+                Some(snapshot) => snapshot,
+                None => wait_and_copy()?,
             }
-            Err(CanonicalCoordinationError::Missing) => {}
-            Err(_) => return Err(CanonicalReaderError::TranscriptAttemptUnreadable),
         }
-    }
-    drop(guard);
+        Err(CanonicalCoordinationError::Missing) => {
+            let bytes = copy_source();
+            let intent = pending();
+            // The first writer can create the stable lock and publish or retire
+            // any number of attempts during an unlocked legacy read.
+            match try_shared_transcript_lock(&lock_path) {
+                Err(CanonicalCoordinationError::Missing) => (bytes, intent?),
+                Ok(guard) => coordinated(guard)?,
+                Err(CanonicalCoordinationError::Contended) => wait_and_copy()?,
+                Err(_) => return Err(CanonicalReaderError::TranscriptAttemptUnreadable),
+            }
+        }
+        Err(_) => return Err(CanonicalReaderError::TranscriptAttemptUnreadable),
+    };
     if let Some(intent) = &intent
         && intent.source_was_absent
     {

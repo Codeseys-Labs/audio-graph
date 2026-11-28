@@ -3572,6 +3572,10 @@ pub(super) fn observe_next_transcript_lock_wait(sender: std::sync::mpsc::Sender<
     TRANSCRIPT_WAITER.replace(Some(sender));
 }
 
+pub(super) fn try_shared_transcript_lock(path: &Path) -> Result<File, CanonicalCoordinationError> {
+    open_transcript_lock(path, true, false, false)
+}
+
 pub(super) fn wait_for_transcript_lock(
     path: &Path,
     shared: bool,
