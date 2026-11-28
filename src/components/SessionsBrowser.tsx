@@ -63,14 +63,15 @@ import ChatSidebar from "./ChatSidebar";
 import Icon, { type IconName } from "./Icon";
 import IconButton from "./IconButton";
 import LiveTranscript from "./LiveTranscript";
-import NotesPanel, {
-  type NotesSynthesisController,
-  useNotesSynthesis,
-} from "./NotesPanel";
+import NotesPanel from "./NotesPanel";
 import Popover, { PopoverItem } from "./Popover";
 import ReviewLensGate from "./ReviewLensGate";
 import SeekTimeline from "./SeekTimeline";
 import SessionDataRoutePanel from "./SessionDataRoutePanel";
+import {
+  type NotesSynthesisController,
+  useNotesSynthesis,
+} from "./useNotesSynthesis";
 
 // Same code-split rationale as the old App.tsx-owned import (ADR-0016 /
 // modernization-audit 2.3): react-force-graph-2d stays a deferred chunk.
@@ -981,7 +982,10 @@ function SessionDetail({
         >
           {lens !== "route" &&
             (reviewLensId !== null ? (
-              <SessionViewProvider reviewSessionId={reviewLensId}>
+              <SessionViewProvider
+                reviewSessionId={reviewLensId}
+                reviewLens={lens === "transcript" ? null : lens}
+              >
                 <LensBody lens={lens} reviewed />
               </SessionViewProvider>
             ) : (

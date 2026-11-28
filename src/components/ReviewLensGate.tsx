@@ -3,22 +3,28 @@
  * lens (Notes, Graph, Timeline) that renders a reviewed session from Review
  * data instead of the global store (issue #140, slice 2).
  *
- * Mounting it IS the lens activation: it starts the lens's artifact query
- * (`useReviewArtifact`), and re-queries on window focus. It renders `children`
- * only once both the session snapshot and the lens artifact have loaded; the
- * children then read the data through `useSessionView()` / `useTimelineView()`.
+ * It fetches nothing: the provider (`SessionViewProvider` via
+ * `useReviewTranscript`) owns every Review query, reading the session snapshot
+ * and the open lens's artifact in ONE round and publishing them together, so
+ * the children never see an artifact next to a snapshot from a different read.
+ * The gate renders `children` only once that pair has been published; they then
+ * read the data through `useSessionView()` / `useTimelineView()`.
  *
  * States, all localized, none showing backend text:
- *   - loading: the first query is in flight.
+ *   - loading: the first round is in flight.
  *   - unavailable: a first load failed (missing, unreadable or corrupt), with a
  *     retry. Backend message text is never stored, so it cannot be rendered.
  *   - refused: the typed byte-ceiling refusal (`ArtifactRefusalNotice`).
- *   - stale: a re-query failed; the last good data stays visible under a notice
- *     with a retry.
+ *   - stale: a round failed in either half; the last good pair stays visible
+ *     under a notice with a retry.
+ *
+ * Keyboard focus: a retry control disappears as soon as loading starts (or the
+ * stale notice, on recovery), so focus is parked on the lens region instead of
+ * being dropped to the document body.
  *
  * Must be rendered under a `SessionViewProvider` with a `reviewSessionId`.
  */
-import type { ReactNode } from "react";
+import { type ReactNode, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { ArtifactKind } from "../session/reviewStore";
 import {
@@ -40,22 +46,51 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
   const review = useReviewView();
   const artifact = useReviewArtifact(kind, reviewSessionId);
 
+  // Keyboard focus: activating "Try again" removes the focused button (the
+  // first-load retry as soon as loading starts, the stale retry once recovery
+  // succeeds). Park focus on the lens region instead of dropping it to <body>.
+  const regionRef = useRef<HTMLDivElement>(null);
+  const focusAfterRetry = useRef(false);
+  useEffect(() => {
+    if (!focusAfterRetry.current) return;
+    const region = regionRef.current;
+    if (region === null || region.querySelector("[data-review-retry]")) return;
+    focusAfterRetry.current = false;
+    region.focus();
+  });
+  const markRetry = () => {
+    focusAfterRetry.current = true;
+  };
+
   if (review === null || artifact === null) return <>{children}</>;
 
+  const frame = (content: ReactNode) => (
+    <section
+      ref={regionRef}
+      tabIndex={-1}
+      aria-label={t(`sessions.lens.${kind}`)}
+      className="flex min-h-0 flex-1 flex-col outline-none"
+      data-testid="review-lens-region"
+    >
+      {content}
+    </section>
+  );
+
   if (artifact.status === "refused" && artifact.refusal) {
-    return (
+    return frame(
       <ArtifactRefusalNotice
         status={{ type: "refused", ...artifact.refusal }}
-      />
+      />,
     );
   }
 
   if (review.status === "error" || artifact.status === "error") {
     const retry = () => {
-      if (review.status === "error") review.retry();
-      if (artifact.status === "error") artifact.retry();
+      markRetry();
+      // One round re-queries the snapshot and this lens together.
+      review.retry();
     };
-    return (
+    return frame(
       <section
         className="flex h-full flex-col items-center justify-center gap-(--space-3) p-(--space-6) text-center"
         data-testid="review-lens-unavailable"
@@ -66,10 +101,15 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
         >
           {t("sessions.review.viewUnavailable")}
         </p>
-        <button type="button" className="ag-btn-micro" onClick={retry}>
+        <button
+          type="button"
+          className="ag-btn-micro"
+          data-review-retry
+          onClick={retry}
+        >
           <Icon name="refresh" size={14} /> {t("sessions.review.retry")}
         </button>
-      </section>
+      </section>,
     );
   }
 
@@ -78,17 +118,17 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
     artifact.status === "idle" ||
     artifact.status === "loading";
   if (loading) {
-    return (
+    return frame(
       <div className="flex flex-1 min-w-0 items-center justify-center p-(--space-6)">
         <p className="m-0 text-sm italic text-text-muted" role="status">
           {t("common.loading")}
         </p>
-      </div>
+      </div>,
     );
   }
 
   const stale = review.stale || artifact.stale;
-  return (
+  return frame(
     <>
       {stale && (
         <div
@@ -100,9 +140,10 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
           <button
             type="button"
             className="ag-btn-micro"
+            data-review-retry
             onClick={() => {
-              if (review.stale) review.retry();
-              if (artifact.stale) artifact.retry();
+              markRetry();
+              review.retry();
             }}
           >
             <Icon name="refresh" size={14} /> {t("sessions.review.retry")}
@@ -110,7 +151,7 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
         </div>
       )}
       {children}
-    </>
+    </>,
   );
 }
 

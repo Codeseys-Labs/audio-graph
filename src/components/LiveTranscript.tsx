@@ -100,6 +100,26 @@ function LiveTranscript() {
   const { transcriptSeekTarget } = useSessionInteractions();
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Keyboard focus: activating a Review "Try again" removes the focused button
+  // (the first-load retry as soon as loading starts, the stale retry once
+  // recovery succeeds). Park focus on the transcript region instead of <body>.
+  const focusAfterRetry = useRef(false);
+  const retryReview = useCallback(() => {
+    focusAfterRetry.current = true;
+    review?.retry();
+  }, [review]);
+  useEffect(() => {
+    if (!focusAfterRetry.current) return;
+    const region = scrollRef.current;
+    if (
+      region === null ||
+      region.parentElement?.querySelector("[data-review-retry]")
+    ) {
+      return;
+    }
+    focusAfterRetry.current = false;
+    region.focus();
+  });
   const wasNearBottomRef = useRef(true);
 
   const [isExporting, setIsExporting] = useState(false);
@@ -337,7 +357,8 @@ function LiveTranscript() {
           <button
             type="button"
             className="ag-btn-micro"
-            onClick={review.retry}
+            data-review-retry
+            onClick={retryReview}
             disabled={review.refreshing}
           >
             <Icon name="refresh" size={14} /> {t("sessions.review.retry")}
@@ -356,6 +377,7 @@ function LiveTranscript() {
       <div
         className="flex-1 overflow-y-auto min-h-0 flex flex-col gap-px [scrollbar-width:thin] [scrollbar-color:var(--hover-overlay-strong)_transparent]"
         ref={scrollRef}
+        tabIndex={-1}
         onScroll={handleScroll}
         role="log"
         aria-live="polite"
@@ -385,7 +407,8 @@ function LiveTranscript() {
                   <button
                     type="button"
                     className="ag-btn-micro mt-(--space-3)"
-                    onClick={review.retry}
+                    data-review-retry
+                    onClick={retryReview}
                   >
                     <Icon name="refresh" size={14} />{" "}
                     {t("sessions.review.retry")}

@@ -836,6 +836,7 @@
       "needsLoad": "This view needs the session loaded first.",
       "loadSession": "Load session",
       "staleView": "This view may be out of date: the latest refresh failed. Showing the last copy that loaded.",
+      "emptyNotes": "This session has no notes.",
       "viewUnavailable": "This session could not be loaded.",
       "emptyTranscript": "This session has no transcript."
     },
@@ -874,7 +875,11 @@
       "classLabel": {
         "materialized_graph": "knowledge graph",
         "materialized_notes": "notes",
-        "projection_events": "projection log"
+        "projection_events": "projection log",
+        "transcript_events": "transcript",
+        "diarization_events": "speaker log",
+        "live_graph": "live graph",
+        "other": "data"
       }
     },
     "lensFetchError": {

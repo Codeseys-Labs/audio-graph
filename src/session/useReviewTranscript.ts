@@ -4,15 +4,18 @@
  * Opens the given session on mount / id change, re-queries on window focus and
  * when the tab becomes visible again (Review is refreshable, not immutable —
  * see `reviewStore.ts`), and releases the selection on unmount so a late
- * response cannot land after the surface is gone.
+ * response cannot land after the surface is gone. `lens` names the artifact
+ * lens that is open (Notes, Graph, Timeline), whose data is read in the same
+ * round as the snapshot; `null` is the Transcript lens.
  *
  * Passing `null` means "no Review selection": the hook is inert, which lets
  * callers invoke it unconditionally (rules of hooks) and fall back to Live.
  *
  * It only ever reads `reviewStore`; nothing here touches the Live store.
  */
-import { useCallback, useLayoutEffect, useMemo } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef } from "react";
 import {
+  type ArtifactKind,
   type ReviewErrorCode,
   type ReviewSnapshot,
   type ReviewStatus,
@@ -36,8 +39,10 @@ export interface ReviewTranscriptView {
 
 export function useReviewTranscript(
   sessionId: string | null,
+  lens: ArtifactKind | null = null,
 ): ReviewTranscriptView | null {
   const select = useReviewStore((s) => s.select);
+  const activateLens = useReviewStore((s) => s.activateLens);
   const refresh = useReviewStore((s) => s.refresh);
   const close = useReviewStore((s) => s.close);
   const storeSessionId = useReviewStore((s) => s.sessionId);
@@ -47,12 +52,20 @@ export function useReviewTranscript(
   const stale = useReviewStore((s) => s.stale);
   const error = useReviewStore((s) => s.error);
 
-  // A layout effect, not a passive one: lens components below call
-  // `useReviewArtifact` in their own passive effects, and those must see the
-  // selection this effect makes (children's effects otherwise run first).
+  // The lens whose artifact the selection's first round fetches, and the lens
+  // the store was last told about (so mounting does not start a second round).
+  const lensRef = useRef(lens);
+  lensRef.current = lens;
+  const appliedLens = useRef<ArtifactKind | null>(lens);
+
+  // The ONE owner of Review fetching and refreshing: open the session (its
+  // snapshot and the active lens's artifact in a single round), then re-query
+  // on window focus and tab visibility. The store coalesces overlapping
+  // requests, so none of these can pile up IPC calls.
   useLayoutEffect(() => {
     if (sessionId === null) return;
-    void select(sessionId);
+    appliedLens.current = lensRef.current;
+    void select(sessionId, lensRef.current);
     const onFocus = () => void refresh();
     const onVisibility = () => {
       if (document.visibilityState === "visible") void refresh();
@@ -65,6 +78,13 @@ export function useReviewTranscript(
       close();
     };
   }, [sessionId, select, refresh, close]);
+
+  // A different lens activated within the same selection.
+  useLayoutEffect(() => {
+    if (sessionId === null || appliedLens.current === lens) return;
+    appliedLens.current = lens;
+    void activateLens(lens);
+  }, [sessionId, lens, activateLens]);
 
   const retry = useCallback(() => void refresh(), [refresh]);
 

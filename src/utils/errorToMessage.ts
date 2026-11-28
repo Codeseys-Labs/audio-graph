@@ -36,11 +36,48 @@ export function artifactTooLargeDetails(
   e: unknown,
 ): { artifactClass: string; sizeBytes: number; ceilingBytes: number } | null {
   if (!isAppErrorPayload(e) || e.code !== "artifact_too_large") return null;
+  // Validate at the boundary: this runs inside `catch` handlers, so it must
+  // never throw, and a malformed refusal (no message, a class outside the
+  // closed set, a number that is not finite and non-negative) is not a typed
+  // refusal at all: the caller falls back to its closed error state.
+  const message: unknown = e.message;
+  if (typeof message !== "object" || message === null) return null;
+  const { artifact_class, size_bytes, ceiling_bytes } = message as Record<
+    string,
+    unknown
+  >;
+  if (
+    typeof artifact_class !== "string" ||
+    !(ARTIFACT_REFUSAL_CLASSES as readonly string[]).includes(artifact_class)
+  ) {
+    return null;
+  }
+  if (!isByteCount(size_bytes) || !isByteCount(ceiling_bytes)) return null;
   return {
-    artifactClass: e.message.artifact_class,
-    sizeBytes: e.message.size_bytes,
-    ceilingBytes: e.message.ceiling_bytes,
+    artifactClass: artifact_class,
+    sizeBytes: size_bytes,
+    ceilingBytes: ceiling_bytes,
   };
+}
+
+/**
+ * The closed set of artifact classes the backend's byte ceilings name for the
+ * session lenses (`enforce_artifact_ceiling` call sites in `commands.rs`):
+ * Notes (`materialized_notes`, `projection_events`), Graph
+ * (`materialized_graph`) and Timeline (`transcript_events`,
+ * `diarization_events`, `live_graph`). Each has a label in both locales.
+ */
+export const ARTIFACT_REFUSAL_CLASSES = [
+  "materialized_graph",
+  "materialized_notes",
+  "projection_events",
+  "transcript_events",
+  "diarization_events",
+  "live_graph",
+] as const;
+
+function isByteCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 /**

@@ -98,7 +98,7 @@ function SeekTimeline() {
     transcriptEvents: sessionTranscriptEvents,
     speakers,
   } = useTimelineView();
-  const { seekTranscriptToSegment, focusGraphEdges } = useSessionInteractions();
+  const { seekToSpan, focusGraphEdges } = useSessionInteractions();
 
   // Bridge the timeline's ASR `span_id` to the segment id the transcript list
   // renders (`transcript_segment_id` when present, else `span_id`).
@@ -161,10 +161,11 @@ function SeekTimeline() {
 
   const handleSeek = useCallback(
     (entry: TimelineEntry) => {
-      const segmentId = segmentIdBySpan.get(entry.span_id) ?? entry.span_id;
-      seekTranscriptToSegment(segmentId);
+      // A span the transcript events do not know: Live seeks to the raw span
+      // id (its transcript list uses it); Review refreshes its snapshot first.
+      seekToSpan(entry.span_id, segmentIdBySpan.get(entry.span_id) ?? null);
     },
-    [segmentIdBySpan, seekTranscriptToSegment],
+    [segmentIdBySpan, seekToSpan],
   );
 
   // Badge activation → focus the utterance's related edges in the graph. This

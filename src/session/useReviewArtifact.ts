@@ -1,19 +1,13 @@
 /**
- * `useReviewArtifact` — fetches one heavy lens artifact (Notes, Graph or
- * Timeline) for the Review selection, only while the lens that needs it is
- * mounted.
+ * `useReviewArtifact` — a read-only view of one heavy lens artifact (Notes,
+ * Graph or Timeline) for the Review selection.
  *
- * Mounting is the activation: the effect queries once on mount and again on
- * window focus / tab visibility (Review is refreshable, see `reviewStore.ts`).
- * The last good data stays on screen while it re-queries and after a failed
- * re-query, which marks it `stale`.
- *
- * Must run under a `SessionViewProvider` that has a `reviewSessionId`; the
- * provider's `useReviewTranscript` selects the session in a layout effect, so
- * the selection exists by the time this passive effect runs. Outside a Review
- * subtree it is inert and returns `null`.
+ * It fetches nothing: the provider's `useReviewTranscript` owns every query, so
+ * the artifact is always read in the same round as the snapshot (see
+ * `reviewStore.ts`). `retry` re-runs that round. Outside a Review subtree it is
+ * inert and returns `null`.
  */
-import { useCallback, useEffect } from "react";
+import { useCallback } from "react";
 import {
   type ArtifactKind,
   type ReviewArtifacts,
@@ -25,7 +19,7 @@ export interface ReviewArtifactView<K extends ArtifactKind> {
   data: ReviewArtifacts[K]["data"];
   stale: boolean;
   refusal: ReviewArtifacts[K]["refusal"];
-  /** Re-run the query (retry after an error, or manual refresh). */
+  /** Re-run the round (retry after an error, or manual refresh). */
   retry: () => void;
 }
 
@@ -33,29 +27,10 @@ export function useReviewArtifact<K extends ArtifactKind>(
   kind: K,
   reviewSessionId: string | null,
 ): ReviewArtifactView<K> | null {
-  const loadArtifact = useReviewStore((s) => s.loadArtifact);
+  const refresh = useReviewStore((s) => s.refresh);
   const slot = useReviewStore((s) => s.artifacts[kind]) as ReviewArtifacts[K];
   const selected = useReviewStore((s) => s.sessionId);
-
-  useEffect(() => {
-    if (reviewSessionId === null) return;
-    void loadArtifact(kind);
-    const onFocus = () => void loadArtifact(kind);
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") void loadArtifact(kind);
-    };
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      window.removeEventListener("focus", onFocus);
-      document.removeEventListener("visibilitychange", onVisibility);
-    };
-  }, [kind, reviewSessionId, loadArtifact]);
-
-  const retry = useCallback(
-    () => void loadArtifact(kind),
-    [kind, loadArtifact],
-  );
+  const retry = useCallback(() => void refresh(), [refresh]);
 
   if (reviewSessionId === null) return null;
   // Until the provider's selection lands the slot belongs to nothing: loading.

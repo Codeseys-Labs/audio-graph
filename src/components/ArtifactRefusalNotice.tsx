@@ -33,9 +33,12 @@ function formatMb(bytes: number): string {
 export function ArtifactRefusalNotice({ status }: ArtifactRefusalNoticeProps) {
   const { t } = useTranslation();
 
+  // The class is validated against a closed set at the boundary
+  // (`artifactTooLargeDetails`); a generic label, never the raw class name,
+  // covers anything that still reaches here.
   const artifactLabel = t(
     `sessions.artifactRefusal.classLabel.${status.artifactClass}`,
-    { defaultValue: status.artifactClass },
+    { defaultValue: t("sessions.artifactRefusal.classLabel.other") },
   );
 
   return (

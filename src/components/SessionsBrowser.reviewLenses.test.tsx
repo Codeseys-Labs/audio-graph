@@ -11,7 +11,7 @@ import { Profiler } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "../i18n";
 import { useReviewStore } from "../session/reviewStore";
-import { deferred, segment } from "../session/reviewTestUtils";
+import { type Deferred, deferred, segment } from "../session/reviewTestUtils";
 import { useAudioGraphStore } from "../store";
 import type {
   GraphNode,
@@ -22,24 +22,37 @@ import type {
   SessionNotesArtifacts,
   SessionTimelineFold,
 } from "../types";
+import { downloadAsFile } from "../utils/download";
 import SessionsBrowser from "./SessionsBrowser";
 
 // react-force-graph-2d draws to a canvas jsdom cannot drive.
+const forceGraphProps: { current: Record<string, unknown> | null } = {
+  current: null,
+};
 vi.mock("react-force-graph-2d", async () => {
   const React = await vi.importActual<typeof import("react")>("react");
   return {
-    default: React.forwardRef((_props: unknown, ref: React.Ref<unknown>) => {
-      React.useImperativeHandle(ref, () => ({
-        zoomToFit: () => {},
-        d3ReheatSimulation: () => {},
-        d3Force: () => ({ strength: () => {}, distance: () => {} }),
-      }));
-      return React.createElement("div", { "data-testid": "force-graph" });
-    }),
+    default: React.forwardRef(
+      (props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+        forceGraphProps.current = props;
+        React.useImperativeHandle(ref, () => ({
+          zoomToFit: () => {},
+          d3ReheatSimulation: () => {},
+          d3Force: () => ({ strength: () => {}, distance: () => {} }),
+        }));
+        return React.createElement("div", { "data-testid": "force-graph" });
+      },
+    ),
   };
 });
 
+vi.mock("../utils/download", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  downloadAsFile: vi.fn(),
+}));
+
 const mockedInvoke = vi.mocked(invoke);
+const mockedDownload = vi.mocked(downloadAsFile);
 
 /**
  * Slice 2 of #140: while capture runs, a completed session's Notes, Timeline
@@ -76,10 +89,17 @@ function metadata(id: string, title: string): SessionMetadata {
 const SESSION_A = metadata("session-a", "Session A");
 const SESSION_B = metadata("session-b", "Session B");
 
-const NODES: Record<string, number> = { "session-a": 2, "session-b": 3 };
+// The two graph representations deliberately differ in size, so a count
+// assertion tells which one a lens shows: `load_session`'s live-lane snapshot
+// (LEGACY_NODES) or the richer materialized artifact the Graph lens prefers.
+const LEGACY_NODES: Record<string, number> = { "session-a": 2, "session-b": 3 };
+const MATERIALIZED_NODES: Record<string, number> = {
+  "session-a": 4,
+  "session-b": 5,
+};
 
 function graphSnapshot(id: string): GraphSnapshot {
-  const count = NODES[id] ?? 1;
+  const count = LEGACY_NODES[id] ?? 1;
   const nodes: GraphNode[] = Array.from({ length: count }, (_, i) => ({
     id: `${id}-n${i}`,
     name: `${id} node ${i}`,
@@ -156,7 +176,7 @@ function graphArtifactPayload(id: string): MaterializedGraph {
     schema_version: 1,
     session_id: id,
     last_sequence: 3,
-    nodes: Array.from({ length: NODES[id] ?? 1 }, (_, i) => ({
+    nodes: Array.from({ length: MATERIALIZED_NODES[id] ?? 1 }, (_, i) => ({
       id: `${id}-m${i}`,
       name: `${id} materialized ${i}`,
       entity_type: "Topic",
@@ -167,7 +187,19 @@ function graphArtifactPayload(id: string): MaterializedGraph {
       basis: null,
       provenance: null,
     })),
-    edges: [],
+    edges: ["edge-1", "edge-2"].map((edgeId, i) => ({
+      id: edgeId,
+      source: `${id}-m${i}`,
+      target: `${id}-m${i + 1}`,
+      relation_type: "relates_to",
+      weight: 1,
+      confidence: 1,
+      valid_from_ms: 0,
+      updated_by_sequence: 1,
+      updated_at_ms: 1,
+      basis: null,
+      provenance: null,
+    })),
   };
 }
 
@@ -242,6 +274,7 @@ const CONTENT_FIELDS = [
   "graphEdgeFocus",
   "asrPartial",
   "liveAssistCards",
+  "samplePreviewActive",
 ] as const;
 
 function liveContent(): Record<string, unknown> {
@@ -277,7 +310,7 @@ async function expectLensShows(lens: Lens, id: string): Promise<void> {
     );
   } else {
     expect(
-      await within(pane).findByText(`Nodes: ${NODES[id] ?? 1}`),
+      await within(pane).findByText(`Nodes: ${MATERIALIZED_NODES[id] ?? 1}`),
     ).toBeInTheDocument();
   }
 }
@@ -368,7 +401,7 @@ describe("SessionsBrowser: Notes, Timeline and Graph from Review while capture r
     it("shows only the latest selection when replies arrive out of order (A, B, A)", async () => {
       const pending: Array<{
         id: string;
-        reply: ReturnType<typeof deferred<unknown>>;
+        reply: Deferred<unknown>;
       }> = [];
       mockBackend((cmd, id) => {
         if (cmd !== COMMAND[lens]) return defaultRespond(cmd, id);
@@ -410,7 +443,9 @@ describe("SessionsBrowser: Notes, Timeline and Graph from Review while capture r
       expect(
         within(pane).queryByText("Note of stale A"),
       ).not.toBeInTheDocument();
-      expect(within(pane).queryByText("Nodes: 3")).not.toBeInTheDocument();
+      expect(within(pane).queryByText("Nodes: 5")).not.toBeInTheDocument();
+      // Nor the live-lane snapshot's count.
+      expect(within(pane).queryByText("Nodes: 2")).not.toBeInTheDocument();
       expect(
         screen
           .queryAllByTestId("seek-timeline-block")
@@ -493,7 +528,7 @@ describe("SessionsBrowser: Notes, Timeline and Graph from Review while capture r
         throw {
           code: "artifact_too_large",
           message: {
-            artifact_class: "notes",
+            artifact_class: "materialized_notes",
             size_bytes: 80 * 1024 * 1024,
             ceiling_bytes: 64 * 1024 * 1024,
           },
@@ -564,10 +599,378 @@ describe("SessionsBrowser: Notes, Timeline and Graph from Review while capture r
       // Opening the Transcript lens consumes Review's target.
       await openLens("transcript");
       await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
+
+      // Opening the Graph lens shows the reviewed graph with the focused edge
+      // emphasised: the focused edge keeps its colour and gets thicker, the
+      // other edge is dimmed.
+      await openLens("graph");
+      await expectLensShows("graph", "session-a");
+      type EdgeStyle = (link: unknown) => string | number;
+      const style = (name: "linkColor" | "linkWidth"): EdgeStyle => {
+        const fn = forceGraphProps.current?.[name];
+        if (typeof fn !== "function") throw new Error(`${name} not set`);
+        return fn as EdgeStyle;
+      };
+      const focused = { id: "edge-1", color: "#123456", weight: 1 };
+      const other = { id: "edge-2", color: "#123456", weight: 1 };
+      await waitFor(() => expect(style("linkColor")(focused)).toBe("#123456"));
+      expect(style("linkColor")(other)).toBe("#12345615");
+      expect(Number(style("linkWidth")(focused))).toBeGreaterThan(
+        Number(style("linkWidth")(other)),
+      );
+
+      // Its export is the reviewed session's own graph, built locally: the
+      // backend's `export_graph` dumps the LIVE session's.
+      mockedInvoke.mockClear();
+      mockedDownload.mockClear();
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("button", {
+            name: /export knowledge graph as json/i,
+          }),
+        );
+      });
+      await waitFor(() => expect(mockedDownload).toHaveBeenCalledTimes(1));
+      const [json, filename] = mockedDownload.mock.calls[0];
+      expect(filename).toMatch(/^graph-session-a-/);
+      const exported = JSON.parse(json);
+      expect(exported.session_id).toBe("session-a");
+      expect(exported.materialized_graph.nodes).toHaveLength(4);
+      expect(exported.snapshot.stats.total_nodes).toBe(4);
+      expect(JSON.stringify(exported)).not.toContain("session-b");
+      expect(mockedInvoke).not.toHaveBeenCalledWith("export_graph");
+      expect(mockedInvoke).not.toHaveBeenCalledWith("get_session_id");
     } finally {
       useReviewStore.setState({ transcriptSeekTarget: null });
       HTMLElement.prototype.scrollIntoView = original;
     }
+  });
+
+  describe("one consistent read per round", () => {
+    function transcriptEvent(spanId: string, segmentId: string) {
+      return {
+        span_id: spanId,
+        provider: "deepgram",
+        source_id: "system-default",
+        transcript_segment_id: segmentId,
+        text: "t",
+        start_time: 0,
+        end_time: 1,
+        confidence: 1,
+        is_final: true,
+        stability: "final",
+        revision_number: 1,
+        end_of_turn: true,
+        received_at_ms: 1,
+      };
+    }
+
+    function snapshotWith(id: string, spans: string[]) {
+      return {
+        ...loadSessionPayload(id),
+        transcript_events: spans.map((span) =>
+          transcriptEvent(span, span.replace("span", "seg")),
+        ),
+      };
+    }
+
+    function foldOf(spans: string[]): SessionTimelineFold {
+      return {
+        entries: spans.map((span, i) => ({
+          span_id: span,
+          start_ms: i * 1000,
+          end_ms: i * 1000 + 900,
+          received_at_ms: 1,
+          speaker_id: null,
+          speaker_label: null,
+          text: `said ${span}`,
+          related_edge_ids: [],
+        })),
+        total_count: spans.length,
+      };
+    }
+
+    function blockSpans(): Array<string | null> {
+      return screen
+        .queryAllByTestId("seek-timeline-block")
+        .map((el) => el.getAttribute("data-span-id"));
+    }
+
+    it("renders neither half of a transcript-then-timeline activation alone, then seeks a new span's block to its own segment", async () => {
+      const snapshotTwo = deferred<unknown>();
+      const timelineTwo = deferred<unknown>();
+      let loads = 0;
+      mockBackend((cmd, id) => {
+        if (cmd === "load_session") {
+          loads += 1;
+          return loads === 1
+            ? snapshotWith(id, ["span-1"])
+            : snapshotTwo.promise;
+        }
+        if (cmd === COMMAND.timeline) return timelineTwo.promise;
+        return defaultRespond(cmd, id);
+      });
+      render(<SessionsBrowser />);
+      await selectRow("session-a");
+      await screen.findByText("transcript of session-a"); // snapshot one
+
+      // Finalization persisted another span; Timeline activates. The round
+      // re-reads the snapshot AND the fold together.
+      const pane = await openLens("timeline");
+      await waitFor(() => expect(loads).toBe(2));
+
+      // The fold (with the new span) arrives first: it must not render next
+      // to the older snapshot.
+      await act(async () => {
+        timelineTwo.resolve(foldOf(["span-1", "span-2"]));
+      });
+      expect(blockSpans()).toEqual([]);
+      expect(within(pane).getByRole("status")).toHaveTextContent(/loading/i);
+
+      // Both halves land together.
+      await act(async () => {
+        snapshotTwo.resolve(snapshotWith("session-a", ["span-1", "span-2"]));
+      });
+      await waitFor(() => expect(blockSpans()).toEqual(["span-1", "span-2"]));
+
+      fireEvent.click(
+        screen
+          .getAllByTestId("seek-timeline-block")
+          .find(
+            (el) => el.getAttribute("data-span-id") === "span-2",
+          ) as HTMLElement,
+      );
+      expect(useReviewStore.getState().transcriptSeekTarget?.segmentId).toBe(
+        "seg-2",
+      );
+      expect(loads).toBe(2); // resolved from the same round: no extra read
+    });
+
+    it("refreshes the snapshot once, then seeks, when a block names a span the snapshot lacks", async () => {
+      const refresh = deferred<unknown>();
+      let loads = 0;
+      mockBackend((cmd, id) => {
+        if (cmd === "load_session") {
+          loads += 1;
+          if (loads <= 2) return snapshotWith(id, ["span-1"]); // behind the fold
+          return refresh.promise;
+        }
+        if (cmd === COMMAND.timeline) return foldOf(["span-1", "span-2"]);
+        return defaultRespond(cmd, id);
+      });
+      render(<SessionsBrowser />);
+      await selectRow("session-a");
+      await openLens("timeline");
+      await waitFor(() => expect(blockSpans()).toEqual(["span-1", "span-2"]));
+
+      fireEvent.click(
+        screen
+          .getAllByTestId("seek-timeline-block")
+          .find(
+            (el) => el.getAttribute("data-span-id") === "span-2",
+          ) as HTMLElement,
+      );
+      await waitFor(() => expect(loads).toBe(3));
+      // Not a raw span id, and nothing yet: the refresh is still pending.
+      expect(useReviewStore.getState().transcriptSeekTarget).toBeNull();
+
+      await act(async () => {
+        refresh.resolve(snapshotWith("session-a", ["span-1", "span-2"]));
+      });
+      await waitFor(() =>
+        expect(useReviewStore.getState().transcriptSeekTarget?.segmentId).toBe(
+          "seg-2",
+        ),
+      );
+      expect(loads).toBe(3); // one refresh, not more
+    });
+
+    it("keeps the previous pair, marked stale, when a focus refresh gets a new snapshot but a failing fold", async () => {
+      let loads = 0;
+      let failTimeline = false;
+      mockBackend((cmd, id) => {
+        if (cmd === "load_session") {
+          loads += 1;
+          return snapshotWith(
+            id,
+            loads <= 2 ? ["span-1"] : ["span-1", "span-2"],
+          );
+        }
+        if (cmd === COMMAND.timeline) {
+          if (failTimeline) throw { code: "io", message: "disk gone" };
+          return foldOf(["span-1"]);
+        }
+        return defaultRespond(cmd, id);
+      });
+      render(<SessionsBrowser />);
+      await selectRow("session-a");
+      await openLens("timeline");
+      await waitFor(() => expect(blockSpans()).toEqual(["span-1"]));
+
+      failTimeline = true;
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+      });
+      // The newer snapshot was NOT published next to the old fold.
+      expect(
+        useReviewStore
+          .getState()
+          .snapshot?.transcriptEvents.map((e) => e.span_id),
+      ).toEqual(["span-1"]);
+      expect(await screen.findByTestId("review-lens-stale")).toBeVisible();
+      expect(blockSpans()).toEqual(["span-1"]);
+    });
+  });
+
+  describe("refresh pile-up", () => {
+    it("starts no overlapping refresh for focus, visibility and quick lens re-activation, and queues one trailing round", async () => {
+      const gate = deferred<unknown>();
+      let loads = 0;
+      mockBackend((cmd, id) => {
+        if (cmd === "load_session") {
+          loads += 1;
+          return loads === 1 ? gate.promise : loadSessionPayload(id);
+        }
+        return defaultRespond(cmd, id);
+      });
+      render(<SessionsBrowser />);
+      await selectRow("session-a");
+      await openLens("notes");
+      await waitFor(() => expect(loads).toBe(1));
+
+      // While the opening round is in flight: focus x3, visibility, and a
+      // quick Notes -> Transcript -> Notes re-activation.
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+        window.dispatchEvent(new Event("focus"));
+        window.dispatchEvent(new Event("focus"));
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await openLens("transcript");
+      await openLens("notes");
+      expect(loads).toBe(1);
+
+      await act(async () => {
+        gate.resolve(loadSessionPayload("session-a"));
+      });
+      await expectLensShows("notes", "session-a");
+      await act(async () => {});
+      // The opening round plus ONE trailing round for everything above.
+      expect(loads).toBeLessThanOrEqual(2);
+    });
+  });
+
+  describe("keyboard focus after a retry", () => {
+    it("moves focus to the lens region when the first-load retry control goes away", async () => {
+      let failures = 1;
+      mockBackend((cmd, id) => {
+        if (cmd === COMMAND.notes && failures > 0) {
+          failures -= 1;
+          throw { code: "io", message: "disk gone" };
+        }
+        return defaultRespond(cmd, id);
+      });
+      render(<SessionsBrowser />);
+      await selectRow("session-a");
+      const pane = await openLens("notes");
+      const retry = await within(pane).findByRole("button", {
+        name: /try again/i,
+      });
+      retry.focus();
+      expect(document.activeElement).toBe(retry);
+
+      fireEvent.click(retry); // what Enter / Space do on a button
+      await expectLensShows("notes", "session-a");
+      expect(document.activeElement).toBe(
+        screen.getByTestId("review-lens-region"),
+      );
+    });
+
+    it("moves focus to the lens region when the stale retry control goes away on recovery", async () => {
+      let failing = false;
+      mockBackend((cmd, id) => {
+        if (cmd === COMMAND.notes && failing) {
+          throw { code: "io", message: "disk gone" };
+        }
+        return defaultRespond(cmd, id);
+      });
+      render(<SessionsBrowser />);
+      await selectRow("session-a");
+      await openLens("notes");
+      await expectLensShows("notes", "session-a");
+
+      failing = true;
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+      });
+      const stale = await screen.findByTestId("review-lens-stale");
+      const retry = within(stale).getByRole("button", { name: /try again/i });
+      retry.focus();
+      failing = false;
+      fireEvent.click(retry);
+
+      await waitFor(() =>
+        expect(screen.queryByTestId("review-lens-stale")).toBeNull(),
+      );
+      expect(document.activeElement).toBe(
+        screen.getByTestId("review-lens-region"),
+      );
+    });
+
+    it("moves focus to the transcript region when the transcript's retry control goes away", async () => {
+      let failures = 1;
+      mockBackend((cmd, id) => {
+        if (cmd === "load_session" && failures > 0) {
+          failures -= 1;
+          throw { code: "io", message: "disk gone" };
+        }
+        return defaultRespond(cmd, id);
+      });
+      render(<SessionsBrowser />);
+      await selectRow("session-a");
+      const pane = screen.getByRole("tabpanel");
+      const retry = await within(pane).findByRole("button", {
+        name: /try again/i,
+      });
+      retry.focus();
+      fireEvent.click(retry);
+      await screen.findByText("transcript of session-a");
+      expect(document.activeElement).toBe(
+        within(screen.getByRole("tabpanel")).getByRole("log"),
+      );
+    });
+  });
+
+  describe("malformed typed refusals", () => {
+    it.each([
+      ["no message", undefined],
+      [
+        "an unexpected artifact class",
+        { artifact_class: "../../etc/passwd", size_bytes: 1, ceiling_bytes: 1 },
+      ],
+      [
+        "a negative size",
+        {
+          artifact_class: "materialized_notes",
+          size_bytes: -1,
+          ceiling_bytes: 1,
+        },
+      ],
+    ])("show the closed unavailable state, never the raw class, for %s", async (_name, message) => {
+      mockBackend((cmd, id) => {
+        if (cmd === COMMAND.notes)
+          throw { code: "artifact_too_large", message };
+        return defaultRespond(cmd, id);
+      });
+      render(<SessionsBrowser />);
+      await selectRow("session-a");
+      const pane = await openLens("notes");
+      expect(
+        await within(pane).findByTestId("review-lens-unavailable"),
+      ).toBeVisible();
+      expect(pane.textContent).not.toMatch(/etc\/passwd/);
+      expect(within(pane).queryByText(/^loading/i)).toBeNull();
+    });
   });
 
   describe("Live updates while Review is open", () => {

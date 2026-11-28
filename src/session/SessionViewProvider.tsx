@@ -15,8 +15,8 @@
  *   - Wrapped with a `reviewSessionId`: a Review subtree. Every read comes from
  *     the query-backed Review store (`reviewStore.ts`): the transcript and
  *     live-lane graph from the `load_session` snapshot, and Notes, Graph and
- *     Timeline from per-lens artifacts fetched when the lens activates
- *     (`useReviewArtifact`). The global selectors collapse to constants, so
+ *     Timeline from the open lens's artifact, read in the SAME round as the
+ *     snapshot and published with it (`reviewLens`). The global selectors collapse to constants, so
  *     Live content events neither re-render nor reach the subtree, and the
  *     seek / edge-focus targets are Review's own.
  *
@@ -40,7 +40,7 @@ import type {
   TranscriptEvent,
   TranscriptSegment,
 } from "../types";
-import { useReviewStore } from "./reviewStore";
+import { type ArtifactKind, useReviewStore } from "./reviewStore";
 import {
   type ReviewTranscriptView,
   useReviewTranscript,
@@ -77,6 +77,7 @@ const EMPTY_GRAPH: GraphSnapshot = {
 export function SessionViewProvider({
   children,
   reviewSessionId = null,
+  reviewLens = null,
 }: {
   children: ReactNode;
   /**
@@ -84,9 +85,15 @@ export function SessionViewProvider({
    * Live behaviour: every read comes straight from the global store.
    */
   reviewSessionId?: string | null;
+  /**
+   * The artifact lens (Notes, Graph, Timeline) currently open below, whose
+   * data is queried in the same round as the session snapshot; `null` for the
+   * Transcript lens, which needs none.
+   */
+  reviewLens?: ArtifactKind | null;
 }) {
   const reviewing = reviewSessionId !== null;
-  const review = useReviewTranscript(reviewSessionId);
+  const review = useReviewTranscript(reviewSessionId, reviewLens);
   // Under a Review selection these selectors return constants, so Live
   // content events never re-render (or leak into) the Review subtree.
   const transcriptSegments = useAudioGraphStore((s) =>
@@ -283,8 +290,13 @@ export interface TimelineView {
 export function useTimelineView(): TimelineView {
   const review = useContext(ReviewViewContext);
   const reviewing = review !== null;
+  // The snapshot and the timeline slot are read from the store in the same
+  // render, so they are always the pair one round published.
   const slot = useReviewStore((s) =>
     reviewing && s.sessionId === review.sessionId ? s.artifacts.timeline : null,
+  );
+  const reviewSnapshot = useReviewStore((s) =>
+    reviewing && s.sessionId === review.sessionId ? s.snapshot : null,
   );
   const timeline = useAudioGraphStore((s) =>
     reviewing ? null : s.sessionTimeline,
@@ -309,7 +321,7 @@ export function useTimelineView(): TimelineView {
     totalCount: slot?.data?.total_count ?? null,
     loading: slot === null || slot.status === "loading",
     transcriptEvents:
-      review.snapshot?.transcriptEvents ?? EMPTY_TRANSCRIPT_EVENTS,
+      reviewSnapshot?.transcriptEvents ?? EMPTY_TRANSCRIPT_EVENTS,
     speakers,
   };
 }
@@ -318,6 +330,12 @@ export function useTimelineView(): TimelineView {
 export interface SessionInteractions {
   transcriptSeekTarget: { segmentId: string; nonce: number } | null;
   seekTranscriptToSegment: (segmentId: string | null) => void;
+  /**
+   * Seek to the segment behind a timeline span; `knownSegmentId` is what the
+   * caller's transcript events resolve it to (or `null`). Review refreshes its
+   * snapshot first when the span is unknown to it.
+   */
+  seekToSpan: (spanId: string, knownSegmentId: string | null) => void;
   graphEdgeFocus: { edgeIds: string[]; nonce: number } | null;
   focusGraphEdges: (edgeIds: string[] | null) => void;
 }
@@ -341,6 +359,7 @@ export function useSessionInteractions(): SessionInteractions {
     reviewing ? s.transcriptSeekTarget : null,
   );
   const reviewSeek = useReviewStore((s) => s.seekTranscriptToSegment);
+  const reviewSeekToSpan = useReviewStore((s) => s.seekToSpan);
   const reviewEdgeFocus = useReviewStore((s) =>
     reviewing ? s.graphEdgeFocus : null,
   );
@@ -349,12 +368,14 @@ export function useSessionInteractions(): SessionInteractions {
     ? {
         transcriptSeekTarget: reviewSeekTarget,
         seekTranscriptToSegment: reviewSeek,
+        seekToSpan: (spanId, known) => void reviewSeekToSpan(spanId, known),
         graphEdgeFocus: reviewEdgeFocus,
         focusGraphEdges: reviewFocus,
       }
     : {
         transcriptSeekTarget: liveSeekTarget,
         seekTranscriptToSegment: liveSeek,
+        seekToSpan: (spanId, known) => liveSeek(known ?? spanId),
         graphEdgeFocus: liveEdgeFocus,
         focusGraphEdges: liveFocus,
       };

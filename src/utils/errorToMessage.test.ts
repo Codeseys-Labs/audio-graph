@@ -201,6 +201,72 @@ describe("errorToMessage", () => {
     expect(artifactTooLargeDetails("boom")).toBeNull();
   });
 
+  it.each([
+    ["no message", undefined],
+    ["a null message", null],
+    ["a string message", "too large"],
+    ["a missing class", { size_bytes: 1, ceiling_bytes: 1 }],
+    [
+      "an unexpected class",
+      { artifact_class: "../secret", size_bytes: 1, ceiling_bytes: 1 },
+    ],
+    [
+      "a negative size",
+      {
+        artifact_class: "materialized_notes",
+        size_bytes: -1,
+        ceiling_bytes: 1,
+      },
+    ],
+    [
+      "an infinite size",
+      {
+        artifact_class: "materialized_notes",
+        size_bytes: Number.POSITIVE_INFINITY,
+        ceiling_bytes: 1,
+      },
+    ],
+    [
+      "a NaN ceiling",
+      {
+        artifact_class: "materialized_notes",
+        size_bytes: 1,
+        ceiling_bytes: Number.NaN,
+      },
+    ],
+    [
+      "string numbers",
+      {
+        artifact_class: "materialized_notes",
+        size_bytes: "1",
+        ceiling_bytes: "1",
+      },
+    ],
+  ])("artifactTooLargeDetails returns null, and never throws, for an artifact_too_large with %s", (_name, message) => {
+    expect(() =>
+      artifactTooLargeDetails({ code: "artifact_too_large", message }),
+    ).not.toThrow();
+    expect(
+      artifactTooLargeDetails({ code: "artifact_too_large", message }),
+    ).toBeNull();
+  });
+
+  it.each([
+    "materialized_graph",
+    "materialized_notes",
+    "projection_events",
+    "transcript_events",
+    "diarization_events",
+    "live_graph",
+  ])("artifactTooLargeDetails accepts the %s class", (artifact_class) => {
+    expect(
+      artifactTooLargeDetails({
+        code: "artifact_too_large",
+        message: { artifact_class, size_bytes: 0, ceiling_bytes: 0 },
+      }),
+    ).toEqual({ artifactClass: artifact_class, sizeBytes: 0, ceilingBytes: 0 });
+  });
+
   it("falls back to String(e) for legacy bare-string rejections", () => {
     // Older invoke surfaces or JS code may still reject with a plain
     // string. Must still produce a readable message.
