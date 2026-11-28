@@ -75,6 +75,11 @@ impl Drop for LiveReply {
 }
 
 impl PendingLiveTranscript {
+    #[cfg(test)]
+    pub(super) fn is_waiting(&self) -> bool {
+        matches!(*self.shared.0.lock().unwrap(), State::Waiting)
+    }
+
     pub(crate) fn wait(self) -> LiveTranscriptResult {
         let (mutex, cv) = &*self.shared;
         let state = mutex.lock().unwrap_or_else(|p| p.into_inner());
