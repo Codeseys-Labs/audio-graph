@@ -109,6 +109,15 @@ impl SseDecoder {
         self.buf.extend_from_slice(chunk);
     }
 
+    /// The body has ended, so what is still buffered is the last frame even
+    /// without the blank line that ends one. [`SseDecoder::next_event`] then
+    /// yields it.
+    pub fn end_of_input(&mut self) {
+        if !self.buf.is_empty() {
+            self.buf.extend_from_slice(b"\n\n");
+        }
+    }
+
     /// Try to extract the next complete frame from the internal buffer.
     ///
     /// Returns `None` when the buffer doesn't yet contain a full frame

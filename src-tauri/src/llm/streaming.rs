@@ -23,7 +23,6 @@
 use std::sync::Arc;
 
 use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
-use bytes::Bytes;
 use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -809,8 +808,11 @@ async fn run_sse_stream(
             chunk = byte_stream.next() => chunk,
         };
 
-        let bytes: Bytes = match next_chunk {
-            Some(Ok(b)) => b,
+        let ended = match next_chunk {
+            Some(Ok(bytes)) => {
+                decoder.feed(&bytes);
+                false
+            }
             Some(Err(e)) => {
                 send_terminal(
                     &tx,
@@ -823,9 +825,13 @@ async fn run_sse_stream(
                 .await;
                 return;
             }
-            None => break, // server closed the connection cleanly
+            // The server closed the connection cleanly. What is still buffered
+            // is its last event, sent without the blank line that ends one.
+            None => {
+                decoder.end_of_input();
+                true
+            }
         };
-        decoder.feed(&bytes);
 
         loop {
             match decoder.next_event() {
@@ -867,14 +873,18 @@ async fn run_sse_stream(
                             for choice in &chunk.choices {
                                 // Normalize the provider's value once, here, so
                                 // neither frame can carry it raw. The last
-                                // non-empty one wins: it often rides the final
+                                // non-blank one wins: it often rides the final
                                 // delta, sometimes a separate trailer.
                                 let finish_reason = choice
                                     .finish_reason
                                     .as_deref()
-                                    .filter(|reason| !reason.is_empty())
+                                    .filter(|reason| !reason.trim().is_empty())
                                     .map(FinishReason::from_provider);
-                                if finish_reason.is_some() {
+                                // Except over `error`: a turn the provider
+                                // called failed stays failed whatever follows.
+                                if finish_reason.is_some()
+                                    && last_finish_reason != Some(FinishReason::Error)
+                                {
                                     last_finish_reason = finish_reason;
                                 }
                                 if let Some(content) = choice.delta.content.as_deref()
@@ -905,6 +915,9 @@ async fn run_sse_stream(
                     }
                 }
             }
+        }
+        if ended {
+            break;
         }
     }
 
@@ -1472,6 +1485,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_final_event_without_its_blank_line_is_still_read() {
+        // The last event carries the only terminal marker, and the server
+        // closes without ending it.
+        let frames = frames_of(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"whole \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}",
+        ))
+        .await;
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content: first, .. },
+                TokenDelta::Delta { content: second, .. },
+                TokenDelta::Done { full_text, finish_reason, .. },
+            ] if first == "whole " && second == "answer"
+                && full_text == "whole answer" && finish_reason == "stop"),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_final_fragment_that_does_not_parse_is_still_a_cut_off_stream() {
+        let frames = frames_of(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lost",
+        ))
+        .await;
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content, .. },
+                TokenDelta::Error { diagnostic, full_text },
+            ] if content == "partial"
+                && diagnostic.to_string() == "runtime/invalid_response"
+                && full_text == "partial"),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_finish_reason_is_not_a_terminal_marker() {
+        let frames = frames_of(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"   \"}]}\n\n",
+        )
+        .await;
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content, finish_reason: None },
+                TokenDelta::Error { diagnostic, full_text },
+            ] if content == "partial"
+                && diagnostic.to_string() == "runtime/invalid_response"
+                && full_text == "partial"),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_provider_reported_error_finish_is_a_failed_stream() {
         let base = spawn_sse_mock(concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
@@ -1500,6 +1568,35 @@ mod tests {
                 && full_text == "partial"),
             "{frames:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_error_finish_is_not_undone_by_a_later_finish_reason() {
+        // With `[DONE]`, and with the server closing after the last chunk.
+        for body in [
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            ),
+        ] {
+            let frames = frames_of(body).await;
+            assert!(
+                matches!(&frames[..], [
+                    TokenDelta::Delta { content, .. },
+                    TokenDelta::Error { diagnostic, full_text },
+                ] if content == "partial"
+                    && diagnostic.to_string() == "runtime/internal"
+                    && full_text == "partial"),
+                "{frames:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2975,12 +3072,16 @@ mod tests {
                         break;
                     }
                 }
-                // Promise far more body than we deliver, emit one partial
-                // delta, then drop the socket so the client's body read errors.
+                // Promise far more body than we deliver, emit one delta, then
+                // drop the socket so the client's body read errors. The delta
+                // carries a `finish_reason`, so a clean end of body here would
+                // be a complete answer and only a read error is a failure.
                 let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n";
                 let _ = stream.write_all(header.as_bytes()).await;
                 let _ = stream
-                    .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+                    .write_all(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    )
                     .await;
                 // Abort without flushing the promised Content-Length.
                 drop(stream);
