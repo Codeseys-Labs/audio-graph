@@ -95,15 +95,39 @@
     },
     {
       "type": "error",
-      "message": "Deepgram error code=CLIENT_MESSAGE_TIMEOUT request_id=dg-error-1 description_len=66"
+      "message": {
+        "kind": "runtime",
+        "detail": {
+          "code": "timeout",
+          "retryable": true,
+          "recovery_action": "retry",
+          "context": { "operation": "transcription", "transport": "websocket" }
+        }
+      }
     },
     {
       "type": "error",
-      "message": "Deepgram error code=INVALID_AUTH request_id=dg-error-2 description_len=20"
+      "message": {
+        "kind": "runtime",
+        "detail": {
+          "code": "request_rejected",
+          "retryable": false,
+          "recovery_action": "review_configuration",
+          "context": { "operation": "transcription", "transport": "websocket" }
+        }
+      }
     },
     {
       "type": "error",
-      "message": "Invalid server JSON: EOF while parsing an object at line 1 column 1"
+      "message": {
+        "kind": "runtime",
+        "detail": {
+          "code": "invalid_response",
+          "retryable": false,
+          "recovery_action": "none",
+          "context": { "operation": "transcription", "transport": "websocket" }
+        }
+      }
     }
   ]
 }

@@ -35,19 +35,13 @@
       "received_at_ms": 1700000000405,
       "raw": "{\"message\":\"Error\",\"type\":\"invalid_model\",\"reason\":\"Model is not available\",\"code\":4004,\"seq_no\":7}",
       "expected_revision_count": 0,
-      "expected_provider_error": {
-        "error_type": "invalid_model",
-        "reason": "Model is not available",
-        "code": "4004",
-        "seq_no": 7
-      }
+      "expected_provider_error": "request_rejected"
     },
     {
       "received_at_ms": 1700000000406,
       "raw": "{\"message\":\"NewFutureMessage\"}",
       "expected_parse_error": {
-        "kind": "unsupported_message_type",
-        "value": "NewFutureMessage"
+        "kind": "unsupported_message_type"
       }
     },
     {

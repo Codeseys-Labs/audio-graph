@@ -14,7 +14,9 @@ use tokio_tungstenite::{
     tungstenite::{self, Message},
 };
 
-use super::ProviderContentEgressPolicy;
+use super::{
+    ProviderContentEgressPolicy, RuntimeDiagnostic, websocket_error, websocket_write_error,
+};
 
 pub(super) type AsrWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub(super) type AsrWsWriter = futures_util::stream::SplitSink<AsrWsStream, Message>;
@@ -39,33 +41,31 @@ impl AsrTransportPayloadKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum AsrTransportWriteError {
-    Policy {
-        message: String,
-    },
+    Policy,
     Write {
         provider: &'static str,
         payload_kind: AsrTransportPayloadKind,
-        message: String,
+        diagnostic: RuntimeDiagnostic,
     },
 }
 
 impl AsrTransportWriteError {
     pub(super) fn is_policy_blocked(&self) -> bool {
-        matches!(self, Self::Policy { .. })
+        matches!(self, Self::Policy)
     }
 }
 
 impl fmt::Display for AsrTransportWriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Policy { message, .. } => f.write_str(message),
+            Self::Policy => fmt::Display::fmt(&websocket_write_error(self), f),
             Self::Write {
                 provider,
                 payload_kind,
-                message,
+                diagnostic,
             } => write!(
                 f,
-                "WebSocket write failed for {provider} {}: {message}",
+                "WebSocket write failed for {provider} {}: {diagnostic}",
                 payload_kind.label()
             ),
         }
@@ -136,7 +136,7 @@ impl AsrWsWriteGuard {
             AsrTransportPayloadKind::Terminal => Ok(()),
         };
 
-        result.map_err(|message| AsrTransportWriteError::Policy { message })
+        result.map_err(|_| AsrTransportWriteError::Policy)
     }
 
     fn write_error(
@@ -147,7 +147,7 @@ impl AsrWsWriteGuard {
         AsrTransportWriteError::Write {
             provider: self.provider,
             payload_kind,
-            message: error.to_string(),
+            diagnostic: websocket_error(&error),
         }
     }
 }
@@ -157,6 +157,48 @@ mod tests {
     use super::*;
     use crate::asr::ws_fixture::{self, ClientFrame, ServerStep};
     use futures_util::StreamExt;
+
+    #[test]
+    fn write_errors_keep_the_typed_class_and_drop_native_details() {
+        use super::super::diagnostic_tests::assert_safe;
+        use super::super::{RuntimeErrorCode as Code, RuntimeSafeRecoveryAction as Recovery};
+        use tungstenite::{
+            Error,
+            error::{CapacityError, ProtocolError},
+        };
+
+        let guard = AsrWsWriteGuard::new("asr.test", ProviderContentEgressPolicy::allow());
+        for (native, code, action) in [
+            (
+                Error::Capacity(CapacityError::MessageTooLong {
+                    size: 691,
+                    max_size: 379,
+                }),
+                Code::CapacityExhausted,
+                Recovery::ReviewConfiguration,
+            ),
+            (
+                Error::Protocol(ProtocolError::SendAfterClosing),
+                Code::ProtocolError,
+                Recovery::None,
+            ),
+            (
+                Error::WriteBufferFull(Box::new(Message::Text("asr-secret-canary".into()))),
+                Code::CapacityExhausted,
+                Recovery::ReviewConfiguration,
+            ),
+        ] {
+            let error = guard.write_error(AsrTransportPayloadKind::Audio, native);
+            assert_safe(&format!("{error:?} {error}"));
+            let RuntimeDiagnostic::Runtime(actual) = websocket_write_error(&error) else {
+                panic!("expected runtime write diagnostic");
+            };
+            assert_eq!(
+                (actual.code, actual.retryable, actual.recovery_action),
+                (code, false, action)
+            );
+        }
+    }
 
     #[test]
     fn content_bearing_payloads_require_policy_allow() {
@@ -171,7 +213,7 @@ mod tests {
                 .check(payload_kind)
                 .expect_err("content-bearing payload should be blocked");
             assert!(error.is_policy_blocked());
-            assert!(error.to_string().contains("Privacy policy blocked"));
+            assert_eq!(error.to_string(), "runtime/policy_blocked");
             assert!(!error.to_string().contains("secret-session-json"));
         }
     }
@@ -231,11 +273,9 @@ mod tests {
             "audio refusal must be a policy block, not a transport error: {binary_error:?}"
         );
         let binary_message = binary_error.to_string();
-        assert!(binary_message.contains("Privacy policy blocked"));
-        assert!(binary_message.contains("audio"));
-        assert!(binary_message.contains("local_only"));
+        assert_eq!(binary_message, "runtime/policy_blocked");
         assert!(
-            !binary_message.contains("SECRET_AUDIO_PCM_FRAME"),
+            !format!("{binary_error:?} {binary_message}").contains("SECRET_AUDIO_PCM_FRAME"),
             "policy error must not echo audio bytes: {binary_message}"
         );
 
@@ -255,11 +295,9 @@ mod tests {
             "session-json refusal must be a policy block: {text_error:?}"
         );
         let text_message = text_error.to_string();
-        assert!(text_message.contains("Privacy policy blocked"));
-        assert!(text_message.contains("json"));
-        assert!(text_message.contains("local_only"));
+        assert_eq!(text_message, "runtime/policy_blocked");
         assert!(
-            !text_message.contains("SECRET_SESSION_JSON"),
+            !format!("{text_error:?} {text_message}").contains("SECRET_SESSION_JSON"),
             "policy error must not echo session-config payload: {text_message}"
         );
 

@@ -555,11 +555,8 @@ pub fn openai_event_to_signal(
         // Transcription handling). Turn boundaries come from VAD/the caller.
         E::Transcript { .. } => None,
         E::Error { message } => Some(TurnSignal::Error {
-            // The STT client does not classify errors; default to Server (a
-            // recoverable engine-side failure) so the FSM surfaces it without
-            // claiming an auth/network root cause it can't know here.
             category: TurnErrorCategory::Server,
-            message,
+            message: message.to_string(),
         }),
         // Connection lifecycle — handled at the transport layer, not the FSM.
         E::Connected | E::Disconnected | E::Reconnecting { .. } | E::Reconnected => None,
@@ -1718,13 +1715,18 @@ mod tests {
     #[test]
     fn openai_error_maps_to_turn_error_and_lifecycle_is_none() {
         use crate::asr::openai_realtime::OpenAiRealtimeEvent as E;
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeOperation,
+        };
         assert_eq!(
             openai_event_to_signal(E::Error {
-                message: "boom".into()
+                message: RuntimeDiagnostic::internal(RuntimeDiagnosticContext::new(
+                    RuntimeOperation::Transcription,
+                )),
             }),
             Some(TurnSignal::Error {
                 category: TurnErrorCategory::Server,
-                message: "boom".into()
+                message: "runtime/internal".into()
             })
         );
         // Transport/lifecycle frames are handled at the connection layer.

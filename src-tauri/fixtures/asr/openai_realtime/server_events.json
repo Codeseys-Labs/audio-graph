@@ -71,15 +71,39 @@
     },
     {
       "type": "error",
-      "message": "transcription failed item_id=b OpenAI Realtime provider_error type=none code=none param=none event_id=none message_len=12"
+      "message": {
+        "kind": "runtime",
+        "detail": {
+          "code": "internal",
+          "retryable": false,
+          "recovery_action": "none",
+          "context": { "operation": "transcription", "transport": "websocket" }
+        }
+      }
     },
     {
       "type": "error",
-      "message": "OpenAI Realtime provider_error type=none code=none param=none event_id=none message_len=11"
+      "message": {
+        "kind": "runtime",
+        "detail": {
+          "code": "internal",
+          "retryable": false,
+          "recovery_action": "none",
+          "context": { "operation": "transcription", "transport": "websocket" }
+        }
+      }
     },
     {
       "type": "error",
-      "message": "Invalid server JSON: EOF while parsing an object at line 1 column 1"
+      "message": {
+        "kind": "runtime",
+        "detail": {
+          "code": "invalid_response",
+          "retryable": false,
+          "recovery_action": "none",
+          "context": { "operation": "transcription", "transport": "websocket" }
+        }
+      }
     }
   ]
 }
