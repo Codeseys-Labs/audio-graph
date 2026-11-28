@@ -6,9 +6,9 @@
 //! evidence is strong enough to promote Soniox from planned to selectable.
 
 use super::{
-    BuiltInCredentialSetId, asr_diagnostic, is_terminal_reconnect_error, required_api_key,
-    websocket_close, websocket_diagnostic, websocket_error, websocket_upgrade_error,
-    websocket_write_error,
+    AsrSessionStop, AsrStopReason, BuiltInCredentialSetId, asr_diagnostic,
+    is_terminal_reconnect_error, required_api_key, websocket_close, websocket_diagnostic,
+    websocket_error, websocket_upgrade_error, websocket_write_error,
 };
 use crate::error::AppError;
 use audio_graph_ipc_contract::runtime_diagnostic::{
@@ -37,7 +37,7 @@ use crate::events::{AsrSpanRevisionPayload, AsrSpanStability};
 const PROVIDER: &str = "soniox";
 const WEBSOCKET_URL: &str = "wss://stt-rt.soniox.com/transcribe-websocket";
 /// Steady-state cap on the audio-chunk backlog (~6.4s at the 32ms chunk
-/// cadence). Overflow is **fail-fast** (flip `user_disconnected`, end the
+/// cadence). Overflow is **fail-fast** (latch a backlog timeout, end the
 /// session) — the shared ASR overflow policy documented on
 /// `asr::deepgram::AUDIO_BUFFER_MAX_CHUNKS` (deliberately the opposite of
 /// Gemini's lossy-drop; review m2). While a reconnect is climbing the ladder
@@ -488,7 +488,7 @@ pub struct SonioxClient {
     event_tx: crossbeam_channel::Sender<SonioxEvent>,
     event_rx: crossbeam_channel::Receiver<SonioxEvent>,
     connected: Arc<AtomicBool>,
-    user_disconnected: Arc<AtomicBool>,
+    stop_signal: Arc<AsrSessionStop>,
     rt: Option<tokio::runtime::Runtime>,
     audio_tx: Option<tokio_mpsc::UnboundedSender<AudioCmd>>,
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
@@ -507,7 +507,7 @@ impl SonioxClient {
             event_tx,
             event_rx,
             connected: Arc::new(AtomicBool::new(false)),
-            user_disconnected: Arc::new(AtomicBool::new(false)),
+            stop_signal: Arc::new(AsrSessionStop::default()),
             rt: None,
             audio_tx: None,
             pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -532,8 +532,8 @@ impl SonioxClient {
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
         let connected = Arc::clone(&self.connected);
-        let user_disconnected = Arc::clone(&self.user_disconnected);
-        user_disconnected.store(false, Ordering::SeqCst);
+        let stop_signal = Arc::clone(&self.stop_signal);
+        stop_signal.reset();
         self.pending_chunks
             .store(0, std::sync::atomic::Ordering::Relaxed);
         // Disarm the reconnect-scoped backlog latch for the fresh session.
@@ -553,7 +553,7 @@ impl SonioxClient {
                 config,
                 event_tx,
                 connected,
-                user_disconnected,
+                stop_signal,
                 pending_chunks,
                 #[cfg(test)]
                 reconnect_opener: None,
@@ -570,8 +570,14 @@ impl SonioxClient {
     }
 
     pub fn send_audio(&self, audio: &[f32]) -> Result<(), String> {
-        if self.user_disconnected.load(Ordering::SeqCst) {
-            return Err("Soniox client has been disconnected".to_string());
+        match self.stop_signal.reason() {
+            Some(AsrStopReason::UserRequested) => {
+                return Err("Soniox client has been disconnected".to_string());
+            }
+            Some(AsrStopReason::BacklogTimeout) => {
+                return Err(websocket_diagnostic(Code::Timeout).to_string());
+            }
+            None => {}
         }
         if audio.is_empty() {
             return Ok(());
@@ -597,11 +603,8 @@ impl SonioxClient {
             RECONNECT_AUDIO_BUFFER_MAX_CHUNKS,
         );
         if depth >= cap {
-            self.user_disconnected
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            return Err(format!(
-                "Soniox audio buffer full ({depth}/{cap} chunks) — likely a stuck reconnect. Restart the session."
-            ));
+            self.stop_signal.request(AsrStopReason::BacklogTimeout);
+            return Err(websocket_diagnostic(Code::Timeout).to_string());
         }
 
         let pcm_bytes = crate::audio::pcm::f32_mono_to_pcm_s16le_bytes(audio);
@@ -623,8 +626,8 @@ impl SonioxClient {
     }
 
     pub fn disconnect(&self) {
-        log::info!("SonioxClient: disconnecting (user-initiated)");
-        self.user_disconnected.store(true, Ordering::SeqCst);
+        log::info!("SonioxClient: disconnecting");
+        self.stop_signal.request(AsrStopReason::UserRequested);
         self.connected.store(false, Ordering::SeqCst);
         if let Some(ref tx) = self.audio_tx {
             let _ = tx.send(AudioCmd::Stop);
@@ -634,7 +637,7 @@ impl SonioxClient {
 
 impl Drop for SonioxClient {
     fn drop(&mut self) {
-        self.user_disconnected.store(true, Ordering::SeqCst);
+        self.stop_signal.request(AsrStopReason::UserRequested);
         self.connected.store(false, Ordering::SeqCst);
         if let Some(ref tx) = self.audio_tx {
             let _ = tx.send(AudioCmd::Stop);
@@ -723,7 +726,7 @@ struct SonioxSessionCtx {
     config: SonioxConfig,
     event_tx: crossbeam_channel::Sender<SonioxEvent>,
     connected: Arc<AtomicBool>,
-    user_disconnected: Arc<AtomicBool>,
+    stop_signal: Arc<AsrSessionStop>,
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     reconnect_opener: Option<ReconnectOpener>,
@@ -764,7 +767,7 @@ async fn session_task_with_backoff(
     let config = ctx.config;
     let event_tx = ctx.event_tx;
     let connected = ctx.connected;
-    let user_disconnected = ctx.user_disconnected;
+    let stop_signal = ctx.stop_signal;
     let pending_chunks = ctx.pending_chunks;
     #[cfg(test)]
     let reconnect_opener = ctx.reconnect_opener;
@@ -790,7 +793,7 @@ async fn session_task_with_backoff(
             &mut reader,
             &mut audio_rx,
             &event_tx,
-            &user_disconnected,
+            &stop_signal,
             &pending_chunks,
             &mut parser,
             &write_guard,
@@ -810,6 +813,15 @@ async fn session_task_with_backoff(
             reconnect_attempts = 0;
         }
 
+        let disconnect = if stop_signal.reason() == Some(AsrStopReason::BacklogTimeout)
+            && !matches!(
+                disconnect,
+                DisconnectKind::TerminalError(_) | DisconnectKind::PolicyBlocked(_)
+            ) {
+            DisconnectKind::TerminalError(websocket_diagnostic(Code::Timeout))
+        } else {
+            disconnect
+        };
         match disconnect {
             DisconnectKind::UserRequested | DisconnectKind::WriterEnded => {
                 log::info!("Soniox session: ending ({disconnect:?})");
@@ -828,7 +840,7 @@ async fn session_task_with_backoff(
                 break;
             }
             _ => {
-                if user_disconnected.load(Ordering::SeqCst) {
+                if stop_signal.reason() == Some(AsrStopReason::UserRequested) {
                     emit_disconnected_once(&event_tx, &disconnected_emitted);
                     break;
                 }
@@ -847,6 +859,20 @@ async fn session_task_with_backoff(
                 }
 
                 let reconnected = loop {
+                    match stop_signal.reason() {
+                        Some(AsrStopReason::UserRequested) => {
+                            emit_disconnected_once(&event_tx, &disconnected_emitted);
+                            break false;
+                        }
+                        Some(AsrStopReason::BacklogTimeout) => {
+                            emit_disconnected_once(&event_tx, &disconnected_emitted);
+                            let _ = event_tx.send(SonioxEvent::Error {
+                                message: websocket_diagnostic(Code::Timeout),
+                            });
+                            break false;
+                        }
+                        None => {}
+                    }
                     let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
                         ReconnectStep::Retry {
                             attempt,
@@ -876,24 +902,11 @@ async fn session_task_with_backoff(
                         backoff_secs: backoff,
                     });
 
-                    let sleep = tokio::time::sleep(backoff_duration(backoff));
-                    tokio::pin!(sleep);
-                    loop {
-                        tokio::select! {
-                            _ = &mut sleep => break,
-                            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                                if user_disconnected.load(Ordering::SeqCst) {
-                                    log::info!("Soniox session: user cancelled during backoff");
-                                    emit_disconnected_once(&event_tx, &disconnected_emitted);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-
-                    if user_disconnected.load(Ordering::SeqCst) {
-                        emit_disconnected_once(&event_tx, &disconnected_emitted);
-                        return;
+                    stop_signal
+                        .wait_for_backoff(backoff_duration(backoff))
+                        .await;
+                    if stop_signal.reason().is_some() {
+                        continue;
                     }
 
                     #[cfg(test)]
@@ -903,6 +916,7 @@ async fn session_task_with_backoff(
                     let reconnect_result = open_ws(&config).await;
 
                     match reconnect_result {
+                        Ok(_) if stop_signal.reason().is_some() => continue,
                         Ok((new_writer, new_reader)) => {
                             writer = new_writer;
                             reader = new_reader;
@@ -953,7 +967,7 @@ async fn run_io(
     reader: &mut AsrWsReader,
     audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
     event_tx: &crossbeam_channel::Sender<SonioxEvent>,
-    user_disconnected: &Arc<AtomicBool>,
+    stop_signal: &AsrSessionStop,
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     parser: &mut SonioxRealtimeParser,
     write_guard: &AsrWsWriteGuard,
@@ -964,7 +978,7 @@ async fn run_io(
         reader,
         audio_rx,
         event_tx,
-        user_disconnected,
+        stop_signal,
         pending_chunks,
         parser,
         write_guard,
@@ -980,7 +994,7 @@ async fn run_io_with_keepalive_interval(
     reader: &mut AsrWsReader,
     audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
     event_tx: &crossbeam_channel::Sender<SonioxEvent>,
-    user_disconnected: &Arc<AtomicBool>,
+    stop_signal: &AsrSessionStop,
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     parser: &mut SonioxRealtimeParser,
     write_guard: &AsrWsWriteGuard,
@@ -1064,7 +1078,7 @@ async fn run_io_with_keepalive_interval(
                         ) {
                             Ok(ServerMessage::DurationRollover) => {
                                 let _ = tokio::time::timeout(Duration::from_secs(1), writer.close()).await;
-                                return if finishing || user_disconnected.load(Ordering::SeqCst) {
+                                return if finishing || stop_signal.reason() == Some(AsrStopReason::UserRequested) {
                                     DisconnectKind::UserRequested
                                 } else {
                                     DisconnectKind::DurationRollover
@@ -1075,14 +1089,16 @@ async fn run_io_with_keepalive_interval(
                                 return DisconnectKind::UserRequested;
                             }
                             Ok(_) => {}
-                            Err(_) if finishing || user_disconnected.load(Ordering::SeqCst) => {
+                            Err(_) if stop_signal.reason() == Some(AsrStopReason::UserRequested)
+                                || (finishing && stop_signal.reason().is_none()) =>
+                            {
                                 return DisconnectKind::UserRequested;
                             }
                             Err(message) => return DisconnectKind::TerminalError(message),
                         }
                     }
                     Ok(Message::Close(frame)) => {
-                        let locally_closed = user_disconnected.load(Ordering::SeqCst) || finishing;
+                        let locally_closed = stop_signal.reason() == Some(AsrStopReason::UserRequested) || finishing;
                         let diagnostic = if locally_closed {
                             websocket_diagnostic(Code::Cancelled)
                         } else {
@@ -1340,7 +1356,7 @@ mod tests {
                     audio_rx,
                     event_tx,
                     connected: Arc::new(AtomicBool::new(true)),
-                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    stop_signal: Arc::new(AsrSessionStop::default()),
                     pending_chunks: Arc::new(AtomicUsize::new(0)),
                     reconnect_opener: Some(opener),
                     run_io_entries: None,
@@ -1390,38 +1406,71 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn terminal_frame_after_requested_stop_is_a_clean_disconnect() {
-        let (url, server) = ws_fixture::spawn_scripted_server(vec![
-            ws_fixture::ServerStep::expect_binary(Vec::<u8>::new()),
-            ws_fixture::ServerStep::send_text(
-                r#"{"error_code":402,"error_type":"organization_balance_exhausted"}"#,
-            ),
-        ])
-        .await;
-        let (writer, reader) = ws_fixture::connect_client(&url).await.split();
-        let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
-        audio_tx.send(AudioCmd::Stop).unwrap();
-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            session_task(SonioxSessionCtx {
-                writer,
-                reader,
-                config: test_config(),
-                audio_rx,
-                event_tx,
-                connected: Arc::new(AtomicBool::new(true)),
-                user_disconnected: Arc::new(AtomicBool::new(false)),
-                pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                reconnect_opener: Some(Arc::new(|_| panic!("a user stop must never reconnect"))),
-                run_io_entries: None,
-            }),
-        )
-        .await
-        .expect("stop must complete after the terminal frame");
-        server.await.unwrap();
-        let events: Vec<_> = event_rx.try_iter().collect();
-        assert!(matches!(events.as_slice(), [SonioxEvent::Disconnected]));
+    async fn terminal_frame_after_stop_preserves_backlog_timeout_reason() {
+        for expected in [None, Some(Code::CapacityExhausted), Some(Code::Timeout)] {
+            let terminal = if expected == Some(Code::Timeout) {
+                ws_fixture::ServerStep::send_close()
+            } else {
+                ws_fixture::ServerStep::send_text(
+                    r#"{"error_code":402,"error_type":"organization_balance_exhausted"}"#,
+                )
+            };
+            let (url, peer) = ws_fixture::spawn_scripted_server(vec![
+                ws_fixture::ServerStep::expect_binary(Vec::<u8>::new()),
+                terminal,
+            ])
+            .await;
+            let (writer, reader) = ws_fixture::connect_client(&url).await.split();
+            let mut client = SonioxClient::new(test_config());
+            let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+            client.audio_tx = Some(audio_tx);
+            if expected.is_some() {
+                client
+                    .pending_chunks
+                    .store(RECONNECT_AUDIO_BUFFER_MAX_CHUNKS, Ordering::SeqCst);
+                assert_eq!(client.send_audio(&[0.1]).unwrap_err(), "runtime/timeout");
+                client.disconnect();
+                assert_eq!(client.send_audio(&[0.1]).unwrap_err(), "runtime/timeout");
+            } else {
+                client
+                    .audio_tx
+                    .as_ref()
+                    .unwrap()
+                    .send(AudioCmd::Stop)
+                    .unwrap();
+            }
+            let (event_tx, event_rx) = crossbeam_channel::unbounded();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                session_task(SonioxSessionCtx {
+                    writer,
+                    reader,
+                    config: test_config(),
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(true)),
+                    stop_signal: Arc::clone(&client.stop_signal),
+                    pending_chunks: Arc::clone(&client.pending_chunks),
+                    reconnect_opener: Some(Arc::new(|_| panic!("stop must not reconnect"))),
+                    run_io_entries: None,
+                }),
+            )
+            .await
+            .expect("stop must complete after the terminal frame");
+            peer.await.unwrap();
+            let events: Vec<_> = event_rx.try_iter().collect();
+            match expected {
+                None => assert!(matches!(events.as_slice(), [SonioxEvent::Disconnected])),
+                Some(code) => assert!(
+                    matches!(
+                        events.as_slice(),
+                        [SonioxEvent::Disconnected, SonioxEvent::Error { message }]
+                            if *message == websocket_diagnostic(code)
+                    ),
+                    "unexpected events: {events:?}"
+                ),
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1463,7 +1512,7 @@ mod tests {
                     audio_rx,
                     event_tx,
                     connected: Arc::new(AtomicBool::new(true)),
-                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    stop_signal: Arc::new(AsrSessionStop::default()),
                     pending_chunks: Arc::new(AtomicUsize::new(0)),
                     reconnect_opener: Some(opener),
                     run_io_entries: None,
@@ -1558,7 +1607,7 @@ mod tests {
                         audio_rx,
                         event_tx,
                         connected: Arc::new(AtomicBool::new(true)),
-                        user_disconnected: Arc::new(AtomicBool::new(false)),
+                        stop_signal: Arc::new(AsrSessionStop::default()),
                         pending_chunks: Arc::new(AtomicUsize::new(0)),
                         reconnect_opener: Some(opener),
                         run_io_entries: None,
@@ -1621,7 +1670,7 @@ mod tests {
                     audio_rx,
                     event_tx,
                     connected: Arc::new(AtomicBool::new(true)),
-                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    stop_signal: Arc::new(AsrSessionStop::default()),
                     pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     reconnect_opener: Some(opener),
                     run_io_entries: None,
@@ -1644,6 +1693,100 @@ mod tests {
                 SonioxEvent::Error { message: replaced },
             ] if *replaced == websocket_diagnostic(Code::Cancelled)
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_duration_rollover_reports_the_last_reconnect_diagnostic() {
+        use super::super::diagnostic_tests::{assert_outcome, reject_upgrades};
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeSafeRecoveryAction as Action, RuntimeStatusClass::ClientError,
+        };
+
+        let (initial_url, initial) = ws_fixture::spawn_scripted_server(vec![
+            ws_fixture::ServerStep::send_text(
+                r#"{"error_code":413,"error_type":"max_duration_reached"}"#,
+            ),
+            ws_fixture::ServerStep::expect_close(),
+        ])
+        .await;
+        let (writer, reader) = ws_fixture::connect_client(&initial_url).await.split();
+        let budget = crate::reconnect::DEFAULT_BACKOFF_SECONDS.len();
+        let mut statuses = vec![(503, None); budget - 1];
+        statuses.push((408, None));
+        let (url, rejections) = reject_upgrades(statuses, true).await;
+        let opener: ReconnectOpener = Arc::new(move |config| {
+            let url = url.clone();
+            Box::pin(async move { open_ws_url(&config, &url).await })
+        });
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            session_task_with_backoff(
+                SonioxSessionCtx {
+                    writer,
+                    reader,
+                    config: test_config(),
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(true)),
+                    stop_signal: Arc::new(AsrSessionStop::default()),
+                    pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    reconnect_opener: Some(opener),
+                    run_io_entries: None,
+                },
+                |_| Duration::ZERO,
+                tokio::time::Instant::now,
+            ),
+        )
+        .await
+        .expect("failed rollover must exhaust the reconnect budget");
+        initial.await.unwrap();
+        rejections.await.unwrap();
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert!(matches!(
+            events.first(),
+            Some(SonioxEvent::Reconnecting { attempt: 1, .. })
+        ));
+        assert!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    SonioxEvent::Reconnecting { attempt, .. } => Some(*attempt),
+                    _ => None,
+                })
+                .eq(1..=budget as u32)
+        );
+        let [
+            ..,
+            SonioxEvent::Disconnected,
+            SonioxEvent::Error { message },
+        ] = events.as_slice()
+        else {
+            panic!("expected terminal reconnect diagnostic: {events:?}");
+        };
+        assert_outcome(
+            message,
+            (Code::Timeout, true, Action::Retry, Some(ClientError)),
+        );
+    }
+
+    #[test]
+    fn only_the_exact_duration_error_type_rolls_over() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut parser = SonioxRealtimeParser::new("sample source");
+        for (status, error_type, code) in [
+            (413, "max_duration_reached_extra", Code::Internal),
+            (503, "service_unavailable", Code::ProviderUnavailable),
+        ] {
+            let frame = json!({"error_code":status,"error_type":error_type,"error_message":"private duration lookalike"});
+            assert!(!handle_server_message(&frame.to_string(), &tx, &mut parser).unwrap());
+            let event = rx.try_recv().expect("non-rollover error event");
+            assert!(
+                matches!(event, SonioxEvent::Error { message } if message == websocket_diagnostic(code))
+            );
+        }
+        assert!(rx.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1686,7 +1829,7 @@ mod tests {
                 audio_rx,
                 event_tx,
                 connected: Arc::new(AtomicBool::new(true)),
-                user_disconnected: Arc::new(AtomicBool::new(false)),
+                stop_signal: Arc::new(AsrSessionStop::default()),
                 pending_chunks: Arc::new(AtomicUsize::new(0)),
                 reconnect_opener: Some(opener),
                 run_io_entries: None,
@@ -1880,13 +2023,17 @@ mod tests {
             let (mut writer, mut reader) = ws_fixture::connect_client(&url).await.split();
             let (_audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
             let (event_tx, _) = crossbeam_channel::unbounded();
+            let stop_signal = AsrSessionStop::default();
+            if locally_closed {
+                stop_signal.request(AsrStopReason::UserRequested);
+            }
             let capture = LogCapture::start();
             let disconnect = run_io(
                 &mut writer,
                 &mut reader,
                 &mut audio_rx,
                 &event_tx,
-                &Arc::new(AtomicBool::new(locally_closed)),
+                &stop_signal,
                 &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 &mut SonioxRealtimeParser::new("source"),
                 &AsrWsWriteGuard::new(
@@ -2243,7 +2390,7 @@ mod tests {
         let (mut writer, mut reader) = client_socket.split();
         let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let mut parser = SonioxRealtimeParser::new("mixed");
         let write_guard = AsrWsWriteGuard::new(
@@ -2252,7 +2399,7 @@ mod tests {
         );
 
         let run = tokio::spawn({
-            let user_disconnected = Arc::clone(&user_disconnected);
+            let stop_signal = Arc::clone(&stop_signal);
             let pending_chunks = Arc::clone(&pending_chunks);
             async move {
                 run_io(
@@ -2260,7 +2407,7 @@ mod tests {
                     &mut reader,
                     &mut audio_rx,
                     &event_tx,
-                    &user_disconnected,
+                    &stop_signal,
                     &pending_chunks,
                     &mut parser,
                     &write_guard,
@@ -2340,7 +2487,7 @@ mod tests {
         let (mut writer, mut reader) = client_socket.split();
         let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, _event_rx) = crossbeam_channel::bounded(16);
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let mut parser = SonioxRealtimeParser::new("mixed");
         let write_guard = AsrWsWriteGuard::new(
@@ -2349,7 +2496,7 @@ mod tests {
         );
 
         let run = tokio::spawn({
-            let user_disconnected = Arc::clone(&user_disconnected);
+            let stop_signal = Arc::clone(&stop_signal);
             let pending_chunks = Arc::clone(&pending_chunks);
             async move {
                 run_io(
@@ -2357,7 +2504,7 @@ mod tests {
                     &mut reader,
                     &mut audio_rx,
                     &event_tx,
-                    &user_disconnected,
+                    &stop_signal,
                     &pending_chunks,
                     &mut parser,
                     &write_guard,
@@ -2415,7 +2562,7 @@ mod tests {
         let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
         let connected = Arc::new(AtomicBool::new(true));
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let run_io_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let opener_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2437,7 +2584,7 @@ mod tests {
             config: test_config(),
             event_tx,
             connected: Arc::clone(&connected),
-            user_disconnected: Arc::clone(&user_disconnected),
+            stop_signal: Arc::clone(&stop_signal),
             pending_chunks,
             reconnect_opener: Some(opener),
             run_io_entries: Some(Arc::clone(&run_io_entries)),
@@ -2482,7 +2629,7 @@ mod tests {
             "failed reconnect must not re-enter run_io with stale socket halves"
         );
 
-        user_disconnected.store(true, Ordering::SeqCst);
+        stop_signal.request(AsrStopReason::UserRequested);
         match recv_event(&event_rx, Duration::from_secs(2)).await {
             SonioxEvent::Disconnected => {}
             other => panic!("expected cancellation disconnect, got {other:?}"),
@@ -2522,7 +2669,7 @@ mod tests {
         let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(32);
         let connected = Arc::new(AtomicBool::new(true));
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let run_io_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let opener_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2594,7 +2741,7 @@ mod tests {
             config: test_config(),
             event_tx,
             connected: Arc::clone(&connected),
-            user_disconnected: Arc::clone(&user_disconnected),
+            stop_signal: Arc::clone(&stop_signal),
             pending_chunks: Arc::clone(&pending_chunks),
             reconnect_opener: Some(opener),
             run_io_entries: Some(Arc::clone(&run_io_entries)),

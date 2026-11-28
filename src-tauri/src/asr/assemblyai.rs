@@ -21,9 +21,9 @@
 //! delivered back through `crossbeam_channel`.
 
 use super::{
-    BuiltInCredentialSetId, asr_diagnostic, is_terminal_reconnect_error, required_api_key,
-    websocket_close, websocket_diagnostic, websocket_error, websocket_upgrade_error,
-    websocket_write_error,
+    AsrSessionStop, AsrStopReason, BuiltInCredentialSetId, asr_diagnostic,
+    is_terminal_reconnect_error, required_api_key, websocket_close, websocket_diagnostic,
+    websocket_error, websocket_upgrade_error, websocket_write_error,
 };
 use crate::error::AppError;
 use audio_graph_ipc_contract::runtime_diagnostic::{
@@ -498,7 +498,7 @@ impl std::fmt::Debug for AssemblyAIConfig {
 
 /// Steady-state cap on the audio-chunk backlog (see `pending_chunks` on
 /// `AssemblyAIClient`). ~6.4s worth of 32ms chunks. Overflow is **fail-fast**
-/// (flip `user_disconnected`, end the session) — the shared ASR overflow policy
+/// (latch a backlog timeout, end the session) — the shared ASR overflow policy
 /// documented on `asr::deepgram::AUDIO_BUFFER_MAX_CHUNKS` (deliberately the
 /// opposite of Gemini's lossy-drop; review m2). While a reconnect is climbing
 /// the ladder `send_audio` uses the wider `RECONNECT_AUDIO_BUFFER_MAX_CHUNKS`
@@ -553,7 +553,7 @@ pub struct AssemblyAIClient {
     connected: Arc<AtomicBool>,
     /// Set to `true` when the user has explicitly called `disconnect()`.
     /// Suppresses auto-reconnect on teardown.
-    user_disconnected: Arc<AtomicBool>,
+    stop_signal: Arc<AsrSessionStop>,
     /// Tokio runtime that owns the WebSocket tasks.
     rt: Option<tokio::runtime::Runtime>,
     /// Sender for audio commands -> async writer task.
@@ -580,7 +580,7 @@ impl AssemblyAIClient {
             event_tx,
             event_rx,
             connected: Arc::new(AtomicBool::new(false)),
-            user_disconnected: Arc::new(AtomicBool::new(false)),
+            stop_signal: Arc::new(AsrSessionStop::default()),
             rt: None,
             audio_tx: None,
             pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -613,10 +613,10 @@ impl AssemblyAIClient {
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
         let connected = Arc::clone(&self.connected);
-        let user_disconnected = Arc::clone(&self.user_disconnected);
+        let stop_signal = Arc::clone(&self.stop_signal);
         // Reset on (re)connect so a prior teardown flag does not poison a
         // fresh session.
-        user_disconnected.store(false, Ordering::SeqCst);
+        stop_signal.reset();
         self.pending_chunks
             .store(0, std::sync::atomic::Ordering::Relaxed);
         // Disarm the reconnect-scoped backlog latch for the fresh session.
@@ -640,7 +640,7 @@ impl AssemblyAIClient {
                 config,
                 event_tx,
                 connected,
-                user_disconnected,
+                stop_signal,
                 pending_chunks,
                 #[cfg(test)]
                 reconnect_opener: None,
@@ -670,12 +670,18 @@ impl AssemblyAIClient {
     ///
     /// # Behaviour during auto-reconnect
     ///
-    /// Only `user_disconnected` is checked — not the transient `connected`
+    /// The stop signal is checked independently of the transient `connected`
     /// flag — so the caller can keep streaming audio during a reconnect
     /// cycle. Queued chunks flush as soon as the new socket is open.
     pub fn send_audio(&self, audio: &[f32]) -> Result<(), String> {
-        if self.user_disconnected.load(Ordering::SeqCst) {
-            return Err("AssemblyAI client has been disconnected".to_string());
+        match self.stop_signal.reason() {
+            Some(AsrStopReason::UserRequested) => {
+                return Err("AssemblyAI client has been disconnected".to_string());
+            }
+            Some(AsrStopReason::BacklogTimeout) => {
+                return Err(websocket_diagnostic(Code::Timeout).to_string());
+            }
+            None => {}
         }
 
         if audio.is_empty() {
@@ -706,11 +712,8 @@ impl AssemblyAIClient {
             RECONNECT_AUDIO_BUFFER_MAX_CHUNKS,
         );
         if depth >= cap {
-            self.user_disconnected
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            return Err(format!(
-                "AssemblyAI audio buffer full ({depth}/{cap} chunks) — likely a stuck reconnect. Restart the session."
-            ));
+            self.stop_signal.request(AsrStopReason::BacklogTimeout);
+            return Err(websocket_diagnostic(Code::Timeout).to_string());
         }
 
         let pcm_bytes = f32_to_i16_le_bytes(audio);
@@ -749,14 +752,14 @@ impl AssemblyAIClient {
     /// Disconnect from the AssemblyAI API and clean up resources.
     ///
     /// Sends `Terminate`, closes the WebSocket, and shuts down
-    /// the internal tokio runtime on Drop. Setting `user_disconnected`
+    /// the internal tokio runtime on Drop. Setting `stop_signal`
     /// prevents the session task from attempting to auto-reconnect.
     pub fn disconnect(&self) {
-        log::info!("AssemblyAIClient: disconnecting (user-initiated)");
+        log::info!("AssemblyAIClient: disconnecting");
 
         // Mark this teardown as user-initiated so the session task does not
         // try to reconnect after the close frame is observed.
-        self.user_disconnected.store(true, Ordering::SeqCst);
+        self.stop_signal.request(AsrStopReason::UserRequested);
 
         // Signal not connected first (stops send_audio calls).
         self.connected.store(false, Ordering::SeqCst);
@@ -771,7 +774,7 @@ impl AssemblyAIClient {
 impl Drop for AssemblyAIClient {
     fn drop(&mut self) {
         // Mark teardown as user-initiated so the session task exits cleanly.
-        self.user_disconnected.store(true, Ordering::SeqCst);
+        self.stop_signal.request(AsrStopReason::UserRequested);
         self.connected.store(false, Ordering::SeqCst);
 
         // Signal writer to stop.
@@ -804,6 +807,7 @@ enum DisconnectKind {
     NetworkError(RuntimeDiagnostic),
     ProtocolError(RuntimeDiagnostic),
     PolicyBlocked(RuntimeDiagnostic),
+    TerminalError(RuntimeDiagnostic),
     UserRequested,
     WriterEnded,
 }
@@ -897,7 +901,7 @@ struct AssemblyAISessionCtx {
     config: AssemblyAIConfig,
     event_tx: crossbeam_channel::Sender<AssemblyAIEvent>,
     connected: Arc<AtomicBool>,
-    user_disconnected: Arc<AtomicBool>,
+    stop_signal: Arc<AsrSessionStop>,
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     reconnect_opener: Option<ReconnectOpener>,
@@ -941,7 +945,7 @@ async fn session_task_with_backoff(
     let config = ctx.config;
     let event_tx = ctx.event_tx;
     let connected = ctx.connected;
-    let user_disconnected = ctx.user_disconnected;
+    let stop_signal = ctx.stop_signal;
     let pending_chunks = ctx.pending_chunks;
     #[cfg(test)]
     let reconnect_opener = ctx.reconnect_opener;
@@ -966,7 +970,7 @@ async fn session_task_with_backoff(
             &mut reader,
             &mut audio_rx,
             &event_tx,
-            &user_disconnected,
+            &stop_signal,
             &pending_chunks,
             &write_guard,
             Some(|| {
@@ -985,6 +989,15 @@ async fn session_task_with_backoff(
             reconnect_attempts = 0;
         }
 
+        let disconnect = if stop_signal.reason() == Some(AsrStopReason::BacklogTimeout)
+            && !matches!(
+                disconnect,
+                DisconnectKind::PolicyBlocked(_) | DisconnectKind::TerminalError(_)
+            ) {
+            DisconnectKind::TerminalError(websocket_diagnostic(Code::Timeout))
+        } else {
+            disconnect
+        };
         match disconnect {
             DisconnectKind::UserRequested | DisconnectKind::WriterEnded => {
                 log::info!("AssemblyAI session: ending ({disconnect:?})");
@@ -997,8 +1010,13 @@ async fn session_task_with_backoff(
                 emit_session_terminated_once(&event_tx, &terminated_emitted);
                 break;
             }
+            DisconnectKind::TerminalError(message) => {
+                let _ = event_tx.send(AssemblyAIEvent::Error { message });
+                emit_session_terminated_once(&event_tx, &terminated_emitted);
+                break;
+            }
             _ => {
-                if user_disconnected.load(Ordering::SeqCst) {
+                if stop_signal.reason() == Some(AsrStopReason::UserRequested) {
                     emit_session_terminated_once(&event_tx, &terminated_emitted);
                     break;
                 }
@@ -1014,6 +1032,20 @@ async fn session_task_with_backoff(
                 }
 
                 let reconnected = loop {
+                    match stop_signal.reason() {
+                        Some(AsrStopReason::UserRequested) => {
+                            emit_session_terminated_once(&event_tx, &terminated_emitted);
+                            break false;
+                        }
+                        Some(AsrStopReason::BacklogTimeout) => {
+                            let _ = event_tx.send(AssemblyAIEvent::Error {
+                                message: websocket_diagnostic(Code::Timeout),
+                            });
+                            emit_session_terminated_once(&event_tx, &terminated_emitted);
+                            break false;
+                        }
+                        None => {}
+                    }
                     let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
                         ReconnectStep::Retry {
                             attempt,
@@ -1043,27 +1075,11 @@ async fn session_task_with_backoff(
                         backoff_secs: backoff,
                     });
 
-                    // Sleep for the backoff window but bail out early on user
-                    // cancellation so shutdown doesn't wait up to 10s.
-                    let sleep = tokio::time::sleep(backoff_duration(backoff));
-                    tokio::pin!(sleep);
-                    loop {
-                        tokio::select! {
-                            _ = &mut sleep => break,
-                            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                                if user_disconnected.load(Ordering::SeqCst) {
-                                    log::info!("AssemblyAI session: user cancelled during backoff");
-                                    emit_session_terminated_once(&event_tx, &terminated_emitted);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-
-                    if user_disconnected.load(Ordering::SeqCst) {
-                        log::info!("AssemblyAI session: user cancelled before reconnect open");
-                        emit_session_terminated_once(&event_tx, &terminated_emitted);
-                        return;
+                    stop_signal
+                        .wait_for_backoff(backoff_duration(backoff))
+                        .await;
+                    if stop_signal.reason().is_some() {
+                        continue;
                     }
 
                     #[cfg(test)]
@@ -1073,6 +1089,7 @@ async fn session_task_with_backoff(
                     let reconnect_result = open_ws(&config).await;
 
                     match reconnect_result {
+                        Ok(_) if stop_signal.reason().is_some() => continue,
                         Ok((new_writer, new_reader)) => {
                             writer = new_writer;
                             reader = new_reader;
@@ -1118,7 +1135,7 @@ async fn run_io(
     reader: &mut WsReader,
     audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
     event_tx: &crossbeam_channel::Sender<AssemblyAIEvent>,
-    user_disconnected: &Arc<AtomicBool>,
+    stop_signal: &AsrSessionStop,
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     write_guard: &AsrWsWriteGuard,
     on_begin: Option<impl FnOnce()>,
@@ -1128,7 +1145,7 @@ async fn run_io(
         reader,
         audio_rx,
         event_tx,
-        user_disconnected,
+        stop_signal,
         pending_chunks,
         write_guard,
         Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
@@ -1143,7 +1160,7 @@ async fn run_io_with_keepalive_interval(
     reader: &mut WsReader,
     audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
     event_tx: &crossbeam_channel::Sender<AssemblyAIEvent>,
-    user_disconnected: &Arc<AtomicBool>,
+    stop_signal: &AsrSessionStop,
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     write_guard: &AsrWsWriteGuard,
     keepalive_interval: Duration,
@@ -1224,10 +1241,12 @@ async fn run_io_with_keepalive_interval(
 
                 match result {
                     Ok(Message::Text(text)) => {
-                        handle_server_message_with_begin(&text, event_tx, &mut on_begin);
+                        if let Some(message) = handle_server_message_with_begin(&text, event_tx, &mut on_begin, stop_signal) {
+                            return DisconnectKind::TerminalError(message);
+                        }
                     }
                     Ok(Message::Close(frame)) => {
-                        if user_disconnected.load(Ordering::SeqCst) {
+                        if stop_signal.reason() == Some(AsrStopReason::UserRequested) {
                             return DisconnectKind::UserRequested;
                         }
                         let diagnostic = websocket_close(frame.as_ref());
@@ -1261,24 +1280,33 @@ async fn run_io_with_keepalive_interval(
 /// Parse a single server JSON message and emit appropriate events.
 #[cfg(test)]
 pub(super) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<AssemblyAIEvent>) {
-    handle_server_message_with_begin(text, tx, &mut None::<fn()>);
+    let _ =
+        handle_server_message_with_begin(text, tx, &mut None::<fn()>, &AsrSessionStop::default());
 }
 
+/// A Termination frame during backlog timeout returns the diagnostic so the
+/// session task can emit it before the termination event.
 fn handle_server_message_with_begin(
     text: &str,
     tx: &crossbeam_channel::Sender<AssemblyAIEvent>,
     on_begin: &mut Option<impl FnOnce()>,
-) {
+    stop_signal: &AsrSessionStop,
+) -> Option<RuntimeDiagnostic> {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => {
             emit_invalid_response(tx);
-            return;
+            return None;
         }
     };
 
     let message_type = parsed.get("type").and_then(Value::as_str);
     if let Some(message_type) = AssemblyAiServerMessageType::from_wire(message_type) {
+        if message_type == AssemblyAiServerMessageType::Termination
+            && stop_signal.reason() == Some(AsrStopReason::BacklogTimeout)
+        {
+            return Some(websocket_diagnostic(Code::Timeout));
+        }
         // The receiver parses this frame again with source context. Forward
         // only that parser's fields, dropping unrecognized wire metadata.
         let payload =
@@ -1290,7 +1318,7 @@ fn handle_server_message_with_begin(
             });
         let Ok(payload) = payload else {
             emit_invalid_response(tx);
-            return;
+            return None;
         };
         // https://www.assemblyai.com/docs/streaming/message-sequence
         if message_type == AssemblyAiServerMessageType::Begin
@@ -1309,6 +1337,7 @@ fn handle_server_message_with_begin(
     } else {
         log::debug!("AssemblyAI: unsupported server message");
     }
+    None
 }
 
 fn emit_invalid_response(tx: &crossbeam_channel::Sender<AssemblyAIEvent>) {
@@ -1355,6 +1384,57 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
+    async fn backlog_timeout_survives_termination_and_peer_close() {
+        for frame in [
+            ws_fixture::ServerStep::send_text(r#"{"type":"Termination"}"#),
+            ws_fixture::ServerStep::send_close(),
+        ] {
+            let (url, peer) = ws_fixture::spawn_scripted_server(vec![frame]).await;
+            let (writer, reader) = ws_fixture::connect_client(&url).await.split();
+            let mut client = AssemblyAIClient::new(test_config());
+            let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+            client.audio_tx = Some(audio_tx);
+            client
+                .pending_chunks
+                .store(RECONNECT_AUDIO_BUFFER_MAX_CHUNKS, Ordering::SeqCst);
+            assert_eq!(client.send_audio(&[0.1]).unwrap_err(), "runtime/timeout");
+            // A later user request cannot replace an earlier backlog timeout.
+            client.stop_signal.request(AsrStopReason::UserRequested);
+            assert_eq!(client.send_audio(&[0.1]).unwrap_err(), "runtime/timeout");
+            let (event_tx, event_rx) = crossbeam_channel::unbounded();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                session_task(AssemblyAISessionCtx {
+                    writer,
+                    reader,
+                    config: test_config(),
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(false)),
+                    stop_signal: Arc::clone(&client.stop_signal),
+                    pending_chunks: Arc::clone(&client.pending_chunks),
+                    reconnect_opener: Some(Arc::new(|_| {
+                        panic!("backlog timeout must not reconnect")
+                    })),
+                    run_io_entries: None,
+                }),
+            )
+            .await
+            .expect("backlog timeout must end the session");
+            peer.await.unwrap();
+            let events: Vec<_> = event_rx.try_iter().collect();
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [AssemblyAIEvent::Error { message }, AssemblyAIEvent::SessionTerminated]
+                        if *message == websocket_diagnostic(Code::Timeout)
+                ),
+                "unexpected events: {events:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn reconnect_exhausts_budget_when_every_socket_closes_before_readiness() {
         assert_reconnect_exhausts_when_sockets_flap(false).await;
     }
@@ -1399,7 +1479,7 @@ mod tests {
                     audio_rx,
                     event_tx,
                     connected: Arc::new(AtomicBool::new(true)),
-                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    stop_signal: Arc::new(AsrSessionStop::default()),
                     pending_chunks: Arc::new(AtomicUsize::new(0)),
                     reconnect_opener: Some(opener),
                     run_io_entries: None,
@@ -1493,7 +1573,7 @@ mod tests {
                     audio_rx,
                     event_tx,
                     connected: Arc::new(AtomicBool::new(true)),
-                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    stop_signal: Arc::new(AsrSessionStop::default()),
                     pending_chunks: Arc::new(AtomicUsize::new(0)),
                     reconnect_opener: Some(opener),
                     run_io_entries: None,
@@ -1565,7 +1645,7 @@ mod tests {
                 audio_rx,
                 event_tx,
                 connected: Arc::new(AtomicBool::new(true)),
-                user_disconnected: Arc::new(AtomicBool::new(false)),
+                stop_signal: Arc::new(AsrSessionStop::default()),
                 pending_chunks: Arc::new(AtomicUsize::new(0)),
                 reconnect_opener: Some(opener),
                 run_io_entries: None,
@@ -1740,7 +1820,7 @@ mod tests {
                 let (mut writer, mut reader) = socket.split();
                 let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
                 let (event_tx, event_rx) = crossbeam_channel::unbounded();
-                let user_disconnected = Arc::new(AtomicBool::new(false));
+                let stop_signal = Arc::new(AsrSessionStop::default());
                 let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(usize::from(
                     audio.is_some(),
                 )));
@@ -1756,7 +1836,7 @@ mod tests {
                     &mut reader,
                     &mut audio_rx,
                     &event_tx,
-                    &user_disconnected,
+                    &stop_signal,
                     &pending_chunks,
                     &write_guard,
                     keepalive_interval,
@@ -2163,7 +2243,7 @@ mod tests {
         let (mut writer, mut reader) = client_socket.split();
         let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let write_guard = AsrWsWriteGuard::new(
             "asr.assemblyai",
@@ -2171,7 +2251,7 @@ mod tests {
         );
 
         let run = tokio::spawn({
-            let user_disconnected = Arc::clone(&user_disconnected);
+            let stop_signal = Arc::clone(&stop_signal);
             let pending_chunks = Arc::clone(&pending_chunks);
             async move {
                 run_io(
@@ -2179,7 +2259,7 @@ mod tests {
                     &mut reader,
                     &mut audio_rx,
                     &event_tx,
-                    &user_disconnected,
+                    &stop_signal,
                     &pending_chunks,
                     &write_guard,
                     None::<fn()>,
@@ -2280,7 +2360,7 @@ mod tests {
         let (mut writer, mut reader) = client_socket.split();
         let (_audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, _event_rx) = crossbeam_channel::bounded(16);
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let write_guard = AsrWsWriteGuard::new(
             "asr.assemblyai",
@@ -2293,7 +2373,7 @@ mod tests {
                 &mut reader,
                 &mut audio_rx,
                 &event_tx,
-                &user_disconnected,
+                &stop_signal,
                 &pending_chunks,
                 &write_guard,
                 Duration::from_millis(50),
@@ -2386,13 +2466,13 @@ mod tests {
         let (mut writer, mut reader) = client_socket.split();
         let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, _event_rx) = crossbeam_channel::bounded(16);
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let config = with_blocked_content_egress(test_config());
         let write_guard = AsrWsWriteGuard::new("asr.assemblyai", config.content_egress_policy);
 
         let run = tokio::spawn({
-            let user_disconnected = Arc::clone(&user_disconnected);
+            let stop_signal = Arc::clone(&stop_signal);
             let pending_chunks = Arc::clone(&pending_chunks);
             async move {
                 run_io(
@@ -2400,7 +2480,7 @@ mod tests {
                     &mut reader,
                     &mut audio_rx,
                     &event_tx,
-                    &user_disconnected,
+                    &stop_signal,
                     &pending_chunks,
                     &write_guard,
                     None::<fn()>,
@@ -2626,7 +2706,7 @@ mod tests {
         let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
         let connected = Arc::new(AtomicBool::new(true));
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let run_io_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let opener_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2648,7 +2728,7 @@ mod tests {
             config: test_config(),
             event_tx,
             connected: Arc::clone(&connected),
-            user_disconnected: Arc::clone(&user_disconnected),
+            stop_signal: Arc::clone(&stop_signal),
             pending_chunks,
             reconnect_opener: Some(opener),
             run_io_entries: Some(Arc::clone(&run_io_entries)),
@@ -2693,7 +2773,7 @@ mod tests {
             "failed reconnect must stay in the reconnect ladder, not re-enter run_io with stale socket halves"
         );
 
-        user_disconnected.store(true, Ordering::SeqCst);
+        stop_signal.request(AsrStopReason::UserRequested);
         match recv_event(&event_rx, Duration::from_secs(2)).await {
             AssemblyAIEvent::SessionTerminated => {}
             other => panic!("expected cancellation termination, got {other:?}"),
@@ -2733,7 +2813,7 @@ mod tests {
         let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(32);
         let connected = Arc::new(AtomicBool::new(true));
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let run_io_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let opener_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2802,7 +2882,7 @@ mod tests {
             config: test_config(),
             event_tx,
             connected: Arc::clone(&connected),
-            user_disconnected: Arc::clone(&user_disconnected),
+            stop_signal: Arc::clone(&stop_signal),
             pending_chunks: Arc::clone(&pending_chunks),
             reconnect_opener: Some(opener),
             run_io_entries: Some(Arc::clone(&run_io_entries)),

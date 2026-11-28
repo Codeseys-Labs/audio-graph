@@ -1178,6 +1178,7 @@ async fn run_io(ctx: RunIoCtx<'_>, now: impl Fn() -> tokio::time::Instant) -> Di
                             }
                             ServerMessage::TerminalError(message) => {
                                 if stop_signal.reason() == Some(AsrStopReason::UserRequested) {
+                                    log::warn!("OpenAI Realtime: terminal response during teardown {message}");
                                     return DisconnectKind::UserRequested;
                                 }
                                 return DisconnectKind::TerminalError(message);
@@ -1567,6 +1568,62 @@ mod tests {
                 "unexpected events: {events:?}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_frame_during_user_stop_logs_only_the_closed_code() {
+        use crate::test_log_capture::ThreadLogCapture;
+
+        let (url, peer) = ws_fixture::spawn_scripted_server(vec![
+            ws_fixture::ServerStep::expect_any_text(),
+            ws_fixture::ServerStep::send_text(
+                r#"{"type":"error","error":{"code":"credit_balance_exhausted","message":"private stop balance note"}}"#,
+            ),
+        ])
+        .await;
+        let config = test_config();
+        let (writer, reader) = open_ws_url(&config, &url).await.unwrap();
+        peer.await.unwrap();
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let stop_signal = Arc::new(AsrSessionStop::default());
+        stop_signal.request(AsrStopReason::UserRequested);
+        let capture = ThreadLogCapture::start();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            session_task(OpenAiRealtimeSessionCtx {
+                writer,
+                reader,
+                config,
+                audio_rx,
+                event_tx,
+                connected: Arc::new(AtomicBool::new(false)),
+                stop_signal,
+                disconnected_emitted: Arc::new(AtomicBool::new(false)),
+                pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                reconnect_opener: Some(Arc::new(|_| panic!("user stop must not reconnect"))),
+                run_io_entries: None,
+            }),
+        )
+        .await
+        .expect("terminal frame must complete teardown");
+        let records = capture.finish();
+        let terminal: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record
+                    .message
+                    .starts_with("OpenAI Realtime: terminal response during teardown")
+            })
+            .map(|record| record.message.as_str())
+            .collect();
+        assert_eq!(
+            terminal,
+            ["OpenAI Realtime: terminal response during teardown runtime/capacity_exhausted"]
+        );
+        assert!(!crate::test_log_capture::render(&records).contains("private stop balance note"));
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert_eq!(events, [OpenAiRealtimeEvent::Disconnected]);
     }
 
     #[tokio::test(flavor = "current_thread")]

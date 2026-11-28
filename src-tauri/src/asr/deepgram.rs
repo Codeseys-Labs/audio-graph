@@ -1146,7 +1146,8 @@ fn emit_disconnected_once(
 /// half reports a disconnect (server Close frame, tungstenite error, etc.),
 /// the task:
 ///
-/// 1. Checks the `stop_signal` flag — if set, exits silently.
+/// 1. Checks the stop reason. User stopping ends cleanly. Backlog timeout
+///    ends with a diagnostic and skips further reconnect attempts.
 /// 2. Emits `Disconnected` + a fresh `Reconnecting { attempt }` event.
 /// 3. Sleeps for the exponential backoff period (1s/2s/5s/10s).
 /// 4. Calls [`open_ws`] to re-establish the socket.
