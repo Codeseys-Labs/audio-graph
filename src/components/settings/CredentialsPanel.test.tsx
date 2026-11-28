@@ -2,6 +2,12 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import i18n from "i18next";
 import { describe, expect, it, vi } from "vitest";
 import "../../i18n";
+import {
+  FAILURE_CASES,
+  failedReadiness,
+  READINESS_NOTE_CASES,
+  runtimeFailure,
+} from "../../test/readinessFixtures";
 import type {
   CredentialPresence,
   ModelInfo,
@@ -49,7 +55,7 @@ function readiness(
   return {
     provider_id: "asr.local_whisper",
     status: "unchecked",
-    message: "msg",
+    note: { kind: "local_models_managed" },
     stale: false,
     credential_epoch: 0,
     credentials: [],
@@ -282,7 +288,10 @@ describe("CredentialsPanel — the tone law", () => {
       makeValue({
         savedCredentialEntries: [deepgramCredential],
         relatedReadinessForCredential: () => [
-          readiness({ provider_id: "asr.deepgram", status: "error" }),
+          readiness({
+            provider_id: "asr.deepgram",
+            ...failedReadiness(runtimeFailure("provider_unavailable", "retry")),
+          }),
         ],
         activeReadinessProviderIdSet: new Set(["asr.deepgram"]),
       }),
@@ -397,5 +406,75 @@ describe("CredentialsPanel in-place credential entry", () => {
         name: t("settings.credentialHealth.save"),
       }),
     ).not.toBeInTheDocument();
+  });
+});
+
+// ── Readiness copy comes from closed fields, in both locales ────────────────
+// The rollup renders each entry from its `note` / typed `diagnostic` only; no
+// backend text, `runtime/<code>` token or note kind may reach the DOM.
+describe("CredentialsPanel — readiness copy from closed fields", () => {
+  const LOCALES = ["en", "pt"] as const;
+  const renderEntry = (
+    locale: (typeof LOCALES)[number],
+    entry: ProviderReadiness,
+  ) => {
+    mockUseSettings.mockReturnValue(
+      makeValue({
+        t: i18n.getFixedT(locale),
+        visibleProviderReadiness: [entry],
+      }),
+    );
+    const view = render(<CredentialsPanel />);
+    const item = view.container.querySelector(
+      ".settings-readiness__item",
+    ) as HTMLElement;
+    return { view, item };
+  };
+
+  it.each(
+    READINESS_NOTE_CASES.map((c) => [JSON.stringify(c.note), c] as const),
+  )("renders the note %s as localized copy, not a raw token", (_label, c) => {
+    for (const locale of LOCALES) {
+      const { view, item } = renderEntry(
+        locale,
+        readiness({ provider_id: "asr.deepgram", note: c.note }),
+      );
+      expect(
+        item.querySelector(".settings-readiness__message")?.textContent,
+      ).toBe(c[locale]);
+      expect(item.textContent).not.toMatch(/runtime\/|credential\//);
+      if (c.note.kind.includes("_")) {
+        expect(item.textContent).not.toContain(c.note.kind);
+      }
+      view.unmount();
+    }
+  });
+
+  it.each(
+    FAILURE_CASES.map((c) => [c.name, c] as const),
+  )("presents %s with its own copy and recovery action", (_name, c) => {
+    for (const locale of LOCALES) {
+      const { view, item } = renderEntry(
+        locale,
+        readiness({
+          provider_id: "asr.deepgram",
+          credentials: [{ key: "deepgram_api_key", present: true }],
+          ...failedReadiness(c.diagnostic),
+        }),
+      );
+      expect(
+        item.querySelector(".settings-readiness__message")?.textContent,
+      ).toBe(c.message[locale]);
+      const recovery = item.querySelector(".settings-readiness__recovery");
+      if (c.recovery) {
+        expect(recovery).toHaveTextContent(c.recovery[locale]);
+      } else {
+        // The sentence above is already the next step.
+        expect(recovery).toBeNull();
+      }
+      expect(item.textContent).not.toContain("(401)");
+      expect(item.textContent).not.toMatch(/runtime\/|credential\//);
+      view.unmount();
+    }
   });
 });

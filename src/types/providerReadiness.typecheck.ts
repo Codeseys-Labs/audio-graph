@@ -7,7 +7,7 @@ import type {
 export const readyButDegradedFinalOnlyReadiness = {
   provider_id: "asr.api",
   status: "ready",
-  message: "Provider health check succeeded",
+  note: { kind: "verified" },
   stale: false,
   credential_epoch: 1,
   credentials: [],

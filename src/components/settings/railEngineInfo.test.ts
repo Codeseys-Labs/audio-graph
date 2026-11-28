@@ -12,7 +12,7 @@ function readiness(
   return {
     provider_id: "test.provider",
     status: "ready",
-    message: "",
+    note: { kind: "verified" },
     stale: false,
     credential_epoch: 0,
     credentials: [],

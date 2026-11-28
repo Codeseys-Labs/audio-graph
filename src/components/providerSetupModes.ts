@@ -7,6 +7,7 @@ import type {
   ProviderDataBoundary,
   ProviderDescriptor,
   ProviderReadiness,
+  ProviderRuntimeReadiness,
   ProviderStage,
   SourceRecoveryIssue,
 } from "../types";
@@ -81,6 +82,13 @@ export interface ProviderSetupBlocker {
   sourceName?: string;
   permissionStatus?: AudioPermissionStatus;
   permissionRecovery?: AudioPermissionRecoveryHint;
+  /**
+   * The readiness entry or local runtime check this blocker reports. Its
+   * `message` is only an English summary; present the closed fields with
+   * `providerSetupBlockerMessage`.
+   */
+  readiness?: ProviderReadiness;
+  runtime?: ProviderRuntimeReadiness;
 }
 
 export interface ProviderSetupCredentialStatus {
@@ -104,7 +112,8 @@ export interface ProviderSetupProviderSelection {
   dataLeavesDevice: boolean;
   credentials: ProviderSetupCredentialStatus[];
   readinessStatus: ProviderSetupReadinessStatus;
-  readinessMessage: string | null;
+  /** Backend readiness entry; present it with `providerReadinessMessage`. */
+  readiness: ProviderReadiness | null;
   blockers: ProviderSetupBlocker[];
   supportsStreaming: boolean;
   supportsPartialRevisions: boolean;
@@ -625,7 +634,7 @@ function selectProvider(
     dataLeavesDevice: descriptor.privacy.data_leaves_device,
     credentials,
     readinessStatus: providerReadinessStatus(descriptor, blockers, readiness),
-    readinessMessage: readiness?.message ?? null,
+    readiness,
     blockers,
     supportsStreaming: descriptor.supports_streaming,
     supportsPartialRevisions: descriptor.supports_partial_revisions,
@@ -867,7 +876,8 @@ function providerBlockers(
       kind: "missing_credential",
       providerId: descriptor.id,
       stage: descriptor.stage,
-      message: readiness.message,
+      message: `${descriptor.display_name} is missing required credentials.`,
+      readiness,
     });
   }
 
@@ -876,7 +886,8 @@ function providerBlockers(
       kind: "provider_error",
       providerId: descriptor.id,
       stage: descriptor.stage,
-      message: readiness.message,
+      message: `${descriptor.display_name} readiness check failed.`,
+      readiness,
     });
   }
 
@@ -1084,7 +1095,7 @@ function runtimeReadinessBlocker(
   const common = {
     providerId: descriptor.id,
     stage: descriptor.stage,
-    message: runtime.message,
+    runtime,
   };
 
   switch (runtime.status) {
@@ -1092,18 +1103,28 @@ function runtimeReadinessBlocker(
       return {
         ...common,
         kind: "missing_feature",
+        message: `${descriptor.display_name} needs a runtime feature this build does not include.`,
         feature: runtime.required_feature ?? undefined,
       };
     case "model_missing":
       return {
         ...common,
         kind: "missing_model",
+        message: `${descriptor.display_name} has no complete local model installed.`,
         model: runtime.model_id ?? undefined,
       };
     case "runtime_unavailable":
-      return { ...common, kind: "runtime_unavailable" };
+      return {
+        ...common,
+        kind: "runtime_unavailable",
+        message: `${descriptor.display_name} local runtime is not available.`,
+      };
     case "load_failed":
-      return { ...common, kind: "load_failed" };
+      return {
+        ...common,
+        kind: "load_failed",
+        message: `${descriptor.display_name} local runtime could not load its model.`,
+      };
   }
 }
 

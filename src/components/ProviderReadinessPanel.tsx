@@ -7,11 +7,14 @@ import type {
   ProviderDescriptor,
   ProviderPolicyStatus,
   ProviderReadiness,
+  ProviderReadinessNote,
+  ProviderRuntimeReadiness,
   ProviderSensitiveErrorPolicy,
   SttFidelityDegradation,
 } from "../types";
 import { runtimeDiagnosticPresentation } from "../utils/runtimeDiagnostic";
 import { providerRoadmapAuthLabel } from "./providerRegistryHelpers";
+import type { ProviderSetupBlocker } from "./providerSetupModes";
 import { readinessTone as statusTone } from "./settings/badgeTone";
 import { readinessChipTone } from "./settings/readinessTone";
 
@@ -427,60 +430,192 @@ export function credentialSourceLabel(
   );
 }
 
-// Stable text prefix the backend wraps around a provider probe's HTTP 401
-// (Unauthorized) detail message before it reaches `ProviderReadiness.message`
-// — mirrors `crate::error::CREDENTIAL_REJECTED_PREFIX` (src-tauri/src/error.rs)
-// and every 401-capable probe path that routes through
-// `classify_credential_rejected_message` (Deepgram, Soniox, the generic
-// OpenAI-compatible arm, AssemblyAI, Gemini, OpenRouter). A stable PREFIX
-// (checked with `startsWith`, not just a "401" substring search) is
-// deliberate: a provider error body can coincidentally contain "401" in
-// unrelated data (a request id, a project id, ...), so a substring match
-// would be a false-positive-prone classifier. This is the same
-// stable-prefix-over-substring design `isCredentialFileParseError` (App.tsx)
-// already uses for the `Failed to parse ` credential-file-parse marker.
-// (audio-graph-57cc)
-const CREDENTIAL_REJECTED_PREFIX = "Credential rejected (401):";
-
-// The closed diagnostic tokens a migrated probe returns as its whole message
-// when the provider refused the caller's identity — `RuntimeErrorCode`
-// rendered as `runtime/<code>` (today the OpenRouter probe). A token is matched
-// exactly, never as a prefix or substring. Probes not yet migrated still send
-// the legacy prefix above.
-//
-// A 401 on a request that carried a key means the same thing as that prefix,
-// so it shares the dedicated "replace the key" copy.
-const CREDENTIAL_REJECTED_TOKEN = "runtime/credential_rejected";
-
-export function isCredentialRejectedReadinessMessage(message: string): boolean {
-  return (
-    message === CREDENTIAL_REJECTED_TOKEN ||
-    message.startsWith(CREDENTIAL_REJECTED_PREFIX)
-  );
-}
-
-// An expired credential or a valid one the provider will not let do this is
-// not fixed by replacing the key, so each gets the copy for its own cause.
-function providerAuthRecoveryKey(message: string) {
-  switch (message) {
-    case "runtime/credential_expired":
-      return "runtimeDiagnostics.runtime.credential_expired" as const;
-    case "runtime/permission_denied":
-      return "runtimeDiagnostics.runtime.permission_denied" as const;
-    default:
-      return null;
+// A readiness entry says one thing, in closed fields: a typed `diagnostic` when
+// the check failed, otherwise its `note`. Both are localized here and nowhere
+// else, so every surface that shows readiness (Settings panels, the
+// credentials rollup, capability cards, Express setup) reads the same copy.
+function providerReadinessNoteMessage(
+  entry: ProviderReadiness,
+  t: TFunction,
+): string {
+  const note: ProviderReadinessNote = entry.note;
+  switch (note.kind) {
+    case "ready_to_check":
+    case "aws_profile_required":
+    case "vertex_project_required":
+    case "vertex_not_probed":
+    case "no_automatic_probe":
+    case "local_models_managed":
+    case "not_selected":
+    case "cancelled":
+    case "check_in_progress":
+    case "failed":
+      return t(`settings.providerReadiness.note.${note.kind}`);
+    case "missing_credentials":
+      // An empty list would read as a sentence with a hole; the status label
+      // already says the same thing without one.
+      return note.keys.length > 0
+        ? t("settings.providerReadiness.note.missing_credentials", {
+            count: note.keys.length,
+            keys: note.keys.join(", "),
+          })
+        : t("settings.providerReadiness.status.missing_credentials");
+    case "local_models": {
+      const parts = [
+        note.ready === 0
+          ? t("settings.providerReadiness.note.local_models_none_ready", {
+              total: note.total,
+            })
+          : t("settings.providerReadiness.note.local_models", {
+              ready: note.ready,
+              total: note.total,
+            }),
+      ];
+      if (note.missing.length > 0) {
+        parts.push(
+          t("settings.providerReadiness.note.local_models_missing", {
+            ids: note.missing.join(", "),
+          }),
+        );
+      }
+      if (note.invalid.length > 0) {
+        parts.push(
+          t("settings.providerReadiness.note.local_models_invalid", {
+            ids: note.invalid.join(", "),
+          }),
+        );
+      }
+      if (note.planned) {
+        parts.push(t("settings.providerReadiness.note.local_models_planned"));
+      }
+      return parts.join(" ");
+    }
+    case "check_rate_limited":
+      return t("settings.providerReadiness.note.check_rate_limited", {
+        count: note.retry_after_secs,
+      });
+    case "verified": {
+      // `model_count` is the catalog size for any catalog kind (a voice
+      // catalog is counted too), so only claim "models" when the entry's own
+      // catalog is a model catalog.
+      const catalog = providerCatalogSummary(entry);
+      return catalog?.kind === "models"
+        ? t("settings.providerReadiness.note.verified_models", {
+            count: catalog.count,
+          })
+        : t("settings.providerReadiness.note.verified");
+    }
+    default: {
+      // A note kind this build does not know (newer backend): the localized
+      // status label is the safe, closed statement.
+      const unknownNote: never = note;
+      void unknownNote;
+      return t(`settings.providerReadiness.status.${entry.status}`);
+    }
   }
 }
 
-// A typed failure is presented from its closed code. The `message` the backend
-// sends with it is the bare `runtime/<code>` token, which is not copy.
 export function providerReadinessMessage(
   entry: ProviderReadiness,
   t: TFunction,
 ): string {
   return entry.diagnostic
     ? t(runtimeDiagnosticPresentation(entry.diagnostic).translationKey)
-    : entry.message;
+    : providerReadinessNoteMessage(entry, t);
+}
+
+/**
+ * A local runtime check, from its closed `status` and the static registry/build
+ * values (`required_feature`, `model_id`, `runtime_version`) it concerns.
+ */
+export function providerRuntimeMessage(
+  runtime: ProviderRuntimeReadiness,
+  t: TFunction,
+): string {
+  const feature = runtime.required_feature || null;
+  const model = runtime.model_id || null;
+  const key = (name: string) =>
+    `settings.providerReadiness.runtimeDetail.${name}`;
+  let sentence: string;
+  switch (runtime.status) {
+    case "feature_missing":
+      sentence = feature
+        ? t(key("feature_missing"), { feature })
+        : t(key("feature_missing_unnamed"));
+      break;
+    case "model_missing":
+      sentence = model
+        ? t(key("model_missing"), { model })
+        : t(key("model_missing_unnamed"));
+      break;
+    case "runtime_unavailable":
+      sentence = t(key("runtime_unavailable"));
+      break;
+    case "load_failed":
+      sentence = model
+        ? t(key("load_failed"), { model })
+        : t(key("load_failed_unnamed"));
+      break;
+    case "healthy":
+      sentence = model
+        ? t(key("healthy"), { model })
+        : t(key("healthy_unnamed"));
+      break;
+    default: {
+      const unknownStatus: never = runtime.status;
+      void unknownStatus;
+      return t("settings.providerReadiness.unknown");
+    }
+  }
+  return runtime.runtime_version
+    ? `${sentence} ${t(key("version"), { version: runtime.runtime_version })}`
+    : sentence;
+}
+
+/**
+ * A setup blocker, presented from the readiness entry or runtime check it
+ * carries when it has one; every other blocker keeps its own summary.
+ */
+export function providerSetupBlockerMessage(
+  blocker: ProviderSetupBlocker,
+  t: TFunction,
+): string {
+  if (blocker.runtime) return providerRuntimeMessage(blocker.runtime, t);
+  if (blocker.readiness) return providerReadinessMessage(blocker.readiness, t);
+  return blocker.message;
+}
+
+// The one "what to do next" rule for a failed check, decided from the typed
+// cause's recovery action alone (never from message text): the same for ASR,
+// TTS, LLM and AWS entries.
+function providerFailureRecovery(
+  entry: ProviderReadiness,
+  t: TFunction,
+): string | null {
+  if (!entry.diagnostic) return null;
+  const presentation = runtimeDiagnosticPresentation(entry.diagnostic);
+  // A credential-store failure (locked, missing, corrupt) says what to do in
+  // its own sentence; replacing the provider key would not help.
+  if (presentation.diagnostic.kind === "credential") {
+    return t(presentation.translationKey);
+  }
+  switch (presentation.recoveryAction) {
+    case "reenter_credential":
+      return t("settings.providerReadiness.recovery.credentialRejected");
+    // Replacing the key fixes neither an expired credential...
+    case "refresh_credential":
+      return t("runtimeDiagnostics.runtime.credential_expired");
+    // ...nor a valid one the provider will not let do this.
+    case "review_configuration": {
+      const { diagnostic } = presentation;
+      return diagnostic.kind === "runtime" &&
+        diagnostic.detail.code === "permission_denied"
+        ? t("runtimeDiagnostics.runtime.permission_denied")
+        : null;
+    }
+    default:
+      return null;
+  }
 }
 
 export function providerRecoveryAction(
@@ -491,18 +626,13 @@ export function providerRecoveryAction(
   switch (entry.status) {
     case "missing_credentials":
       return t("settings.providerReadiness.recovery.missingCredentials");
-    case "error": {
-      if (isCredentialRejectedReadinessMessage(entry.message)) {
-        return t("settings.providerReadiness.recovery.credentialRejected");
-      }
-      const authRecoveryKey = providerAuthRecoveryKey(entry.message);
-      if (authRecoveryKey) {
-        return t(authRecoveryKey);
-      }
-      return hasPresentCredential(entry)
-        ? t("settings.providerReadiness.recovery.errorWithCredentials")
-        : t("settings.providerReadiness.recovery.errorWithoutCredentials");
-    }
+    case "error":
+      return (
+        providerFailureRecovery(entry, t) ??
+        (hasPresentCredential(entry)
+          ? t("settings.providerReadiness.recovery.errorWithCredentials")
+          : t("settings.providerReadiness.recovery.errorWithoutCredentials"))
+      );
     case "unchecked":
       if (!hasCredentialSlots(entry) || !hasPresentCredential(entry)) {
         return null;
@@ -561,7 +691,7 @@ export function ProviderReadinessDetails({
               {t(
                 `settings.providerReadiness.runtimeStatus.${entry.runtime.status}`,
               )}
-              {`: ${entry.runtime.message}`}
+              {`: ${providerRuntimeMessage(entry.runtime, t)}`}
             </dd>
           </div>
         )}
