@@ -3847,14 +3847,39 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                     // Revised-only by construction: content this apply
                     // covered was actually superseded, not merely trailed by
                     // a later append.
-                    let stale_apply = matches!(
-                        &error,
+                    let (stale_apply, error_code) = match error {
                         ProjectionRuntimeApplyError::Apply {
-                            error: ProjectionApplyError::StaleBasis { .. }
+                            error: ProjectionApplyError::StaleBasis { .. },
+                        } => (true, "stale_basis"),
+                        ProjectionRuntimeApplyError::Apply { .. } => (false, "patch_apply_failed"),
+                        ProjectionRuntimeApplyError::RotationInProgress { .. } => {
+                            (false, "rotation_in_progress")
                         }
-                    );
+                        ProjectionRuntimeApplyError::SessionMismatch { .. } => {
+                            (false, "session_mismatch")
+                        }
+                        ProjectionRuntimeApplyError::PatchBasisMismatch { .. } => {
+                            (false, "patch_basis_mismatch")
+                        }
+                        ProjectionRuntimeApplyError::SaveMaterializedNotes { .. } => {
+                            (false, "save_notes_failed")
+                        }
+                        ProjectionRuntimeApplyError::SaveMaterializedGraph { .. } => {
+                            (false, "save_graph_failed")
+                        }
+                        ProjectionRuntimeApplyError::ProjectionEventWriterUnavailable {
+                            ..
+                        } => (false, "event_writer_unavailable"),
+                        ProjectionRuntimeApplyError::ProjectionEventEnqueueFailed { .. } => {
+                            (false, "event_enqueue_failed")
+                        }
+                        ProjectionRuntimeApplyError::SessionChangedDuringApply { .. } => {
+                            (false, "session_changed_during_apply")
+                        }
+                    };
                     log::warn!(
-                        "Projection job apply failed kind={:?} stale_apply={stale_apply}",
+                        "Projection job apply failed job_id={} kind={:?} stale_apply={stale_apply} error_code={error_code}",
+                        job.id,
                         job.kind
                     );
                     finish_projection_scheduler_job(
