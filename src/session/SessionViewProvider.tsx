@@ -3,39 +3,28 @@
  * audio-graph-59fb, parent audio-graph-19c7, plan §R1), extended for
  * Review-while-Live (issue #140, ADR-0028).
  *
- * Today every session-scoped reader (`NotesPanel`, `LiveTranscript`,
- * `KnowledgeGraphViewer`, `SeekTimeline`) reads straight off the global
- * `useAudioGraphStore`: `transcriptSegments`, `graphSnapshot`,
- * `materializedNotes`, `sessionTimeline`, `sessionProjectionEvents`. That is
- * correct for Live because the store holds exactly one live/loaded session's
- * worth of this data at a time.
+ * Every session-scoped reader (`NotesPanel`, `LiveTranscript`,
+ * `KnowledgeGraphViewer`, `SeekTimeline`) reads through this module instead of
+ * straight off the global `useAudioGraphStore`, so a second, historical
+ * session can be shown without ever being written into that store.
  *
- * This module is the seam that keeps a second, historical session out of
- * that store. `useSessionView()` returns the same five fields either way:
- *   - Wrapped in a `SessionViewProvider` with no `reviewSessionId`: the
+ *   - Wrapped in a `SessionViewProvider` with no `reviewSessionId`: Live. The
  *     provider's own store reads (the same global-store selectors).
- *   - Not wrapped (e.g. a component test that mounts `NotesPanel` etc. in
- *     isolation, as several already do): falls back to reading the global
- *     store directly, so no test needs to add a wrapper for this to keep
- *     working.
- *   - Wrapped with a `reviewSessionId`: a Review subtree. Transcript reads
- *     come from the query-backed Review store (`reviewStore.ts`); every
- *     field Review does not hold (graph, notes, timeline, projection
- *     events) is EMPTY rather than falling through to Live data, and the
- *     provider's global selectors collapse to constants so Live content
- *     events neither re-render nor reach the subtree. Lenses that are not
- *     migrated yet stay gated by their caller (`SessionsBrowser`).
+ *   - Not wrapped (a component test that mounts `NotesPanel` etc. in
+ *     isolation): the hooks fall back to reading the global store directly.
+ *   - Wrapped with a `reviewSessionId`: a Review subtree. Every read comes from
+ *     the query-backed Review store (`reviewStore.ts`): the transcript and
+ *     live-lane graph from the `load_session` snapshot, and Notes, Graph and
+ *     Timeline from the open lens's artifact, read in the SAME round as the
+ *     snapshot and published with it (`reviewLens`). The global selectors collapse to constants, so
+ *     Live content events neither re-render nor reach the subtree, and the
+ *     seek / edge-focus targets are Review's own.
  *
- * `useTranscriptView()` is the transcript pane's read: the segments plus the
- * speaker state (`speakers`, the diarization ledger, transcript events) that
- * `LiveTranscript` used to pull from the global store directly.
+ * `useSessionView()` subscribes to the global store ONLY when no provider is
+ * above it; under any provider it reads the provider's value alone.
  *
- * Known deviation, left as-is: `useSessionView()` unconditionally calls the
- * five global-store selectors on every render (the fallback path), so a
- * wrapped consumer still holds a live global subscription underneath the
- * context read. No Review pane reads `useSessionView()` directly today
- * (`LiveTranscript` uses `useTranscriptView()`, whose selectors collapse
- * under Review); the Notes/Graph migration (#140 slice 2) must tighten it.
+ * `useTranscriptView()`, `useTimelineView()` and `useSessionInteractions()` are
+ * the transcript, timeline and cross-lens (seek / edge focus) reads.
  */
 import { createContext, type ReactNode, useContext, useMemo } from "react";
 import { useAudioGraphStore } from "../store";
@@ -43,6 +32,7 @@ import type {
   AsrPartialEvent,
   DiarizationSpanRevisionEvent,
   GraphSnapshot,
+  MaterializedGraph,
   MaterializedNotes,
   ProjectionPatch,
   SpeakerInfo,
@@ -50,6 +40,7 @@ import type {
   TranscriptEvent,
   TranscriptSegment,
 } from "../types";
+import { type ArtifactKind, useReviewStore } from "./reviewStore";
 import {
   type ReviewTranscriptView,
   useReviewTranscript,
@@ -61,6 +52,8 @@ export interface SessionView {
   materializedNotes: MaterializedNotes | null;
   sessionTimeline: TimelineEntry[] | null;
   sessionProjectionEvents: ProjectionPatch[];
+  /** The richer materialized graph, when this session has loaded one. */
+  materializedProjectionGraph: MaterializedGraph | null;
 }
 
 const SessionViewContext = createContext<SessionView | null>(null);
@@ -84,6 +77,7 @@ const EMPTY_GRAPH: GraphSnapshot = {
 export function SessionViewProvider({
   children,
   reviewSessionId = null,
+  reviewLens = null,
 }: {
   children: ReactNode;
   /**
@@ -91,9 +85,15 @@ export function SessionViewProvider({
    * Live behaviour: every read comes straight from the global store.
    */
   reviewSessionId?: string | null;
+  /**
+   * The artifact lens (Notes, Graph, Timeline) currently open below, whose
+   * data is queried in the same round as the session snapshot; `null` for the
+   * Transcript lens, which needs none.
+   */
+  reviewLens?: ArtifactKind | null;
 }) {
   const reviewing = reviewSessionId !== null;
-  const review = useReviewTranscript(reviewSessionId);
+  const review = useReviewTranscript(reviewSessionId, reviewLens);
   // Under a Review selection these selectors return constants, so Live
   // content events never re-render (or leak into) the Review subtree.
   const transcriptSegments = useAudioGraphStore((s) =>
@@ -111,25 +111,48 @@ export function SessionViewProvider({
   const sessionProjectionEvents = useAudioGraphStore((s) =>
     reviewing ? EMPTY_PROJECTION_EVENTS : s.sessionProjectionEvents,
   );
+  const materializedProjectionGraph = useAudioGraphStore((s) =>
+    reviewing ? null : s.materializedProjectionGraph,
+  );
+  // The Review store's artifacts, but only once they belong to THIS session
+  // (a render can precede the layout effect that selects it).
+  const artifacts = useReviewStore((s) =>
+    reviewing && s.sessionId === reviewSessionId ? s.artifacts : null,
+  );
   const reviewedTranscript = review?.snapshot?.transcript;
+  const reviewedGraph = review?.snapshot?.graph;
   const value = useMemo<SessionView>(
-    () => ({
-      transcriptSegments: reviewing
-        ? (reviewedTranscript ?? EMPTY_SEGMENTS)
-        : transcriptSegments,
-      graphSnapshot,
-      materializedNotes,
-      sessionTimeline,
-      sessionProjectionEvents,
-    }),
+    () =>
+      reviewing
+        ? {
+            transcriptSegments: reviewedTranscript ?? EMPTY_SEGMENTS,
+            graphSnapshot: reviewedGraph ?? EMPTY_GRAPH,
+            materializedNotes: artifacts?.notes.data?.notes ?? null,
+            sessionTimeline: artifacts?.timeline.data?.entries ?? null,
+            sessionProjectionEvents:
+              artifacts?.notes.data?.projection_events ??
+              EMPTY_PROJECTION_EVENTS,
+            materializedProjectionGraph: artifacts?.graph.data ?? null,
+          }
+        : {
+            transcriptSegments,
+            graphSnapshot,
+            materializedNotes,
+            sessionTimeline,
+            sessionProjectionEvents,
+            materializedProjectionGraph,
+          },
     [
       reviewing,
       reviewedTranscript,
+      reviewedGraph,
+      artifacts,
       transcriptSegments,
       graphSnapshot,
       materializedNotes,
       sessionTimeline,
       sessionProjectionEvents,
+      materializedProjectionGraph,
     ],
   );
   return (
@@ -142,21 +165,34 @@ export function SessionViewProvider({
 }
 
 /**
- * Session-scoped selector set. Always calls the same global-store hooks
- * (rules-of-hooks-safe — no conditional hook calls) so it behaves
- * identically whether or not a `SessionViewProvider` is mounted above it;
- * see the module doc for why that is a real invariant this unit needs, not
- * an accident of the current implementation.
+ * Session-scoped selector set. Calls the same global-store hooks on every
+ * render (rules-of-hooks-safe), but their selectors collapse to constants as
+ * soon as a `SessionViewProvider` sits above: the provider's value is then the
+ * only source, so a consumer under a Review provider holds no Live
+ * subscription and cannot re-render on Live content events. Without a
+ * provider (an isolated component test) they read the global store directly.
  */
 export function useSessionView(): SessionView {
-  const transcriptSegments = useAudioGraphStore((s) => s.transcriptSegments);
-  const graphSnapshot = useAudioGraphStore((s) => s.graphSnapshot);
-  const materializedNotes = useAudioGraphStore((s) => s.materializedNotes);
-  const sessionTimeline = useAudioGraphStore((s) => s.sessionTimeline);
-  const sessionProjectionEvents = useAudioGraphStore(
-    (s) => s.sessionProjectionEvents,
-  );
   const ctx = useContext(SessionViewContext);
+  const provided = ctx !== null;
+  const transcriptSegments = useAudioGraphStore((s) =>
+    provided ? EMPTY_SEGMENTS : s.transcriptSegments,
+  );
+  const graphSnapshot = useAudioGraphStore((s) =>
+    provided ? EMPTY_GRAPH : s.graphSnapshot,
+  );
+  const materializedNotes = useAudioGraphStore((s) =>
+    provided ? null : s.materializedNotes,
+  );
+  const sessionTimeline = useAudioGraphStore((s) =>
+    provided ? null : s.sessionTimeline,
+  );
+  const sessionProjectionEvents = useAudioGraphStore((s) =>
+    provided ? EMPTY_PROJECTION_EVENTS : s.sessionProjectionEvents,
+  );
+  const materializedProjectionGraph = useAudioGraphStore((s) =>
+    provided ? null : s.materializedProjectionGraph,
+  );
   return (
     ctx ?? {
       transcriptSegments,
@@ -164,8 +200,19 @@ export function useSessionView(): SessionView {
       materializedNotes,
       sessionTimeline,
       sessionProjectionEvents,
+      materializedProjectionGraph,
     }
   );
+}
+
+/** The reviewed session id below a Review provider; `null` for Live. */
+export function useReviewSessionId(): string | null {
+  return useContext(ReviewViewContext)?.sessionId ?? null;
+}
+
+/** The Review snapshot's load state below a Review provider; `null` for Live. */
+export function useReviewView(): ReviewTranscriptView | null {
+  return useContext(ReviewViewContext);
 }
 
 /** What a transcript pane renders: Live from the global store, or Review. */
@@ -224,4 +271,112 @@ export function useTranscriptView(): TranscriptView {
     speakers,
     asrPartial,
   };
+}
+
+/** What the seek-timeline renders. */
+export interface TimelineView {
+  timeline: TimelineEntry[] | null;
+  /** Fold length before the backend's tail cap; `null` when not known. */
+  totalCount: number | null;
+  loading: boolean;
+  transcriptEvents: TranscriptEvent[];
+  speakers: SpeakerInfo[];
+}
+
+/**
+ * Timeline reads. Review: the timeline fold slot (a first query is `loading`)
+ * and the snapshot's transcript events; speakers are Live-only and empty.
+ */
+export function useTimelineView(): TimelineView {
+  const review = useContext(ReviewViewContext);
+  const reviewing = review !== null;
+  // The snapshot and the timeline slot are read from the store in the same
+  // render, so they are always the pair one round published.
+  const slot = useReviewStore((s) =>
+    reviewing && s.sessionId === review.sessionId ? s.artifacts.timeline : null,
+  );
+  const reviewSnapshot = useReviewStore((s) =>
+    reviewing && s.sessionId === review.sessionId ? s.snapshot : null,
+  );
+  const timeline = useAudioGraphStore((s) =>
+    reviewing ? null : s.sessionTimeline,
+  );
+  const totalCount = useAudioGraphStore((s) =>
+    reviewing ? null : s.sessionTimelineTotalCount,
+  );
+  const loading = useAudioGraphStore((s) =>
+    reviewing ? false : s.sessionTimelineLoading,
+  );
+  const transcriptEvents = useAudioGraphStore((s) =>
+    reviewing ? EMPTY_TRANSCRIPT_EVENTS : s.sessionTranscriptEvents,
+  );
+  const speakers = useAudioGraphStore((s) =>
+    reviewing ? EMPTY_SPEAKERS : s.speakers,
+  );
+  if (!reviewing) {
+    return { timeline, totalCount, loading, transcriptEvents, speakers };
+  }
+  return {
+    timeline: slot?.data?.entries ?? null,
+    totalCount: slot?.data?.total_count ?? null,
+    loading: slot === null || slot.status === "loading",
+    transcriptEvents:
+      reviewSnapshot?.transcriptEvents ?? EMPTY_TRANSCRIPT_EVENTS,
+    speakers,
+  };
+}
+
+/** Cross-lens targets: the Timeline lens drives Transcript and Graph. */
+export interface SessionInteractions {
+  transcriptSeekTarget: { segmentId: string; nonce: number } | null;
+  seekTranscriptToSegment: (segmentId: string | null) => void;
+  /**
+   * Seek to the segment behind a timeline span; `knownSegmentId` is what the
+   * caller's transcript events resolve it to (or `null`). Review refreshes its
+   * snapshot first when the span is unknown to it.
+   */
+  seekToSpan: (spanId: string, knownSegmentId: string | null) => void;
+  graphEdgeFocus: { edgeIds: string[]; nonce: number } | null;
+  focusGraphEdges: (edgeIds: string[] | null) => void;
+}
+
+/**
+ * Seek and edge-focus targets. A Review subtree has its own (in the Review
+ * store), so a click in a reviewed session's Timeline never writes a Live
+ * field, and a Review pane holds no subscription to the Live targets.
+ */
+export function useSessionInteractions(): SessionInteractions {
+  const reviewing = useContext(ReviewViewContext) !== null;
+  const liveSeekTarget = useAudioGraphStore((s) =>
+    reviewing ? null : s.transcriptSeekTarget,
+  );
+  const liveSeek = useAudioGraphStore((s) => s.seekTranscriptToSegment);
+  const liveEdgeFocus = useAudioGraphStore((s) =>
+    reviewing ? null : s.graphEdgeFocus,
+  );
+  const liveFocus = useAudioGraphStore((s) => s.focusGraphEdges);
+  const reviewSeekTarget = useReviewStore((s) =>
+    reviewing ? s.transcriptSeekTarget : null,
+  );
+  const reviewSeek = useReviewStore((s) => s.seekTranscriptToSegment);
+  const reviewSeekToSpan = useReviewStore((s) => s.seekToSpan);
+  const reviewEdgeFocus = useReviewStore((s) =>
+    reviewing ? s.graphEdgeFocus : null,
+  );
+  const reviewFocus = useReviewStore((s) => s.focusGraphEdges);
+  return reviewing
+    ? {
+        transcriptSeekTarget: reviewSeekTarget,
+        seekTranscriptToSegment: reviewSeek,
+        seekToSpan: (spanId, known) => void reviewSeekToSpan(spanId, known),
+        graphEdgeFocus: reviewEdgeFocus,
+        focusGraphEdges: reviewFocus,
+      }
+    : {
+        transcriptSeekTarget: liveSeekTarget,
+        seekTranscriptToSegment: liveSeek,
+        seekToSpan: (spanId, known) => liveSeek(known ?? spanId),
+        graphEdgeFocus: liveEdgeFocus,
+        focusGraphEdges: liveFocus,
+      };
 }

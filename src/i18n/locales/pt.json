@@ -835,6 +835,8 @@
       "stale": "Esta transcrição pode estar desatualizada: a última atualização falhou. Mostrando a última cópia carregada.",
       "needsLoad": "Esta visualização precisa que a sessão seja carregada primeiro.",
       "loadSession": "Carregar sessão",
+      "staleView": "Esta visualização pode estar desatualizada: a última atualização falhou. Mostrando a última cópia carregada.",
+      "emptyNotes": "Esta sessão não tem notas.",
       "viewUnavailable": "Não foi possível carregar esta sessão.",
       "emptyTranscript": "Esta sessão não tem transcrição."
     },
@@ -873,7 +875,11 @@
       "classLabel": {
         "materialized_graph": "grafo de conhecimento",
         "materialized_notes": "notas",
-        "projection_events": "registro de projeção"
+        "projection_events": "registro de projeção",
+        "transcript_events": "transcrição",
+        "diarization_events": "registro de falantes",
+        "live_graph": "grafo ao vivo",
+        "other": "dados"
       }
     },
     "lensFetchError": {

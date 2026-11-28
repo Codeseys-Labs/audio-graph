@@ -11,10 +11,14 @@
  * `SessionMetadata`) on the left, a detail pane on the right. Selecting a
  * row sets `nav.sessionId` (`useAudioGraphStore`'s `setNavSessionId`) and, for
  * any row that ISN'T the session that just finished recording, calls
- * `loadSession` when no capture is running (while it runs, the Transcript lens
- * is a query-backed Review pane instead and Notes/Timeline/Graph are gated —
- * see `globalHoldsRow` in `SessionDetail`). The just-stopped session's row is
- * a special case: see `handleSelect` below.
+ * `loadSession` when no capture is running. Every lens of a reviewed session
+ * (Transcript, Notes, Timeline, Graph) is a query-backed Review pane keyed by
+ * the row's id (`session/reviewStore.ts`), so it never reads or writes the
+ * global store, with capture running or not; only Ask and "Generate prose
+ * summary", which need the backend's current buffers, stay behind
+ * `globalHoldsRow` in `SessionDetail`. The just-stopped session's row, whose
+ * data is resident in the global store, is a special case: see
+ * `handleSelect` and `residentRow`.
  *
  * Source of truth is still the backend `sessions.json` index —
  * `list_sessions` returns all known sessions, `load_session` hydrates the
@@ -39,23 +43,37 @@
  * yet read that field — lens selection here stays local component state,
  * reset per session via `key={selectedId}` on `<SessionDetail>`.
  */
-import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import {
+  createContext,
+  lazy,
+  type ReactNode,
+  Suspense,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
+import { useReviewStore } from "../session/reviewStore";
 import { SessionViewProvider } from "../session/SessionViewProvider";
 import { useAudioGraphStore } from "../store";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
 import { downloadAsFile, filenameTimestamp } from "../utils/download";
 import { formatDurationHoursAware, formatRelativeTime } from "../utils/format";
-import ArtifactRefusalNotice from "./ArtifactRefusalNotice";
 import ChatSidebar from "./ChatSidebar";
 import Icon, { type IconName } from "./Icon";
 import IconButton from "./IconButton";
-import LensFetchErrorNotice from "./LensFetchErrorNotice";
 import LiveTranscript from "./LiveTranscript";
-import NotesPanel, { useNotesSynthesis } from "./NotesPanel";
+import NotesPanel from "./NotesPanel";
 import Popover, { PopoverItem } from "./Popover";
+import ReviewLensGate from "./ReviewLensGate";
 import SeekTimeline from "./SeekTimeline";
 import SessionDataRoutePanel from "./SessionDataRoutePanel";
+import {
+  type NotesSynthesisController,
+  useNotesSynthesis,
+} from "./useNotesSynthesis";
 
 // Same code-split rationale as the old App.tsx-owned import (ADR-0016 /
 // modernization-audit 2.3): react-force-graph-2d stays a deferred chunk.
@@ -686,6 +704,100 @@ function ReviewLockedNotice({ message }: { message: string }) {
   );
 }
 
+/**
+ * "Generate prose summary" reads the BACKEND's current buffers, so it is
+ * offered only for the session whose data is resident in the global store. Its
+ * controller (`useNotesSynthesis`, which follows the Live transcript and graph)
+ * therefore lives in this scope, mounted ONLY while the action is offered: a
+ * reviewed session never pays for, or re-renders on, Live updates through it.
+ */
+const SynthesisContext = createContext<NotesSynthesisController | null>(null);
+
+function ResidentSynthesisScope({ children }: { children: ReactNode }) {
+  const synthesis = useNotesSynthesis();
+  return (
+    <SynthesisContext.Provider value={synthesis}>
+      {children}
+    </SynthesisContext.Provider>
+  );
+}
+
+function SummaryMenu() {
+  const { t } = useTranslation();
+  const synthesis = useContext(SynthesisContext);
+  if (synthesis === null) return null;
+  return (
+    <Popover
+      trigger={
+        <IconButton
+          icon="more"
+          label={t("sessions.detailActionsLabel")}
+          variant="ghost"
+        />
+      }
+    >
+      <PopoverItem
+        onClick={() => void synthesis.handleSynthesize()}
+        disabled={synthesis.loading}
+      >
+        {synthesis.loading
+          ? t("notes.synthesizing")
+          : t("sessions.generateProseSummary")}
+      </PopoverItem>
+    </Popover>
+  );
+}
+
+/** The resident session's Notes lens: shares the summary's controller. */
+function ResidentNotesLens() {
+  const synthesis = useContext(SynthesisContext);
+  return (
+    <NotesPanel synthesis={synthesis ?? undefined} headerActions={false} />
+  );
+}
+
+/** The lens body, shared by the Review and resident (global store) paths. */
+function LensBody({
+  lens,
+  reviewed,
+}: {
+  lens: "notes" | "transcript" | "timeline" | "graph";
+  /** True under a Review provider: Notes, Timeline and Graph sit in a gate. */
+  reviewed: boolean;
+}) {
+  const graph = (
+    <Suspense fallback={null}>
+      <KnowledgeGraphViewer />
+    </Suspense>
+  );
+  switch (lens) {
+    case "transcript":
+      return <LiveTranscript />;
+    case "notes":
+      return reviewed ? (
+        <ReviewLensGate kind="notes">
+          <NotesPanel headerActions={false} />
+        </ReviewLensGate>
+      ) : (
+        <ResidentNotesLens />
+      );
+    case "timeline":
+      return reviewed ? (
+        <ReviewLensGate kind="timeline">
+          <SeekTimeline />
+        </ReviewLensGate>
+      ) : (
+        <SeekTimeline />
+      );
+    case "graph":
+      return reviewed ? (
+        <ReviewLensGate kind="graph">{graph}</ReviewLensGate>
+      ) : (
+        graph
+      );
+  }
+}
+
 interface SessionDetailProps {
   row: SessionRow | null;
   samplePreviewActive: boolean;
@@ -699,62 +811,18 @@ function SessionDetail({
 }: SessionDetailProps) {
   const { t } = useTranslation();
   const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
-  // While capture runs the Transcript lens is the only migrated one, so open
-  // there instead of landing on a gated Notes lens.
+  // While capture runs the Transcript lens is the cheapest to land on (Notes,
+  // Timeline and Graph each fetch a heavy artifact when they activate).
   const [lens, setLens] = useState<DetailLens>(
     liveRunning ? "transcript" : "notes",
   );
   const [askOpen, setAskOpen] = useState(false);
-  const synthesis = useNotesSynthesis();
 
-  // Per-lens lazy fetch (seed audio-graph-4fa5 deliverable a): the Notes and
-  // Graph lenses each own a heavy artifact `load_session` no longer bundles.
-  // Gated on `loadedSessionId === row.id` (not `row.id` alone) so the fetch
-  // fires only once `loadSession`'s own response has landed and actually
-  // matches this row — firing earlier would race `loadSessionNotesArtifacts`
-  // / `loadSessionGraphArtifact`'s own `loadedSessionId !== sessionId`
-  // stale-guard and get dropped as "stale" before it ever started. This also
-  // means the resident-just-stopped-live row (`row.optimistic`, which skips
-  // `loadSession` entirely — see `handleSelect`) never fires a redundant
-  // fetch: `loadedSessionId` stays whatever it was during capture, so it
-  // never matches that row's id, and the panel already renders correctly
-  // from the live-populated store fields regardless.
-  const notesLensStatus = useAudioGraphStore((s) => s.notesLensStatus);
-  const graphLensStatus = useAudioGraphStore((s) => s.graphLensStatus);
-  const loadSessionNotesArtifacts = useAudioGraphStore(
-    (s) => s.loadSessionNotesArtifacts,
-  );
-  const loadSessionGraphArtifact = useAudioGraphStore(
-    (s) => s.loadSessionGraphArtifact,
-  );
-  const activeSessionId = samplePreviewActive ? null : (row?.id ?? null);
-  useEffect(() => {
-    // While live, Notes/Graph are gated: their fetch actions hydrate the
-    // Live global fields, which a Review selection must never touch.
-    if (liveRunning) return;
-    if (!activeSessionId || loadedSessionId !== activeSessionId) return;
-    if (lens === "notes" && notesLensStatus.type === "idle") {
-      void loadSessionNotesArtifacts(activeSessionId);
-    }
-    if (lens === "graph" && graphLensStatus.type === "idle") {
-      void loadSessionGraphArtifact(activeSessionId);
-    }
-  }, [
-    liveRunning,
-    activeSessionId,
-    loadedSessionId,
-    lens,
-    notesLensStatus.type,
-    graphLensStatus.type,
-    loadSessionNotesArtifacts,
-    loadSessionGraphArtifact,
-  ]);
-
-  // ONE predicate decides whether anything that reads the global store, or
-  // asks the backend about its current buffers (Notes, Timeline and Graph
-  // lenses, Ask, "Generate prose summary"), may be shown for this row: the
-  // global store holds THIS session's data and nothing is capturing or
-  // transcribing. "Holds this session" is store truth, two ways:
+  // What reads the BACKEND's current buffers or the global store, and so needs
+  // the global store to hold THIS row's data: Ask and "Generate prose summary"
+  // (the lenses no longer do, see `reviewLensId` below). ONE predicate, store
+  // truth: nothing is capturing or transcribing, and the global store holds
+  // this session's data, two ways:
   //   - `loadedSessionId === row.id` (a session loaded by explicit action), or
   //   - `loadedSessionId === null && pendingFinalizingSession?.id === row.id`:
   //     the just-stopped session's resident live data. `stopCapture` writes
@@ -764,38 +832,62 @@ function SessionDetail({
   //     is resident (see the invariant at the slot's declaration). It covers
   //     the row both while optimistic and after it is indexed, and is false
   //     after an unresolved Stop (null slot).
-  // Sample preview holds the store by construction. When the predicate is
-  // false the lens shows a gated or placeholder state with an explicit "Load"
-  // action; nothing here ever loads the global store on the user's behalf.
+  // Sample preview holds the store by construction. When false, those two
+  // actions are simply unavailable; nothing here loads the global store on the
+  // user's behalf.
   const pendingFinalizingSession = useAudioGraphStore(
     (s) => s.pendingFinalizingSession,
   );
-  const loadSession = useAudioGraphStore((s) => s.loadSession);
+  const residentRow =
+    !liveRunning &&
+    row !== null &&
+    (row.optimistic === true ||
+      (loadedSessionId === null && pendingFinalizingSession?.id === row.id));
   const globalHoldsRow =
     samplePreviewActive ||
     (!liveRunning &&
       row !== null &&
       (loadedSessionId === row.id ||
         (loadedSessionId === null && pendingFinalizingSession?.id === row.id)));
-  const [loadState, setLoadState] = useState<"idle" | "loading" | "failed">(
-    "idle",
-  );
-  const handleLoadClick = () => {
-    if (activeSessionId === null || liveRunning) return;
-    setLoadState("loading");
-    void loadSession(activeSessionId).then((loaded) => {
-      setLoadState(loaded === null ? "failed" : "idle");
-    });
-  };
+  const synthesisOffered = globalHoldsRow && !loadedSessionId;
 
-  // Concurrent Live + Review (ADR-0028): the Transcript lens is a Review pane
-  // keyed by the row's own id, for every row except the optimistic just-stopped
-  // one (its data is resident in the global store). It does not depend on the
-  // capture flags, so Start/Stop never swaps what a reviewed session shows or
-  // exports. While capture runs a row that is not completed (the live session
-  // itself) stays locked.
-  const reviewSessionId =
-    !samplePreviewActive && row && row.optimistic !== true ? row.id : null;
+  // Concurrent Live + Review (ADR-0028): every lens (Transcript, Notes,
+  // Timeline, Graph) is a Review pane keyed by the row's own id, whatever the
+  // capture flags say, so Start/Stop never swaps what a reviewed session shows
+  // or exports and nothing reads the global store for it. Two cases hold their
+  // data in the global store by construction and keep reading it: sample
+  // preview, and the just-stopped session's resident data (`residentRow`).
+  // While capture runs a row that is not completed (the live session itself)
+  // stays locked.
+  const reviewLensId =
+    !samplePreviewActive && row && !residentRow ? row.id : null;
+
+  // A "→N" badge click on a reviewed session's Timeline (an explicit user
+  // action) records Review's own edge-focus target; bring this pane to its
+  // Graph lens, where the edges are emphasised. The Live view has no equivalent
+  // (the `App.tsx` bridge sets `nav.lens`, which nothing reads), and this
+  // reads only Review's store, never a Live field.
+  const edgeFocusNonce = useReviewStore((s) => s.graphEdgeFocus?.nonce ?? null);
+  const seenEdgeFocus = useRef(edgeFocusNonce);
+  const focusGraphTab = useRef(false);
+  useEffect(() => {
+    if (edgeFocusNonce === seenEdgeFocus.current) return;
+    seenEdgeFocus.current = edgeFocusNonce;
+    if (edgeFocusNonce !== null && reviewLensId !== null) {
+      focusGraphTab.current = true;
+      setLens("graph");
+    }
+  }, [edgeFocusNonce, reviewLensId]);
+  // The badge that was activated is gone with the Timeline lens: when focus
+  // fell to the body, move it to the Graph tab (never if the user moved it).
+  useEffect(() => {
+    if (!focusGraphTab.current || lens !== "graph") return;
+    focusGraphTab.current = false;
+    const active = document.activeElement;
+    if (active === null || active === document.body) {
+      document.getElementById("sessions-lens-tab-graph")?.focus();
+    }
+  }, [lens]);
   if (liveRunning && row && !samplePreviewActive && !reviewableWhileLive(row)) {
     return (
       <section
@@ -843,18 +935,11 @@ function SessionDetail({
     tabs?.[nextIndex]?.focus();
   };
 
-  // Ask/Chat and the overflow actions read the global store or the backend's
-  // current buffers, so they follow the same predicate as the lenses.
+  // Ask/Chat reads the global store.
   const canAsk = askAvailable(lens) && globalHoldsRow;
-  // Notes, Graph and Timeline still read the global store (slice 2 of #140
-  // migrates them).
-  const lensUsesGlobalStore =
-    lens === "notes" || lens === "graph" || lens === "timeline";
-  const lensBlocked = lensUsesGlobalStore && !globalHoldsRow;
-  const lensGatedWhileLive = lensBlocked && liveRunning;
   const sessionIdForRoute = samplePreviewActive ? null : (row?.id ?? null);
 
-  return (
+  const detail = (
     <section
       aria-label={t("sessions.detail")}
       className="flex flex-1 min-w-0 flex-col overflow-hidden"
@@ -883,26 +968,7 @@ function SessionDetail({
           >
             <Icon name="chat" size={14} /> {t("sessions.ask")}
           </button>
-          {globalHoldsRow && !loadedSessionId && (
-            <Popover
-              trigger={
-                <IconButton
-                  icon="more"
-                  label={t("sessions.detailActionsLabel")}
-                  variant="ghost"
-                />
-              }
-            >
-              <PopoverItem
-                onClick={() => void synthesis.handleSynthesize()}
-                disabled={synthesis.loading}
-              >
-                {synthesis.loading
-                  ? t("notes.synthesizing")
-                  : t("sessions.generateProseSummary")}
-              </PopoverItem>
-            </Popover>
-          )}
+          {synthesisOffered && <SummaryMenu />}
         </div>
       </div>
 
@@ -943,71 +1009,16 @@ function SessionDetail({
           aria-labelledby={`sessions-lens-tab-${lens}`}
           className="flex-1 min-w-0 min-h-0 overflow-hidden flex flex-col"
         >
-          {lensGatedWhileLive && (
-            <ReviewLockedNotice
-              message={t("sessions.reviewLensLockedWhileLive")}
-            />
-          )}
-          {lensBlocked && !liveRunning && (
-            <div className="flex flex-1 min-w-0 flex-col items-center justify-center gap-(--space-3) p-(--space-6) text-center">
-              {loadState === "failed" ? (
-                <p
-                  className="m-0 max-w-[360px] text-sm text-text-secondary"
-                  role="alert"
-                >
-                  {t("sessions.review.viewUnavailable")}
-                </p>
-              ) : (
-                <p
-                  className="m-0 max-w-[360px] text-sm text-text-secondary"
-                  role="status"
-                >
-                  {loadState === "loading"
-                    ? t("common.loading")
-                    : t("sessions.review.needsLoad")}
-                </p>
-              )}
-              <button
-                type="button"
-                className="ag-btn-micro"
-                onClick={handleLoadClick}
-                disabled={loadState === "loading"}
+          {lens !== "route" &&
+            (reviewLensId !== null ? (
+              <SessionViewProvider
+                reviewSessionId={reviewLensId}
+                reviewLens={lens === "transcript" ? null : lens}
               >
-                <Icon name="refresh" size={14} />{" "}
-                {loadState === "failed"
-                  ? t("sessions.review.retry")
-                  : t("sessions.review.loadSession")}
-              </button>
-            </div>
-          )}
-          {!lensBlocked &&
-            lens === "notes" &&
-            (notesLensStatus.type === "refused" ? (
-              <ArtifactRefusalNotice status={notesLensStatus} />
-            ) : notesLensStatus.type === "error" ? (
-              <LensFetchErrorNotice status={notesLensStatus} />
-            ) : (
-              <NotesPanel synthesis={synthesis} headerActions={false} />
-            ))}
-          {lens === "transcript" &&
-            (reviewSessionId !== null ? (
-              <SessionViewProvider reviewSessionId={reviewSessionId}>
-                <LiveTranscript />
+                <LensBody lens={lens} reviewed />
               </SessionViewProvider>
             ) : (
-              <LiveTranscript />
-            ))}
-          {!lensBlocked && lens === "timeline" && <SeekTimeline />}
-          {!lensBlocked &&
-            lens === "graph" &&
-            (graphLensStatus.type === "refused" ? (
-              <ArtifactRefusalNotice status={graphLensStatus} />
-            ) : graphLensStatus.type === "error" ? (
-              <LensFetchErrorNotice status={graphLensStatus} />
-            ) : (
-              <Suspense fallback={null}>
-                <KnowledgeGraphViewer />
-              </Suspense>
+              <LensBody lens={lens} reviewed={false} />
             ))}
           {lens === "route" && (
             <SessionDataRoutePanel sessionId={sessionIdForRoute} />
@@ -1020,6 +1031,11 @@ function SessionDetail({
         )}
       </div>
     </section>
+  );
+  return synthesisOffered ? (
+    <ResidentSynthesisScope>{detail}</ResidentSynthesisScope>
+  ) : (
+    detail
   );
 }
 
