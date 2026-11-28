@@ -4,7 +4,8 @@ use super::domain::{
     AuthorityJournal, CredentialRecordEnvelope, CredentialStoreFailure, EncodedCredentialRecord,
 };
 use super::service::{
-    CredentialEntryStore, CredentialMutationSession, CredentialSettingsActivationPort,
+    AuthoritativeActiveRead, CredentialEntryStore, CredentialMutationSession,
+    CredentialSettingsActivationPort,
 };
 use audio_graph_ipc_contract::credential_contract::{CredentialOperationId, CredentialSetId};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -140,6 +141,15 @@ impl FakeCredentialStore {
             .journal
             .clone()
     }
+
+    /// Puts `journal` back as the persisted journal, as a restore from an
+    /// older copy of the same authority would.
+    pub(crate) fn restore_journal(&self, journal: AuthorityJournal) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .journal = journal;
+    }
 }
 
 impl FakeCredentialState {
@@ -161,20 +171,24 @@ impl CredentialEntryStore for FakeCredentialStore {
     fn read_active(
         &self,
         set_id: &CredentialSetId,
-    ) -> Result<Option<EncodedCredentialRecord>, CredentialStoreFailure> {
+    ) -> Result<AuthoritativeActiveRead, CredentialStoreFailure> {
         self.entry_reads.fetch_add(1, Ordering::SeqCst);
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.record_call(FakeStoreCall::ReadActive)?;
-        Ok(state
+        let record = state
             .active
             .iter()
             .find(|(candidate, _)| candidate == set_id)
             .map(|(_, bytes)| {
                 EncodedCredentialRecord::from_boundary_bytes(bytes.as_slice().to_vec())
-            }))
+            });
+        Ok(AuthoritativeActiveRead {
+            journal: Some(state.journal.clone()),
+            record,
+        })
     }
 
     fn begin_mutation(

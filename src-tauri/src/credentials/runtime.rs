@@ -1384,9 +1384,9 @@ mod tests {
     };
     use crate::credentials::fake::{FakeCredentialStore, FakeStoreCall};
     use crate::credentials::service::{
-        CredentialChangeEvent, CredentialEntryStore, CredentialMutationSession,
-        CredentialResolution, CredentialService, CredentialTokenSource, CredentialUseRequest,
-        DeleteCredentialSet, PrepareCredentialActivation,
+        AuthoritativeActiveRead, CredentialChangeEvent, CredentialEntryStore,
+        CredentialMutationSession, CredentialResolution, CredentialService, CredentialTokenSource,
+        CredentialUseRequest, DeleteCredentialSet, PrepareCredentialActivation,
     };
     use crate::credentials::test_support::DeterministicTokenSource;
     use audio_graph_ipc_contract::credential_contract::{
@@ -1520,18 +1520,22 @@ mod tests {
         fn read_active(
             &self,
             set_id: &CredentialSetId,
-        ) -> Result<Option<EncodedCredentialRecord>, CredentialStoreFailure> {
+        ) -> Result<AuthoritativeActiveRead, CredentialStoreFailure> {
             let state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Ok(state
+            let record = state
                 .active
                 .iter()
                 .find(|(candidate, _)| candidate == set_id)
                 .map(|(_, bytes)| {
                     EncodedCredentialRecord::from_boundary_bytes(bytes.as_slice().to_vec())
-                }))
+                });
+            Ok(AuthoritativeActiveRead {
+                journal: Some(state.journal.clone()),
+                record,
+            })
         }
 
         fn begin_mutation(

@@ -12,7 +12,9 @@ use super::native_interaction::{
 use crate::credentials::domain::{
     AuthorityJournal, CredentialStoreFailure, EncodedCredentialRecord,
 };
-use crate::credentials::service::{CredentialEntryStore, CredentialMutationSession};
+use crate::credentials::service::{
+    AuthoritativeActiveRead, CredentialEntryStore, CredentialMutationSession,
+};
 use audio_graph_ipc_contract::credential_contract::{
     BUILT_IN_CREDENTIAL_SET_IDS, CredentialBackendKind, CredentialOperationId, CredentialSetId,
 };
@@ -284,18 +286,22 @@ impl CredentialEntryStore for NativeKeyringCredentialStore {
     fn read_active(
         &self,
         set_id: &CredentialSetId,
-    ) -> Result<Option<EncodedCredentialRecord>, CredentialStoreFailure> {
+    ) -> Result<AuthoritativeActiveRead, CredentialStoreFailure> {
         let mut interaction = self.interaction_gate.acquire()?;
         let _mutation_lock = self.journal.acquire_mutation_lock()?;
         // With no authority there are no credentials, and an entry left
         // without one is never served.
-        if self
-            .require_bound_authority_unlocked(&mut interaction)?
-            .is_none()
-        {
-            return Ok(None);
-        }
-        self.read_record_unlocked(&mut interaction, &EntryLocator::active(set_id))
+        let Some(journal) = self.require_bound_authority_unlocked(&mut interaction)? else {
+            return Ok(AuthoritativeActiveRead {
+                journal: None,
+                record: None,
+            });
+        };
+        let record = self.read_record_unlocked(&mut interaction, &EntryLocator::active(set_id))?;
+        Ok(AuthoritativeActiveRead {
+            journal: Some(*journal),
+            record,
+        })
     }
 
     fn begin_mutation(
@@ -540,7 +546,8 @@ mod tests {
         StoredSecretBundle,
     };
     use crate::credentials::service::{
-        CredentialEntryStore, CredentialService, DeleteCredentialSet, ReplaceCredentialSet,
+        AuthoritativeActiveRead, CredentialEntryStore, CredentialService, DeleteCredentialSet,
+        ReplaceCredentialSet,
     };
     use crate::credentials::test_support::DeterministicTokenSource;
     use audio_graph_ipc_contract::credential_contract::{
@@ -1932,7 +1939,10 @@ mod tests {
         let verified_reads = verified_keyring.reads.load(Ordering::SeqCst);
         assert!(matches!(
             verified_store.read_active(&verified_set),
-            Ok(Some(_))
+            Ok(AuthoritativeActiveRead {
+                journal: Some(_),
+                record: Some(_)
+            })
         ));
         // One authority-marker read plus the record read.
         assert_eq!(
@@ -2185,6 +2195,7 @@ mod tests {
             store
                 .read_active(&set_id)
                 .expect("provider-shaped active read")
+                .record
                 .is_none()
         );
         // The provider read revalidates the bound authority under the same
@@ -2444,7 +2455,10 @@ mod tests {
         );
         drop(before_session);
         let before_reads = before_keyring.reads.load(Ordering::SeqCst);
-        assert!(matches!(before_store.read_active(&before_set), Ok(None)));
+        assert!(matches!(
+            before_store.read_active(&before_set),
+            Ok(AuthoritativeActiveRead { record: None, .. })
+        ));
         assert_eq!(
             before_keyring.reads.load(Ordering::SeqCst),
             before_reads + 2
@@ -2576,7 +2590,7 @@ mod tests {
             finished_rx
                 .recv_timeout(Duration::from_secs(1))
                 .expect("second-store read completes after lease drop"),
-            Ok(None)
+            Ok(AuthoritativeActiveRead { record: None, .. })
         ));
         reader.join().expect("second-store reader thread");
         assert_eq!(
@@ -2610,7 +2624,10 @@ mod tests {
         assert_eq!(journal.reads.load(Ordering::SeqCst), journal_reads);
 
         journal.lock_contended.store(false, Ordering::SeqCst);
-        assert!(matches!(store.read_active(&set_id), Ok(None)));
+        assert!(matches!(
+            store.read_active(&set_id),
+            Ok(AuthoritativeActiveRead { record: None, .. })
+        ));
     }
 
     /// An open store is bound to the authority it opened. Losing a half of
@@ -2623,7 +2640,10 @@ mod tests {
         let gate = NativeInteractionGate::isolated_for_test();
         let original = ready_store_with_gate(keyring.clone(), journal.clone(), gate);
         let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
-        assert!(matches!(original.read_active(&set_id), Ok(None)));
+        assert!(matches!(
+            original.read_active(&set_id),
+            Ok(AuthoritativeActiveRead { record: None, .. })
+        ));
 
         journal.bytes.lock().expect("memory journal lock").take();
         let native_reads = keyring.reads.load(Ordering::SeqCst);
@@ -2640,7 +2660,10 @@ mod tests {
             .expect("memory keyring lock")
             .retain(|(account, _)| account != "v2/_authority");
         let replacement = ready_store_with_gate(keyring.clone(), journal.clone(), gate);
-        assert!(matches!(replacement.read_active(&set_id), Ok(None)));
+        assert!(matches!(
+            replacement.read_active(&set_id),
+            Ok(AuthoritativeActiveRead { record: None, .. })
+        ));
         assert!(matches!(
             original.read_active(&set_id),
             Err(CredentialStoreFailure::CorruptRecord)
@@ -2667,7 +2690,13 @@ mod tests {
         };
         let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
         let native_reads = keyring.reads.load(Ordering::SeqCst);
-        assert!(matches!(fresh.read_active(&set_id), Ok(None)));
+        assert!(matches!(
+            fresh.read_active(&set_id),
+            Ok(AuthoritativeActiveRead {
+                journal: None,
+                record: None
+            })
+        ));
         // Only the authority marker was read; the record never was.
         assert_eq!(keyring.reads.load(Ordering::SeqCst), native_reads + 1);
 

@@ -56,14 +56,27 @@ pub(crate) trait CredentialMutationSession {
     fn commit_journal(&mut self, journal: &AuthorityJournal) -> Result<(), CredentialStoreFailure>;
 }
 
+/// A read for use, taken under one cooperating-process lock: the authority's
+/// journal at that moment and the active record it governs. Deciding on this
+/// pair, rather than on a journal cached earlier, keeps another process's
+/// persisted intent or a restored older journal from being missed.
+pub(crate) struct AuthoritativeActiveRead {
+    /// `None` only when the store has never had an authority, in which case
+    /// `record` is `None` too.
+    pub(crate) journal: Option<AuthorityJournal>,
+    pub(crate) record: Option<EncodedCredentialRecord>,
+}
+
 /// Entry reads and mutation-session creation are the only core-visible store
 /// operations. Every write lives on the opaque session, so a concrete adapter
 /// must retain its cooperating-process lock until that session is dropped.
 pub(crate) trait CredentialEntryStore: Send + Sync {
+    /// Reads the authoritative journal and `set_id`'s active record under one
+    /// lock.
     fn read_active(
         &self,
         set_id: &CredentialSetId,
-    ) -> Result<Option<EncodedCredentialRecord>, CredentialStoreFailure>;
+    ) -> Result<AuthoritativeActiveRead, CredentialStoreFailure>;
 
     fn begin_mutation(
         &self,
@@ -780,6 +793,67 @@ impl CredentialService {
         self.worker.complete_stalled_operation(operation_id)
     }
 
+    fn recovery_required(set_id: &CredentialSetId) -> CredentialError {
+        content_free_error(
+            CredentialErrorCode::RecoveryRequired,
+            CredentialSafeRecoveryAction::Reconcile,
+            Some(set_id.clone()),
+        )
+    }
+
+    /// Whether `journal` lets `set_id`'s active record be read for use: the
+    /// set is known and no mutation of it is in flight, except a staged
+    /// settings activation, whose expected record stays usable until it
+    /// commits.
+    fn journal_allows_entry_read(journal: &AuthorityJournal, set_id: &CredentialSetId) -> bool {
+        let Some(set) = journal.set_state(set_id) else {
+            return false;
+        };
+        let pending = journal.pending_activation.as_ref();
+        match set.recovery_state {
+            CredentialSetRecoveryState::None => {
+                pending.is_none_or(|pending| pending.set_id != *set_id)
+            }
+            CredentialSetRecoveryState::PendingIntent => pending.is_some_and(|pending| {
+                pending.set_id == *set_id && pending.stage == CredentialActivationStage::Staged
+            }),
+            CredentialSetRecoveryState::RecordJournalMismatch
+            | CredentialSetRecoveryState::CommitUnknown => false,
+        }
+    }
+
+    /// Whether `record` is the one `journal` commits for `set_id` and may be
+    /// handed out.
+    fn journal_allows_resolution(
+        journal: &AuthorityJournal,
+        set_id: &CredentialSetId,
+        record: &CredentialRecordEnvelope,
+    ) -> bool {
+        let Some(set) = journal.set_state(set_id) else {
+            return false;
+        };
+        let state_matches = set.revision.as_ref() == Some(&record.revision)
+            && matches!(
+                (set.record_state, record.is_tombstone()),
+                (CredentialSetRecordState::Configured, false)
+                    | (CredentialSetRecordState::Tombstoned, true)
+            );
+        let pending = journal.pending_activation.as_ref();
+        let recovery_allows = match set.recovery_state {
+            CredentialSetRecoveryState::None => {
+                pending.is_none_or(|pending| pending.set_id != *set_id)
+            }
+            CredentialSetRecoveryState::PendingIntent => pending.is_some_and(|pending| {
+                pending.set_id == *set_id
+                    && pending.expected_revision.as_ref() == Some(&record.revision)
+                    && pending.stage == CredentialActivationStage::Staged
+            }),
+            CredentialSetRecoveryState::RecordJournalMismatch
+            | CredentialSetRecoveryState::CommitUnknown => false,
+        };
+        state_matches && recovery_allows
+    }
+
     pub(crate) fn resolve_for_use(
         &self,
         request: CredentialUseRequest,
@@ -835,57 +909,52 @@ impl CredentialService {
             ));
         }
 
-        let (committed_set, pending_activation) = {
-            let journal = self
+        // A refusal the cached journal already proves costs no store I/O.
+        let cached_allows_read = Self::journal_allows_entry_read(
+            &self
                 .journal
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                journal.set_state(&request.set_id).cloned(),
-                journal.pending_activation.clone(),
-            )
-        };
-        let Some(committed_set) = committed_set else {
-            return Err(content_free_error(
-                CredentialErrorCode::RecoveryRequired,
-                CredentialSafeRecoveryAction::Reconcile,
-                Some(request.set_id),
-            ));
-        };
-        let recovery_allows_entry_read = match committed_set.recovery_state {
-            CredentialSetRecoveryState::None => pending_activation
-                .as_ref()
-                .is_none_or(|pending| pending.set_id != request.set_id),
-            CredentialSetRecoveryState::PendingIntent => {
-                pending_activation.as_ref().is_some_and(|pending| {
-                    pending.set_id == request.set_id
-                        && pending.stage == CredentialActivationStage::Staged
-                })
-            }
-            CredentialSetRecoveryState::RecordJournalMismatch
-            | CredentialSetRecoveryState::CommitUnknown => false,
-        };
-        if !recovery_allows_entry_read {
-            return Err(content_free_error(
-                CredentialErrorCode::RecoveryRequired,
-                CredentialSafeRecoveryAction::Reconcile,
-                Some(request.set_id),
-            ));
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            &request.set_id,
+        );
+        if !cached_allows_read {
+            return Err(Self::recovery_required(&request.set_id));
         }
 
         let operation_id = self.token_source.next_operation_id();
         let _permit = self.worker.admit(&operation_id, &request.set_id)?;
-        let encoded = self
+        // The decision is made on the journal read under the same lock as the
+        // record. The cache may predate another process's persisted intent,
+        // and an older journal of the same authority is refused by its epoch.
+        let read = self
             .store
             .read_active(&request.set_id)
-            .map_err(|failure| self.map_store_failure(failure, &request.set_id))?
-            .ok_or_else(|| {
-                content_free_error(
+            .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
+        let Some(journal) = read.journal else {
+            return Err(match read.record {
+                None => content_free_error(
                     CredentialErrorCode::Missing,
                     CredentialSafeRecoveryAction::ReenterCredential,
-                    Some(request.set_id.clone()),
-                )
-            })?;
+                    Some(request.set_id),
+                ),
+                Some(_) => content_free_error(
+                    CredentialErrorCode::CorruptRecord,
+                    CredentialSafeRecoveryAction::Reconcile,
+                    Some(request.set_id),
+                ),
+            });
+        };
+        self.reconcile_authoritative_journal(&journal, &request.set_id)?;
+        if !Self::journal_allows_entry_read(&journal, &request.set_id) {
+            return Err(Self::recovery_required(&request.set_id));
+        }
+        let encoded = read.record.ok_or_else(|| {
+            content_free_error(
+                CredentialErrorCode::Missing,
+                CredentialSafeRecoveryAction::ReenterCredential,
+                Some(request.set_id.clone()),
+            )
+        })?;
         let record = CredentialRecordEnvelope::decode(&encoded)?;
         if record.set_id != request.set_id {
             return Err(content_free_error(
@@ -894,32 +963,8 @@ impl CredentialService {
                 Some(request.set_id),
             ));
         }
-        let state_matches = committed_set.revision.as_ref() == Some(&record.revision)
-            && matches!(
-                (committed_set.record_state, record.is_tombstone()),
-                (CredentialSetRecordState::Configured, false)
-                    | (CredentialSetRecordState::Tombstoned, true)
-            );
-        let recovery_allows_resolution = match committed_set.recovery_state {
-            CredentialSetRecoveryState::None => pending_activation
-                .as_ref()
-                .is_none_or(|pending| pending.set_id != request.set_id),
-            CredentialSetRecoveryState::PendingIntent => {
-                pending_activation.as_ref().is_some_and(|pending| {
-                    pending.set_id == request.set_id
-                        && pending.expected_revision.as_ref() == Some(&record.revision)
-                        && pending.stage == CredentialActivationStage::Staged
-                })
-            }
-            CredentialSetRecoveryState::RecordJournalMismatch
-            | CredentialSetRecoveryState::CommitUnknown => false,
-        };
-        if !state_matches || !recovery_allows_resolution {
-            return Err(content_free_error(
-                CredentialErrorCode::RecoveryRequired,
-                CredentialSafeRecoveryAction::Reconcile,
-                Some(request.set_id),
-            ));
+        if !Self::journal_allows_resolution(&journal, &request.set_id, &record) {
+            return Err(Self::recovery_required(&request.set_id));
         }
         if record.is_tombstone() {
             return Err(content_free_error(
@@ -2146,9 +2191,10 @@ impl CredentialService {
 #[cfg(test)]
 mod tests {
     use super::{
-        CredentialEntryStore, CredentialMutationSession, CredentialResolution, CredentialService,
-        CredentialSettingsActivationPort, CredentialUseRequest, DeleteCredentialSet,
-        PrepareCredentialActivation, ReplaceCredentialSet, verify_exact_store_readback,
+        AuthoritativeActiveRead, CredentialEntryStore, CredentialMutationSession,
+        CredentialResolution, CredentialService, CredentialSettingsActivationPort,
+        CredentialUseRequest, DeleteCredentialSet, PrepareCredentialActivation,
+        ReplaceCredentialSet, verify_exact_store_readback,
     };
     use crate::credentials::domain::{
         AuthorityJournal, CredentialRecordEnvelope, CredentialStoreFailure,
@@ -2162,10 +2208,11 @@ mod tests {
         AuthMethodId, AwsPartition, AwsSdkService, BuiltInCredentialSetId, CREDENTIAL_USE_POLICIES,
         CredentialActivationStage, CredentialAudience, CredentialAudiencePolicyDefinition,
         CredentialBackendKind, CredentialErrorCode, CredentialIdempotencyToken,
-        CredentialMutationResultCode, CredentialOperationId, CredentialPurpose,
-        CredentialSafeRecoveryAction, CredentialSetId, CredentialSetRecordState,
-        CredentialSetRecoveryState, CredentialUsePolicyDecisionDefinition, CredentialWorkerState,
-        CustomCredentialSetId, PORTABLE_ENCODED_RECORD_MAX_BYTES, SecureTransportScheme,
+        CredentialMutationReceipt, CredentialMutationResultCode, CredentialOperationId,
+        CredentialPurpose, CredentialRevision, CredentialSafeRecoveryAction, CredentialSetId,
+        CredentialSetRecordState, CredentialSetRecoveryState,
+        CredentialUsePolicyDecisionDefinition, CredentialWorkerState, CustomCredentialSetId,
+        PORTABLE_ENCODED_RECORD_MAX_BYTES, SecureTransportScheme,
     };
     use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::Duration;
@@ -2215,7 +2262,7 @@ mod tests {
         fn read_active(
             &self,
             set_id: &CredentialSetId,
-        ) -> Result<Option<EncodedCredentialRecord>, CredentialStoreFailure> {
+        ) -> Result<AuthoritativeActiveRead, CredentialStoreFailure> {
             self.inner.read_active(set_id)
         }
 
@@ -5268,5 +5315,102 @@ mod tests {
             assert!(!artifact.contains("secret_length"));
             assert!(!artifact.contains("fingerprint"));
         }
+    }
+
+    fn configure_deepgram(
+        service: &CredentialService,
+        token: &str,
+        expected: Option<CredentialRevision>,
+    ) -> CredentialMutationReceipt {
+        service
+            .replace_set(ReplaceCredentialSet {
+                set_id: CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("lease-generation").expect("API key"),
+                expected_revision: expected,
+                idempotency_token: idempotency(token),
+            })
+            .expect("replace succeeds")
+    }
+
+    /// Process B persists a replacement intent and dies before it replaces
+    /// the native record. Process A still caches the clean journal, and the
+    /// old record still matches that cache, but the authority now says the
+    /// set is mid-mutation: A must not hand out a lease.
+    #[test]
+    fn a_stale_service_refuses_a_lease_while_another_services_intent_is_pending() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let stale = CredentialService::new(
+            store.clone(),
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let created = configure_deepgram(&stale, "51515151-5151-4151-8151-515151515151", None);
+        let interrupted = CredentialService::new(
+            store.clone(),
+            store.journal_snapshot(),
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        store.fail_next(
+            FakeStoreCall::ReplaceActive,
+            CredentialStoreFailure::Unavailable,
+        );
+        interrupted
+            .replace_set(ReplaceCredentialSet {
+                set_id: CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("interrupted-generation").expect("API key"),
+                expected_revision: created.new_revision.clone(),
+                idempotency_token: idempotency("52525252-5252-4252-8252-525252525252"),
+            })
+            .expect_err("the interrupted writer stops after persisting its intent");
+        assert_eq!(store.journal_snapshot().pending_intents.len(), 1);
+
+        let error = stale
+            .resolve_for_use(deepgram_use_request())
+            .expect_err("a pending intent forbids a lease");
+
+        assert_eq!(error.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(
+            stale
+                .snapshot_status()
+                .sets
+                .iter()
+                .find(|set| set.set_id
+                    == CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram))
+                .expect("Deepgram status")
+                .recovery_state,
+            CredentialSetRecoveryState::PendingIntent,
+            "the stale service adopts the authoritative journal it read"
+        );
+    }
+
+    /// The persisted journal is rolled back to an older copy of the same
+    /// authority while the native record and the service cache are newer:
+    /// identity alone matches, so the epoch must refuse it.
+    #[test]
+    fn a_same_authority_journal_rollback_is_refused_before_a_lease() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let service = CredentialService::new(
+            store.clone(),
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let created = configure_deepgram(&service, "53535353-5353-4353-8353-535353535353", None);
+        let older = store.journal_snapshot();
+        configure_deepgram(
+            &service,
+            "54545454-5454-4454-8454-545454545454",
+            created.new_revision,
+        );
+        store.restore_journal(older);
+
+        let error = service
+            .resolve_for_use(deepgram_use_request())
+            .expect_err("an older journal forbids a lease");
+
+        assert_eq!(error.code, CredentialErrorCode::RecoveryRequired);
     }
 }
