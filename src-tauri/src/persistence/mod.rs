@@ -2267,9 +2267,7 @@ fn write_segment(writer: &mut BufWriter<fs::File>, segment: &TranscriptSegment, 
                 io::handle_write_error(app_handle(), file_path, 0, bytes_lost, &e);
             }
         }
-        Err(e) => {
-            log::warn!("Transcript writer: serialize error: {}", e);
-        }
+        Err(_) => log::warn!("transcript_writer.serialize_failed"),
     }
 }
 
@@ -2348,18 +2346,37 @@ fn projection_worker(
 /// inside the worker allowed `spawn()` to return `Some` and publish a new
 /// session even when the target was unwritable. Synchronous open makes `None`
 /// mean the writer is genuinely unavailable.
-fn open_session_writer_file(path: &Path, label: &str) -> Option<fs::File> {
+fn open_session_writer_file(path: &Path) -> Option<fs::File> {
     match fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(file) => {
-            crate::fs_util::set_owner_only(path);
+            if crate::fs_util::try_set_owner_only(path).is_err() {
+                log::warn!("transcript_writer.permissions_failed");
+            }
             Some(file)
         }
         Err(error) => {
             io::handle_write_error(app_handle(), path, 0, 0, &error);
-            log::warn!("{label} unavailable: {error}");
+            log::warn!("transcript_writer.open_failed");
             None
         }
     }
+}
+
+fn flush_transcript_writer(writer: &mut impl Write, path: &Path) {
+    let started = std::time::Instant::now();
+    let result = writer.flush();
+    let elapsed = started.elapsed();
+    let outcome = match result {
+        Ok(()) => "ok",
+        Err(error) => {
+            io::handle_write_error(app_handle(), path, 0, 0, &error);
+            "error"
+        }
+    };
+    log::info!(
+        "transcript_writer.final_flush elapsed_ms={} outcome={outcome}",
+        elapsed.as_millis()
+    );
 }
 
 /// Handle to the transcript writer thread.
@@ -2386,13 +2403,13 @@ impl TranscriptWriter {
     /// Returns `None` if the base directory cannot be resolved or created.
     pub fn spawn(session_id: &str) -> Option<Self> {
         let dir = transcripts_dir()?;
-        if let Err(e) = ensure_dir(&dir) {
-            log::warn!("Transcript persistence disabled: {}", e);
+        if ensure_dir(&dir).is_err() {
+            log::warn!("transcript_writer.directory_unavailable");
             return None;
         }
 
         let file_path = dir.join(format!("{}.jsonl", session_id));
-        let file = open_session_writer_file(&file_path, "Transcript writer")?;
+        let file = open_session_writer_file(&file_path)?;
         let (tx, rx) = mpsc::channel::<TranscriptWriteMsg>();
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let shutdown_flag = shutdown_requested.clone();
@@ -2446,24 +2463,7 @@ impl TranscriptWriter {
                 // dominant term in the rotation shutdown budget. Logging
                 // it per-rotation gives us the data we need to tune
                 // TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT against real p99.
-                let flush_start = std::time::Instant::now();
-                let flush_result = writer.flush();
-                let flush_elapsed = flush_start.elapsed();
-                if let Err(e) = flush_result {
-                    io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
-                    log::info!(
-                        "transcript_writer.final_flush file={:?} elapsed_ms={} outcome=error",
-                        thread_path,
-                        flush_elapsed.as_millis()
-                    );
-                } else {
-                    log::info!(
-                        "transcript_writer.final_flush file={:?} elapsed_ms={} outcome=ok",
-                        thread_path,
-                        flush_elapsed.as_millis()
-                    );
-                }
-                log::info!("Transcript writer: shut down for {:?}", thread_path);
+                flush_transcript_writer(&mut writer, &thread_path);
             })
             .ok()?;
 
@@ -2477,8 +2477,12 @@ impl TranscriptWriter {
     /// Enqueue a transcript segment for writing. Non-blocking.
     pub fn append(&self, segment: &TranscriptSegment) {
         // Best-effort; if the channel is full or closed, we log and move on.
-        if let Err(e) = self.tx.send(TranscriptWriteMsg::Append(segment.clone())) {
-            log::warn!("Transcript writer: failed to enqueue segment: {}", e);
+        if self
+            .tx
+            .send(TranscriptWriteMsg::Append(segment.clone()))
+            .is_err()
+        {
+            log::warn!("transcript_writer.queue_disconnected");
         }
     }
 
@@ -3719,6 +3723,31 @@ mod shutdown_tests {
             end_time: 1.0,
             confidence: 1.0,
         }
+    }
+
+    #[test]
+    fn final_flush_reports_closed_outcomes_without_the_session_or_directory() {
+        let path = unique_tempfile("willow").with_file_name("orchard.jsonl");
+        fs::write(&path, []).unwrap();
+        let mut readonly = BufWriter::new(fs::File::open(&path).unwrap());
+        readonly.write_all(b"clover").unwrap();
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        flush_transcript_writer(&mut Vec::new(), &path);
+        flush_transcript_writer(&mut readonly, &path);
+        let logs = crate::test_log_capture::render(&capture.finish());
+        assert_eq!(
+            logs.matches("transcript_writer.final_flush elapsed_ms=")
+                .count(),
+            2
+        );
+        assert!(logs.contains("outcome=ok"));
+        assert!(logs.contains("outcome=error"));
+        assert!(logs.contains("persistence.write_failed kind="));
+        for canary in ["willow", "orchard", "clover"] {
+            assert!(!logs.contains(canary));
+        }
+        drop(readonly);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     pub(super) fn transcript_event(span_id: &str, text: &str) -> TranscriptEvent {
