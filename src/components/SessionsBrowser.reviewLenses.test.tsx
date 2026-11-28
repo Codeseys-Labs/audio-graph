@@ -8,11 +8,20 @@ import {
   within,
 } from "@testing-library/react";
 import { Profiler } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import i18n from "../i18n";
 import { useReviewStore } from "../session/reviewStore";
 import { type Deferred, deferred, segment } from "../session/reviewTestUtils";
 import { useAudioGraphStore } from "../store";
+import { preloadGraphLens } from "../test/lazyChunks";
 import type {
   GraphNode,
   GraphSnapshot,
@@ -314,6 +323,8 @@ async function expectLensShows(lens: Lens, id: string): Promise<void> {
     ).toBeInTheDocument();
   }
 }
+
+beforeAll(preloadGraphLens);
 
 describe("SessionsBrowser: Notes, Timeline and Graph from Review while capture runs", () => {
   beforeEach(async () => {
