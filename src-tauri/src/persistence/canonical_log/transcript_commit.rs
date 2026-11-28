@@ -7,6 +7,7 @@ use crate::persistence::canonical_durability::{
 };
 use crate::projections::{ProjectionPatch, TranscriptEvent};
 mod domain;
+mod retirement;
 pub(super) fn remember_speaker_head(
     path: &Path,
     file: &File,
@@ -416,6 +417,7 @@ impl Drop for TranscriptGuard<'_> {
 #[derive(Default)]
 struct CommitExpectation<'a> {
     basis: Option<&'a CanonicalBasisHeadVector>,
+    verified_retry: Option<&'a CanonicalRecord<serde_json::Value>>,
     head: Option<u64>,
     lane: Option<u64>,
 }
@@ -818,7 +820,24 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
             ends_with_newline: cache.ends_with_newline,
             poisoned: None,
         };
-        let frame = match basis.plan(&metadata, event) {
+        let plan = if let Some(row) = expected.verified_retry {
+            // Recheck the exact frame under the writer lock. A typed decode can
+            // normalize an older model ID, but the receipt commits to the original.
+            if cache.events.get(&metadata.event_id).map(|r| &r.record_hash)
+                != Some(&row.record_hash)
+            {
+                return Err(TranscriptCommitError::LiveHeadChanged);
+            }
+            if row.encoding == CanonicalRecordEncoding::FramedV1 {
+                basis.plan(&metadata, &row.payload)
+            } else {
+                // Synthetic identities for legacy JSONL commit to the typed payload.
+                basis.plan(&metadata, event)
+            }
+        } else {
+            basis.plan(&metadata, event)
+        };
+        let frame = match plan {
             PlannedAppend::New(frame) => {
                 if expected
                     .head
@@ -892,7 +911,11 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
             self.record_attempt_origin(&intent, cache);
             let descriptor =
                 serde_json::to_vec(&intent).map_err(|_| TranscriptCommitError::InvalidHistory)?;
+            #[cfg(all(test, not(debug_assertions)))]
+            let stage = std::time::Instant::now();
             self.publish_intent(&mut lease, &intent_path, &descriptor)?;
+            #[cfg(all(test, not(debug_assertions)))]
+            crate::persistence::projection_profile::record(|s| s.intent_publish = stage.elapsed());
             #[cfg(test)]
             kill_at(Cut::KillIntent);
         }
@@ -910,7 +933,11 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
             .map_err(TranscriptCommitError::Rejected)?;
         file.seek(SeekFrom::Start(frame.base_byte_len))
             .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
+        #[cfg(all(test, not(debug_assertions)))]
+        let stage = std::time::Instant::now();
         write_new_frame(&mut file, &frame.frame)?;
+        #[cfg(all(test, not(debug_assertions)))]
+        crate::persistence::projection_profile::record(|s| s.frame_write_sync = stage.elapsed());
         let namespace = if first_create {
             self.sync_namespace()?
         } else {
@@ -920,6 +947,8 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
             }
         };
         self.record_barrier(&witness, cache, None);
+        #[cfg(all(test, not(debug_assertions)))]
+        let stage = std::time::Instant::now();
         if let Err(error) = self.finish_intent(&intent_path) {
             lease.pending.as_mut().unwrap().retiring = Some(vec![RecoveredEvent {
                 record_hash: frame.record_hash.clone(),
@@ -932,6 +961,8 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
             }]);
             return Err(error);
         }
+        #[cfg(all(test, not(debug_assertions)))]
+        crate::persistence::projection_profile::record(|s| s.intent_retire = stage.elapsed());
         lease.pending = None;
         prefix.head_frame = HeadFrame::from_verified(&frame.frame, frame.base_byte_len);
         cache.byte_len = frame.base_byte_len + frame.frame.len() as u64;
@@ -1524,17 +1555,20 @@ impl PreparedProjectionStorage {
             return Ok(None);
         };
         let snapshot = captured
-            .verify::<ProjectionPatch>(&self.session)
+            .verify::<serde_json::Value>(&self.session)
             .map_err(|_| TranscriptCommitError::InvalidHistory)?;
         for row in snapshot.records.into_iter().rev() {
-            if row.payload.kind != attempted.kind || row.payload.sequence != attempted.sequence {
+            let stored = ProjectionPatch::deserialize(&row.payload)
+                .map_err(|_| TranscriptCommitError::InvalidHistory)?;
+            if stored.kind != attempted.kind || stored.sequence != attempted.sequence {
                 continue;
             }
             let mut candidate = attempted.clone();
+            candidate.provenance.normalize_stored_model();
             if candidate.apply_latency_ms.is_none() {
-                candidate.apply_latency_ms = row.payload.apply_latency_ms;
+                candidate.apply_latency_ms = stored.apply_latency_ms;
             }
-            if candidate != row.payload {
+            if candidate != stored {
                 return Err(TranscriptCommitError::Frame(
                     CanonicalAppendRejection::EventIdConflict,
                 ));
@@ -1544,7 +1578,7 @@ impl PreparedProjectionStorage {
             let expected =
                 (row.encoding == CanonicalRecordEncoding::FramedV1).then_some(&row.basis_heads);
             let (_, currency) = domain::projection_basis(
-                &row.payload,
+                &stored,
                 &self.path,
                 &self.session,
                 basis,
@@ -1552,7 +1586,16 @@ impl PreparedProjectionStorage {
                 &self.source_basis,
             )?
             .ok_or(TranscriptCommitError::InvalidHistory)?;
-            let receipt = self.commit_at_lane(&row.payload, None, causes, previous_lane, None)?;
+            let receipt = self.commit_checked(
+                &stored,
+                None,
+                causes,
+                CommitExpectation {
+                    lane: previous_lane,
+                    verified_retry: Some(&row),
+                    ..Default::default()
+                },
+            )?;
             return Ok(Some((receipt, currency)));
         }
         Ok(None)
@@ -1581,6 +1624,37 @@ impl PreparedProjectionStorage {
         previous_lane: Option<u64>,
         basis: Option<&CanonicalBasisHeadVector>,
     ) -> Result<ProjectionReceipt, TranscriptCommitError> {
+        let result = self.commit_checked(
+            patch,
+            observed_transcript_count,
+            causal_ids,
+            CommitExpectation {
+                lane: previous_lane,
+                basis,
+                ..Default::default()
+            },
+        );
+        // A pre-placement frame may have a different stored payload hash from
+        // the same decoded request. Take the verified retry path on conflict.
+        if matches!(
+            result,
+            Err(TranscriptCommitError::Frame(
+                CanonicalAppendRejection::EventIdConflict
+            ))
+        ) && let Some((receipt, _)) = self.accepted_patch(patch, causal_ids, previous_lane)?
+        {
+            return Ok(receipt);
+        }
+        result
+    }
+
+    fn commit_checked(
+        &self,
+        patch: &ProjectionPatch,
+        observed_transcript_count: Option<u64>,
+        causal_ids: &[String],
+        expected: CommitExpectation<'_>,
+    ) -> Result<ProjectionReceipt, TranscriptCommitError> {
         if causal_ids.iter().any(|id| {
             !id.strip_prefix("projection-gap-")
                 .is_some_and(valid_attempt)
@@ -1593,11 +1667,7 @@ impl PreparedProjectionStorage {
                     Some(patch),
                     observed_transcript_count,
                     causal_ids,
-                    CommitExpectation {
-                        head: None,
-                        lane: previous_lane,
-                        basis,
-                    },
+                    expected,
                     process_owner(),
                     &self.cache,
                 )?

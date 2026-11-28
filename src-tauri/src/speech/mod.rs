@@ -3096,6 +3096,16 @@ pub(crate) fn discard_recovery_publication(
     );
 }
 
+pub(crate) fn retire_transcript_publications(
+    session: &str,
+    outstanding: &[crate::projections::TranscriptEvent],
+) {
+    publications()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|p| p.session != session || !outstanding.contains(&p.event));
+}
+
 impl TranscriptProcessingContext {
     fn publication(
         &self,

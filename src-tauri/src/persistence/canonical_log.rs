@@ -1857,7 +1857,9 @@ pub(super) fn remember_speaker_head(
 }
 
 #[cfg(test)]
-pub(crate) use transcript_commit::tests::interrupted_historical_caption;
+pub(crate) use transcript_commit::tests::{
+    interrupted_historical_caption, kill_at_writer_checkpoint,
+};
 pub use transcript_commit::tier::StreamReceiptEvidence;
 pub(crate) use transcript_commit::tier::receipt_evidence;
 pub(crate) mod transcript_export;

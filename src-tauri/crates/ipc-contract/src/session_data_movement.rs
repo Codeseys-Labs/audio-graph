@@ -232,7 +232,11 @@ pub struct MovementModel {
     /// Where the model ran, written with the model rule applied at the
     /// endpoint dialled. Absent on rows written before it, which are read by
     /// what their boundary and provider say.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::model_id::lenient_placement"
+    )]
     pub model_placement: Option<crate::model_id::ModelPlacement>,
 }
 
@@ -862,6 +866,34 @@ mod tests {
             marked("llm.cerebras", "local").model_id.as_deref(),
             Some("claude-sonnet-4")
         );
+    }
+
+    #[test]
+    fn an_unknown_placement_reads_as_an_unmarked_row() {
+        for placement in [
+            serde_json::json!("elsewhere"),
+            serde_json::json!(7),
+            serde_json::json!({ "kind": "remote" }),
+        ] {
+            for (provider, expected) in [
+                // Unmarked: a provider that takes a base URL reads locally,
+                ("llm.openrouter", "claude-sonnet-4"),
+                // and one that dials only public hosts keeps the hosted id.
+                ("llm.cerebras", "anthropic/claude-sonnet-4"),
+            ] {
+                let mut row = serde_json::to_value(sample_event()).expect("serialize");
+                row["destination"]["provider_id"] = provider.into();
+                row["model"]["provider_id"] = provider.into();
+                row["model"]["model_id"] = "anthropic/claude-sonnet-4".into();
+                row["model"]["model_placement"] = placement.clone();
+                let model = serde_json::from_value::<DataMovementEvent>(row)
+                    .expect("an unknown placement does not fail the row")
+                    .model
+                    .expect("a model");
+                assert_eq!(model.model_id.as_deref(), Some(expected), "{placement}");
+                assert_eq!(model.model_placement, None);
+            }
+        }
     }
 
     #[test]

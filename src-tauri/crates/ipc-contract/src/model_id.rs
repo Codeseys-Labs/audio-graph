@@ -67,6 +67,28 @@ impl ModelPlacement {
     }
 }
 
+/// Read a stored `model_placement` leniently: a value this build does not
+/// know (a later build's variant, or any other JSON) reads as absent, so the
+/// record falls back to the rule for unmarked records instead of failing its
+/// decode, and with it a strict reader's whole stream.
+///
+/// For `#[serde(default, deserialize_with = "...")]` on a stored field.
+pub fn lenient_placement<'de, D>(deserializer: D) -> Result<Option<ModelPlacement>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Known(ModelPlacement),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Stored>::deserialize(deserializer)? {
+        Some(Stored::Known(placement)) => Some(placement),
+        Some(Stored::Other(_)) | None => None,
+    })
+}
+
 /// A stored model id, read by its record's [`ModelPlacement`] when it has one
 /// and by `legacy_remote` (what an unmarked record's other fields say) when it
 /// does not. The credential screen runs either way.
@@ -444,6 +466,40 @@ mod tests {
         for id in LEGITIMATE {
             assert!(!super::looks_credential_shaped(id), "{id:?}");
             assert_eq!(for_place(id, true), id);
+        }
+    }
+
+    #[test]
+    fn an_unknown_stored_placement_reads_as_absent() {
+        use super::ModelPlacement;
+
+        #[derive(serde::Deserialize)]
+        struct Stored {
+            #[serde(default, deserialize_with = "super::lenient_placement")]
+            model_placement: Option<ModelPlacement>,
+        }
+        let read = |json: &str| {
+            serde_json::from_str::<Stored>(json)
+                .expect("a stored placement never fails the record")
+                .model_placement
+        };
+        assert_eq!(
+            read(r#"{"model_placement":"local"}"#),
+            Some(ModelPlacement::Local)
+        );
+        assert_eq!(
+            read(r#"{"model_placement":"remote"}"#),
+            Some(ModelPlacement::Remote)
+        );
+        for unknown in [
+            r#"{}"#,
+            r#"{"model_placement":null}"#,
+            r#"{"model_placement":"elsewhere"}"#,
+            r#"{"model_placement":"Remote"}"#,
+            r#"{"model_placement":3}"#,
+            r#"{"model_placement":{"kind":"remote"}}"#,
+        ] {
+            assert_eq!(read(unknown), None, "{unknown}");
         }
     }
 
