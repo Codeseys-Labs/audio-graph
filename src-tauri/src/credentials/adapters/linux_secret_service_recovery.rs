@@ -1,20 +1,24 @@
 //! Interactive policy, a private lexical child of the sealed recovery gate.
 #![cfg_attr(not(test), allow(dead_code))] // The Linux factory remains dormant.
 
+use super::super::process_native_interaction_gate;
 use super::{
-    AllowPrompt, CancellationToken, ForbidPrompt, NativeInteractionGate, NativeRecoveryFacade,
-    RecoveryBoundary, RecoveryFailure, RecoveryOutcome, RecoveryTarget,
+    AllowPrompt, CancellationToken, ForbidPrompt, NativeRecoveryFacade, RecoveryBoundary,
+    RecoveryFailure, RecoveryOutcome, RecoveryTarget,
 };
+use crate::crash_handler::{RedactedPanicOp, catch_redacted_panic};
 use crate::credentials::adapters::linux_secret_service_wire::{
-    LockedTarget, WireError, recovery_error, recovery_until,
+    LockedTarget, WireError, ensure_worker_context, recovery_error, recovery_until,
 };
 use crate::credentials::domain::CredentialStoreFailure as Failure;
-use futures_util::StreamExt;
 use futures_util::future::{Either, select};
+use futures_util::{FutureExt, StreamExt};
 use serde::Serialize;
-use std::future::Future;
+use std::future::{Future, poll_fn};
+use std::path::Path;
 use std::pin::pin;
 use std::sync::{Arc, OnceLock};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 use zbus::message::Type;
 use zbus::names::OwnedUniqueName;
@@ -28,6 +32,8 @@ use zruntime::SharedRuntime;
 const SERVICE: &str = "org.freedesktop.Secret.Service";
 const SERVICE_PATH: &str = "/org/freedesktop/secrets";
 const PROMPT: &str = "org.freedesktop.Secret.Prompt";
+const UNLOCK_METHOD: &str = "Unlock";
+const PROMPT_METHOD: &str = "Prompt";
 const DISMISS_GRACE: Duration = Duration::from_millis(500);
 const RETIRE_GRACE: Duration = Duration::from_millis(125);
 const CANCELLATION_POLL: Duration = Duration::from_millis(25);
@@ -35,8 +41,8 @@ const CANCELLATION_POLL: Duration = Duration::from_millis(25);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Dismissal {
     NoPrompt,
-    Completed,
-    Unconfirmed,
+    ServiceAcknowledged,
+    Unacknowledged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,19 +53,32 @@ enum Outcome {
     TimedOut(Dismissal),
     StillLocked,
     Unavailable,
+    Unsupported,
     Failed(Failure),
-    DismissalUnconfirmed,
+    PromptMayStillBeOpen(Dismissal),
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestOptions {
+    gate: Option<&'static super::NativeInteractionGate>,
+    daemon: Option<&'static str>,
+    cancel_with_queued_completion: bool,
+    panic_after_prompt: bool,
 }
 
 /// Dedicated worker only. The existing facade holds the lease, issues the
 /// AllowPrompt capability, and invokes verification with a separate ForbidPrompt.
 fn recover_exact(
-    gate: &'static NativeInteractionGate,
     target: LockedTarget,
     window: Option<String>,
     budget: Duration,
     cancellation: &CancellationToken,
+    #[cfg(test)] test: TestOptions,
 ) -> Outcome {
+    if let Err(WireError(code)) = ensure_worker_context() {
+        return failed(code);
+    }
     let Some(end) = Instant::now().checked_add(budget) else {
         return Outcome::Failed(Failure::Internal);
     };
@@ -69,7 +88,12 @@ fn recover_exact(
         window,
         end,
         result: Arc::clone(&result),
+        #[cfg(test)]
+        test,
     };
+    let gate = process_native_interaction_gate();
+    #[cfg(test)]
+    let gate = boundary.test.gate.unwrap_or(gate);
     let facade = NativeRecoveryFacade::from_boundary(gate, Box::new(boundary));
     let closed = facade.diagnose_or_unlock(RecoveryTarget::CredentialStore, cancellation);
     result.get().copied().unwrap_or_else(|| match closed {
@@ -86,6 +110,8 @@ struct Boundary {
     // The sealed facade returns a platform-neutral readiness result. Keep the
     // detailed closed Linux outcome in this single-call boundary.
     result: Arc<OnceLock<Outcome>>,
+    #[cfg(test)]
+    test: TestOptions,
 }
 
 impl RecoveryBoundary for Boundary {
@@ -101,6 +127,8 @@ impl RecoveryBoundary for Boundary {
             self.window.as_deref().unwrap_or_default(),
             self.end,
             cancellation,
+            #[cfg(test)]
+            &self.test,
         ));
         if let Some(outcome) = outcome {
             let _ = self.result.set(outcome);
@@ -137,6 +165,46 @@ struct Peer<'lease, 'gate> {
     _permission: &'lease AllowPrompt<'lease, 'gate>,
     connection: Connection,
     owner: OwnedUniqueName,
+}
+
+impl<'lease, 'gate> Peer<'lease, 'gate> {
+    // Only the lexical child can own the raw interactive connection, and it
+    // takes the existing sealed grant before it can open one.
+    async fn connect_for_recovery(
+        permission: &'lease AllowPrompt<'lease, 'gate>,
+        target: &LockedTarget,
+        #[cfg(test)] test: &TestOptions,
+    ) -> WireResult<Option<Self>> {
+        let connection = zbus::connection::Builder::address(target.address().clone())
+            .build()
+            .await
+            .map_err(recovery_error)?;
+        let (owner, pid, locked) = target.check_recovery_connection(&connection).await?;
+        #[cfg(test)]
+        let override_name = test.daemon;
+        #[cfg(not(test))]
+        let override_name: Option<&str> = None;
+        let executable = match override_name {
+            Some(executable) => executable.into(),
+            None => {
+                std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|_| Failure::Unsupported)?
+            }
+        };
+        if !allows_interactive_recovery(&executable) {
+            return Err(Failure::Unsupported.into());
+        }
+        Ok(locked.then_some(Self {
+            _permission: permission,
+            connection,
+            owner,
+        }))
+    }
+}
+
+fn allows_interactive_recovery(executable: &Path) -> bool {
+    executable
+        .file_name()
+        .is_some_and(|name| name == "gnome-keyring-daemon")
 }
 
 impl Peer<'_, '_> {
@@ -189,7 +257,7 @@ impl Peer<'_, '_> {
         let request = self.call::<_, ()>(path.as_str(), PROMPT, "Dismiss", &());
         let Some(mut completions) = completions else {
             let _ = recovery_until(end, request).await;
-            return Dismissal::Unconfirmed;
+            return Dismissal::Unacknowledged;
         };
         let settlement = async {
             let mut request = pin!(request);
@@ -198,10 +266,10 @@ impl Peer<'_, '_> {
                 Either::Right((result, _)) => result,
             }
         };
-        if recovery_until(end, settlement).await.is_ok() {
-            Dismissal::Completed
+        if matches!(recovery_until(end, settlement).await, Ok(true)) {
+            Dismissal::ServiceAcknowledged
         } else {
-            Dismissal::Unconfirmed
+            Dismissal::Unacknowledged
         }
     }
 }
@@ -212,19 +280,31 @@ async fn interact(
     window: &str,
     end: Instant,
     cancellation: &CancellationToken,
+    #[cfg(test)] test: &TestOptions,
 ) -> Option<Outcome> {
     let wait = Wait { end, cancellation };
-    let (connection, owner) = match wait.run(target.connect_for_recovery()).await {
+    let peer = match wait
+        .run(Peer::connect_for_recovery(
+            permission,
+            target,
+            #[cfg(test)]
+            test,
+        ))
+        .await
+    {
         Ok(Some(peer)) => peer,
         Ok(None) => return None, // The target unlocked before dispatch.
         Err(stop) => return Some(stop.outcome(Dismissal::NoPrompt)),
     };
-    let peer = Peer {
-        _permission: permission,
-        connection,
-        owner,
-    };
-    let outcome = unlock(&peer, target, window, &wait).await;
+    let outcome = unlock(
+        &peer,
+        target,
+        window,
+        &wait,
+        #[cfg(test)]
+        test,
+    )
+    .await;
     let _ = recovery_until(Instant::now() + RETIRE_GRACE, async {
         peer.connection.close().await.map_err(recovery_error)
     })
@@ -237,10 +317,11 @@ async fn unlock(
     target: &LockedTarget,
     window: &str,
     wait: &Wait<'_>,
+    #[cfg(test)] test: &TestOptions,
 ) -> Option<Outcome> {
     let objects = [target.path()];
     let reply: UnlockReply = match wait
-        .run(peer.call(SERVICE_PATH, SERVICE, "Unlock", &(objects.as_slice(),)))
+        .run(peer.call(SERVICE_PATH, SERVICE, UNLOCK_METHOD, &(objects.as_slice(),)))
         .await
     {
         Ok(reply) => reply,
@@ -250,23 +331,88 @@ async fn unlock(
     if path.as_str() == "/" {
         return None;
     }
-    let mut completions = match wait.run(peer.subscribe(&path)).await {
-        Ok(stream) => stream,
-        Err(stop) => return Some(stop.outcome(peer.dismiss(&path, None).await)),
-    };
-    let result = wait
-        .run(async {
-            peer.call::<_, ()>(path.as_str(), PROMPT, "Prompt", &(window,))
-                .await?;
-            completed(&mut completions).await
+    PromptGuard {
+        peer,
+        path,
+        completions: None,
+    }
+    .settle(
+        window,
+        wait,
+        #[cfg(test)]
+        test,
+    )
+    .await
+}
+
+// Keep the prompt and its original connection alive across an unwind so
+// cleanup can still be driven within the same runtime. Drop cannot await.
+struct PromptGuard<'peer, 'lease, 'gate> {
+    peer: &'peer Peer<'lease, 'gate>,
+    path: OwnedObjectPath,
+    completions: Option<MessageStream>,
+}
+
+impl PromptGuard<'_, '_, '_> {
+    async fn settle(
+        mut self,
+        window: &str,
+        wait: &Wait<'_>,
+        #[cfg(test)] test: &TestOptions,
+    ) -> Option<Outcome> {
+        let result = catch_interactive(async {
+            let stream = wait.run(self.peer.subscribe(&self.path)).await?;
+            let completions = self.completions.insert(stream);
+            wait.run(async {
+                self.peer
+                    .call::<_, ()>(self.path.as_str(), PROMPT, PROMPT_METHOD, &(window,))
+                    .await?;
+                #[cfg(test)]
+                {
+                    assert!(!test.panic_after_prompt, "scripted prompt unwind");
+                    if test.cancel_with_queued_completion {
+                        wait.cancellation.cancel();
+                        std::future::pending::<()>().await;
+                    }
+                }
+                completed(completions).await
+            })
+            .await
         })
         .await;
-    // Peer (and its stream) are dropped before the facade can call verify.
-    match result {
-        Ok(false) => None,
-        Ok(true) => Some(Outcome::DismissedByUser),
-        Err(stop) => Some(stop.outcome(peer.dismiss(&path, Some(completions)).await)),
+        match result {
+            Ok(Ok(false)) => None,
+            Ok(Ok(true)) => Some(Outcome::DismissedByUser),
+            Ok(Err(Stop::Cancelled)) if self.approval_is_queued() => None,
+            Ok(Err(stop)) => Some(stop.outcome(self.dismiss().await)),
+            Err(()) => Some(Outcome::PromptMayStillBeOpen(self.dismiss().await)),
+        }
     }
+
+    fn approval_is_queued(&mut self) -> bool {
+        self.completions
+            .as_mut()
+            .is_some_and(|stream| matches!(completed(stream).now_or_never(), Some(Ok(false))))
+    }
+
+    async fn dismiss(self) -> Dismissal {
+        catch_interactive(self.peer.dismiss(&self.path, self.completions))
+            .await
+            .unwrap_or(Dismissal::Unacknowledged)
+    }
+}
+
+async fn catch_interactive<T>(future: impl Future<Output = T>) -> Result<T, ()> {
+    let mut future = pin!(future);
+    poll_fn(|cx| {
+        match catch_redacted_panic(RedactedPanicOp::CredentialBoundary, || {
+            future.as_mut().poll(cx)
+        }) {
+            Ok(result) => result.map(Ok),
+            Err(_) => Poll::Ready(Err(())),
+        }
+    })
+    .await
 }
 
 async fn completed(completions: &mut MessageStream) -> WireResult<bool> {
@@ -323,7 +469,9 @@ impl Stop {
         match self {
             Self::Cancelled => Outcome::Cancelled(dismissal),
             Self::TimedOut => Outcome::TimedOut(dismissal),
-            Self::Failed(_) if dismissal == Dismissal::Unconfirmed => Outcome::DismissalUnconfirmed,
+            Self::Failed(_) if dismissal == Dismissal::Unacknowledged => {
+                Outcome::PromptMayStillBeOpen(dismissal)
+            }
             Self::Failed(code) => failed(code),
         }
     }
@@ -333,6 +481,7 @@ fn failed(code: Failure) -> Outcome {
     match code {
         Failure::Locked => Outcome::StillLocked,
         Failure::Unavailable => Outcome::Unavailable,
+        Failure::Unsupported => Outcome::Unsupported,
         code => Outcome::Failed(code),
     }
 }
