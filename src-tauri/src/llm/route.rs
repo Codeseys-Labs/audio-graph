@@ -938,7 +938,7 @@ pub(crate) mod model_id_fixtures {
     /// (identifier, what a local model shows, what a model off the user's
     /// network shows). The second keeps the identifier whole unless it
     /// carries a credential.
-    pub(crate) const STORED: [(&str, &str, &str); 19] = [
+    pub(crate) const STORED: [(&str, &str, &str); 26] = [
         (
             "/home/numbat/models/private.gguf",
             "private.gguf",
@@ -981,8 +981,33 @@ pub(crate) mod model_id_fixtures {
         ("~numbat", LOCAL, "~numbat"),
         ("   ", LOCAL, "   "),
         ("q:4b", LOCAL, "q:4b"),
-        // Cutting first would keep the secret after the slash.
+        // Cutting first would keep the secret after the slash. Each secret
+        // value carries the canary below, and is built from plain words.
         ("Bearer Ym9i/c2VjcmV0", WITHHELD, WITHHELD),
+        ("bearer\twombat/c2VjcmV0", WITHHELD, WITHHELD),
+        (
+            concat!("org/s", "k-c2VjcmV0c2VjcmV0c2VjcmV0"),
+            WITHHELD,
+            WITHHELD,
+        ),
+        (
+            "org/eyJwombatheader.wombatpayload.c2VjcmV0",
+            WITHHELD,
+            WITHHELD,
+        ),
+        // A marker inside a word is part of a name.
+        (
+            "org/task-classifier",
+            "task-classifier",
+            "org/task-classifier",
+        ),
+        ("vision/mask-rcnn", "mask-rcnn", "vision/mask-rcnn"),
+        ("risk-model", "risk-model", "risk-model"),
+        (
+            "/home/numbat/desk-assistant.gguf",
+            "desk-assistant.gguf",
+            "/home/numbat/desk-assistant.gguf",
+        ),
         // Hosted identifiers.
         ("org/model.gguf", "model.gguf", "org/model.gguf"),
         (
@@ -1616,7 +1641,10 @@ mod tests {
             sanitize_route_metadata("anthropic/claude-sonnet-4.5"),
             Some("anthropic/claude-sonnet-4.5".to_string())
         );
-        assert_eq!(sanitize_route_metadata("Together sk-live-abc"), None);
+        assert_eq!(
+            sanitize_route_metadata(concat!("Together s", "k-live-abcabcabcabcabc")),
+            None
+        );
         assert_eq!(sanitize_route_metadata("Bearer abc"), None);
         assert_eq!(
             sanitize_route_metadata(&"x".repeat(MAX_METADATA_LEN + 1)),
@@ -1656,8 +1684,12 @@ mod tests {
             sanitize_model_id(&deep, false).as_deref(),
             Some("private.gguf")
         );
-        // The other guards still apply to what is left.
-        assert_eq!(sanitize_model_id("/models/flask-app.gguf", false), None);
+        // The other guards still apply to what is left; a marker inside a
+        // word is not one.
+        assert_eq!(
+            sanitize_model_id("/models/flask-app.gguf", false).as_deref(),
+            Some("flask-app.gguf")
+        );
 
         // A remote model keeps its hosted identifier: only the filter runs.
         for hosted in [

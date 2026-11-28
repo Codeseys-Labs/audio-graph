@@ -2096,15 +2096,20 @@ pub struct ProjectionProvenance {
     /// mistaken for served identity.
     #[serde(default)]
     pub model_source: crate::llm::route::ModelIdentitySource,
+    /// Where the model ran, written with the model rule applied at the
+    /// endpoint the client dialled. `None` on records written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_placement: Option<audio_graph_ipc_contract::model_id::ModelPlacement>,
 }
 
 /// A [`ProjectionProvenance`] as a patch, note or graph item stores it.
 ///
 /// Records written before the model rule can hold a local model's path, or
-/// what the old character filter left of a Windows path. Building the typed
-/// value from this one applies the rule on every read: nothing loaded,
-/// exported or written again carries the path, and the stored record is not
-/// rewritten.
+/// what the old character filter left of a Windows path, and carry no
+/// `model_placement`. Building the typed value from this one applies the rule
+/// on every read: a marked record is read by its placement, and an unmarked
+/// one by what its provider and route say. Nothing loaded, exported or
+/// written again carries the path, and the stored record is not rewritten.
 #[derive(serde::Deserialize)]
 struct StoredProjectionProvenance {
     provider: String,
@@ -2114,18 +2119,25 @@ struct StoredProjectionProvenance {
     route_id: Option<String>,
     #[serde(default)]
     model_source: crate::llm::route::ModelIdentitySource,
+    #[serde(default)]
+    model_placement: Option<audio_graph_ipc_contract::model_id::ModelPlacement>,
 }
 
 impl From<StoredProjectionProvenance> for ProjectionProvenance {
     fn from(stored: StoredProjectionProvenance) -> Self {
-        let ran_remotely =
+        let legacy_remote =
             crate::llm::route::recorded_as_remote(&stored.provider, stored.route_id.as_deref());
         Self {
-            model: crate::llm::route::owned_model_id_for_place(stored.model, ran_remotely),
+            model: audio_graph_ipc_contract::model_id::stored_for_place(
+                stored.model,
+                stored.model_placement,
+                legacy_remote,
+            ),
             provider: stored.provider,
             prompt_id: stored.prompt_id,
             route_id: stored.route_id,
             model_source: stored.model_source,
+            model_placement: stored.model_placement,
         }
     }
 }
@@ -6140,6 +6152,7 @@ mod tests {
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -6216,6 +6229,7 @@ mod tests {
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -6349,6 +6363,7 @@ mod tests {
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -7232,6 +7247,7 @@ mod tests {
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -7278,6 +7294,7 @@ mod tests {
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -7688,6 +7705,7 @@ mod tests {
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -9413,6 +9431,7 @@ mod tests {
                     prompt_id: "complexity_v1".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 },
                 queued_at_ms: Some(created_at_ms),
                 generation_latency_ms: Some(5),
@@ -11763,6 +11782,7 @@ mod tests {
                     prompt_id: "graph-v1".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 },
                 queued_at_ms: None,
                 generation_latency_ms: None,
@@ -11885,6 +11905,7 @@ mod tests {
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -11941,6 +11962,7 @@ mod tests {
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,

@@ -4647,7 +4647,9 @@ fn approved_agent_projection_patch(
             // Locally generated: no LLM route was dispatched, so there is no route
             // to stamp and the model id is ours, not a served one.
             route_id: None,
+            // Our own rule ran on this machine.
             model_source: crate::llm::route::ModelIdentitySource::Requested,
+            model_placement: Some(audio_graph_ipc_contract::model_id::ModelPlacement::Local),
         },
         route: None,
         queued_at_ms: Some(now_ms),
@@ -5941,6 +5943,7 @@ fn build_assist_answer_started_event(
     .model(crate::persistence::MovementModel {
         provider_id: Some(provider_id.to_string()),
         model_id: None,
+        model_placement: None,
     })
     .source(crate::persistence::DataMovementSource {
         kind: assist_answer_action_id(auto).to_string(),
@@ -5992,6 +5995,7 @@ fn build_assist_answer_terminal_event(
     .model(crate::persistence::MovementModel {
         provider_id: Some(provider_id.to_string()),
         model_id: None,
+        model_placement: None,
     })
     .source(crate::persistence::DataMovementSource {
         kind: assist_answer_action_id(auto).to_string(),
@@ -14791,6 +14795,7 @@ mod tests {
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -15869,6 +15874,7 @@ mod tests {
                 prompt_id: "report-notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: Some(1_700_000_050_000 + sequence),
             generation_latency_ms: Some(30 + sequence),
@@ -15902,6 +15908,7 @@ mod tests {
                 prompt_id: "report-graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: Some(1_700_000_150_000 + sequence),
             generation_latency_ms: Some(40 + sequence),
@@ -15940,6 +15947,7 @@ mod tests {
                 prompt_id: "report-invalid-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -15993,6 +16001,7 @@ mod tests {
                 prompt_id: "stale-notes".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             evidence: None,
         });
@@ -16023,6 +16032,7 @@ mod tests {
                 prompt_id: "stale-graph".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             evidence: None,
         });
@@ -16044,6 +16054,7 @@ mod tests {
             prompt_id: "active-before-load".to_string(),
             route_id: None,
             model_source: crate::llm::route::ModelIdentitySource::Requested,
+            model_placement: None,
         };
         let mut state = crate::projections::MaterializedProjectionState::new(session_id);
         state.notes.last_sequence = 99;
@@ -16616,7 +16627,8 @@ mod tests {
         .data_classes([DataClass::Prompts, DataClass::TranscriptText])
         .model(MovementModel {
             provider_id: Some("llm.openrouter".to_string()),
-            model_id: Some("gpt-4o-mini".to_string()),
+            model_id: Some("openai/gpt-4o-mini".to_string()),
+            model_placement: Some(audio_graph_ipc_contract::model_id::ModelPlacement::Remote),
         })
         .build();
 
@@ -16686,6 +16698,8 @@ mod tests {
                     .model(MovementModel {
                         provider_id: Some(provider.to_string()),
                         model_id: Some(model_id.to_string()),
+                        // Rows as builds before the placement marker wrote them.
+                        model_placement: None,
                     })
                     .build()
                 },
@@ -19194,6 +19208,7 @@ mod tests {
                 prompt_id: "report-graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -19218,6 +19233,7 @@ mod tests {
                 prompt_id: "report-graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             queued_at_ms: None,
             generation_latency_ms: None,
@@ -25896,6 +25912,7 @@ mod tests {
                     prompt_id: "test".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
+                    model_placement: None,
                 },
                 evidence: None,
             });

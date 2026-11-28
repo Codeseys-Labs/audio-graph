@@ -48,6 +48,9 @@ pub struct ProjectionMovementFacts {
     pub provider_id: String,
     /// Model id when known (empty string when the local sentinel).
     pub model_id: String,
+    /// Where that model ran, from the patch provenance; `None` when no model
+    /// id is known.
+    pub model_placement: Option<audio_graph_ipc_contract::model_id::ModelPlacement>,
     /// Whether the resolved path actually leaves the device. When `false` the
     /// call is a local movement and no remote summary/prefix is recorded.
     pub requires_cloud_transfer: bool,
@@ -228,6 +231,7 @@ pub fn build_terminal_event(
     .model(MovementModel {
         provider_id: Some(facts.provider_id.clone()),
         model_id: (!facts.model_id.is_empty()).then(|| facts.model_id.clone()),
+        model_placement: facts.model_placement,
     })
     .counts(movement_counts(facts))
     .basis(MovementBasis {
@@ -276,6 +280,7 @@ pub fn build_started_event(facts: &ProjectionMovementFacts) -> DataMovementEvent
     .model(MovementModel {
         provider_id: Some(facts.provider_id.clone()),
         model_id: (!facts.model_id.is_empty()).then(|| facts.model_id.clone()),
+        model_placement: facts.model_placement,
     })
     .basis(MovementBasis {
         transcript_sequence: None,
@@ -295,6 +300,7 @@ mod tests {
             session_id: "session-1".to_string(),
             provider_id: "llm.openrouter".to_string(),
             model_id: "anthropic/claude-sonnet-4.5".to_string(),
+            model_placement: Some(audio_graph_ipc_contract::model_id::ModelPlacement::Remote),
             requires_cloud_transfer: true,
             cloud_transfer_allowed: true,
             projection_sequence: 4,

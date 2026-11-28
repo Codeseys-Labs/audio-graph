@@ -34,6 +34,7 @@ use super::route::{
     authorize_route_dispatch, owned_model_id_for_place, retry_class_for_terminal_status,
     route_for_api_endpoint, route_for_openrouter_policy,
 };
+use audio_graph_ipc_contract::model_id::ModelPlacement;
 
 /// Models where the structured-outputs (`response_format: json_schema`) request
 /// is worth skipping for the rest of this process run because NO provider for
@@ -756,6 +757,8 @@ struct ProjectionBackendOutput {
     /// which of those it is, is recorded in `model_source`, never guessed.
     model: String,
     model_source: ModelIdentitySource,
+    /// Where the model ran: the endpoint the client dialled decides.
+    model_placement: ModelPlacement,
     tokens_used: u32,
     wire: WireOutcome,
     completion_budget_clamped: bool,
@@ -1061,6 +1064,7 @@ fn projection_outcome_from_output(
             provider: output.provider_id.to_string(),
             model: output.model.clone(),
             model_source: output.model_source,
+            model_placement: Some(output.model_placement),
             route_id: Some(output.route_id.to_string()),
             route: Some(output.route_record()),
             prompt_id: prompt_id.to_string(),
@@ -1342,8 +1346,8 @@ fn projection_output_from_wire(
         Some(served) => (served, ModelIdentitySource::Served),
         None => (requested_model, ModelIdentitySource::Requested),
     };
-    let ran_remotely = !crate::llm::route::endpoint_may_be_on_users_network(endpoint);
-    let model = owned_model_id_for_place(model, ran_remotely);
+    let model_placement = ModelPlacement::at(endpoint);
+    let model = owned_model_id_for_place(model, model_placement.ran_remotely());
     ProjectionBackendOutput {
         raw_json,
         route_id: live.id,
@@ -1351,6 +1355,7 @@ fn projection_output_from_wire(
         wire_skin: route.skin().as_str(),
         model,
         model_source,
+        model_placement,
         tokens_used,
         wire,
         completion_budget_clamped: route.completion_budget_clamped(),
@@ -1386,6 +1391,7 @@ fn projection_native(
         // loaded model IS the requested one, recorded as such.
         model: "loaded_local_llama".to_string(),
         model_source: ModelIdentitySource::Requested,
+        model_placement: ModelPlacement::Local,
         tokens_used: outcome.tokens_used,
         wire: WireOutcome::plain(
             TerminalStatus::Completed,
@@ -1442,6 +1448,7 @@ fn projection_mistralrs(
         wire_skin: route.skin().as_str(),
         model: "loaded_mistralrs".to_string(),
         model_source: ModelIdentitySource::Requested,
+        model_placement: ModelPlacement::Local,
         tokens_used,
         wire: WireOutcome::plain(TerminalStatus::Completed, grade),
         completion_budget_clamped: route.completion_budget_clamped(),
@@ -1790,6 +1797,7 @@ mod tests {
             wire_skin: "chat_completions",
             model: "test-model".to_string(),
             model_source: ModelIdentitySource::Served,
+            model_placement: ModelPlacement::Remote,
             tokens_used,
             wire: WireOutcome::plain(
                 TerminalStatus::Completed,
@@ -3106,6 +3114,10 @@ mod tests {
                     "served {id} {openrouter}"
                 );
                 assert_eq!(patch.provenance.model_source, served_source);
+                assert_eq!(
+                    patch.provenance.model_placement,
+                    Some(ModelPlacement::Local)
+                );
                 let persisted = serde_json::to_string(&patch).expect("serialize the patch");
                 assert!(!persisted.contains(PATH_CANARY), "{persisted}");
                 assert!(!persisted.contains(SECRET_CANARY), "{persisted}");
@@ -3122,6 +3134,66 @@ mod tests {
                 assert!(!persisted.contains(PATH_CANARY), "{persisted}");
                 assert!(!persisted.contains(SECRET_CANARY), "{persisted}");
             }
+        }
+    }
+
+    #[test]
+    fn a_model_at_openrouters_host_keeps_its_namespace_through_a_reload() {
+        // The endpoint decides, before anything is sent: no request is made.
+        for (base_url, placement, expected) in [
+            (
+                crate::llm::openrouter::DEFAULT_BASE_URL,
+                ModelPlacement::Remote,
+                "anthropic/claude-sonnet-4",
+            ),
+            (
+                "http://127.0.0.1:9/api/v1",
+                ModelPlacement::Local,
+                "claude-sonnet-4",
+            ),
+        ] {
+            let route = authorize_route_dispatch(&LlmProvider::OpenRouter {
+                model: "anthropic/claude-sonnet-4".to_string(),
+                base_url: base_url.to_string(),
+                provider_order: None,
+                include_usage_in_stream: true,
+                api_key: "probe-key".to_string(),
+            })
+            .expect("OpenRouter is authorized");
+            let mut wire = WireOutcome::plain(
+                TerminalStatus::Completed,
+                ConstrainedDecodingGrade::Unconstrained,
+            );
+            wire.served_model = Some("anthropic/claude-sonnet-4".to_string());
+            let output = projection_output_from_wire(
+                &route,
+                route.descriptor(),
+                String::new(),
+                "anthropic/claude-sonnet-4".to_string(),
+                0,
+                wire,
+                base_url,
+            );
+            assert_eq!(output.model, expected, "{base_url}");
+            assert_eq!(output.model_placement, placement);
+
+            // The provenance written from it reads back the same.
+            let provenance = crate::projections::ProjectionProvenance {
+                provider: output.provider_id.to_string(),
+                model: output.model.clone(),
+                prompt_id: "notes-v1".to_string(),
+                route_id: Some(output.route_id.to_string()),
+                model_source: output.model_source,
+                model_placement: Some(output.model_placement),
+            };
+            let stored = serde_json::to_value(&provenance).expect("serialize provenance");
+            assert_eq!(
+                stored["model_placement"],
+                serde_json::to_value(placement).unwrap()
+            );
+            let read: crate::projections::ProjectionProvenance =
+                serde_json::from_value(stored).expect("read provenance");
+            assert_eq!(read, provenance, "{base_url}");
         }
     }
 

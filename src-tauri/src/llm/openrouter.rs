@@ -4815,8 +4815,16 @@ mod tests {
             Some("Amazon Bedrock"),
             "a legitimate multi-word provider name must survive intact"
         );
-        // Credential-shaped values are dropped, not kept.
-        assert_eq!(sanitize_metadata_value("sk-abc123"), None);
+        // Credential-shaped values are dropped, not kept; a short `sk-` run
+        // is a name.
+        assert_eq!(
+            sanitize_metadata_value(concat!("s", "k-abc123abc123abc123")),
+            None
+        );
+        assert_eq!(
+            sanitize_metadata_value(concat!("s", "k-abc123")).as_deref(),
+            Some(concat!("s", "k-abc123"))
+        );
         assert_eq!(sanitize_metadata_value("Bearer tok123"), None);
         // Over-length values are dropped, not truncated.
         let long = "a".repeat(MAX_METADATA_LEN + 1);

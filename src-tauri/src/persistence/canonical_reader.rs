@@ -329,6 +329,7 @@ mod tests {
                 // defaults when reading a patch written before the route table.
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
+                model_placement: None,
             },
             route: None,
             queued_at_ms: None,
@@ -686,6 +687,49 @@ mod tests {
                 assert_eq!(fs::read(&path).expect("re-read legacy bytes"), bytes);
                 let _ = fs::remove_dir_all(root);
             }
+        }
+    }
+
+    #[test]
+    fn a_marked_model_id_is_read_as_written() {
+        use audio_graph_ipc_contract::model_id::ModelPlacement;
+
+        // (served at, what a build with the rule wrote, what it reads back as)
+        for (placement, written, read_back) in [
+            // OpenRouter's real host: the hosted id, namespace and all.
+            (
+                ModelPlacement::Remote,
+                "anthropic/claude-sonnet-4",
+                "anthropic/claude-sonnet-4",
+            ),
+            // OpenRouter at a loopback base URL: a display name.
+            (ModelPlacement::Local, "private.gguf", "private.gguf"),
+            // The credential screen runs on a marked record too.
+            (
+                ModelPlacement::Remote,
+                "Bearer Ym9i/c2VjcmV0",
+                crate::llm::route::WITHHELD_MODEL_PLACEHOLDER,
+            ),
+        ] {
+            let root = unique_tempdir("marked-model-id");
+            let path = root.join("projection.jsonl");
+            let session_id = "session-marked-model-id";
+            let mut patch = projection_patch(1);
+            patch.provenance.provider = "llm.openrouter".to_string();
+            patch.provenance.route_id = Some("route.openrouter".to_string());
+            patch.provenance.model = written.to_string();
+            patch.provenance.model_placement = Some(placement);
+            let mut bytes = serde_json::to_vec(&patch).expect("serialize patch");
+            bytes.push(b'\n');
+            fs::create_dir_all(&root).expect("create fixture root");
+            fs::write(&path, &bytes).expect("write accepted patch");
+
+            let read = load_projection_patches(&path, session_id).expect("decode the patch");
+            let provenance = &present_snapshot(&read).records[0].payload.provenance;
+            assert_eq!(provenance.model, read_back, "{placement:?} {written}");
+            assert_eq!(provenance.model_placement, Some(placement));
+            assert_eq!(fs::read(&path).expect("re-read bytes"), bytes);
+            let _ = fs::remove_dir_all(root);
         }
     }
 

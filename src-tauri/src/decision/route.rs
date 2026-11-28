@@ -9,6 +9,7 @@ use crate::settings::{DecisionRouteSettings, PrivacyMode};
 use audio_graph_decision_contract::{
     Answer, DecisionEngine, DecisionRequest, DecisionResponse, Egress, EngineLimits, Usage,
 };
+use audio_graph_ipc_contract::model_id::{ModelPlacement, stored_for_place};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -429,14 +430,20 @@ pub struct DecisionRecord {
     pub latency_ms: u64,
     pub usage: Usage,
     pub error_class: Option<String>,
+    /// Where the decision model ran, written with the model rule applied.
+    /// `None` on records written before it, which are read by `egress`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_placement: Option<ModelPlacement>,
 }
 
 /// A [`DecisionRecord`] as a card or a relabel run stores it.
 ///
 /// Records written before the model rule can hold the path a local server
-/// loaded or a user configured. Building the typed value from this one applies
-/// the rule on every read: a record that does not say `cloud` is a local
-/// model's, and shows a display name. The stored record is not rewritten.
+/// loaded or a user configured, and carry no `model_placement`. Building the
+/// typed value from this one applies the rule on every read: a marked record
+/// is read by its placement, and an unmarked one that does not say `cloud` is
+/// a local model's and shows a display name. The stored record is not
+/// rewritten.
 #[derive(Deserialize)]
 struct StoredDecisionRecord {
     id: String,
@@ -465,11 +472,14 @@ struct StoredDecisionRecord {
     latency_ms: u64,
     usage: Usage,
     error_class: Option<String>,
+    #[serde(default)]
+    model_placement: Option<ModelPlacement>,
 }
 
 impl From<StoredDecisionRecord> for DecisionRecord {
     fn from(stored: StoredDecisionRecord) -> Self {
-        let ran_remotely = stored.egress == "cloud";
+        let legacy_remote = stored.egress == "cloud";
+        let placed = |id| stored_for_place(id, stored.model_placement, legacy_remote);
         Self {
             id: stored.id,
             call_id: stored.call_id,
@@ -478,13 +488,11 @@ impl From<StoredDecisionRecord> for DecisionRecord {
             engine: stored.engine,
             egress: stored.egress,
             model_pin: stored.model_pin.map(|pin| ModelPin {
-                requested: owned_model_id_for_place(pin.requested, ran_remotely),
+                requested: placed(pin.requested),
                 ..pin
             }),
             model_pin_digest: stored.model_pin_digest,
-            served_model: stored
-                .served_model
-                .map(|served| owned_model_id_for_place(served, ran_remotely)),
+            served_model: stored.served_model.map(placed),
             model_identity_source: stored.model_identity_source,
             question_id: stored.question_id,
             schema_version: stored.schema_version,
@@ -502,6 +510,7 @@ impl From<StoredDecisionRecord> for DecisionRecord {
             latency_ms: stored.latency_ms,
             usage: stored.usage,
             error_class: stored.error_class,
+            model_placement: stored.model_placement,
         }
     }
 }
@@ -678,6 +687,13 @@ fn records(
             latency_ms: 0,
             usage: Usage::default(),
             error_class: None,
+            model_placement: route.map(|r| {
+                if r.engine.egress() == Egress::Cloud {
+                    ModelPlacement::Remote
+                } else {
+                    ModelPlacement::Local
+                }
+            }),
         })
         .collect()
 }
@@ -740,6 +756,7 @@ fn movement(
             .served_model
             .clone()
             .or_else(|| record.model_pin.as_ref().map(|pin| pin.requested.clone())),
+        model_placement: record.model_placement,
     });
     if sent {
         builder = builder.data_classes([DataClass::TranscriptText, DataClass::UsageMetadata]);

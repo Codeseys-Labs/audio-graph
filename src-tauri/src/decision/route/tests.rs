@@ -678,7 +678,11 @@ fn a_stored_decision_record_is_read_by_where_its_model_ran() {
         &[],
     )
     .remove(0);
-    let template = serde_json::to_value(&record).unwrap();
+    // A native engine ran on this machine, and the record says so.
+    assert_eq!(record.model_placement, Some(ModelPlacement::Local));
+    // Rows as builds before the placement marker wrote them.
+    let mut template = serde_json::to_value(&record).unwrap();
+    template.as_object_mut().unwrap().remove("model_placement");
 
     for (stored, local, remote) in STORED {
         for (egress, expected) in [("local", local), ("cloud", remote)] {
@@ -696,6 +700,31 @@ fn a_stored_decision_record_is_read_by_where_its_model_ran() {
             assert!(!shown.contains(SECRET_CANARY), "{shown}");
             if egress == "local" {
                 assert!(!shown.contains(PATH_CANARY), "{shown}");
+            }
+        }
+        // A marked record is read by its marker, whatever its egress says.
+        for (placement, expected) in [
+            (ModelPlacement::Local, local),
+            (ModelPlacement::Remote, remote),
+        ] {
+            for egress in ["local", "cloud"] {
+                let mut row = template.clone();
+                row["egress"] = egress.into();
+                row["served_model"] = stored.into();
+                row["model_pin"]["requested"] = stored.into();
+                row["model_placement"] = serde_json::to_value(placement).unwrap();
+                let read: DecisionRecord = serde_json::from_value(row).unwrap();
+                assert_eq!(
+                    read.served_model.as_deref(),
+                    Some(expected),
+                    "{stored} {placement:?}"
+                );
+                assert_eq!(read.model_pin.as_ref().unwrap().requested, expected);
+                assert_eq!(read.model_placement, Some(placement));
+                // And written again as it was read.
+                let again: DecisionRecord =
+                    serde_json::from_value(serde_json::to_value(&read).unwrap()).unwrap();
+                assert_eq!(again, read);
             }
         }
     }
@@ -734,6 +763,7 @@ fn a_stored_card_file_is_read_by_where_its_decision_model_ran_and_left_alone() {
         for egress in ["local", "cloud"] {
             let mut row = template.clone();
             row.egress = egress.to_string();
+            row.model_placement = None;
             row.served_model = Some(stored.to_string());
             row.model_pin.as_mut().unwrap().requested = stored.to_string();
             rows.push(row);

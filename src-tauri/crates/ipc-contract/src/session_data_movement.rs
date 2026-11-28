@@ -229,6 +229,11 @@ pub struct MovementModel {
     pub provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Where the model ran, written with the model rule applied at the
+    /// endpoint dialled. Absent on rows written before it, which are read by
+    /// what their boundary and provider say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_placement: Option<crate::model_id::ModelPlacement>,
 }
 
 /// Quantitative, non-content measures of the movement.
@@ -416,16 +421,16 @@ struct StoredDataMovementEvent {
 
 impl From<StoredDataMovementEvent> for DataMovementEvent {
     fn from(stored: StoredDataMovementEvent) -> Self {
-        // A provider boundary is the egress classification, which calls a
-        // server on the user's LAN remote. Only a provider whose every
-        // endpoint is a fixed public host says the model ran off the user's
-        // network; any other row is read by the local rule.
+        // An unmarked row is read by its boundary and provider. A provider
+        // boundary is the egress classification, which calls a server on the
+        // user's LAN remote, so only a provider whose every endpoint is a
+        // fixed public host says the model ran off the user's network.
         let provider_id = stored
             .destination
             .provider_id
             .as_deref()
             .or_else(|| stored.model.as_ref()?.provider_id.as_deref());
-        let ran_remotely = stored.destination.boundary == DestinationBoundary::Provider
+        let legacy_remote = stored.destination.boundary == DestinationBoundary::Provider
             && provider_id.is_some_and(crate::model_id::provider_dials_only_public_hosts);
         Self {
             event_id: stored.event_id,
@@ -441,9 +446,10 @@ impl From<StoredDataMovementEvent> for DataMovementEvent {
             basis: stored.basis,
             model: stored.model.map(|model| MovementModel {
                 provider_id: model.provider_id,
-                model_id: model
-                    .model_id
-                    .map(|id| crate::model_id::owned_for_place(id, ran_remotely)),
+                model_id: model.model_id.map(|id| {
+                    crate::model_id::stored_for_place(id, model.model_placement, legacy_remote)
+                }),
+                model_placement: model.model_placement,
             }),
             counts: stored.counts,
             policy: stored.policy,
@@ -632,9 +638,12 @@ export interface MovementBasis {{
   projection_sequence?: number | null;
 }}
 
+export type ModelPlacement = "local" | "remote";
+
 export interface MovementModel {{
   provider_id?: string | null;
   model_id?: string | null;
+  model_placement?: ModelPlacement | null;
 }}
 
 export interface MovementCounts {{
@@ -717,6 +726,7 @@ mod tests {
             model: Some(MovementModel {
                 provider_id: Some("llm.cerebras".to_string()),
                 model_id: Some("cerebras/llama-3.3-70b".to_string()),
+                model_placement: Some(crate::model_id::ModelPlacement::Remote),
             }),
             counts: Some(MovementCounts {
                 audio_ms: None,
@@ -752,12 +762,17 @@ mod tests {
 
     #[test]
     fn a_stored_model_id_is_read_by_where_the_row_says_its_model_ran() {
+        // A row as a build before the placement marker wrote it.
         let stored_row = |boundary: &str, provider: &str, model_id: serde_json::Value| {
             let mut row = serde_json::to_value(sample_event()).expect("serialize");
             row["destination"]["boundary"] = boundary.into();
             row["destination"]["provider_id"] = provider.into();
             row["model"]["provider_id"] = provider.into();
             row["model"]["model_id"] = model_id;
+            row["model"]
+                .as_object_mut()
+                .expect("a model")
+                .remove("model_placement");
             row
         };
         let read = |row: serde_json::Value| {
@@ -815,6 +830,37 @@ mod tests {
         assert_eq!(
             read(stored_row("local", "llm.cerebras", serde_json::Value::Null)),
             None
+        );
+    }
+
+    #[test]
+    fn a_marked_row_is_read_by_where_it_says_its_model_ran() {
+        let marked = |provider: &str, placement: &str| {
+            let mut row = serde_json::to_value(sample_event()).expect("serialize");
+            row["destination"]["provider_id"] = provider.into();
+            row["model"]["provider_id"] = provider.into();
+            row["model"]["model_id"] = "anthropic/claude-sonnet-4".into();
+            row["model"]["model_placement"] = placement.into();
+            serde_json::from_value::<DataMovementEvent>(row)
+                .expect("a stored row")
+                .model
+                .expect("a model")
+        };
+        // A row written at OpenRouter's real host keeps its namespace.
+        let remote = marked("llm.openrouter", "remote");
+        assert_eq!(
+            remote.model_id.as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+        assert_eq!(
+            remote.model_placement,
+            Some(crate::model_id::ModelPlacement::Remote)
+        );
+        // One written at a loopback base URL is a display name, whatever
+        // its provider.
+        assert_eq!(
+            marked("llm.cerebras", "local").model_id.as_deref(),
+            Some("claude-sonnet-4")
         );
     }
 

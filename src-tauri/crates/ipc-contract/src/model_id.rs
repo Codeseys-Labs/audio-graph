@@ -23,6 +23,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use serde::{Deserialize, Serialize};
+
 /// What stands in for a local model whose identifier leaves no name to show:
 /// a bare root, a home marker, or anything that still begins with a drive.
 ///
@@ -35,15 +37,128 @@ pub const LOCAL_MODEL_PLACEHOLDER: &str = "local-model";
 /// wherever the model ran. No part of such a value is kept.
 pub const WITHHELD_MODEL_PLACEHOLDER: &str = "withheld-model";
 
-/// Heuristic guard: does this value contain a credential-shaped token? Catches
-/// the common API-key prefixes and bearer-token shapes so a routed-provider echo
-/// can never persist a secret as "metadata". Case-insensitive.
+/// Where a record's model ran, written by the build that applied the model
+/// rule with the endpoint it dialled in hand. A record that carries it is read
+/// as written; one without it was written before the rule and is read by the
+/// rule for records that cannot say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPlacement {
+    /// On this machine, or at an endpoint that could be on the user's own
+    /// machine or network: the record holds a display name.
+    Local,
+    /// At an endpoint off the user's network: the record holds the
+    /// provider's hosted identifier.
+    Remote,
+}
+
+impl ModelPlacement {
+    /// Where a model at `endpoint` ran, by [`endpoint_may_be_on_users_network`].
+    pub fn at(endpoint: &str) -> Self {
+        if endpoint_may_be_on_users_network(endpoint) {
+            Self::Local
+        } else {
+            Self::Remote
+        }
+    }
+
+    pub fn ran_remotely(self) -> bool {
+        self == Self::Remote
+    }
+}
+
+/// A stored model id, read by its record's [`ModelPlacement`] when it has one
+/// and by `legacy_remote` (what an unmarked record's other fields say) when it
+/// does not. The credential screen runs either way.
+pub fn stored_for_place(
+    id: String,
+    placement: Option<ModelPlacement>,
+    legacy_remote: bool,
+) -> String {
+    let ran_remotely = placement.map_or(legacy_remote, ModelPlacement::ran_remotely);
+    owned_for_place(id, ran_remotely)
+}
+
+/// Characters of an API key after its prefix.
+fn is_key_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
+/// Whether `index` starts a token: nothing alphanumeric right before it.
+fn starts_token(bytes: &[u8], index: usize) -> bool {
+    index == 0 || !bytes[index - 1].is_ascii_alphanumeric()
+}
+
+/// The fewest key characters after `sk-` that read as a key: real keys run to
+/// dozens, and a model name such as `sk-small` stays well under.
+const MIN_KEY_RUN: usize = 16;
+
+/// Heuristic guard: does this value contain a credential-shaped token?
+///
+/// Matches, case-insensitively:
+/// - an `sk-` prefix that starts a token and is followed by at least
+///   [`MIN_KEY_RUN`] key characters (`task-`, `mask-` or `risk-` inside a name
+///   does not start a token),
+/// - `bearer` starting a token and followed by any whitespace,
+/// - `api_key` or `apikey` anywhere,
+/// - a JWT: three base64url segments joined by dots, the first starting
+///   `eyJ` (case-sensitive, as a JSON header encodes).
 pub fn looks_credential_shaped(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    lower.contains("sk-")
-        || lower.contains("bearer ")
+    let bytes = lower.as_bytes();
+    let key_prefix = lower.match_indices("sk-").any(|(index, prefix)| {
+        starts_token(bytes, index)
+            && bytes[index + prefix.len()..]
+                .iter()
+                .take_while(|byte| is_key_char(**byte))
+                .count()
+                >= MIN_KEY_RUN
+    });
+    let bearer = lower.match_indices("bearer").any(|(index, word)| {
+        starts_token(bytes, index)
+            && lower[index + word.len()..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+    });
+    key_prefix
+        || bearer
         || lower.contains("api_key")
         || lower.contains("apikey")
+        || contains_jwt(value)
+}
+
+/// Three base64url segments joined by dots, the first starting `eyJ` at a
+/// token start and at least ten characters long.
+fn contains_jwt(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let segment = |from: usize| {
+        bytes[from..]
+            .iter()
+            .take_while(|byte| is_key_char(**byte))
+            .count()
+    };
+    value.match_indices("eyJ").any(|(start, _)| {
+        if start > 0 && is_key_char(bytes[start - 1]) {
+            return false;
+        }
+        let header = segment(start);
+        if header < 10 {
+            return false;
+        }
+        let mut at = start + header;
+        for _ in 0..2 {
+            if bytes.get(at) != Some(&b'.') {
+                return false;
+            }
+            let length = segment(at + 1);
+            if length == 0 {
+                return false;
+            }
+            at += 1 + length;
+        }
+        true
+    })
 }
 
 /// Could `endpoint` be on the user's own machine or network?
@@ -53,9 +168,9 @@ pub fn looks_credential_shaped(value: &str) -> bool {
 /// `*.localhost` name, private, link-local, unique-local and carrier-grade-NAT
 /// addresses (also as IPv4-mapped IPv6), a host-less URL such as a Unix
 /// socket, a single-label host name, and names under `.local`, `.lan`,
-/// `.home.arpa` and `.internal`. An endpoint that does not parse as a URL is
-/// treated as local. No name is resolved, so a public name that resolves to
-/// the user's own machine is not detected.
+/// `.home.arpa`, `.home`, `.internal`, `.localdomain` and `.corp`. An endpoint
+/// that does not parse as a URL is treated as local. No name is resolved, so a
+/// public name that resolves to the user's own machine is not detected.
 pub fn endpoint_may_be_on_users_network(endpoint: &str) -> bool {
     let Ok(url) = url::Url::parse(endpoint.trim()) else {
         return true;
@@ -103,14 +218,23 @@ fn domain_may_be_on_users_network(name: &str) -> bool {
         };
     }
     !name.contains('.')
-        || ["localhost", "local", "lan", "home.arpa", "internal"]
-            .iter()
-            .any(|suffix| {
-                name == *suffix
-                    || name
-                        .strip_suffix(suffix)
-                        .is_some_and(|rest| rest.ends_with('.'))
-            })
+        || [
+            "localhost",
+            "local",
+            "lan",
+            "home.arpa",
+            "home",
+            "internal",
+            "localdomain",
+            "corp",
+        ]
+        .iter()
+        .any(|suffix| {
+            name == *suffix
+                || name
+                    .strip_suffix(suffix)
+                    .is_some_and(|rest| rest.ends_with('.'))
+        })
 }
 
 /// Providers whose every endpoint is a fixed public host, so a record that
@@ -271,15 +395,40 @@ mod tests {
         }
     }
 
+    /// Credential-shaped values, built from plain words so nothing here looks
+    /// like a real key.
+    const CREDENTIAL_SHAPED: [&str; 8] = [
+        "Bearer Ym9i/c2VjcmV0",
+        "bearer\twombat/c2VjcmV0",
+        "Authorization: BEARER\u{a0}wombat",
+        concat!("/models/s", "k-", "wombatwombatwombat.gguf"),
+        concat!("org/s", "k-proj-wombat_wombat-wombat"),
+        "org/apikey",
+        "eyJwombatheader.wombatpayload.wombatsignature",
+        "org/eyJwombatheader.wombatpayload.c2VjcmV0",
+    ];
+
+    /// Names that only contain a marker inside a word, or a short run after
+    /// it: they are model names and must survive.
+    const LEGITIMATE: [&str; 10] = [
+        "task-classifier",
+        "org/mask-rcnn",
+        "risk-model-v2",
+        "desk-assistant.gguf",
+        "flask-app.gguf",
+        concat!("s", "k-small"),
+        "bearer-llm",
+        "forbearer model",
+        "eyJ.short.name",
+        "keyJwombatheader.wombatpayload.wombatsignature",
+    ];
+
     #[test]
     fn a_credential_shaped_identifier_is_withheld_before_anything_is_cut() {
-        for id in [
-            "Bearer Ym9i/c2VjcmV0",
-            "/models/sk-numbat-key.gguf",
-            "org/apikey",
-        ] {
+        for id in CREDENTIAL_SHAPED {
+            assert!(super::looks_credential_shaped(id), "{id:?}");
             for remote in [false, true] {
-                assert_eq!(for_place(id, remote), WITHHELD_MODEL_PLACEHOLDER, "{id}");
+                assert_eq!(for_place(id, remote), WITHHELD_MODEL_PLACEHOLDER, "{id:?}");
             }
         }
         for remote in [false, true] {
@@ -288,6 +437,54 @@ mod tests {
                 WITHHELD_MODEL_PLACEHOLDER
             );
         }
+    }
+
+    #[test]
+    fn a_marker_inside_a_name_does_not_withhold_it() {
+        for id in LEGITIMATE {
+            assert!(!super::looks_credential_shaped(id), "{id:?}");
+            assert_eq!(for_place(id, true), id);
+        }
+    }
+
+    #[test]
+    fn a_marked_record_is_read_as_written_and_an_unmarked_one_by_its_fallback() {
+        use super::{ModelPlacement, stored_for_place};
+        let hosted = "anthropic/claude-sonnet-4".to_string();
+        assert_eq!(
+            stored_for_place(hosted.clone(), Some(ModelPlacement::Remote), false),
+            hosted
+        );
+        assert_eq!(
+            stored_for_place(hosted.clone(), Some(ModelPlacement::Local), true),
+            "claude-sonnet-4"
+        );
+        assert_eq!(
+            stored_for_place(hosted.clone(), None, false),
+            "claude-sonnet-4"
+        );
+        assert_eq!(stored_for_place(hosted.clone(), None, true), hosted);
+        // The credential screen runs on a marked record too.
+        assert_eq!(
+            stored_for_place(
+                "Bearer Ym9i/c2VjcmV0".to_string(),
+                Some(ModelPlacement::Remote),
+                true
+            ),
+            WITHHELD_MODEL_PLACEHOLDER
+        );
+        assert_eq!(
+            serde_json::to_value(ModelPlacement::Remote).unwrap(),
+            "remote"
+        );
+        assert_eq!(
+            ModelPlacement::at("https://openrouter.ai/api/v1"),
+            ModelPlacement::Remote
+        );
+        assert_eq!(
+            ModelPlacement::at("http://[::1]:8080/v1"),
+            ModelPlacement::Local
+        );
     }
 
     #[test]
@@ -300,7 +497,7 @@ mod tests {
     }
 
     /// (endpoint, could it be on the user's own machine or network)
-    pub(crate) const ENDPOINTS: [(&str, bool); 30] = [
+    pub(crate) const ENDPOINTS: [(&str, bool); 34] = [
         ("http://127.0.0.1:8080/v1", true),
         ("http://127.8.9.10/v1", true),
         ("http://[::1]:8080/v1", true),
@@ -324,6 +521,10 @@ mod tests {
         ("http://gpu-box.lan./v1", true),
         ("http://gpu.home.arpa/v1", true),
         ("http://llm.corp.internal/v1", true),
+        ("http://gpu-box.localdomain/v1", true),
+        ("http://nas.home/v1", true),
+        ("http://llm.example.corp/v1", true),
+        ("http://[fe80::1%25eth0]/v1", true),
         ("not a url", true),
         // Public hosts, and public addresses that only look nearby.
         ("https://openrouter.ai/api/v1", false),
