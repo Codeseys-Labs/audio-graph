@@ -1196,29 +1196,22 @@ impl RuntimeWorker {
             .as_ref()
             .expect("reconciliation requires ready credential service");
         let snapshot = service.snapshot_status();
-        let batch = service.events_since(self.event_cursor);
-        let mut expected = self.event_cursor;
-        let ordered = !batch.gap_detected
-            && batch.latest_epoch >= self.event_cursor
-            && batch.latest_epoch == snapshot.global_epoch
-            && batch.events.iter().all(|event| {
-                expected = match expected.checked_add(1) {
-                    Some(next) => next,
-                    None => return false,
-                };
-                event.global_epoch == expected
-            })
-            && expected == batch.latest_epoch;
-        if !ordered {
+        // Every epoch since the cursor must be this service's own event, in
+        // order, or a commit by another process that the service observed in
+        // the authority journal. Anything else is a lost event.
+        let Some((latest_epoch, events)) = service.accounted_events_since(self.event_cursor) else {
+            return Err(runtime_stalled_error(None));
+        };
+        if latest_epoch != snapshot.global_epoch {
             return Err(runtime_stalled_error(None));
         }
         shared.cache_service_while_admitted(snapshot);
-        for event in batch.events {
+        for event in events {
             self.event_sink
                 .emit(event)
                 .map_err(|_| runtime_stalled_error(None))?;
         }
-        self.event_cursor = batch.latest_epoch;
+        self.event_cursor = latest_epoch;
         Ok(())
     }
 }
@@ -2823,6 +2816,161 @@ mod tests {
         assert_eq!(cached.lifecycle, CredentialRuntimeLifecycle::Ready);
         assert_eq!(cached.service.global_epoch, 2);
         assert_eq!(cached.service.worker.state, CredentialWorkerState::Idle);
+    }
+
+    /// Another process's commit reaches this runtime only through the
+    /// authority journal, with no local event. A request that adopts that
+    /// epoch, including one that then loses with `RevisionConflict`, leaves
+    /// the runtime admitted at the new epoch: its next read and a replace on
+    /// the new revision succeed, and it emits only the event of its own
+    /// commit.
+    #[tokio::test]
+    async fn a_runtime_that_observes_another_runtimes_commit_stays_admitted() {
+        let deepgram = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
+        let deadline = Duration::from_secs(1);
+        for first in ["replace", "delete", "prepare", "resolve"] {
+            let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+            let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+            let winner = CredentialRuntime::dormant_with_token_source(
+                CredentialBackendKind::InMemory,
+                Arc::new(SecureUuidCredentialTokenSource),
+            );
+            let (winner_tx, _winner_rx) = mpsc::channel();
+            winner
+                .configure(
+                    Box::new(AlwaysReadyBackend {
+                        journal: journal.clone(),
+                        store: Arc::clone(&store),
+                    }),
+                    Arc::new(RecordingEventSink {
+                        sender: Mutex::new(winner_tx),
+                        emitted: AtomicUsize::new(0),
+                    }),
+                )
+                .expect("configure the winning runtime");
+            let loser = CredentialRuntime::dormant_with_token_source(
+                CredentialBackendKind::InMemory,
+                Arc::new(DeterministicTokenSource::default()),
+            );
+            let (loser_tx, loser_rx) = mpsc::channel();
+            loser
+                .configure(
+                    Box::new(AlwaysReadyBackend { journal, store }),
+                    Arc::new(RecordingEventSink {
+                        sender: Mutex::new(loser_tx),
+                        emitted: AtomicUsize::new(0),
+                    }),
+                )
+                .expect("configure the losing runtime");
+            loser
+                .initialize(deadline)
+                .await
+                .expect("the losing runtime opens at epoch 0");
+
+            let won = winner
+                .replace_set(
+                    api_key_draft("00000000-0000-0000-0000-000000000501", None),
+                    deadline,
+                )
+                .await
+                .expect("the winning runtime commits epoch 1");
+
+            match first {
+                "replace" => {
+                    let conflict = loser
+                        .replace_set(
+                            api_key_draft("00000000-0000-0000-0000-000000000502", None),
+                            deadline,
+                        )
+                        .await
+                        .expect_err("a replace on the old revision loses");
+                    assert_eq!(conflict.code, CredentialErrorCode::RevisionConflict);
+                }
+                "delete" => {
+                    let conflict = loser
+                        .delete_set(
+                            DeleteCredentialSet {
+                                set_id: deepgram.clone(),
+                                expected_revision: None,
+                                idempotency_token: idempotency(
+                                    "00000000-0000-0000-0000-000000000503",
+                                ),
+                            },
+                            deadline,
+                        )
+                        .await
+                        .expect_err("a delete on the old revision loses");
+                    assert_eq!(conflict.code, CredentialErrorCode::RevisionConflict);
+                }
+                "prepare" => {
+                    let conflict = loser
+                        .prepare_settings_activation(
+                            PrepareCredentialActivation {
+                                set_id: deepgram.clone(),
+                                auth_method_id: AuthMethodId::ApiKey,
+                                material: StoredSecretBundle::api_key("stale-activation")
+                                    .expect("API key"),
+                                expected_revision: None,
+                                expected_settings_revision: 1,
+                                proposed_settings_revision: 2,
+                                idempotency_token: idempotency(
+                                    "00000000-0000-0000-0000-000000000504",
+                                ),
+                            },
+                            deadline,
+                        )
+                        .await
+                        .expect_err("an activation on the old revision loses");
+                    assert_eq!(conflict.code, CredentialErrorCode::RevisionConflict);
+                }
+                _ => assert!(matches!(
+                    loser
+                        .resolve_for_use(deepgram_use_request(), deadline)
+                        .await,
+                    Ok(CredentialResolution::Stored(_))
+                )),
+            }
+            let status = loser.status();
+            assert_eq!(
+                (
+                    status.lifecycle,
+                    status.service.global_epoch,
+                    status.service.worker.state
+                ),
+                (
+                    CredentialRuntimeLifecycle::Ready,
+                    1,
+                    CredentialWorkerState::Idle
+                ),
+                "{first}"
+            );
+
+            match loser
+                .resolve_for_use(deepgram_use_request(), deadline)
+                .await
+            {
+                Ok(CredentialResolution::Stored(lease)) => {
+                    assert_eq!(Some(lease.revision.clone()), won.new_revision, "{first}");
+                }
+                _ => panic!("{first}: the losing runtime reads the winner's revision"),
+            }
+            let replaced = loser
+                .replace_set(
+                    api_key_draft(
+                        "00000000-0000-0000-0000-000000000505",
+                        won.new_revision.clone(),
+                    ),
+                    deadline,
+                )
+                .await
+                .expect("a replace on the new revision");
+            assert_eq!(replaced.previous_revision, won.new_revision, "{first}");
+            let event = loser_rx
+                .recv_timeout(deadline)
+                .expect("the event of the losing runtime's own commit");
+            assert_eq!(event.global_epoch, 2, "{first}");
+            assert!(loser_rx.try_recv().is_err(), "{first}");
+        }
     }
 
     #[tokio::test]

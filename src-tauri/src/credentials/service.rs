@@ -296,6 +296,10 @@ struct CredentialEventLog {
     capacity: usize,
     service_start_epoch: u64,
     events: VecDeque<CredentialChangeEvent>,
+    /// Epoch ranges `(after, through]` this service adopted from the
+    /// authority journal without committing them itself: another process's
+    /// commits. They have no local event.
+    observed: VecDeque<(u64, u64)>,
 }
 
 impl CredentialEventLog {
@@ -304,6 +308,7 @@ impl CredentialEventLog {
             capacity: capacity.max(1),
             service_start_epoch,
             events: VecDeque::new(),
+            observed: VecDeque::new(),
         }
     }
 
@@ -312,6 +317,45 @@ impl CredentialEventLog {
         while self.events.len() > self.capacity {
             self.events.pop_front();
         }
+    }
+
+    fn observe(&mut self, after_epoch: u64, through_epoch: u64) {
+        self.observed.push_back((after_epoch, through_epoch));
+        while self.observed.len() > self.capacity {
+            self.observed.pop_front();
+        }
+    }
+
+    /// The local events in `(after_epoch, latest_epoch]`, in epoch order, or
+    /// `None` when an epoch there has neither a retained local event nor a
+    /// retained observation of another process's commit: a local event was
+    /// lost or has left retention.
+    fn accounted_since(
+        &self,
+        after_epoch: u64,
+        latest_epoch: u64,
+    ) -> Option<Vec<CredentialChangeEvent>> {
+        if after_epoch < self.service_start_epoch || latest_epoch < after_epoch {
+            return None;
+        }
+        let mut accounted = after_epoch;
+        let mut events = Vec::new();
+        while accounted < latest_epoch {
+            let next = accounted + 1;
+            if let Some(event) = self.events.iter().find(|event| event.global_epoch == next) {
+                events.push(event.clone());
+                accounted = next;
+            } else if let Some(&(_, through)) = self
+                .observed
+                .iter()
+                .find(|&&(after, through)| after <= accounted && accounted < through)
+            {
+                accounted = through.min(latest_epoch);
+            } else {
+                return None;
+            }
+        }
+        Some(events)
     }
 
     fn since(&self, after_epoch: u64, latest_epoch: u64) -> CredentialEventBatch {
@@ -354,6 +398,16 @@ impl fmt::Debug for CredentialResolution {
             }
         }
     }
+}
+
+/// Where a journal about to be cached came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JournalOrigin {
+    /// Read from the authority under a session's lock. Epochs past the
+    /// cache were committed by another process.
+    Authority,
+    /// Persisted or committed by this service, which publishes any event.
+    ThisService,
 }
 
 struct WorkerAdmission {
@@ -558,6 +612,27 @@ impl CredentialService {
             .since(after_epoch, latest_epoch)
     }
 
+    /// For the runtime, which forwards this service's events in order: the
+    /// latest epoch and the local events after `after_epoch`, or `None` when
+    /// an epoch in between is unaccounted for. An epoch that another process
+    /// committed, and this service only observed in the authority journal,
+    /// is accounted for without an event.
+    pub(crate) fn accounted_events_since(
+        &self,
+        after_epoch: u64,
+    ) -> Option<(u64, Vec<CredentialChangeEvent>)> {
+        let latest_epoch = self
+            .journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .global_epoch;
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accounted_since(after_epoch, latest_epoch)
+            .map(|events| (latest_epoch, events))
+    }
+
     #[cfg(test)]
     fn pause_next_event_snapshot(&self, snapshot_captured: Sender<()>, resume: Receiver<()>) {
         *self
@@ -677,11 +752,29 @@ impl CredentialService {
         })
     }
 
-    fn cache_journal(&self, journal: &AuthorityJournal) {
-        *self
+    /// The one place the cached journal is written, always under the worker
+    /// permit of the operation that read or wrote `journal`. The observed
+    /// epoch never moves backwards: a journal older than the cache is not
+    /// cached, and `false` is returned. When a journal read from the
+    /// authority is newer than the cache, the epochs in between were
+    /// committed by another process and are recorded as observed, so the
+    /// runtime can tell them from a lost local event.
+    fn cache_journal(&self, journal: AuthorityJournal, origin: JournalOrigin) -> bool {
+        let mut cached = self
             .journal
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = journal.clone();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if journal.global_epoch < cached.global_epoch {
+            return false;
+        }
+        if origin == JournalOrigin::Authority && journal.global_epoch > cached.global_epoch {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .observe(cached.global_epoch, journal.global_epoch);
+        }
+        *cached = journal;
+        true
     }
 
     fn reconcile_authoritative_journal(
@@ -689,19 +782,11 @@ impl CredentialService {
         authoritative: &AuthorityJournal,
         set_id: &CredentialSetId,
     ) -> Result<(), CredentialError> {
-        let mut cached = self
-            .journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if authoritative.global_epoch < cached.global_epoch {
-            return Err(content_free_error(
-                CredentialErrorCode::RecoveryRequired,
-                CredentialSafeRecoveryAction::Reconcile,
-                Some(set_id.clone()),
-            ));
+        if self.cache_journal(authoritative.clone(), JournalOrigin::Authority) {
+            Ok(())
+        } else {
+            Err(Self::recovery_required(set_id))
         }
-        *cached = authoritative.clone();
-        Ok(())
     }
 
     /// Loads the journal under the session's lock and, before the caller
@@ -1084,7 +1169,7 @@ impl CredentialService {
             session
                 .persist_intent(&journal)
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-            self.cache_journal(&journal);
+            self.cache_journal(journal.clone(), JournalOrigin::ThisService);
             session
                 .replace_active(&request.set_id, encoded)
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
@@ -1141,10 +1226,7 @@ impl CredentialService {
         };
 
         let global_epoch = committed_journal.global_epoch;
-        *self
-            .journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = committed_journal;
+        self.cache_journal(committed_journal, JournalOrigin::ThisService);
         self.publish_committed_change(receipt.clone(), global_epoch);
         Ok(receipt)
     }
@@ -1240,7 +1322,7 @@ impl CredentialService {
             session
                 .persist_intent(&journal)
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-            self.cache_journal(&journal);
+            self.cache_journal(journal.clone(), JournalOrigin::ThisService);
             session
                 .replace_active(&request.set_id, encoded)
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
@@ -1292,10 +1374,7 @@ impl CredentialService {
         };
 
         let global_epoch = committed_journal.global_epoch;
-        *self
-            .journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = committed_journal;
+        self.cache_journal(committed_journal, JournalOrigin::ThisService);
         self.publish_committed_change(receipt.clone(), global_epoch);
         Ok(receipt)
     }
@@ -1403,7 +1482,7 @@ impl CredentialService {
             session
                 .persist_intent(&journal)
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-            self.cache_journal(&journal);
+            self.cache_journal(journal.clone(), JournalOrigin::ThisService);
             session
                 .write_staging(&operation_id, &request.set_id, encoded)
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
@@ -1420,10 +1499,7 @@ impl CredentialService {
             (journal, expected_global_epoch, proposed_global_epoch)
         };
 
-        *self
-            .journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = committed_journal;
+        self.cache_journal(committed_journal, JournalOrigin::ThisService);
         Ok(PreparedCredentialActivation {
             operation_id,
             idempotency_token: request.idempotency_token,
@@ -1563,10 +1639,7 @@ impl CredentialService {
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
             journal
         };
-        *self
-            .journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = committed_journal;
+        self.cache_journal(committed_journal, JournalOrigin::ThisService);
         Ok(())
     }
 
@@ -1671,10 +1744,7 @@ impl CredentialService {
             })?;
             (journal, receipt)
         };
-        *self
-            .journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = committed_journal;
+        self.cache_journal(committed_journal, JournalOrigin::ThisService);
         Ok(receipt)
     }
 
@@ -1781,10 +1851,7 @@ impl CredentialService {
             journal
         };
         let global_epoch = committed_journal.global_epoch;
-        *self
-            .journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = committed_journal;
+        self.cache_journal(committed_journal, JournalOrigin::ThisService);
         self.publish_committed_change(receipt.clone(), global_epoch);
         Ok(receipt)
     }
@@ -1827,10 +1894,7 @@ impl CredentialService {
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
             journal
         };
-        *self
-            .journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = recovery_journal;
+        self.cache_journal(recovery_journal, JournalOrigin::ThisService);
         Ok(())
     }
 
@@ -2158,10 +2222,7 @@ impl CredentialService {
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
             journal
         };
-        *self
-            .journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = committed_journal;
+        self.cache_journal(committed_journal, JournalOrigin::ThisService);
         Ok(())
     }
 }
