@@ -37,6 +37,7 @@ def main():
     optional = "diarization,sherpa-streaming,surrealdb-embedded"
     for profile, features in (
         ("default", []),
+        ("all features", ["--all-features"]),
         ("cloud", ["--no-default-features", "--features", "cloud"]),
         ("default + optional", ["--features", optional]),
         ("cloud + optional", ["--no-default-features", "--features", f"cloud,{optional}"]),
