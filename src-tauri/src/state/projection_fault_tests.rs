@@ -128,3 +128,41 @@ fn killing_the_projection_snapshot_writer_recovers_the_committed_patch_over_the_
     assert_eq!(repo.load_materialized_notes(id).unwrap(), Some(original));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn historical_notes_load_after_snapshot_process_death_uses_the_log_and_ignores_staging() {
+    use tauri::Manager;
+
+    let _lock = crate::sessions::TEST_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = unique_tempdir("historical-snapshot");
+    let _home = HomeGuard::set(&dir);
+    crate::persistence::canonical_log::kill_at_writer_checkpoint(&dir, "snapshot-replace", || {});
+    let id = ReceiptFixture::SESSION;
+    let repo = FileMemoryRepository::with_data_root(&dir);
+    let previous = repo.load_materialized_notes(id).unwrap().unwrap();
+    assert_eq!(previous.last_sequence, 1);
+    let staged = dir.join("notes").join(format!("{id}.json.tmp"));
+    assert!(staged.is_file());
+    // Even an unreadable temporary must neither mask replay nor be promoted by Review.
+    std::fs::write(&staged, b"fern").unwrap();
+    let app = tauri::test::mock_app();
+    app.manage(AppState::new());
+    let state = app.state::<AppState>();
+    assert_ne!(state.current_session_id(), id);
+    let artifacts = tauri::async_runtime::block_on(
+        crate::commands::load_session_notes_artifacts_cmd(id.into(), state.clone()),
+    )
+    .unwrap();
+    let notes = artifacts.notes.unwrap();
+    assert_eq!(artifacts.projection_events.len(), 2);
+    assert_eq!(notes.last_sequence, 2);
+    assert_eq!(notes.projection_log_head.unwrap().sequence, 2);
+    assert_eq!(notes.notes[0].body, "gold");
+    assert_eq!(repo.load_materialized_notes(id).unwrap(), Some(previous));
+    assert_eq!(std::fs::read(staged).unwrap(), b"fern");
+    drain_writers(&state);
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}

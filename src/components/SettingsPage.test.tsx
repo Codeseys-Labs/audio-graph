@@ -10,6 +10,7 @@ import {
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import { useAudioGraphStore } from "../store";
+import { failedReadiness, runtimeFailure } from "../test/readinessFixtures";
 import type { AppSettings, AudioSourceInfo, ProviderReadiness } from "../types";
 import SettingsPage from "./SettingsPage";
 import SettingsFindPalette from "./settings/SettingsFindPalette";
@@ -540,7 +541,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "asr.deepgram",
         status: "ready",
-        message: "Deepgram key is valid",
+        note: { kind: "verified" },
         checked_at: checkedAt,
         stale: false,
         credential_epoch: 0,
@@ -568,7 +569,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "asr.soniox",
         status: "ready",
-        message: "Soniox key is valid but provider remains planned",
+        note: { kind: "verified" },
         checked_at: checkedAt,
         stale: false,
         credential_epoch: 0,
@@ -578,7 +579,14 @@ describe("SettingsPage", () => {
       {
         provider_id: "asr.moonshine",
         status: "unchecked",
-        message: "Local model files are present but runtime is not wired yet.",
+        note: {
+          kind: "local_models",
+          ready: 1,
+          total: 3,
+          missing: [],
+          invalid: [],
+          planned: true,
+        },
         checked_at: null,
         stale: false,
         credential_epoch: 0,
@@ -586,7 +594,6 @@ describe("SettingsPage", () => {
         model_count: 3,
         runtime: {
           status: "runtime_unavailable",
-          message: "Moonshine native runtime adapter is not wired yet.",
           required_feature: "asr-moonshine",
           runtime_version: null,
           model_id: "moonshine-small-streaming-en",
@@ -595,7 +602,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "llm.openrouter",
         status: "ready",
-        message: "OpenRouter API key is valid",
+        note: { kind: "verified" },
         checked_at: checkedAt,
         stale: false,
         credential_epoch: 0,
@@ -605,7 +612,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "tts.deepgram_aura",
         status: "ready",
-        message: "Deepgram Aura key is valid",
+        note: { kind: "verified" },
         checked_at: checkedAt,
         stale: false,
         credential_epoch: 0,
@@ -616,7 +623,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "realtime_agent.gemini_live",
         status: "ready",
-        message: "Gemini key is valid",
+        note: { kind: "verified" },
         checked_at: checkedAt,
         stale: false,
         credential_epoch: 0,
@@ -748,7 +755,7 @@ describe("SettingsPage", () => {
     // "Unchecked" too, same as the badge above it and the Soniox card below.
     expect(deepgramCard).not.toHaveTextContent(/Readiness\s*Ready/i);
     expect(deepgramCard).toHaveTextContent(/Readiness\s*Unchecked/i);
-    expect(deepgramCard).toHaveTextContent(/Deepgram key is valid/i);
+    expect(deepgramCard).toHaveTextContent(/Provider check passed/i);
     expect(
       within(deepgramCard).queryByRole("region", {
         name: /transcription fidelity/i,
@@ -786,7 +793,9 @@ describe("SettingsPage", () => {
       /Platform blockers\s*Planned provider gate, Feature: asr-moonshine/i,
     );
     expect(moonshineCard).toHaveTextContent(/Runtime unavailable/i);
-    expect(moonshineCard).toHaveTextContent(/native runtime adapter/i);
+    expect(moonshineCard).toHaveTextContent(
+      /the local runtime is not available yet/i,
+    );
 
     const googleCard = await capabilityCardForProvider(/^Google Chirp 3$/i);
     expect(googleCard).toHaveTextContent(/Planned/i);
@@ -968,7 +977,7 @@ describe("SettingsPage", () => {
     const readinessEntry: ProviderReadiness = {
       provider_id: "asr.deepgram",
       status: "ready",
-      message: "Deepgram key is valid",
+      note: { kind: "verified" },
       checked_at: Date.now(),
       stale: false,
       credential_epoch: 0,
@@ -1720,7 +1729,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.deepgram",
             status: "ready",
-            message: "Deepgram ready",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -1729,7 +1738,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "llm.openrouter",
             status: "ready",
-            message: "OpenRouter ready",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -1786,7 +1795,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.local_whisper",
             status: "ready",
-            message: "Local Whisper model ready",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -1795,7 +1804,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "llm.local_llama",
             status: "ready",
-            message: "Local llama.cpp model ready",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -1804,7 +1813,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "realtime_agent.gemini_live",
             status: "ready",
-            message: "Gemini API key is valid",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -1871,7 +1880,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.local_whisper",
             status: "ready",
-            message: "Local Whisper model ready",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -1880,7 +1889,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "llm.local_llama",
             status: "ready",
-            message: "Local llama.cpp model ready",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -1889,7 +1898,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "realtime_agent.gemini_live",
             status: "ready",
-            message: "Gemini API key is valid",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -1949,7 +1958,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.local_whisper",
             status: "ready",
-            message: "Local Whisper model ready",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -1958,7 +1967,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "llm.local_llama",
             status: "ready",
-            message: "Local llama.cpp model ready",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -2030,7 +2039,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.local_whisper",
             status: "ready",
-            message: "Local Whisper model ready",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -2039,7 +2048,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "llm.openrouter",
             status: "ready",
-            message: "OpenRouter key is valid",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -2185,7 +2194,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.deepgram",
             status: "blocked",
-            message: "Deepgram blocked by policy",
+            note: { kind: "no_automatic_probe" },
             checked_at: null,
             stale: false,
             credential_epoch: 0,
@@ -2194,7 +2203,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "llm.openrouter",
             status: "unchecked",
-            message: "OpenRouter policy checks are blocked",
+            note: { kind: "ready_to_check" },
             checked_at: null,
             stale: true,
             credential_epoch: 0,
@@ -2244,7 +2253,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.local_whisper",
             status: "ready",
-            message: "Local Whisper model file is present",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: true,
             credential_epoch: 0,
@@ -2290,7 +2299,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.deepgram",
             status: "missing_credentials",
-            message: "Missing saved credential(s): deepgram_api_key",
+            note: { kind: "missing_credentials", keys: ["deepgram_api_key"] },
             checked_at: null,
             stale: false,
             credential_epoch: 0,
@@ -2353,7 +2362,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.deepgram",
             status: "missing_credentials",
-            message: "Missing saved credential(s): deepgram_api_key",
+            note: { kind: "missing_credentials", keys: ["deepgram_api_key"] },
             checked_at: null,
             stale: false,
             credential_epoch: 0,
@@ -2568,7 +2577,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "llm.openrouter",
         status: "ready",
-        message: "OpenRouter API key is valid",
+        note: { kind: "verified" },
         checked_at: Date.now(),
         stale: false,
         credential_epoch: 0,
@@ -2576,8 +2585,7 @@ describe("SettingsPage", () => {
       },
       {
         provider_id: "asr.deepgram",
-        status: "error",
-        message: "Deepgram key failed validation",
+        ...failedReadiness(runtimeFailure("provider_unavailable", "retry")),
         checked_at: null,
         stale: false,
         credential_epoch: 0,
@@ -2707,7 +2715,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "asr.openai_realtime",
         status: "ready",
-        message: "OpenAI Realtime key is valid",
+        note: { kind: "verified" },
         checked_at: Date.now(),
         stale: false,
         credential_epoch: 0,
@@ -2716,7 +2724,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "llm.api",
         status: "ready",
-        message: "OpenAI-compatible LLM key is valid",
+        note: { kind: "verified" },
         checked_at: Date.now(),
         stale: false,
         credential_epoch: 0,
@@ -2780,7 +2788,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "asr.openai_realtime",
         status: "ready",
-        message: "OpenAI Realtime key is valid",
+        note: { kind: "verified" },
         checked_at: Date.now(),
         stale: false,
         credential_epoch: 0,
@@ -2789,7 +2797,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "llm.api",
         status: "ready",
-        message: "OpenAI-compatible LLM key is valid",
+        note: { kind: "verified" },
         checked_at: Date.now(),
         stale: false,
         credential_epoch: 0,
@@ -2847,7 +2855,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "llm.api",
         status: "ready",
-        message: "OpenAI-compatible LLM key is valid",
+        note: { kind: "verified" },
         checked_at: Date.now(),
         stale: false,
         credential_epoch: 0,
@@ -2856,7 +2864,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "asr.openai_realtime",
         status: "ready",
-        message: "OpenAI Realtime key is valid",
+        note: { kind: "verified" },
         checked_at: Date.now(),
         stale: false,
         credential_epoch: 0,
@@ -2918,7 +2926,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "realtime_agent.openai_realtime",
         status: "missing_credentials",
-        message: "Missing saved credential(s): openai_api_key",
+        note: { kind: "missing_credentials", keys: ["openai_api_key"] },
         checked_at: null,
         stale: false,
         credential_epoch: 0,
@@ -3023,7 +3031,7 @@ describe("SettingsPage", () => {
           {
             provider_id: providerId,
             status: "missing_credentials",
-            message: `Missing saved credential(s): ${key}`,
+            note: { kind: "missing_credentials", keys: [key] },
             checked_at: null,
             stale: false,
             credential_epoch: 0,
@@ -3064,7 +3072,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "llm.api",
         status: "ready",
-        message: "OpenAI-compatible LLM key is valid",
+        note: { kind: "verified" },
         checked_at: Date.now(),
         stale: false,
         credential_epoch: 0,
@@ -3073,7 +3081,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "asr.api",
         status: "ready",
-        message: "OpenAI-compatible ASR key is valid",
+        note: { kind: "verified" },
         checked_at: Date.now(),
         stale: false,
         credential_epoch: 0,
@@ -3132,7 +3140,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "asr.deepgram",
         status: "unchecked",
-        message: "Deepgram has not been checked",
+        note: { kind: "ready_to_check" },
         checked_at: null,
         stale: false,
         credential_epoch: 0,
@@ -3141,7 +3149,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "asr.local_whisper",
         status: "unchecked",
-        message: "Local Whisper has not been checked",
+        note: { kind: "ready_to_check" },
         checked_at: null,
         stale: false,
         credential_epoch: 0,
@@ -3150,7 +3158,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "llm.local_llama",
         status: "unchecked",
-        message: "Local llama.cpp has not been checked",
+        note: { kind: "ready_to_check" },
         checked_at: null,
         stale: false,
         credential_epoch: 0,
@@ -3159,7 +3167,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "realtime_agent.gemini_live",
         status: "unchecked",
-        message: "Gemini Live has not been checked",
+        note: { kind: "ready_to_check" },
         checked_at: null,
         stale: false,
         credential_epoch: 0,
@@ -3168,7 +3176,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "tts.none",
         status: "unchecked",
-        message: "Text-to-speech is disabled",
+        note: { kind: "no_automatic_probe" },
         checked_at: null,
         stale: false,
         credential_epoch: 0,
@@ -3177,7 +3185,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "llm.openrouter",
         status: "missing_credentials",
-        message: "Missing saved credential(s): openrouter_api_key",
+        note: { kind: "missing_credentials", keys: ["openrouter_api_key"] },
         checked_at: null,
         stale: false,
         credential_epoch: 0,
@@ -3218,7 +3226,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "asr.deepgram",
         status: "missing_credentials",
-        message: "Missing saved credential(s): deepgram_api_key",
+        note: { kind: "missing_credentials", keys: ["deepgram_api_key"] },
         checked_at: null,
         stale: false,
         credential_epoch: 0,
@@ -3257,8 +3265,9 @@ describe("SettingsPage", () => {
     const readiness: ProviderReadiness[] = [
       {
         provider_id: "llm.openrouter",
-        status: "error",
-        message: "401 Unauthorized",
+        ...failedReadiness(
+          runtimeFailure("credential_rejected", "reenter_credential"),
+        ),
         checked_at: Date.now(),
         stale: false,
         credential_epoch: 0,
@@ -3304,16 +3313,20 @@ describe("SettingsPage", () => {
       {
         provider_id: "asr.moonshine",
         status: "unchecked",
-        message:
-          "Local model files ready: 1/3 model option(s). Provider runtime remains planned and is not selectable yet.",
+        note: {
+          kind: "local_models",
+          ready: 1,
+          total: 3,
+          missing: [],
+          invalid: [],
+          planned: true,
+        },
         checked_at: null,
         stale: false,
         credential_epoch: 0,
         credentials: [],
         runtime: {
           status: "runtime_unavailable",
-          message:
-            "Moonshine native runtime adapter is not wired yet; provider remains planned and unselectable.",
           required_feature: null,
           runtime_version: null,
           model_id: "moonshine-small-streaming-en",
@@ -3339,8 +3352,7 @@ describe("SettingsPage", () => {
     const readiness: ProviderReadiness[] = [
       {
         provider_id: "tts.deepgram_aura",
-        status: "error",
-        message: "Deepgram Aura key failed validation",
+        ...failedReadiness(runtimeFailure("provider_unavailable", "retry")),
         checked_at: Date.now(),
         stale: false,
         credential_epoch: 0,
@@ -3382,7 +3394,7 @@ describe("SettingsPage", () => {
       {
         provider_id: "realtime_agent.gemini_live",
         status: "unchecked",
-        message: "Vertex AI readiness is not probed automatically yet",
+        note: { kind: "vertex_not_probed" },
         automatic_probe_available: false,
         checked_at: null,
         stale: false,
@@ -3479,8 +3491,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.assemblyai",
             status: "ready",
-            message:
-              "AssemblyAI account key is valid via REST; v3 streaming socket smoke not run",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -3496,7 +3507,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.soniox",
             status: "ready",
-            message: "Soniox API key is valid (1 real-time STT models)",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -3513,7 +3524,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.deepgram",
             status: "missing_credentials",
-            message: "Missing saved credential(s): deepgram_api_key",
+            note: { kind: "missing_credentials", keys: ["deepgram_api_key"] },
             checked_at: null,
             stale: false,
             credential_epoch: 0,
@@ -3522,7 +3533,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.openai_realtime",
             status: "ready",
-            message: "OpenAI Realtime key is valid",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -3538,7 +3549,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "llm.openrouter",
             status: "ready",
-            message: "OpenRouter API key is valid (1 models)",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -3549,7 +3560,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "llm.mistralrs",
             status: "unchecked",
-            message: "Local model readiness is checked by the model manager",
+            note: { kind: "local_models_managed" },
             checked_at: null,
             stale: false,
             credential_epoch: 0,
@@ -3565,8 +3576,14 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.moonshine",
             status: "unchecked",
-            message:
-              "Local model files ready: 1/3 model option(s). Provider runtime remains planned and is not selectable yet.",
+            note: {
+              kind: "local_models",
+              ready: 1,
+              total: 3,
+              missing: [],
+              invalid: [],
+              planned: true,
+            },
             checked_at: null,
             stale: false,
             credential_epoch: 0,
@@ -3580,8 +3597,6 @@ describe("SettingsPage", () => {
             ],
             runtime: {
               status: "runtime_unavailable",
-              message:
-                "Moonshine native runtime adapter is not wired yet; provider remains planned and unselectable.",
               required_feature: null,
               runtime_version: null,
               model_id: "moonshine-small-streaming-en",
@@ -3590,7 +3605,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "realtime_agent.gemini_live",
             status: "ready",
-            message: "Gemini API key is valid",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -3606,7 +3621,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "tts.deepgram_aura",
             status: "ready",
-            message: "Deepgram Aura key is valid",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -3635,8 +3650,8 @@ describe("SettingsPage", () => {
       within(assemblyAiReadinessRow).getByText(/^AssemblyAI streaming$/i),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(
-        /AssemblyAI account key is valid via REST; v3 streaming socket smoke not run.*Catalog: 1 models/i,
+      within(assemblyAiReadinessRow).getByText(
+        /Provider check passed: 1 model available\. Catalog: 1 models/i,
       ),
     ).toBeInTheDocument();
     const sonioxReadinessRow =
@@ -3646,7 +3661,7 @@ describe("SettingsPage", () => {
     ).toBeInTheDocument();
     expect(
       within(sonioxReadinessRow).getByText(
-        /Soniox API key is valid.*Catalog: 1 models/i,
+        /Provider check passed: 1 model available\. Catalog: 1 models/i,
       ),
     ).toBeInTheDocument();
     const moonshineReadinessRow = await readinessRowForProvider(
@@ -3658,7 +3673,7 @@ describe("SettingsPage", () => {
     ).toBeInTheDocument();
     expect(
       within(moonshineReadinessRow).getByText(
-        /native runtime adapter is not wired/i,
+        /the local runtime is not available yet/i,
       ),
     ).toBeInTheDocument();
     expect(
@@ -3670,7 +3685,7 @@ describe("SettingsPage", () => {
     const openrouterReadinessRow =
       await readinessRowForProvider(/^OpenRouter$/i);
     expect(
-      within(openrouterReadinessRow).getByText(/OpenRouter API key is valid/i),
+      within(openrouterReadinessRow).getByText(/Provider check passed/i),
     ).toBeInTheDocument();
     fireEvent.click(within(openrouterReadinessRow).getByText(/details/i));
     expect(
@@ -3689,7 +3704,7 @@ describe("SettingsPage", () => {
       .getByRole("heading", { name: /LLM Provider/i, level: 3 })
       .closest(".settings-section") as HTMLElement;
     expect(readinessStatus(llmGroup)).toHaveTextContent(
-      /OpenRouter API key is valid.*Catalog: 1 models/i,
+      /Provider check passed: 1 model available\. Catalog: 1 models/i,
     );
     expect(readinessStatus(llmGroup)).toHaveTextContent(
       /Data\s*Configured endpoint.*Session\s*Per request.*Auth\s*Saved key.*Close\s*Request completes/i,
@@ -3728,7 +3743,7 @@ describe("SettingsPage", () => {
       .getByRole("heading", { name: /ASR Provider/i, level: 3 })
       .closest(".settings-section") as HTMLElement;
     expect(readinessStatus(asrGroup)).toHaveTextContent(
-      /OpenAI Realtime key is valid.*Catalog: 1 models/i,
+      /Provider check passed: 1 model available\. Catalog: 1 models/i,
     );
     expect(readinessStatus(asrGroup)).toHaveTextContent(
       /Data\s*Vendor cloud.*Session\s*WebSocket.*Auth\s*Saved key.*Keepalive\s*Audio stream.*Close\s*End stream \+ close/i,
@@ -3763,7 +3778,7 @@ describe("SettingsPage", () => {
       .getByRole("heading", { name: /Gemini Live/i, level: 3 })
       .closest(".settings-section") as HTMLElement;
     expect(readinessStatus(geminiSection)).toHaveTextContent(
-      /Gemini API key is valid.*Catalog: 1 models/i,
+      /Provider check passed: 1 model available\. Catalog: 1 models/i,
     );
     expect(readinessStatus(geminiSection)).toHaveTextContent(
       /Data\s*Provider account.*Session\s*WebSocket.*Auth\s*Google auth.*Keepalive\s*Audio stream.*Close\s*End stream \+ close/i,
@@ -3786,7 +3801,7 @@ describe("SettingsPage", () => {
       .getByRole("heading", { name: /Text-to-Speech/i, level: 3 })
       .closest(".settings-section") as HTMLElement;
     expect(readinessStatus(ttsGroup)).toHaveTextContent(
-      /Deepgram Aura key is valid.*Catalog: 12 voices/i,
+      /Provider check passed\. Catalog: 12 voices/i,
     );
     expect(readinessStatus(ttsGroup)).toHaveTextContent(
       /Data\s*Vendor cloud.*Session\s*WebSocket.*Auth\s*Saved key.*Keepalive\s*Control message.*Close\s*Provider close/i,
@@ -3918,7 +3933,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "llm.openrouter",
             status: "ready",
-            message: "OpenRouter API key is valid",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -4469,7 +4484,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.api",
             status: "ready",
-            message: "Connected to https://api.groq.com/openai/v1 (1 models)",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -4685,7 +4700,7 @@ describe("SettingsPage", () => {
           {
             provider_id: "asr.deepgram",
             status: "ready",
-            message: "Deepgram API key is valid (2 streaming STT models)",
+            note: { kind: "verified" },
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
@@ -5724,7 +5739,7 @@ describe("SettingsPage", () => {
             {
               provider_id: "llm.cerebras",
               status: "ready",
-              message: "Cerebras API key is valid (2 models)",
+              note: { kind: "verified" },
               stale: false,
               credential_epoch: 1,
               credentials: [{ key: "cerebras_api_key", present: true }],
@@ -7555,7 +7570,7 @@ describe("SettingsPage", () => {
             {
               provider_id: "llm.api",
               status: "ready",
-              message: "OpenAI-compatible endpoint is reachable",
+              note: { kind: "verified" },
               checked_at: Date.now(),
               stale: false,
               credential_epoch: 0,

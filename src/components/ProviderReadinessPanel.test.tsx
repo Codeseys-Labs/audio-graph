@@ -2,11 +2,21 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import i18n from "i18next";
 import { describe, expect, it } from "vitest";
 import { GENERATED_PROVIDER_REGISTRY } from "../generated/providerRegistry";
-import type { ProviderReadiness } from "../types";
+import { RUNTIME_DIAGNOSTIC_CONTRACT } from "../generated/runtimeDiagnostic";
+import {
+  credentialStoreFailure,
+  FAILURE_CASES,
+  failedReadiness,
+  READINESS_NOTE_CASES,
+  runtimeFailure,
+  STALE_PASS,
+} from "../test/readinessFixtures";
+import type { ProviderReadiness, ProviderRuntimeReadiness } from "../types";
 import ProviderReadinessPanel, {
-  isCredentialRejectedReadinessMessage,
   providerCatalogSummary,
+  providerReadinessMessage,
   providerRecoveryAction,
+  providerRuntimeMessage,
 } from "./ProviderReadinessPanel";
 import "../i18n";
 
@@ -18,7 +28,7 @@ function readiness(
   return {
     provider_id: "asr.deepgram",
     status: "unchecked",
-    message: "Ready to check with saved credentials",
+    note: { kind: "ready_to_check" },
     automatic_probe_available: true,
     checked_at: null,
     stale: false,
@@ -35,7 +45,7 @@ describe("ProviderReadinessPanel", () => {
         entry={readiness({
           provider_id: "asr.api",
           status: "ready",
-          message: "Provider health check succeeded",
+          note: { kind: "verified" },
           credentials: [],
           effective_stt_fidelity: {
             revision_semantics: "final_only",
@@ -70,9 +80,7 @@ describe("ProviderReadinessPanel", () => {
 
     const operationalStatus = screen.getByRole("status");
     expect(operationalStatus).toHaveTextContent(/Ready/i);
-    expect(operationalStatus).toHaveTextContent(
-      /Provider health check succeeded/i,
-    );
+    expect(operationalStatus).toHaveTextContent(/Provider check passed/i);
 
     const fidelity = screen.getByRole("region", {
       name: /transcription fidelity/i,
@@ -288,7 +296,7 @@ describe("ProviderReadinessPanel", () => {
       <ProviderReadinessPanel
         entry={readiness({
           status: "missing_credentials",
-          message: "Missing saved credential(s): deepgram_api_key",
+          note: { kind: "missing_credentials", keys: ["deepgram_api_key"] },
           credentials: [{ key: "deepgram_api_key", present: false }],
         })}
         loading={false}
@@ -302,132 +310,147 @@ describe("ProviderReadinessPanel", () => {
     expect(screen.queryByText(/sk-/i)).not.toBeInTheDocument();
   });
 
-  it("guides saved-key errors toward replace or settings repair", () => {
+  it("does not point at the saved key when the provider rejected the request itself", () => {
     const entry = readiness({
-      status: "error",
-      message: "401 Unauthorized",
+      ...failedReadiness(
+        runtimeFailure("request_rejected", "review_configuration"),
+      ),
       credentials: [{ key: "openrouter_api_key", present: true }],
     });
 
-    expect(providerRecoveryAction(entry, t)).toMatch(/replace the saved key/i);
-  });
-
-  it("recognizes the backend's stable credential-rejected (401) prefix", () => {
-    // audio-graph-57cc: `isCredentialRejectedReadinessMessage` keys off the
-    // exact stable prefix `crate::error::CREDENTIAL_REJECTED_PREFIX` emits
-    // (src-tauri/src/error.rs), not a loose "401" substring search — a
-    // provider error body could coincidentally contain "401" elsewhere (a
-    // request id, a project id, ...), so only the recognized prefix counts.
-    expect(
-      isCredentialRejectedReadinessMessage(
-        "Credential rejected (401): Deepgram returned HTTP 401 Unauthorized",
-      ),
-    ).toBe(true);
-    expect(
-      isCredentialRejectedReadinessMessage(
-        "provider request id 401-not-a-status-code",
-      ),
-    ).toBe(false);
-    expect(isCredentialRejectedReadinessMessage("401 Unauthorized")).toBe(
-      false,
+    expect(providerRecoveryAction(entry, t)).toBe(
+      t("settings.providerReadiness.recovery.reviewConfiguration"),
     );
   });
 
-  it("recognizes the closed credential-rejected token exactly", () => {
-    // A migrated probe's whole message is the token. Anything that merely
-    // contains it, or a different closed token, is not a rejected credential.
-    expect(
-      isCredentialRejectedReadinessMessage("runtime/credential_rejected"),
-    ).toBe(true);
-    for (const other of [
-      "runtime/request_rejected",
-      "runtime/permission_denied",
-      "credential/access_denied",
-      "provider said runtime/credential_rejected",
-      "runtime/credential_rejected_elsewhere",
-    ]) {
-      expect(isCredentialRejectedReadinessMessage(other)).toBe(false);
+  it("covers every closed runtime code in the failure table", () => {
+    const covered = new Set(FAILURE_CASES.map((c) => c.name));
+    for (const code of RUNTIME_DIAGNOSTIC_CONTRACT.error_codes) {
+      expect(covered).toContain(`runtime/${code}`);
     }
   });
 
-  it("gives each closed provider-auth token the recovery copy for its cause", () => {
-    const recovery = (message: string) =>
+  it("decides recovery from the typed cause alone, never from message text", () => {
+    // The legacy `Credential rejected (401):` prose used to classify an entry
+    // as a rejected credential. It is inert now: only the diagnostic decides.
+    const entry = {
+      ...readiness({
+        credentials: [{ key: "deepgram_api_key", present: true }],
+        ...failedReadiness(runtimeFailure("request_rejected")),
+      }),
+      message: "Credential rejected (401): Deepgram returned HTTP 401",
+    } as unknown as ProviderReadiness;
+
+    expect(providerRecoveryAction(entry, t)).toBe(
+      t("settings.providerReadiness.recovery.runChecksAgain"),
+    );
+    expect(providerReadinessMessage(entry, t)).toBe(
+      t("runtimeDiagnostics.runtime.request_rejected"),
+    );
+  });
+
+  it("gives each typed provider-auth cause the recovery copy for it", () => {
+    const recovery = (diagnostic: ProviderReadiness["diagnostic"]) =>
       providerRecoveryAction(
         readiness({
           provider_id: "llm.openrouter",
           status: "error",
-          message,
+          note: { kind: "failed" },
+          diagnostic,
           credentials: [{ key: "openrouter_api_key", present: true }],
         }),
         t,
       );
-    const generic = /replace the saved key or adjust provider settings/i;
+    const keyAdvice = /saved key|saved credential|replace/i;
 
-    expect(recovery("runtime/credential_rejected")).toMatch(
-      /rejected \(401\)/i,
-    );
+    expect(
+      recovery(runtimeFailure("credential_rejected", "reenter_credential")),
+    ).toMatch(/saved credential was rejected/i);
     // Replacing the key fixes neither an expired credential nor a valid key
     // the provider will not let do this.
-    expect(recovery("runtime/credential_expired")).toMatch(/expired/i);
-    expect(recovery("runtime/permission_denied")).toMatch(
-      /account permissions or plan/i,
+    expect(
+      recovery(runtimeFailure("credential_expired", "refresh_credential")),
+    ).toMatch(/expired/i);
+    expect(
+      recovery(runtimeFailure("permission_denied", "review_configuration")),
+    ).toMatch(/account permissions or plan/i);
+    // A depleted quota or balance (HTTP 402) points at the plan, not at the
+    // model, region or endpoint.
+    expect(
+      recovery(runtimeFailure("capacity_exhausted", "review_configuration")),
+    ).toBe(t("runtimeDiagnostics.runtime.capacity_exhausted"));
+    // A rejected request, a rate limit, an outage, a timeout and a network
+    // failure are not evidence that the saved key itself is wrong.
+    expect(
+      recovery(runtimeFailure("request_rejected", "review_configuration")),
+    ).toMatch(/model, region, or endpoint/i);
+    expect(
+      recovery(runtimeFailure("rate_limited", "retry_after_delay", true)),
+    ).toMatch(/in a few minutes/i);
+    expect(
+      recovery(runtimeFailure("provider_unavailable", "retry", true)),
+    ).toMatch(/in a few minutes/i);
+    expect(recovery(runtimeFailure("timeout", "retry", true))).toMatch(
+      /in a few minutes/i,
     );
-    for (const token of [
-      "runtime/credential_rejected",
-      "runtime/credential_expired",
-      "runtime/permission_denied",
+    expect(
+      recovery(runtimeFailure("network_unreachable", "check_network", true)),
+    ).toMatch(/network connection/i);
+    for (const diagnostic of [
+      runtimeFailure("request_rejected", "review_configuration"),
+      runtimeFailure("rate_limited", "retry_after_delay", true),
+      runtimeFailure("provider_unavailable", "retry", true),
+      runtimeFailure("timeout", "retry", true),
+      runtimeFailure("network_unreachable", "check_network", true),
+      runtimeFailure("invalid_configuration", "review_configuration"),
     ]) {
-      expect(recovery(token)).not.toMatch(generic);
+      expect(recovery(diagnostic)).not.toMatch(keyAdvice);
     }
-    // A generic rejection is not evidence about the credential.
-    expect(recovery("runtime/request_rejected")).toMatch(generic);
-  });
-
-  it("distinguishes a 401 credential rejection from a generic saved-key error", () => {
-    // A generic (non-401) error with a saved credential still gets the
-    // pre-existing "replace or adjust settings" copy...
-    const genericError = readiness({
-      status: "error",
-      message: "Health check timed out after 10s",
-      credentials: [{ key: "openrouter_api_key", present: true }],
-    });
-    expect(providerRecoveryAction(genericError, t)).toMatch(
-      /replace the saved key or adjust provider settings/i,
-    );
-
-    // ...but a message carrying the stable 401 prefix gets the dedicated
-    // "key rejected — replace it" recovery copy instead of the generic one.
-    const credentialRejected = readiness({
-      status: "error",
-      message: "Credential rejected (401): OpenRouter returned HTTP 401",
-      credentials: [{ key: "openrouter_api_key", present: true }],
-    });
-    const action = providerRecoveryAction(credentialRejected, t);
-    expect(action).toMatch(/rejected \(401\)/i);
-    expect(action).not.toMatch(
-      /replace the saved key or adjust provider settings/i,
+    // A locked store says to unlock it, not to replace the key.
+    expect(recovery(credentialStoreFailure("locked", "unlock_store"))).toMatch(
+      /unlock the credential store/i,
     );
   });
 
-  it("renders the dedicated 401 recovery banner instead of the generic error copy", () => {
+  it("applies one rule to ASR, TTS, LLM and AWS entries", () => {
+    for (const providerId of [
+      "asr.deepgram",
+      "tts.deepgram_aura",
+      "llm.openrouter",
+      "asr.aws_transcribe",
+      "llm.aws_bedrock",
+    ]) {
+      const rejected = readiness({
+        provider_id: providerId,
+        credentials: [{ key: "some_credential", present: true }],
+        ...failedReadiness(
+          runtimeFailure("credential_rejected", "reenter_credential"),
+        ),
+      });
+      expect(providerRecoveryAction(rejected, t)).toBe(
+        t("settings.providerReadiness.recovery.credentialRejected"),
+      );
+    }
+  });
+
+  it("renders the dedicated recovery banner for a rejected credential instead of the generic error copy", () => {
     render(
       <ProviderReadinessPanel
         entry={readiness({
-          status: "error",
-          message: "Credential rejected (401): Deepgram returned HTTP 401",
           credentials: [{ key: "deepgram_api_key", present: true }],
+          ...failedReadiness(
+            runtimeFailure("credential_rejected", "reenter_credential"),
+          ),
         })}
         loading={false}
         t={t}
       />,
     );
 
-    // Scope to the recovery banner's specific copy — the readiness `message`
-    // paragraph above it also legitimately echoes "rejected (401)" (it's the
-    // raw backend detail), so a loose /rejected \(401\)/i match would be
-    // ambiguous (matches both nodes).
+    // The readiness sentence says the provider rejected the credential; the
+    // recovery banner is the one carrying the replace-the-key step.
     expect(
-      screen.getByText(/the saved key was rejected \(401\)/i),
+      screen.getByText(/the saved credential was rejected/i),
     ).toBeInTheDocument();
     expect(
       screen.queryByText(/replace the saved key or adjust provider settings/i),
@@ -445,8 +468,7 @@ describe("ProviderReadinessPanel", () => {
         entry={readiness({
           provider_id: "llm.openrouter",
           status: "error",
-          // What the backend sends beside the typed cause of a 403 or 401.
-          message: `runtime/${code}`,
+          note: { kind: "failed" },
           diagnostic: {
             kind: "runtime",
             detail: {
@@ -620,7 +642,7 @@ describe("ProviderReadinessPanel", () => {
     );
     const entry = readiness({
       provider_id: "asr.gladia",
-      message: "No automatic health probe is available for this provider yet",
+      note: { kind: "no_automatic_probe" },
       automatic_probe_available: false,
       credentials: [{ key: "gladia_api_key", present: true }],
     });
@@ -634,7 +656,7 @@ describe("ProviderReadinessPanel", () => {
     );
     const entry = readiness({
       provider_id: "realtime_agent.gemini_live",
-      message: "Vertex AI readiness is not probed automatically yet",
+      note: { kind: "vertex_not_probed" },
       automatic_probe_available: false,
       credentials: [{ key: "google_service_account_path", present: true }],
     });
@@ -662,7 +684,7 @@ describe("ProviderReadinessPanel", () => {
         entry={readiness({
           provider_id: "llm.mistralrs",
           status: "unchecked",
-          message: "Local model readiness is checked by the model manager",
+          note: { kind: "local_models_managed" },
           credentials: [],
         })}
         loading={false}
@@ -679,7 +701,7 @@ describe("ProviderReadinessPanel", () => {
         entry={readiness({
           provider_id: "asr.aws_transcribe",
           status: "unchecked",
-          message: "Ready to check with saved credentials",
+          note: { kind: "ready_to_check" },
           credentials: [
             { key: "aws_access_key", present: false },
             { key: "aws_secret_key", present: false },
@@ -699,12 +721,17 @@ describe("ProviderReadinessPanel", () => {
       <ProviderReadinessPanel
         entry={readiness({
           provider_id: "asr.moonshine",
-          message: "Local model files ready: 1/3 model option(s).",
+          note: {
+            kind: "local_models",
+            ready: 1,
+            total: 3,
+            missing: [],
+            invalid: [],
+            planned: true,
+          },
           credentials: [],
           runtime: {
             status: "runtime_unavailable",
-            message:
-              "Moonshine native runtime adapter is not wired yet; provider remains planned and unselectable.",
             required_feature: null,
             runtime_version: null,
             model_id: "moonshine-small-streaming-en",
@@ -718,7 +745,7 @@ describe("ProviderReadinessPanel", () => {
     fireEvent.click(screen.getByText(/details/i));
     expect(screen.getByText(/runtime unavailable/i)).toBeInTheDocument();
     expect(
-      screen.getByText(/native runtime adapter is not wired/i),
+      screen.getByText(/the local runtime is not available yet/i),
     ).toBeInTheDocument();
     expect(screen.queryByText(/sk-/i)).not.toBeInTheDocument();
   });
@@ -729,7 +756,7 @@ describe("ProviderReadinessPanel", () => {
         entry={readiness({
           provider_id: "tts.deepgram_aura",
           status: "ready",
-          message: "Deepgram Aura key is valid",
+          note: { kind: "verified" },
           stale: true,
           voice_catalog: [
             {
@@ -762,7 +789,7 @@ describe("ProviderReadinessPanel", () => {
     expect(status).not.toHaveTextContent(/Ready/i);
     expect(status).toHaveTextContent(/Unchecked/i);
     expect(status).toHaveTextContent(/Checking/i);
-    expect(status).toHaveTextContent(/Deepgram Aura key is valid/i);
+    expect(status).toHaveTextContent(/Provider check passed/i);
     expect(status).toHaveTextContent(/Cached result may be stale/i);
     expect(status).toHaveTextContent(/Catalog: 2 voices/i);
   });
@@ -771,7 +798,7 @@ describe("ProviderReadinessPanel", () => {
     const entry = readiness({
       provider_id: "tts.deepgram_aura",
       status: "ready",
-      message: "Deepgram Aura key is valid",
+      note: { kind: "verified" },
       voice_catalog: [
         {
           id: "aura-asteria-en",
@@ -794,7 +821,7 @@ describe("ProviderReadinessPanel", () => {
     });
     const status = screen.getByRole("status");
     expect(status).toHaveTextContent(/Ready/i);
-    expect(status).toHaveTextContent(/Deepgram Aura key is valid/i);
+    expect(status).toHaveTextContent(/Provider check passed/i);
     expect(status).toHaveTextContent(/Catalog: 2 voices/i);
     expect(status).not.toHaveTextContent(/2 models/i);
   });
@@ -879,7 +906,7 @@ describe("ProviderReadinessPanel", () => {
         entry={readiness({
           provider_id: "asr.soniox",
           status: "ready",
-          message: "Soniox key is valid",
+          note: { kind: "verified" },
         })}
         descriptor={descriptor}
         loading={false}
@@ -889,7 +916,7 @@ describe("ProviderReadinessPanel", () => {
 
     const status = screen.getByRole("status");
     expect(status).toHaveTextContent(/Ready/i);
-    expect(status).toHaveTextContent(/Soniox key is valid/i);
+    expect(status).toHaveTextContent(/Provider check passed/i);
     expect(status).not.toHaveTextContent(/Vendor cloud/i);
     expect(status).not.toHaveTextContent(/No policy URL recorded/i);
     expect(screen.getByText(/Vendor cloud/i)).toBeInTheDocument();
@@ -915,7 +942,7 @@ describe("ProviderReadinessPanel", () => {
         entry={readiness({
           provider_id: "asr.deepgram",
           status: "ready",
-          message: "Deepgram key is valid",
+          note: { kind: "verified" },
         })}
         descriptor={descriptor}
         loading={false}
@@ -946,7 +973,7 @@ describe("ProviderReadinessPanel", () => {
       <ProviderReadinessPanel
         entry={readiness({
           status: "missing_credentials",
-          message: "Missing saved credential(s): deepgram_api_key",
+          note: { kind: "missing_credentials", keys: ["deepgram_api_key"] },
           credentials: [{ key: SECRET_SENTINEL, present: false }],
         })}
         loading={false}
@@ -959,7 +986,9 @@ describe("ProviderReadinessPanel", () => {
     const status = screen.getByRole("status");
     expect(status).toHaveAttribute("aria-live", "polite");
     expect(status).toHaveTextContent(/Missing key/i);
-    expect(status).toHaveTextContent(/Missing saved credential\(s\)/i);
+    expect(status).toHaveTextContent(
+      /Missing saved credential: deepgram_api_key/i,
+    );
     // The credential identifier never reaches the live region (no secret leak).
     expect(status).not.toHaveTextContent(SECRET_SENTINEL);
     expect(status).not.toHaveTextContent(/sk-/i);
@@ -969,7 +998,7 @@ describe("ProviderReadinessPanel", () => {
       <ProviderReadinessPanel
         entry={readiness({
           status: "ready",
-          message: "Deepgram key is valid",
+          note: { kind: "verified" },
           credentials: [{ key: SECRET_SENTINEL, present: true }],
         })}
         loading={false}
@@ -982,11 +1011,198 @@ describe("ProviderReadinessPanel", () => {
     const updatedStatus = screen.getByRole("status");
     expect(updatedStatus).toHaveAttribute("aria-live", "polite");
     expect(updatedStatus).toHaveTextContent(/Ready/i);
-    expect(updatedStatus).toHaveTextContent(/Deepgram key is valid/i);
+    expect(updatedStatus).toHaveTextContent(/Provider check passed/i);
     expect(updatedStatus).not.toHaveTextContent(/Missing key/i);
     expect(updatedStatus).not.toHaveTextContent(/Missing saved credential/i);
     // Still no credential value/identifier leak after the transition.
     expect(updatedStatus).not.toHaveTextContent(SECRET_SENTINEL);
     expect(updatedStatus).not.toHaveTextContent(/sk-/i);
+  });
+
+  describe("readiness copy from closed fields", () => {
+    const LOCALES = ["en", "pt"] as const;
+    const renderIn = (
+      locale: (typeof LOCALES)[number],
+      entry: ProviderReadiness,
+    ) => {
+      const view = render(
+        <ProviderReadinessPanel
+          entry={entry}
+          loading={false}
+          t={i18n.getFixedT(locale)}
+        />,
+      );
+      return {
+        view,
+        message: view.container.querySelector(
+          ".settings-provider-readiness__message",
+        ),
+        recovery: view.container.querySelector(
+          ".settings-provider-readiness__recovery",
+        ),
+      };
+    };
+
+    it.each(
+      READINESS_NOTE_CASES.map((c) => [JSON.stringify(c.note), c] as const),
+    )("renders the note %s as localized copy, not a raw token", (_label, c) => {
+      for (const locale of LOCALES) {
+        const { view, message } = renderIn(locale, readiness({ note: c.note }));
+        expect(message?.textContent).toBe(c[locale]);
+        expect(view.container.textContent).not.toMatch(
+          /runtime\/|credential\//,
+        );
+        if (c.note.kind.includes("_")) {
+          expect(view.container.textContent).not.toContain(c.note.kind);
+        }
+        view.unmount();
+      }
+    });
+
+    it.each(
+      FAILURE_CASES.map((c) => [c.name, c] as const),
+    )("presents %s with its own copy and recovery action", (_name, c) => {
+      for (const locale of LOCALES) {
+        const entry = readiness({
+          provider_id: "llm.openrouter",
+          credentials: [{ key: "openrouter_api_key", present: true }],
+          ...failedReadiness(c.diagnostic),
+        });
+        const { view, message, recovery } = renderIn(locale, entry);
+        expect(message?.textContent).toBe(c.message[locale]);
+        if (c.recovery) {
+          expect(recovery).toHaveTextContent(c.recovery[locale]);
+        } else {
+          // The sentence above is already the next step: shown once.
+          expect(recovery).toBeNull();
+          expect(screen.getAllByText(c.message[locale])).toHaveLength(1);
+        }
+        expect(providerRecoveryAction(entry, i18n.getFixedT(locale))).toBe(
+          c.recovery?.[locale] ?? c.message[locale],
+        );
+        // The cause is not always an HTTP 401 (an STS or store failure).
+        expect(view.container.textContent).not.toContain("(401)");
+        expect(view.container.textContent).not.toMatch(
+          /runtime\/|credential\//,
+        );
+        view.unmount();
+      }
+    });
+
+    it("never words a stale passed check as a plain pass", () => {
+      for (const locale of LOCALES) {
+        const { view, message } = renderIn(
+          locale,
+          readiness(STALE_PASS.readiness),
+        );
+        expect(message?.textContent).toBe(STALE_PASS.message[locale]);
+        view.unmount();
+      }
+    });
+
+    it("counts the models of a passed check, pluralized, but never calls voices models", () => {
+      const passed = (
+        overrides: Partial<ProviderReadiness>,
+        locale: (typeof LOCALES)[number] = "en",
+      ) =>
+        providerReadinessMessage(
+          readiness({
+            status: "ready",
+            note: { kind: "verified" },
+            ...overrides,
+          }),
+          i18n.getFixedT(locale),
+        );
+
+      expect(passed({ model_count: 12 })).toBe(
+        "Provider check passed: 12 models available.",
+      );
+      expect(passed({ model_count: 1 })).toBe(
+        "Provider check passed: 1 model available.",
+      );
+      expect(passed({ model_count: 12 }, "pt")).toBe(
+        "A verificação do provedor foi aprovada: 12 modelos disponíveis.",
+      );
+      expect(passed({ model_count: 1 }, "pt")).toBe(
+        "A verificação do provedor foi aprovada: 1 modelo disponível.",
+      );
+      expect(passed({})).toBe("Provider check passed.");
+      expect(
+        passed({
+          model_count: 2,
+          voice_catalog: [
+            {
+              id: "aura-asteria-en",
+              display_name: "Asteria",
+              is_default: true,
+            },
+            { id: "aura-zeus-en", display_name: "Zeus", is_default: false },
+          ],
+        }),
+      ).toBe("Provider check passed.");
+    });
+
+    it("degrades an unknown future note kind to the localized status label", () => {
+      const future = readiness({
+        status: "unchecked",
+        note: {
+          kind: "from_a_newer_backend",
+        } as unknown as ProviderReadiness["note"],
+      });
+      expect(providerReadinessMessage(future, t)).toBe(
+        t("settings.providerReadiness.status.unchecked"),
+      );
+    });
+
+    it.each([
+      [
+        { status: "feature_missing", required_feature: "asr-moonshine" },
+        "This build does not include the asr-moonshine runtime feature.",
+      ],
+      [
+        { status: "feature_missing" },
+        "This build does not include a required runtime feature.",
+      ],
+      [
+        { status: "model_missing", model_id: "moonshine-tiny-en" },
+        "The local model files for moonshine-tiny-en are missing or incomplete.",
+      ],
+      [
+        { status: "model_missing" },
+        "No complete local model is installed yet.",
+      ],
+      [
+        { status: "runtime_unavailable" },
+        "The local runtime is not available yet.",
+      ],
+      [
+        { status: "load_failed", model_id: "moonshine-tiny-en" },
+        "The local runtime could not load moonshine-tiny-en.",
+      ],
+      [
+        { status: "load_failed" },
+        "The local runtime could not load the model.",
+      ],
+      [
+        {
+          status: "healthy",
+          model_id: "moonshine-tiny-en",
+          runtime_version: "1.2.3",
+        },
+        "The local runtime loaded moonshine-tiny-en successfully. Runtime version 1.2.3.",
+      ],
+      [
+        { status: "healthy" },
+        "The local runtime loaded the model successfully.",
+      ],
+    ] as ReadonlyArray<
+      readonly [ProviderRuntimeReadiness, string]
+    >)("renders the runtime check %j from its closed fields", (runtime, sentence) => {
+      expect(providerRuntimeMessage(runtime, t)).toBe(sentence);
+      // Both locales render real copy, never an echoed key.
+      const pt = providerRuntimeMessage(runtime, i18n.getFixedT("pt"));
+      expect(pt).not.toBe(sentence);
+      expect(pt).not.toMatch(/settings\.providerReadiness/);
+    });
   });
 });

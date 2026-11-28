@@ -1590,9 +1590,10 @@ export type ProviderRuntimeReadinessStatus =
 
 export interface ProviderRuntimeReadiness {
   status: ProviderRuntimeReadinessStatus;
-  message: string;
+  /** Build feature the runtime needs (static build value). */
   required_feature?: string | null;
   runtime_version?: string | null;
+  /** Registry model id the status concerns (static registry value). */
   model_id?: string | null;
 }
 
@@ -1637,10 +1638,53 @@ export interface EffectiveSttFidelity {
   degradations: SttFidelityDegradation[];
 }
 
+/**
+ * What a readiness entry says, as a closed code the UI localizes (mirrors Rust
+ * `ProviderReadinessNote`). A failure is `failed`; its cause is the entry's
+ * `diagnostic`. Never render backend prose: switch on `kind`.
+ */
+export type ProviderReadinessNote =
+  /** Credentials are saved and an automatic check can run. */
+  | { kind: "ready_to_check" }
+  /** Registry credential slot names that are not saved, e.g. `deepgram_api_key`. */
+  | { kind: "missing_credentials"; keys: string[] }
+  /** AWS profile mode with an empty profile name. */
+  | { kind: "aws_profile_required" }
+  /** Gemini Vertex AI without a project id or location. */
+  | { kind: "vertex_project_required" }
+  /** Gemini Vertex AI is not probed automatically. */
+  | { kind: "vertex_not_probed" }
+  /** The provider has no automatic health probe. */
+  | { kind: "no_automatic_probe" }
+  /** Local-file provider, checked by the model manager. */
+  | { kind: "local_models_managed" }
+  /** Local model files summary, by registry model id. */
+  | {
+      kind: "local_models";
+      ready: number;
+      total: number;
+      missing: string[];
+      invalid: string[];
+      /** The provider runtime is planned, not selectable yet. */
+      planned: boolean;
+    }
+  /** The probe ran for a provider that is not the selected one. */
+  | { kind: "not_selected" }
+  /** The readiness check was cancelled. */
+  | { kind: "cancelled" }
+  /** A check for this provider is already running. */
+  | { kind: "check_in_progress" }
+  /** A check ran recently; retry after `retry_after_secs` seconds. */
+  | { kind: "check_rate_limited"; retry_after_secs: number }
+  /** The probe passed; the entry's `model_count` (when set) is the catalog size. */
+  | { kind: "verified" }
+  /** `status` is `error`; the entry's `diagnostic` says why. */
+  | { kind: "failed" };
+
 export interface ProviderReadiness {
   provider_id: string;
   status: ProviderReadinessStatus;
-  message: string;
+  note: ProviderReadinessNote;
   automatic_probe_available?: boolean;
   checked_at?: number | null;
   stale: boolean;
@@ -1653,9 +1697,9 @@ export interface ProviderReadiness {
   openrouter_models?: OpenRouterModel[];
   runtime?: ProviderRuntimeReadiness | null;
   /**
-   * Typed cause of an `error` status, when the probe produced one. Present it
-   * through `runtimeDiagnosticPresentation`; `message` is then only the closed
-   * `runtime/<code>` token.
+   * Typed cause of an `error` status; present exactly when `status` is
+   * `error` (and `note.kind` is `failed`). Present it through
+   * `runtimeDiagnosticPresentation`.
    */
   diagnostic?: RuntimeDiagnostic;
   effective_stt_fidelity?: EffectiveSttFidelity;
@@ -2293,6 +2337,7 @@ export interface MaterializedNote {
 /** Read-only diagnostics from this lens's verified projection generation. */
 interface ProjectionReadStatus {
   projection_recovery?: "recompute_required";
+  basis_unavailable?: ProjectionBasisSummary;
   transcript_coverage?: "behind_transcript";
 }
 
@@ -2772,8 +2817,32 @@ export interface ProjectionReplayLatencyMetrics
   graph: ProjectionReplayKindLatencyMetrics;
 }
 
+/** Inclusive canonical projection positions. Later individually verified frames
+ * are evidence only and cannot be applied across the missing basis. */
+export interface ProjectionBasisSummary {
+  first_sequence: number;
+  last_sequence: number;
+  /** Only the cited source bases verify. These patches were withheld from replay. */
+  verified_sequences?: number[];
+}
+
+export interface ProjectionBasisUnavailable {
+  first_sequence: number;
+  last_sequence: number;
+  /** Source-basis evidence only. The operations have not been applied. */
+  verified_frames?: {
+    sequence: number;
+    basis_heads: Record<
+      string,
+      { sequence: number; event_id: string; record_hash: string }
+    >;
+    patch: ProjectionPatch;
+  }[];
+}
+
 /** Non-secret replay parity report from `get_projection_replay_report_cmd`. */
 export interface ProjectionReplayReport {
+  basis_unavailable?: ProjectionBasisSummary;
   session_id: string;
   transcript_event_count: number;
   transcript_replay_error?: string | null;
@@ -2826,6 +2895,7 @@ export interface LoadedSession {
  * `noteRevisionCounts` from. Fetched only when the Notes lens activates.
  */
 export interface SessionNotesArtifacts {
+  basis_unavailable?: ProjectionBasisUnavailable;
   notes: MaterializedNotes | null;
   projection_events: ProjectionPatch[];
 }
@@ -2863,6 +2933,8 @@ export type SessionLensArtifactStatus =
  * ADR-0027 typed-manifest migration.
  */
 export interface SessionExportBundle {
+  basis_unavailable?: ProjectionBasisUnavailable;
+  projection_notice?: { en: string; pt: string };
   /** Bundle schema version; bump when the bundle shape changes. */
   schema_version: number;
   session_id: string;

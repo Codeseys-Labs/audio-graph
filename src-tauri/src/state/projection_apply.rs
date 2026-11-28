@@ -356,6 +356,10 @@ impl PendingProjectionApply {
             .into_iter()
             .find(|r| r.event == self.patch)
         {
+            if self.reply.is_none() {
+                // Only the proven zero-byte storage-full path replies early.
+                log::warn!("projection_recovery.published_after_storage_full");
+            }
             self.publish(ProjectionReceipt {
                 head: crate::persistence::canonical_log::VerifiedTranscriptHead {
                     sequence: frame.receipt.sequence,

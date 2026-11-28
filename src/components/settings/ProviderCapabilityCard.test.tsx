@@ -3,6 +3,14 @@ import i18n from "i18next";
 import { describe, expect, it, vi } from "vitest";
 import "../../i18n";
 import { GENERATED_PROVIDER_REGISTRY } from "../../generated/providerRegistry";
+import {
+  FAILURE_CASES,
+  failedReadiness,
+  READINESS_NOTE_CASES,
+  runtimeFailure,
+  STALE_PASS,
+} from "../../test/readinessFixtures";
+import type { ProviderReadiness } from "../../types";
 import type { SettingsControllerValue } from "./useSettingsController";
 
 // Isolates ProviderCapabilityCard from the heavyweight controller (mirrors
@@ -54,7 +62,7 @@ describe("ProviderCapabilityCard — the tone law (audio-graph-2554, settings T2
           "asr.soniox": {
             provider_id: "asr.soniox",
             status: "ready",
-            message: "Soniox key is valid but provider remains planned",
+            note: { kind: "verified" },
             stale: false,
             credential_epoch: 0,
             credentials: [{ key: "soniox_api_key", present: true }],
@@ -95,8 +103,7 @@ describe("ProviderCapabilityCard — the tone law (audio-graph-2554, settings T2
         providerReadiness: {
           "asr.deepgram": {
             provider_id: "asr.deepgram",
-            status: "error",
-            message: "Deepgram key failed validation",
+            ...failedReadiness(runtimeFailure("internal")),
             stale: false,
             credential_epoch: 0,
             credentials: [{ key: "deepgram_api_key", present: true }],
@@ -130,7 +137,7 @@ describe("ProviderCapabilityCard — the tone law (audio-graph-2554, settings T2
           "asr.deepgram": {
             provider_id: "asr.deepgram",
             status: "ready",
-            message: "Deepgram key was valid as of the last check",
+            note: { kind: "verified" },
             stale: true,
             credential_epoch: 0,
             credentials: [{ key: "deepgram_api_key", present: true }],
@@ -153,5 +160,132 @@ describe("ProviderCapabilityCard — the tone law (audio-graph-2554, settings T2
     );
     expect(readinessChip).toHaveAttribute("data-tone", "neutral");
     expect(within(badges).queryByText("Ready")).not.toBeInTheDocument();
+  });
+});
+
+describe("ProviderCapabilityCard — readiness copy from closed fields", () => {
+  const LOCALES = ["en", "pt"] as const;
+  const renderEntry = (
+    locale: (typeof LOCALES)[number],
+    entry: ProviderReadiness | null,
+  ) => {
+    mockUseSettings.mockReturnValue(
+      makeValue({
+        t: i18n.getFixedT(locale),
+        providerReadiness: entry ? { "asr.deepgram": entry } : {},
+      }),
+    );
+    const view = render(
+      <ProviderCapabilityCard descriptor={DEEPGRAM} stageLabel="ASR" />,
+    );
+    const card = view.container.querySelector(
+      ".settings-provider-capability-card",
+    ) as HTMLElement;
+    return {
+      view,
+      card,
+      summary: card.querySelector(
+        ".settings-provider-capability-card__readiness",
+      ) as HTMLElement,
+    };
+  };
+  const makeEntry = (
+    overrides: Partial<ProviderReadiness>,
+  ): ProviderReadiness => ({
+    provider_id: "asr.deepgram",
+    status: "unchecked",
+    note: { kind: "ready_to_check" },
+    stale: false,
+    credential_epoch: 0,
+    credentials: [{ key: "deepgram_api_key", present: true }],
+    ...overrides,
+  });
+
+  it.each(
+    READINESS_NOTE_CASES.map((c) => [JSON.stringify(c.note), c] as const),
+  )("renders the note %s as localized copy, not a raw token", (_label, c) => {
+    for (const locale of LOCALES) {
+      const { view, card, summary } = renderEntry(
+        locale,
+        makeEntry({ note: c.note }),
+      );
+      expect(summary.textContent).toBe(c[locale]);
+      expect(card.textContent).not.toMatch(/runtime\/|credential\//);
+      if (c.note.kind.includes("_")) {
+        expect(card.textContent).not.toContain(c.note.kind);
+      }
+      view.unmount();
+    }
+  });
+
+  it.each(
+    FAILURE_CASES.map((c) => [c.name, c] as const),
+  )("presents %s from its typed cause", (_name, c) => {
+    for (const locale of LOCALES) {
+      const { view, card, summary } = renderEntry(
+        locale,
+        makeEntry({ ...failedReadiness(c.diagnostic) }),
+      );
+      expect(summary.textContent).toBe(c.message[locale]);
+      expect(card.textContent).not.toMatch(/runtime\/|credential\//);
+      view.unmount();
+    }
+  });
+
+  it("never words a stale passed check as a plain pass", () => {
+    for (const locale of LOCALES) {
+      const { view, summary } = renderEntry(
+        locale,
+        makeEntry(STALE_PASS.readiness),
+      );
+      expect(summary.textContent).toBe(STALE_PASS.message[locale]);
+      view.unmount();
+    }
+  });
+
+  it("keeps the no-readiness fallback localized", () => {
+    for (const locale of LOCALES) {
+      const { view, summary } = renderEntry(locale, null);
+      expect(summary.textContent).toBe(
+        i18n.t("settings.providerReadiness.noReadiness", { lng: locale }),
+      );
+      view.unmount();
+    }
+    expect(
+      i18n.t("settings.providerReadiness.noReadiness", { lng: "pt" }),
+    ).not.toBe(i18n.t("settings.providerReadiness.noReadiness", { lng: "en" }));
+  });
+
+  it("renders the local runtime row from its closed status and registry model id", () => {
+    const { card, view } = renderEntry(
+      "en",
+      makeEntry({
+        runtime: {
+          status: "model_missing",
+          model_id: "moonshine-small-streaming-en",
+          runtime_version: "1.2.3",
+        },
+      }),
+    );
+    const runtimeRow = within(card).getByText("Runtime").closest("div");
+    expect(runtimeRow).toHaveTextContent(
+      "Model missing: The local model files for moonshine-small-streaming-en are missing or incomplete. Runtime version 1.2.3.",
+    );
+    view.unmount();
+
+    const { card: ptCard } = renderEntry(
+      "pt",
+      makeEntry({
+        runtime: {
+          status: "model_missing",
+          model_id: "moonshine-small-streaming-en",
+        },
+      }),
+    );
+    expect(
+      within(ptCard).getByText("Runtime").closest("div"),
+    ).toHaveTextContent(
+      "Os arquivos do modelo local moonshine-small-streaming-en estão ausentes ou incompletos.",
+    );
   });
 });

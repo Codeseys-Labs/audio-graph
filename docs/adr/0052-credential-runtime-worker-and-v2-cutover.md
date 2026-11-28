@@ -52,16 +52,97 @@ Expose `dormant`, `opening`, `uninitialized`, `ready`, `recovery_required`,
 never enqueues work. Ordinary operations must not prompt. Explicit diagnosis
 or unlock is the only interactive path; successful recovery is followed by a
 noninteractive reopen. A recovery-required or unavailable authority does not
-fall back to v1 or to a plaintext store.
+fall back to v1 or to a plaintext store. One explicit, noninteractive repair
+request takes ownership of refused authority state where the platform allows
+it and removes native records the authority journal does not track; it
+reopens only after it changed an owner, and no ordinary operation runs any
+part of it. Explicit diagnosis and that ownership repair are the two routes
+that reopen a runtime. The repair changes only objects whose ownership
+refusal this process recorded, while their paths still reach the same
+objects. Every reopen, whichever route starts it, keeps what the runtime
+adopted: a service bound to another authority, or over a journal older than
+the highest epoch the runtime observed, is refused as recovery-required. The
+floor lives only in memory, so a restarted process accepts an older valid
+journal of the same authority; durable ordering evidence outside the journal
+is owed before any consumer cutover (#521).
+
+Every recovery-class refusal (`recovery_required`, `corrupt_record`,
+`unsupported_schema`, `ambiguous_match`) carries a closed scope, decided
+where the service produces it. A store-scoped refusal concerns the authority
+itself or cannot be attributed to one set: a rolled-back or overflowing
+journal, a failed authority read. It closes the runtime, and explicit
+diagnosis is the only route back; it stays store-scoped when the request
+that met it named a set, whose id it then carries. A path that settles or
+compensates an activation never narrows what it met: a store-level or
+store-scoped failure there, from the store or the settings, closes the
+runtime and an unknown outcome stalls it, even while the activation itself
+concerns one set. Failures met together combine in one order that does not
+depend on which came first, so an unknown outcome is never combined away. An
+activation commit runs only from its first stage: a retry of one that took
+a step is refused unchanged and left for recovery, and no activation is
+aborted once the journal records its credential written. A set-scoped
+refusal is decided from one set's own state, in a journal adopted from the
+authority under the lock, or from that set's own records, and every write
+refuses a record the read path would refuse, its kind as well as its
+revision. It leaves the runtime ready for every other set, and the next
+request for that set reads the authoritative journal and record under the
+lock again, so it sees another process's recovery without a reopen.
+Contention before any native change (another program holding the journal
+without sharing its read or delete, another process holding the lock) is
+neither: it is a retryable `operation_in_progress` for that request alone.
+It closes nothing, and an open it refuses leaves the runtime in the state it
+had before the attempt.
+
+The store's file state is built against one adversary: another local
+principal who can create, rename or replace entries in the store's
+directories or in one of their ancestors while the app runs, trying to make
+the app change, delete or publish over an object it did not qualify. The
+rule that follows: every mutation acts on an object qualified through a
+handle, and nothing can change which object that is between the
+qualification and the act. The one act by path is resolving a root's path
+when the store opens; what it reaches is qualified on its handle before
+anything changes. Inside a held root, which is owner-only once held, names
+are resolved relative to its handle, and only this user can change what
+they name. Two gaps in that argument stay named and undecided, owed under
+#521 before the store is enabled:
+
+- The ancestor gap: an ancestor writable by another principal can choose
+  which of this user's directories the path resolution reaches.
+- The in-place gap (Windows): a handle keeps the access it was opened with,
+  so a principal who owned a root before an ownership repair, or whom the
+  root's old DACL granted `WRITE_DAC` or `WRITE_OWNER`, can keep a handle
+  that later makes the root writable again, and sharing modes cannot detect
+  it. The owner-only argument holds for a root the store created, owner-only
+  from the moment it exists, but not for one repaired or hardened in place.
+  The options are to have the repair build a fresh root and move the
+  qualified entries into it, to refuse a root whose previous owner or DACL
+  was untrusted, or to accept the residual here; none is chosen yet.
 
 Atomic admission allows one live operation, not a backlog of mutations. An
 async deadline limits only the caller's wait: it neither cancels nor retries
 the worker call, and it does not release admission. The worker reconciles a
 late definite commit into the cache and emits its one content-free event before
-releasing admission. An unverified commit is not success and emits no commit
-event. An unhandled dispatch panic latches a terminal stall; dispatch enters
-the crash handler's credential redaction scope before `catch_unwind` so the
-panic hook sees the same boundary as the caller.
+releasing admission. An epoch range another process committed, which this
+process only observed in the authority journal, emits one content-free
+signal with no receipt and no set, in epoch order with local events, once
+per observed range; so does every reopen that adopts a journal past the last
+epoch the runtime reported, whichever route started it. A consumer that
+receives it must drop every use it resolved and take a fresh snapshot. A
+publication of this process whose outcome was unknown, and which an adopted
+journal later records, may be this process's commit or another process's
+recovery of the same operation: it gets its local event with its receipt
+and the external signal too. Only a publication this process saw succeed
+suppresses the signal, and one that failed definitely is never taken for
+this process's. The sink runs on the worker
+before admission is released, so a slow sink holds admission; a sink that
+fails latches a terminal stall, and the signals that would have followed are
+never delivered or replayed. A consumer can rely on every signal it receives
+being in order and on a stalled runtime meaning that some may be missing:
+after a stall it takes a fresh snapshot once the process restarts. An
+unverified commit is not success and emits no commit event when it fails.
+An unhandled dispatch panic latches a terminal stall; dispatch enters the
+crash handler's credential redaction scope before `catch_unwind` so the panic
+hook sees the same boundary as the caller.
 
 ## Cutover and Consequences
 

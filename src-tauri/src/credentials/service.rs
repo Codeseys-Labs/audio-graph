@@ -66,9 +66,78 @@ pub(crate) struct AuthoritativeActiveRead {
     pub(crate) record: Option<EncodedCredentialRecord>,
 }
 
-/// Entry reads and mutation-session creation are the only core-visible store
-/// operations. Every write lives on the opaque session, so a concrete adapter
-/// must retain its cooperating-process lock until that session is dropped.
+/// What an explicit repair did about one built-in set's native records that
+/// the authority journal does not track. It names no operation, revision or
+/// record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UntrackedRecordOutcome {
+    /// Nothing the journal does not track was found.
+    Clean,
+    /// Untracked staging records, the set's staging guard, or both were
+    /// removed.
+    Removed,
+    /// Nothing untracked was found, and a pending activation of this set
+    /// keeps its own staging record, and a guard in the pre-fix format if
+    /// there is one, since that guard may stand for it: the journal's, or
+    /// the one this service last observed while its staging record exists.
+    /// Repair again once that activation completes or is recovered.
+    Tracked,
+    /// A guard in the pre-fix format was removed, with every staging record
+    /// the journal history names for the set. That guard never named its
+    /// operation and staging records cannot be listed, so a staging record
+    /// of an operation the history does not record cannot be found and may
+    /// remain.
+    LegacyGuardRemoved,
+    /// The set's staging guard holds bytes no AudioGraph version writes. It
+    /// was left in place, and so was every staging record of the set.
+    Unrecognized,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UntrackedRecordRepair {
+    pub(crate) set_id: CredentialSetId,
+    pub(crate) outcome: UntrackedRecordOutcome,
+}
+
+/// An epoch-advancing publication whose outcome this service does not know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UncertainCommit {
+    operation_id: CredentialOperationId,
+    global_epoch: u64,
+}
+
+/// A pending activation a service observed and has not seen settled. A
+/// journal restored at the same epoch can omit an activation that is still
+/// live, so an explicit repair keeps the staging of each of these as well as
+/// the journal's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedActivation {
+    pub(crate) set_id: CredentialSetId,
+    pub(crate) operation_id: CredentialOperationId,
+}
+
+impl ObservedActivation {
+    fn of(pending: &PendingSettingsActivation) -> Self {
+        Self {
+            set_id: pending.set_id.clone(),
+            operation_id: pending.operation_id.clone(),
+        }
+    }
+}
+
+/// What an explicit ownership repair of a store's authority state changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreOwnershipRepair {
+    /// Every owner was already trusted, or the platform cannot change one.
+    Unchanged,
+    /// This user took ownership of state another principal owned.
+    Repaired,
+}
+
+/// Entry reads, mutation-session creation and explicit repair are the only
+/// core-visible store operations. Every ordinary write lives on the opaque
+/// session, so a concrete adapter must retain its cooperating-process lock
+/// until that session is dropped.
 pub(crate) trait CredentialEntryStore: Send + Sync {
     /// Reads the authoritative journal and, only if `may_read` admits that
     /// journal, `set_id`'s active record, both under one lock. A read the
@@ -84,6 +153,22 @@ pub(crate) trait CredentialEntryStore: Send + Sync {
         operation_id: &CredentialOperationId,
         set_id: &CredentialSetId,
     ) -> Result<Box<dyn CredentialMutationSession + '_>, CredentialStoreFailure>;
+
+    /// Explicit repair only; no ordinary operation calls it. Reads the
+    /// authoritative journal and, only if `admit` adopts that journal,
+    /// removes the native records it does not track, both under one lock.
+    /// The staging of every activation in `observed`, and a guard naming
+    /// one, is kept too. `None` when `admit` refused the journal and nothing
+    /// was touched.
+    fn repair_untracked_records(
+        &self,
+        observed: &[ObservedActivation],
+        admit: &dyn Fn(&AuthorityJournal) -> bool,
+    ) -> Result<Option<Vec<UntrackedRecordRepair>>, CredentialStoreFailure>;
+
+    /// The authority this store is bound to: it reads and writes only that
+    /// authority's journal and records. Internal; never shown or logged.
+    fn authority_instance(&self) -> &str;
 }
 
 fn verify_exact_store_readback(
@@ -292,13 +377,144 @@ pub(crate) struct CredentialEventBatch {
     pub(crate) events: Vec<CredentialChangeEvent>,
 }
 
+/// One accounted step of the epochs after a runtime's cursor, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AccountedChange {
+    /// A commit with its receipt: one this service made, or one whose
+    /// outcome this service did not know and later found in the journal.
+    /// The latter is followed by `Observed` for the same epoch, since
+    /// another process may have made it.
+    Local(CredentialChangeEvent),
+    /// Epochs through `through_epoch` that another process committed, or
+    /// may have, and this service only observed in the authority journal.
+    /// Nothing here says which sets they changed.
+    Observed { through_epoch: u64 },
+}
+
+/// How far a refusal reaches, decided where the service produces it. The
+/// runtime acts on it only for the recovery class (`RecoveryRequired`,
+/// `CorruptRecord`, `UnsupportedSchema`, `AmbiguousMatch`): a store-scoped
+/// refusal closes the runtime until explicit diagnosis, while a set-scoped
+/// one leaves it open, because the next request for that set reads the
+/// authoritative journal and record under the lock again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusalScope {
+    /// Decided from one set's own journal state or records, on a journal
+    /// read and adopted from the authority under the lock.
+    Set,
+    /// About the authority itself, or not attributable to one set.
+    Store,
+}
+
+/// A service refusal with its scope. A bare `CredentialError` converts to
+/// store scope, so a refusal is set-scoped only where the service says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopedRefusal {
+    pub(crate) error: CredentialError,
+    pub(crate) scope: RefusalScope,
+}
+
+impl ScopedRefusal {
+    fn set(error: CredentialError) -> Self {
+        Self {
+            error,
+            scope: RefusalScope::Set,
+        }
+    }
+
+    /// How much of the runtime this refusal reaches, which decides its
+    /// admission: an unknown outcome or a stalled worker stalls the runtime;
+    /// a store-level refusal, or a store-scoped one of the recovery class,
+    /// closes it; anything else concerns one request or one set.
+    pub(crate) fn reach(&self) -> RefusalReach {
+        match self.error.code {
+            CredentialErrorCode::CommitUnknown | CredentialErrorCode::StalledWorker => {
+                RefusalReach::Terminal
+            }
+            CredentialErrorCode::Locked
+            | CredentialErrorCode::AccessDenied
+            | CredentialErrorCode::PermissionHardeningFailed
+            | CredentialErrorCode::StoreUnavailable
+            | CredentialErrorCode::StoreUnsupported => RefusalReach::Store,
+            CredentialErrorCode::RecoveryRequired
+            | CredentialErrorCode::CorruptRecord
+            | CredentialErrorCode::UnsupportedSchema
+            | CredentialErrorCode::AmbiguousMatch
+                if self.scope == RefusalScope::Store =>
+            {
+                RefusalReach::Store
+            }
+            _ => RefusalReach::Request,
+        }
+    }
+
+    /// Whichever of `self` and `other` comes later in [`Self::precedence`].
+    /// The order is total, so two refusals combine to the same one in
+    /// either order. Every path that meets more than one failure, while it
+    /// settles or compensates an activation or while the runtime reconciles
+    /// its events after a request, combines them through this, so none of
+    /// them downgrades a store-wide or terminal failure or hides an unknown
+    /// outcome.
+    pub(crate) fn wider(self, other: Option<Self>) -> Self {
+        match other {
+            Some(other) if other.precedence() > self.precedence() => other,
+            _ => self,
+        }
+    }
+
+    /// Reach first. Within a reach, an unknown outcome comes before a
+    /// stalled worker, since it also says a publication needs reconciling,
+    /// and a refusal of the recovery class before the rest, since it says
+    /// the state needs recovery. Code declaration order and then store over
+    /// set scope only make the order total: two refusals equal in all of
+    /// these say the same thing.
+    fn precedence(&self) -> (RefusalReach, u8, usize, bool) {
+        let class = match self.error.code {
+            CredentialErrorCode::CommitUnknown => 2,
+            CredentialErrorCode::RecoveryRequired
+            | CredentialErrorCode::CorruptRecord
+            | CredentialErrorCode::UnsupportedSchema
+            | CredentialErrorCode::AmbiguousMatch => 1,
+            _ => 0,
+        };
+        (
+            self.reach(),
+            class,
+            self.error.code as usize,
+            self.scope == RefusalScope::Store,
+        )
+    }
+}
+
+/// How much of the runtime a refusal reaches (see [`ScopedRefusal::reach`]),
+/// ordered from least to most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RefusalReach {
+    /// One request, or one set's state or records.
+    Request,
+    /// The store: the runtime closes until explicit diagnosis.
+    Store,
+    /// An unknown outcome or a stalled worker: the runtime stalls.
+    Terminal,
+}
+
+impl From<CredentialError> for ScopedRefusal {
+    fn from(error: CredentialError) -> Self {
+        Self {
+            error,
+            scope: RefusalScope::Store,
+        }
+    }
+}
+
 struct CredentialEventLog {
     capacity: usize,
     service_start_epoch: u64,
     events: VecDeque<CredentialChangeEvent>,
     /// Epoch ranges `(after, through]` this service adopted from the
-    /// authority journal without committing them itself: another process's
-    /// commits. They have no local event.
+    /// authority journal without knowing it committed them: another
+    /// process's commits, and the epoch of each publication of this service
+    /// whose outcome it did not know, which also has a local event.
     observed: VecDeque<(u64, u64)>,
 }
 
@@ -326,36 +542,41 @@ impl CredentialEventLog {
         }
     }
 
-    /// The local events in `(after_epoch, latest_epoch]`, in epoch order, or
-    /// `None` when an epoch there has neither a retained local event nor a
-    /// retained observation of another process's commit: a local event was
-    /// lost or has left retention.
-    fn accounted_since(
-        &self,
-        after_epoch: u64,
-        latest_epoch: u64,
-    ) -> Option<Vec<CredentialChangeEvent>> {
+    /// What accounts for each epoch in `(after_epoch, latest_epoch]`, in
+    /// epoch order, or `None` when an epoch there has neither a retained
+    /// local event nor a retained observation of another process's commit:
+    /// a local event was lost or has left retention. An epoch with both is
+    /// accounted by both, the receipt first.
+    fn accounted_since(&self, after_epoch: u64, latest_epoch: u64) -> Option<Vec<AccountedChange>> {
         if after_epoch < self.service_start_epoch || latest_epoch < after_epoch {
             return None;
         }
         let mut accounted = after_epoch;
-        let mut events = Vec::new();
+        let mut changes = Vec::new();
         while accounted < latest_epoch {
             let next = accounted + 1;
-            if let Some(event) = self.events.iter().find(|event| event.global_epoch == next) {
-                events.push(event.clone());
-                accounted = next;
-            } else if let Some(&(_, through)) = self
+            let observed = self
                 .observed
                 .iter()
-                .find(|&&(after, through)| after <= accounted && accounted < through)
-            {
+                .find(|&&(after, through)| after <= accounted && accounted < through);
+            if let Some(event) = self.events.iter().find(|event| event.global_epoch == next) {
+                changes.push(AccountedChange::Local(event.clone()));
+                if observed.is_some() {
+                    changes.push(AccountedChange::Observed {
+                        through_epoch: next,
+                    });
+                }
+                accounted = next;
+            } else if let Some(&(_, through)) = observed {
                 accounted = through.min(latest_epoch);
+                changes.push(AccountedChange::Observed {
+                    through_epoch: accounted,
+                });
             } else {
                 return None;
             }
         }
-        Some(events)
+        Some(changes)
     }
 
     fn since(&self, after_epoch: u64, latest_epoch: u64) -> CredentialEventBatch {
@@ -439,8 +660,17 @@ impl WorkerAdmission {
         operation_id: &CredentialOperationId,
         set_id: &CredentialSetId,
     ) -> Result<WorkerPermit<'_>, CredentialError> {
+        self.admit_for(operation_id, Some(set_id))
+    }
+
+    /// Admits an operation on `set_id`, or on the whole store for `None`.
+    fn admit_for(
+        &self,
+        operation_id: &CredentialOperationId,
+        set_id: Option<&CredentialSetId>,
+    ) -> Result<WorkerPermit<'_>, CredentialError> {
         if self.status().state == CredentialWorkerState::Stalled {
-            return Err(CredentialStoreFailure::StalledWorker.into_public(Some(set_id.clone())));
+            return Err(CredentialStoreFailure::StalledWorker.into_public(set_id.cloned()));
         }
         let serial = self
             .serial
@@ -451,12 +681,12 @@ impl WorkerAdmission {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if status.state == CredentialWorkerState::Stalled {
-            return Err(CredentialStoreFailure::StalledWorker.into_public(Some(set_id.clone())));
+            return Err(CredentialStoreFailure::StalledWorker.into_public(set_id.cloned()));
         }
         *status = CredentialWorkerStatus {
             state: CredentialWorkerState::Busy,
             operation_id: Some(operation_id.clone()),
-            set_id: Some(set_id.clone()),
+            set_id: set_id.cloned(),
         };
         drop(status);
         Ok(WorkerPermit {
@@ -520,6 +750,27 @@ pub(crate) struct CredentialService {
     worker: WorkerAdmission,
     events: Mutex<CredentialEventLog>,
     settings_activation: Arc<dyn CredentialSettingsActivationPort>,
+    /// Every pending activation this service saw in a journal it adopted
+    /// and has not seen settled. An entry goes only when a journal this
+    /// service adopts records that activation's receipt (its completion, or
+    /// a recovery that settled it), or when this service aborts it; a
+    /// journal that merely lacks it, such as one restored at the same epoch,
+    /// settles nothing. A journal holds at most one pending activation, and
+    /// a cooperating process admits a new one only once the previous one has
+    /// left the journal, so the set grows by at most one entry per
+    /// activation this service observed. An entry another process settled
+    /// without a receipt (its abort) stays until this service ends, but
+    /// spares nothing once that activation's staging is gone.
+    observed_activations: Mutex<Vec<ObservedActivation>>,
+    /// Epoch-advancing publications this service attempted whose outcome it
+    /// does not know, until a journal it adopts at or past their epoch
+    /// settles them. A journal whose history records the operation is
+    /// accounted at that epoch twice, by the receipt and as another
+    /// process's commit, since another process's recovery of the same
+    /// operation would record the same; any other journal makes the epoch
+    /// another process's only. This service suppresses the signal of
+    /// another process's commit only for a publication it saw succeed.
+    uncertain_commits: Mutex<Vec<UncertainCommit>>,
     #[cfg(test)]
     event_snapshot_test_hook: Mutex<Option<TestPause>>,
     #[cfg(test)]
@@ -577,7 +828,7 @@ impl CredentialService {
         )
     }
 
-    fn with_settings_activation_port(
+    pub(crate) fn with_settings_activation_port(
         store: Arc<dyn CredentialEntryStore>,
         journal: AuthorityJournal,
         token_source: Arc<dyn CredentialTokenSource>,
@@ -600,6 +851,11 @@ impl CredentialService {
         event_capacity: usize,
     ) -> Self {
         let service_start_epoch = journal.global_epoch;
+        let observed_activations = journal
+            .pending_activation
+            .iter()
+            .map(ObservedActivation::of)
+            .collect();
         Self {
             store,
             journal: Mutex::new(journal),
@@ -607,6 +863,8 @@ impl CredentialService {
             worker: WorkerAdmission::new(),
             events: Mutex::new(CredentialEventLog::new(event_capacity, service_start_epoch)),
             settings_activation,
+            observed_activations: Mutex::new(observed_activations),
+            uncertain_commits: Mutex::new(Vec::new()),
             #[cfg(test)]
             event_snapshot_test_hook: Mutex::new(None),
             #[cfg(test)]
@@ -637,15 +895,15 @@ impl CredentialService {
             .since(after_epoch, latest_epoch)
     }
 
-    /// For the runtime, which forwards this service's events in order: the
-    /// latest epoch and the local events after `after_epoch`, or `None` when
-    /// an epoch in between is unaccounted for. An epoch that another process
-    /// committed, and this service only observed in the authority journal,
-    /// is accounted for without an event.
-    pub(crate) fn accounted_events_since(
+    /// For the runtime, which forwards this service's changes in order: the
+    /// latest epoch and what accounts for each epoch after `after_epoch`, or
+    /// `None` when an epoch in between is unaccounted for. An epoch that
+    /// another process committed, and this service only observed in the
+    /// authority journal, is accounted for without a receipt.
+    pub(crate) fn accounted_changes_since(
         &self,
         after_epoch: u64,
-    ) -> Option<(u64, Vec<CredentialChangeEvent>)> {
+    ) -> Option<(u64, Vec<AccountedChange>)> {
         let latest_epoch = self
             .journal
             .lock()
@@ -655,7 +913,7 @@ impl CredentialService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .accounted_since(after_epoch, latest_epoch)
-            .map(|events| (latest_epoch, events))
+            .map(|changes| (latest_epoch, changes))
     }
 
     #[cfg(test)]
@@ -682,6 +940,16 @@ impl CredentialService {
     }
 
     fn publish_committed_change(&self, receipt: CredentialMutationReceipt, global_epoch: u64) {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .publish(Self::committed_change(receipt, global_epoch));
+    }
+
+    fn committed_change(
+        receipt: CredentialMutationReceipt,
+        global_epoch: u64,
+    ) -> CredentialChangeEvent {
         let invalidations = match &receipt.set_id {
             CredentialSetId::BuiltIn(set_id) => CREDENTIAL_USE_POLICIES
                 .iter()
@@ -700,14 +968,62 @@ impl CredentialService {
                 .collect(),
             CredentialSetId::Custom(_) => Vec::new(),
         };
-        self.events
+        CredentialChangeEvent {
+            global_epoch,
+            receipt,
+            invalidations,
+        }
+    }
+
+    /// Remembers that the publication of `receipt` at `global_epoch` may
+    /// have taken effect: its outcome is unknown. A definite failure, which
+    /// took no effect, is never remembered, so a later journal that records
+    /// the same operation, through another process's recovery, is never
+    /// taken for this service's commit.
+    fn remember_uncertain_commit(&self, receipt: &CredentialMutationReceipt, global_epoch: u64) {
+        self.uncertain_commits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .publish(CredentialChangeEvent {
+            .push(UncertainCommit {
+                operation_id: receipt.operation_id.clone(),
                 global_epoch,
-                receipt,
-                invalidations,
             });
+    }
+
+    /// Settles every uncertain commit `journal` reaches. The ones it records
+    /// in `(after_epoch, journal.global_epoch]`, by its history's receipt for
+    /// their operation, are returned in epoch order as the events they would
+    /// have published. Each may be this service's commit or another
+    /// process's recovery of the same operation, which this service cannot
+    /// tell apart.
+    fn settle_uncertain_commits(
+        &self,
+        journal: &AuthorityJournal,
+        after_epoch: u64,
+    ) -> Vec<CredentialChangeEvent> {
+        let mut found = Vec::new();
+        self.uncertain_commits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|attempt| {
+                if attempt.global_epoch > journal.global_epoch {
+                    return true;
+                }
+                if attempt.global_epoch > after_epoch
+                    && let Some(entry) = journal
+                        .idempotency_history
+                        .iter()
+                        .find(|entry| entry.receipt.operation_id == attempt.operation_id)
+                {
+                    found.push(Self::committed_change(
+                        entry.receipt.clone(),
+                        attempt.global_epoch,
+                    ));
+                }
+                false
+            });
+        found.sort_by_key(|event| event.global_epoch);
+        found
     }
 
     fn map_store_failure(
@@ -719,6 +1035,16 @@ impl CredentialService {
             self.worker.mark_stalled();
         }
         failure.into_public(Some(set_id.clone()))
+    }
+
+    /// A failure of a session call on `set_id`'s own records, made after the
+    /// authority's journal was loaded and adopted: set-scoped.
+    fn map_set_failure(
+        &self,
+        failure: CredentialStoreFailure,
+        set_id: &CredentialSetId,
+    ) -> ScopedRefusal {
+        ScopedRefusal::set(self.map_store_failure(failure, set_id))
     }
 
     fn require_core_managed_set(set_id: &CredentialSetId) -> Result<(), CredentialError> {
@@ -735,26 +1061,22 @@ impl CredentialService {
     fn ensure_target_has_no_pending_mutation(
         journal: &AuthorityJournal,
         set_id: &CredentialSetId,
-    ) -> Result<(), CredentialError> {
+    ) -> Result<(), ScopedRefusal> {
         if journal.pending_activation.is_some()
             || journal
                 .pending_intents
                 .iter()
                 .any(|intent| &intent.set_id == set_id)
         {
-            return Err(
-                CredentialStoreFailure::OperationInProgress.into_public(Some(set_id.clone()))
-            );
+            return Err(CredentialStoreFailure::OperationInProgress
+                .into_public(Some(set_id.clone()))
+                .into());
         }
         if journal
             .set_state(set_id)
             .is_some_and(|set| set.recovery_state != CredentialSetRecoveryState::None)
         {
-            return Err(content_free_error(
-                CredentialErrorCode::RecoveryRequired,
-                CredentialSafeRecoveryAction::Reconcile,
-                Some(set_id.clone()),
-            ));
+            return Err(Self::set_recovery_required(set_id));
         }
         Ok(())
     }
@@ -778,7 +1100,9 @@ impl CredentialService {
     /// cached, and `false` is returned. When a journal read from the
     /// authority is newer than the cache, the epochs in between were
     /// committed by another process and are recorded as observed, so the
-    /// runtime can tell them from a lost local event.
+    /// runtime can tell them from a lost local event. An epoch that
+    /// records the operation of one of this service's uncertain
+    /// publications also gets that receipt's local event.
     fn cache_journal(&self, journal: AuthorityJournal, origin: JournalOrigin) -> bool {
         let mut cached = self
             .journal
@@ -788,13 +1112,50 @@ impl CredentialService {
             return false;
         }
         if origin == JournalOrigin::Authority && journal.global_epoch > cached.global_epoch {
-            self.events
+            let found = self.settle_uncertain_commits(&journal, cached.global_epoch);
+            let mut events = self
+                .events
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .observe(cached.global_epoch, journal.global_epoch);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut after = cached.global_epoch;
+            for event in found {
+                let epoch = event.global_epoch;
+                if epoch - 1 > after {
+                    events.observe(after, epoch - 1);
+                }
+                events.observe(epoch - 1, epoch);
+                events.publish(event);
+                after = epoch;
+            }
+            if journal.global_epoch > after {
+                events.observe(after, journal.global_epoch);
+            }
         }
+        self.observe_activation(&journal);
         *cached = journal;
         true
+    }
+
+    /// Remembers the pending activation `journal` records, and forgets every
+    /// remembered one whose receipt `journal` records.
+    fn observe_activation(&self, journal: &AuthorityJournal) {
+        let mut observed = self
+            .observed_activations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        observed.retain(|observed| {
+            !journal.idempotency_history.iter().any(|entry| {
+                entry.mutation_kind == CredentialMutationKind::Activate
+                    && entry.receipt.operation_id == observed.operation_id
+            })
+        });
+        if let Some(pending) = &journal.pending_activation
+            && !observed
+                .iter()
+                .any(|observed| observed.operation_id == pending.operation_id)
+        {
+            observed.push(ObservedActivation::of(pending));
+        }
     }
 
     fn reconcile_authoritative_journal(
@@ -883,21 +1244,36 @@ impl CredentialService {
     fn require_authoritative_prepared_activation(
         journal: &AuthorityJournal,
         prepared: &PreparedCredentialActivation,
-    ) -> Result<(), CredentialError> {
+    ) -> Result<(), ScopedRefusal> {
         if Self::prepared_activation_epoch_is_authoritative(journal, prepared) {
             return Ok(());
         }
-        Err(content_free_error(
-            CredentialErrorCode::RecoveryRequired,
-            CredentialSafeRecoveryAction::Reconcile,
-            Some(prepared.set_id.clone()),
-        ))
+        Err(Self::set_recovery_required(&prepared.set_id))
     }
 
-    fn verify_authoritative_prepared_activation(
+    /// Whether an activation at `stage` may still be rolled back and
+    /// aborted: its credential has not taken effect as far as the journal
+    /// records. Once the journal records the credential written
+    /// (`CleanupPending`) or the activation left for recovery
+    /// (`RecoveryRequired`), only recovery may settle it.
+    fn activation_is_abortable(stage: Option<CredentialActivationStage>) -> bool {
+        matches!(
+            stage,
+            Some(
+                CredentialActivationStage::Staged
+                    | CredentialActivationStage::SettingsPending
+                    | CredentialActivationStage::CredentialPending
+            )
+        )
+    }
+
+    /// Refuses, before the settings backup is restored, a compensation of
+    /// an activation the authority no longer holds as this one, or holds at
+    /// a stage that cannot be aborted (see [`Self::activation_is_abortable`]).
+    fn require_compensable_activation(
         &self,
         prepared: &PreparedCredentialActivation,
-    ) -> Result<(), CredentialError> {
+    ) -> Result<(), ScopedRefusal> {
         let _permit = self
             .worker
             .admit(&prepared.operation_id, &prepared.set_id)?;
@@ -906,7 +1282,11 @@ impl CredentialService {
             .begin_mutation(&prepared.operation_id, &prepared.set_id)
             .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
         let journal = self.load_observed_journal(session.as_mut(), &prepared.set_id)?;
-        Self::require_authoritative_prepared_activation(&journal, prepared)
+        Self::require_authoritative_prepared_activation(&journal, prepared)?;
+        if !Self::activation_is_abortable(Self::activation_stage(&journal)) {
+            return Err(Self::set_recovery_required(&prepared.set_id));
+        }
+        Ok(())
     }
 
     /// Adapter completion signal for an OS call that previously crossed its
@@ -921,6 +1301,28 @@ impl CredentialService {
             CredentialSafeRecoveryAction::Reconcile,
             Some(set_id.clone()),
         )
+    }
+
+    /// `set_id` needs reconciling, decided from its own state in a journal
+    /// adopted from the authority; the rest of the store is unaffected.
+    fn set_recovery_required(set_id: &CredentialSetId) -> ScopedRefusal {
+        ScopedRefusal::set(Self::recovery_required(set_id))
+    }
+
+    /// A set's own record that does not decode: set-scoped.
+    fn decode_set_record(
+        encoded: &EncodedCredentialRecord,
+    ) -> Result<CredentialRecordEnvelope, ScopedRefusal> {
+        CredentialRecordEnvelope::decode(encoded).map_err(ScopedRefusal::set)
+    }
+
+    /// A set's own record that names another set or auth method: set-scoped.
+    fn corrupt_set_record(set_id: &CredentialSetId) -> ScopedRefusal {
+        ScopedRefusal::set(content_free_error(
+            CredentialErrorCode::CorruptRecord,
+            CredentialSafeRecoveryAction::Reconcile,
+            Some(set_id.clone()),
+        ))
     }
 
     /// Whether `journal` lets `set_id`'s active record be read for use: the
@@ -944,6 +1346,58 @@ impl CredentialService {
         }
     }
 
+    /// Whether `journal`'s state for `set_id` is what its active `record`
+    /// holds: no revision for no record, and otherwise the record's revision
+    /// and kind, a configured set for a present record and a tombstoned one
+    /// for a tombstone. Every read of a set's active record and every write
+    /// over it decides on this, so a record a read refuses is never written
+    /// over either.
+    fn journal_matches_record(
+        journal: &AuthorityJournal,
+        set_id: &CredentialSetId,
+        record: Option<&CredentialRecordEnvelope>,
+    ) -> bool {
+        let set = journal.set_state(set_id);
+        match (set, record) {
+            (set, None) => set.and_then(|set| set.revision.as_ref()).is_none(),
+            (Some(set), Some(record)) => {
+                set.revision.as_ref() == Some(&record.revision)
+                    && matches!(
+                        (set.record_state, record.is_tombstone()),
+                        (CredentialSetRecordState::Configured, false)
+                            | (CredentialSetRecordState::Tombstoned, true)
+                    )
+            }
+            (None, Some(_)) => false,
+        }
+    }
+
+    /// Reads `set_id`'s active record in `session` and returns its revision
+    /// once the record names `set_id` and agrees with `journal` (see
+    /// [`Self::journal_matches_record`]); one that disagrees refuses the
+    /// set, before any write.
+    fn read_agreed_revision(
+        &self,
+        session: &mut (dyn CredentialMutationSession + '_),
+        journal: &AuthorityJournal,
+        set_id: &CredentialSetId,
+    ) -> Result<Option<CredentialRevision>, ScopedRefusal> {
+        let active = session
+            .read_active(set_id)
+            .map_err(|failure| self.map_set_failure(failure, set_id))?;
+        let record = active.as_ref().map(Self::decode_set_record).transpose()?;
+        if record
+            .as_ref()
+            .is_some_and(|record| record.set_id != *set_id)
+        {
+            return Err(Self::corrupt_set_record(set_id));
+        }
+        if !Self::journal_matches_record(journal, set_id, record.as_ref()) {
+            return Err(Self::set_recovery_required(set_id));
+        }
+        Ok(record.map(|record| record.revision))
+    }
+
     /// Whether `record` is the one `journal` commits for `set_id` and may be
     /// handed out.
     fn journal_allows_resolution(
@@ -954,12 +1408,7 @@ impl CredentialService {
         let Some(set) = journal.set_state(set_id) else {
             return false;
         };
-        let state_matches = set.revision.as_ref() == Some(&record.revision)
-            && matches!(
-                (set.record_state, record.is_tombstone()),
-                (CredentialSetRecordState::Configured, false)
-                    | (CredentialSetRecordState::Tombstoned, true)
-            );
+        let state_matches = Self::journal_matches_record(journal, set_id, Some(record));
         let pending = journal.pending_activation.as_ref();
         let recovery_allows = match set.recovery_state {
             CredentialSetRecoveryState::None => {
@@ -976,16 +1425,74 @@ impl CredentialService {
         state_matches && recovery_allows
     }
 
+    /// Explicit, user-invoked repair of native records the authority journal
+    /// does not track: an orphaned staging record and its guard, a guard in
+    /// the format written before guards named their operation, or staging
+    /// that survived a lost journal publication. No ordinary operation calls
+    /// it. It is decided on the journal the store reads under its lock,
+    /// which this service adopts before any record is touched, so a later
+    /// failure cannot leave it deciding on an older journal than one it
+    /// acted on; a journal older than the one this service observed is
+    /// refused instead, since it can omit staging that is still in use. The
+    /// staging of every activation this service observed and has not seen
+    /// settled is kept as well. It changes no journal, so it emits no event.
+    pub(crate) fn repair_untracked_records(
+        &self,
+    ) -> Result<Vec<UntrackedRecordRepair>, CredentialError> {
+        let operation_id = self.token_source.next_operation_id();
+        let _permit = self.worker.admit_for(&operation_id, None)?;
+        let observed = self
+            .observed_activations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.store
+            .repair_untracked_records(&observed, &|journal| {
+                self.cache_journal(journal.clone(), JournalOrigin::Authority)
+            })
+            .map_err(|failure| {
+                if failure == CredentialStoreFailure::StalledWorker {
+                    self.worker.mark_stalled();
+                }
+                failure.into_public(None)
+            })?
+            .ok_or_else(|| {
+                content_free_error(
+                    CredentialErrorCode::RecoveryRequired,
+                    CredentialSafeRecoveryAction::Reconcile,
+                    None,
+                )
+            })
+    }
+
+    /// The authority the store under this service is bound to. Internal;
+    /// never shown or logged.
+    pub(crate) fn authority_instance(&self) -> &str {
+        self.store.authority_instance()
+    }
+
     pub(crate) fn resolve_for_use(
         &self,
         request: CredentialUseRequest,
     ) -> Result<CredentialResolution, CredentialError> {
+        self.resolve_for_use_scoped(request)
+            .map_err(|refusal| refusal.error)
+    }
+
+    /// [`Self::resolve_for_use`] with the scope of a refusal: a refusal
+    /// decided from the set's state in the journal read under the lock, or
+    /// from its record, is set-scoped.
+    pub(crate) fn resolve_for_use_scoped(
+        &self,
+        request: CredentialUseRequest,
+    ) -> Result<CredentialResolution, ScopedRefusal> {
         let CredentialSetId::BuiltIn(built_in_set_id) = &request.set_id else {
             return Err(content_free_error(
                 CredentialErrorCode::AudienceNotAllowed,
                 CredentialSafeRecoveryAction::None,
                 Some(request.set_id),
-            ));
+            )
+            .into());
         };
         let policy = CREDENTIAL_USE_POLICIES.iter().find(|policy| {
             policy.set_id == *built_in_set_id
@@ -1003,7 +1510,8 @@ impl CredentialService {
                 CredentialErrorCode::AudienceNotAllowed,
                 CredentialSafeRecoveryAction::None,
                 Some(request.set_id),
-            ));
+            )
+            .into());
         };
 
         if matches!(
@@ -1028,7 +1536,8 @@ impl CredentialService {
                 CredentialErrorCode::AudienceNotAllowed,
                 CredentialSafeRecoveryAction::None,
                 Some(request.set_id),
-            ));
+            )
+            .into());
         }
 
         let operation_id = self.token_source.next_operation_id();
@@ -1054,7 +1563,7 @@ impl CredentialService {
         let journal = read.journal;
         self.reconcile_authoritative_journal(&journal, &request.set_id)?;
         if !Self::journal_allows_entry_read(&journal, &request.set_id) {
-            return Err(Self::recovery_required(&request.set_id));
+            return Err(Self::set_recovery_required(&request.set_id));
         }
         let encoded = read.record.ok_or_else(|| {
             content_free_error(
@@ -1063,34 +1572,27 @@ impl CredentialService {
                 Some(request.set_id.clone()),
             )
         })?;
-        let record = CredentialRecordEnvelope::decode(&encoded)?;
+        let record = Self::decode_set_record(&encoded)?;
         if record.set_id != request.set_id {
-            return Err(content_free_error(
-                CredentialErrorCode::CorruptRecord,
-                CredentialSafeRecoveryAction::Reconcile,
-                Some(request.set_id),
-            ));
+            return Err(Self::corrupt_set_record(&request.set_id));
         }
         if !Self::journal_allows_resolution(&journal, &request.set_id, &record) {
-            return Err(Self::recovery_required(&request.set_id));
+            return Err(Self::set_recovery_required(&request.set_id));
         }
         if record.is_tombstone() {
             return Err(content_free_error(
                 CredentialErrorCode::Missing,
                 CredentialSafeRecoveryAction::ReenterCredential,
                 Some(request.set_id),
-            ));
+            )
+            .into());
         }
         let revision = record.revision.clone();
         let Some((auth_method_id, material)) = record.into_present() else {
             unreachable!("tombstone returned above")
         };
         if auth_method_id != request.auth_method_id {
-            return Err(content_free_error(
-                CredentialErrorCode::CorruptRecord,
-                CredentialSafeRecoveryAction::Reconcile,
-                Some(request.set_id),
-            ));
+            return Err(Self::corrupt_set_record(&request.set_id));
         }
         Ok(CredentialResolution::Stored(CredentialLease {
             set_id: request.set_id,
@@ -1103,6 +1605,15 @@ impl CredentialService {
         &self,
         request: ReplaceCredentialSet,
     ) -> Result<CredentialMutationReceipt, CredentialError> {
+        self.replace_set_scoped(request)
+            .map_err(|refusal| refusal.error)
+    }
+
+    /// [`Self::replace_set`] with the scope of a refusal.
+    pub(crate) fn replace_set_scoped(
+        &self,
+        request: ReplaceCredentialSet,
+    ) -> Result<CredentialMutationReceipt, ScopedRefusal> {
         Self::require_core_managed_set(&request.set_id)?;
         let operation_id = self.token_source.next_operation_id();
         let new_revision = self.token_source.next_revision();
@@ -1136,42 +1647,18 @@ impl CredentialService {
                     CredentialErrorCode::Conflict,
                     CredentialSafeRecoveryAction::Retry,
                     Some(request.set_id),
-                ));
+                )
+                .into());
             }
             Self::ensure_target_has_no_pending_mutation(&journal, &request.set_id)?;
             let committed_epoch = Self::next_committed_epoch(&journal, &request.set_id)?;
 
-            let active = session
-                .read_active(&request.set_id)
-                .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-            let current_revision = match active {
-                Some(encoded) => {
-                    let record = CredentialRecordEnvelope::decode(&encoded)?;
-                    if record.set_id != request.set_id {
-                        return Err(content_free_error(
-                            CredentialErrorCode::CorruptRecord,
-                            CredentialSafeRecoveryAction::Reconcile,
-                            Some(request.set_id),
-                        ));
-                    }
-                    Some(record.revision)
-                }
-                None => None,
-            };
-            let journal_revision = journal
-                .set_state(&request.set_id)
-                .and_then(|set| set.revision.clone());
-            if journal_revision != current_revision {
-                return Err(content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(request.set_id),
-                ));
-            }
+            let current_revision =
+                self.read_agreed_revision(session.as_mut(), &journal, &request.set_id)?;
             if request.expected_revision != current_revision {
-                return Err(
-                    CredentialStoreFailure::RevisionConflict.into_public(Some(request.set_id))
-                );
+                return Err(CredentialStoreFailure::RevisionConflict
+                    .into_public(Some(request.set_id))
+                    .into());
             }
 
             journal.pending_intents.push(PendingCredentialIntent {
@@ -1224,7 +1711,8 @@ impl CredentialService {
                     CredentialErrorCode::InvalidCredentialSet,
                     CredentialSafeRecoveryAction::ReenterCredential,
                     Some(request.set_id),
-                ));
+                )
+                .into());
             };
             set.record_state = CredentialSetRecordState::Configured;
             set.source = CredentialSetSource::NativeV2;
@@ -1239,7 +1727,10 @@ impl CredentialService {
                 receipt: receipt.clone(),
             });
             journal.global_epoch = committed_epoch;
-            session.commit_journal(&journal).map_err(|_| {
+            session.commit_journal(&journal).map_err(|failure| {
+                if failure == CredentialStoreFailure::CommitUnknown {
+                    self.remember_uncertain_commit(&receipt, committed_epoch);
+                }
                 CredentialStoreFailure::CommitUnknown.into_public(Some(receipt.set_id.clone()))
             })?;
             (journal, receipt)
@@ -1255,6 +1746,15 @@ impl CredentialService {
         &self,
         request: DeleteCredentialSet,
     ) -> Result<CredentialMutationReceipt, CredentialError> {
+        self.delete_set_scoped(request)
+            .map_err(|refusal| refusal.error)
+    }
+
+    /// [`Self::delete_set`] with the scope of a refusal.
+    pub(crate) fn delete_set_scoped(
+        &self,
+        request: DeleteCredentialSet,
+    ) -> Result<CredentialMutationReceipt, ScopedRefusal> {
         Self::require_core_managed_set(&request.set_id)?;
         let operation_id = self.token_source.next_operation_id();
         let new_revision = self.token_source.next_revision();
@@ -1286,45 +1786,23 @@ impl CredentialService {
                     CredentialErrorCode::Conflict,
                     CredentialSafeRecoveryAction::Retry,
                     Some(request.set_id),
-                ));
+                )
+                .into());
             }
             Self::ensure_target_has_no_pending_mutation(&journal, &request.set_id)?;
             let committed_epoch = Self::next_committed_epoch(&journal, &request.set_id)?;
 
-            let active = session
-                .read_active(&request.set_id)
-                .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-            let current_revision = match active {
-                Some(encoded) => {
-                    let record = CredentialRecordEnvelope::decode(&encoded)?;
-                    if record.set_id != request.set_id {
-                        return Err(content_free_error(
-                            CredentialErrorCode::CorruptRecord,
-                            CredentialSafeRecoveryAction::Reconcile,
-                            Some(request.set_id),
-                        ));
-                    }
-                    Some(record.revision)
-                }
-                None => None,
-            };
-            let journal_revision = journal
-                .set_state(&request.set_id)
-                .and_then(|set| set.revision.clone());
-            if journal_revision != current_revision {
-                return Err(content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(request.set_id),
-                ));
-            }
+            let current_revision =
+                self.read_agreed_revision(session.as_mut(), &journal, &request.set_id)?;
             if request.expected_revision != current_revision {
-                return Err(
-                    CredentialStoreFailure::RevisionConflict.into_public(Some(request.set_id))
-                );
+                return Err(CredentialStoreFailure::RevisionConflict
+                    .into_public(Some(request.set_id))
+                    .into());
             }
             if current_revision.is_none() {
-                return Err(CredentialStoreFailure::Missing.into_public(Some(request.set_id)));
+                return Err(CredentialStoreFailure::Missing
+                    .into_public(Some(request.set_id))
+                    .into());
             }
 
             journal.pending_intents.push(PendingCredentialIntent {
@@ -1373,7 +1851,8 @@ impl CredentialService {
                     CredentialErrorCode::InvalidCredentialSet,
                     CredentialSafeRecoveryAction::ReenterCredential,
                     Some(request.set_id),
-                ));
+                )
+                .into());
             };
             set.record_state = CredentialSetRecordState::Tombstoned;
             set.source = CredentialSetSource::NativeV2;
@@ -1387,7 +1866,10 @@ impl CredentialService {
                 expected_revision: current_revision,
                 receipt: receipt.clone(),
             });
-            session.commit_journal(&journal).map_err(|_| {
+            session.commit_journal(&journal).map_err(|failure| {
+                if failure == CredentialStoreFailure::CommitUnknown {
+                    self.remember_uncertain_commit(&receipt, committed_epoch);
+                }
                 CredentialStoreFailure::CommitUnknown.into_public(Some(receipt.set_id.clone()))
             })?;
             (journal, receipt)
@@ -1403,13 +1885,25 @@ impl CredentialService {
         &self,
         request: PrepareCredentialActivation,
     ) -> Result<PreparedCredentialActivation, CredentialError> {
+        self.prepare_settings_activation_scoped(request)
+            .map_err(|refusal| refusal.error)
+    }
+
+    /// [`Self::prepare_settings_activation`] with the scope of a refusal. A
+    /// staging record the journal does not track refuses staging for its
+    /// set only (`CorruptRecord`, set-scoped).
+    pub(crate) fn prepare_settings_activation_scoped(
+        &self,
+        request: PrepareCredentialActivation,
+    ) -> Result<PreparedCredentialActivation, ScopedRefusal> {
         Self::require_core_managed_set(&request.set_id)?;
         if request.proposed_settings_revision <= request.expected_settings_revision {
             return Err(content_free_error(
                 CredentialErrorCode::Conflict,
                 CredentialSafeRecoveryAction::Retry,
                 Some(request.set_id),
-            ));
+            )
+            .into());
         }
         let operation_id = self.token_source.next_operation_id();
         let proposed_revision = self.token_source.next_revision();
@@ -1431,46 +1925,20 @@ impl CredentialService {
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
             let mut journal = self.load_observed_journal(session.as_mut(), &request.set_id)?;
             if journal.pending_activation.is_some() || !journal.pending_intents.is_empty() {
-                return Err(
-                    CredentialStoreFailure::OperationInProgress.into_public(Some(request.set_id))
-                );
+                return Err(CredentialStoreFailure::OperationInProgress
+                    .into_public(Some(request.set_id))
+                    .into());
             }
             Self::ensure_target_has_no_pending_mutation(&journal, &request.set_id)?;
             let expected_global_epoch = journal.global_epoch;
             let proposed_global_epoch = Self::next_committed_epoch(&journal, &request.set_id)?;
 
-            let active = session
-                .read_active(&request.set_id)
-                .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-            let current_revision = match active {
-                Some(encoded) => {
-                    let record = CredentialRecordEnvelope::decode(&encoded)?;
-                    if record.set_id != request.set_id {
-                        return Err(content_free_error(
-                            CredentialErrorCode::CorruptRecord,
-                            CredentialSafeRecoveryAction::Reconcile,
-                            Some(request.set_id),
-                        ));
-                    }
-                    Some(record.revision)
-                }
-                None => None,
-            };
-            if journal
-                .set_state(&request.set_id)
-                .and_then(|set| set.revision.clone())
-                != current_revision
-            {
-                return Err(content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(request.set_id),
-                ));
-            }
+            let current_revision =
+                self.read_agreed_revision(session.as_mut(), &journal, &request.set_id)?;
             if request.expected_revision != current_revision {
-                return Err(
-                    CredentialStoreFailure::RevisionConflict.into_public(Some(request.set_id))
-                );
+                return Err(CredentialStoreFailure::RevisionConflict
+                    .into_public(Some(request.set_id))
+                    .into());
             }
 
             journal.pending_intents.push(PendingCredentialIntent {
@@ -1505,7 +1973,7 @@ impl CredentialService {
             self.cache_journal(journal.clone(), JournalOrigin::ThisService);
             session
                 .write_staging(&operation_id, &request.set_id, encoded)
-                .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
+                .map_err(|failure| self.map_set_failure(failure, &request.set_id))?;
             let readback = session
                 .read_staging(&operation_id, &request.set_id)
                 .map_err(|_| {
@@ -1538,89 +2006,151 @@ impl CredentialService {
         &self,
         prepared: PreparedCredentialActivation,
     ) -> Result<CredentialMutationReceipt, CredentialError> {
-        self.transition_activation_stage(&prepared, CredentialActivationStage::SettingsPending)?;
+        self.commit_settings_activation_scoped(prepared)
+            .map_err(|refusal| refusal.error)
+    }
+
+    /// [`Self::commit_settings_activation`] with the scope of a refusal. An
+    /// activation that needs reconciling is set-scoped: it is about this
+    /// activation of this set. The flow runs only from `Staged`: a retry of
+    /// an activation that already took a step is refused, with nothing
+    /// changed, and left for [`Self::recover_settings_activation`], which
+    /// can tell what took effect.
+    pub(crate) fn commit_settings_activation_scoped(
+        &self,
+        prepared: PreparedCredentialActivation,
+    ) -> Result<CredentialMutationReceipt, ScopedRefusal> {
+        if let Some(mismatch) = self.advance_activation_stage(
+            &prepared,
+            CredentialActivationStage::Staged,
+            CredentialActivationStage::SettingsPending,
+        )? {
+            return Err(match self.abort_settings_activation(&prepared) {
+                Ok(()) => mismatch,
+                Err(aborted) => {
+                    Self::left_for_recovery(mismatch.wider(Some(aborted)), &prepared.set_id)
+                }
+            });
+        }
         if let Err(failure) = self.settings_activation.persist_pending_settings(
             &prepared.operation_id,
             &prepared.set_id,
             prepared.expected_settings_revision,
             prepared.proposed_settings_revision,
         ) {
-            let error = self.map_store_failure(failure, &prepared.set_id);
-            if matches!(
-                error.code,
-                CredentialErrorCode::CommitUnknown | CredentialErrorCode::StalledWorker
-            ) {
-                let _ = self.mark_activation_recovery_required(&prepared);
-                return Err(error);
+            let refusal = ScopedRefusal::from(self.map_store_failure(failure, &prepared.set_id));
+            if refusal.reach() == RefusalReach::Terminal {
+                return Err(refusal.wider(self.mark_activation_recovery_required(&prepared).err()));
             }
-            self.rollback_settings_then_abort(&prepared)?;
-            return Err(error);
+            return Err(self.compensate(&prepared, refusal));
         }
         if let Err(failure) = self
             .settings_activation
             .verify_pending_settings(&prepared.operation_id, prepared.proposed_settings_revision)
         {
-            let error = self.map_store_failure(failure, &prepared.set_id);
-            self.rollback_settings_then_abort(&prepared)?;
-            return Err(error);
+            let refusal = ScopedRefusal::from(self.map_store_failure(failure, &prepared.set_id));
+            return Err(self.compensate(&prepared, refusal));
         }
-        if let Err(error) = self
-            .transition_activation_stage(&prepared, CredentialActivationStage::CredentialPending)
-        {
-            self.rollback_settings_then_abort(&prepared)?;
-            return Err(error);
+        if let Err(refusal) = self.advance_activation_stage(
+            &prepared,
+            CredentialActivationStage::SettingsPending,
+            CredentialActivationStage::CredentialPending,
+        ) {
+            return Err(self.compensate(&prepared, refusal));
         }
 
         match self.commit_active_activation(&prepared) {
             Ok(receipt) => self.complete_activation_cleanup(&prepared, receipt),
-            Err(error) => {
-                if error.code == CredentialErrorCode::CommitUnknown {
-                    let _ = self.mark_activation_recovery_required(&prepared);
-                    return Err(error);
-                }
-                if error.code == CredentialErrorCode::StalledWorker {
-                    let _ = self.mark_activation_recovery_required(&prepared);
-                    return Err(error);
-                }
-                self.rollback_settings_then_abort(&prepared)?;
-                Err(error)
+            Err(refusal) if refusal.reach() == RefusalReach::Terminal => {
+                Err(refusal.wider(self.mark_activation_recovery_required(&prepared).err()))
             }
+            Err(refusal) => Err(self.compensate(&prepared, refusal)),
         }
     }
 
+    /// Restores the settings and aborts an activation that `refusal`
+    /// stopped before its credential took effect. Returns `refusal`; when
+    /// the compensation failed too, the activation is left for recovery,
+    /// as far as the wider of the two reaches (see
+    /// [`Self::left_for_recovery`]).
+    fn compensate(
+        &self,
+        prepared: &PreparedCredentialActivation,
+        refusal: ScopedRefusal,
+    ) -> ScopedRefusal {
+        match self.rollback_settings_then_abort(prepared) {
+            Ok(()) => refusal,
+            Err(failed) => Self::left_for_recovery(failed.wider(Some(refusal)), &prepared.set_id),
+        }
+    }
+
+    /// A compensation that fails returns what its steps met, the widest of
+    /// it kept; [`Self::compensate`] turns that into the recovery refusal.
     fn rollback_settings_then_abort(
         &self,
         prepared: &PreparedCredentialActivation,
-    ) -> Result<(), CredentialError> {
-        self.verify_authoritative_prepared_activation(prepared)?;
-        if self
+    ) -> Result<(), ScopedRefusal> {
+        self.require_compensable_activation(prepared)?;
+        if let Err(failure) = self
             .settings_activation
             .restore_settings_backup(&prepared.operation_id, prepared.expected_settings_revision)
-            .is_err()
         {
-            let _ = self.mark_activation_recovery_required(prepared);
-            return Err(content_free_error(
-                CredentialErrorCode::RecoveryRequired,
-                CredentialSafeRecoveryAction::Reconcile,
-                Some(prepared.set_id.clone()),
-            ));
+            let refusal = ScopedRefusal::from(self.map_store_failure(failure, &prepared.set_id));
+            return Err(refusal.wider(self.mark_activation_recovery_required(prepared).err()));
         }
-        if self.abort_settings_activation(prepared).is_err() {
-            let _ = self.mark_activation_recovery_required(prepared);
-            return Err(content_free_error(
-                CredentialErrorCode::RecoveryRequired,
-                CredentialSafeRecoveryAction::Reconcile,
-                Some(prepared.set_id.clone()),
-            ));
+        if let Err(aborted) = self.abort_settings_activation(prepared) {
+            return Err(aborted.wider(self.mark_activation_recovery_required(prepared).err()));
         }
         Ok(())
     }
 
-    fn transition_activation_stage(
+    /// The refusal for an activation left for recovery after `met`, which
+    /// combines every failure met on the way (see [`ScopedRefusal::wider`]).
+    /// An unknown outcome or a stalled worker stays as it is, terminal;
+    /// anything else is `RecoveryRequired`, store-scoped when `met` reaches
+    /// the store and set-scoped otherwise. Every path that leaves an
+    /// activation for recovery after a failure builds its refusal here, so
+    /// none narrows what it met or hides that the activation needs recovery.
+    fn left_for_recovery(met: ScopedRefusal, set_id: &CredentialSetId) -> ScopedRefusal {
+        match met.reach() {
+            RefusalReach::Terminal => met,
+            RefusalReach::Store => Self::recovery_required(set_id).into(),
+            RefusalReach::Request => Self::set_recovery_required(set_id),
+        }
+    }
+
+    /// A store or settings failure while an activation is settled: the
+    /// activation is left for recovery (see [`Self::left_for_recovery`]).
+    /// `scope` is the failure's own: one set's records, or the authority's
+    /// journal or the settings, which no one set owns.
+    fn settle_failure(
+        &self,
+        failure: CredentialStoreFailure,
+        set_id: &CredentialSetId,
+        scope: RefusalScope,
+    ) -> ScopedRefusal {
+        let met = ScopedRefusal {
+            error: self.map_store_failure(failure, set_id),
+            scope,
+        };
+        Self::left_for_recovery(met, set_id)
+    }
+
+    /// Moves `prepared`'s activation from stage `from` to `to` in one
+    /// session, and refuses, with nothing changed, when the journal holds
+    /// it at another stage: a stage this activation, or another process's
+    /// recovery of it, has left is never entered again. Leaving `Staged`,
+    /// before anything of the activation takes effect, the session first
+    /// checks the set's active record and the staging record (see
+    /// [`Self::check_staged_activation`]), so nothing is persisted before
+    /// what it depends on is validated; `Some` is the set-level refusal a
+    /// mismatch there decides, returned with nothing changed.
+    fn advance_activation_stage(
         &self,
         prepared: &PreparedCredentialActivation,
-        stage: CredentialActivationStage,
-    ) -> Result<(), CredentialError> {
+        from: CredentialActivationStage,
+        to: CredentialActivationStage,
+    ) -> Result<Option<ScopedRefusal>, ScopedRefusal> {
         let _permit = self
             .worker
             .admit(&prepared.operation_id, &prepared.set_id)?;
@@ -1631,28 +2161,25 @@ impl CredentialService {
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
             let mut journal = self.load_observed_journal(session.as_mut(), &prepared.set_id)?;
             Self::require_authoritative_prepared_activation(&journal, prepared)?;
-            let Some(pending) = journal.pending_activation.as_mut() else {
-                return Err(content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(prepared.set_id.clone()),
-                ));
-            };
-            if pending.operation_id != prepared.operation_id {
-                return Err(content_free_error(
-                    CredentialErrorCode::Conflict,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(prepared.set_id.clone()),
-                ));
+            if Self::activation_stage(&journal) != Some(from) {
+                return Err(Self::set_recovery_required(&prepared.set_id));
             }
-            pending.stage = stage;
+            if from == CredentialActivationStage::Staged {
+                match self.check_staged_activation(session.as_mut(), &journal, prepared) {
+                    Ok(()) => {}
+                    Err(refusal) if refusal.reach() == RefusalReach::Request => {
+                        return Ok(Some(refusal));
+                    }
+                    Err(refusal) => return Err(refusal),
+                }
+            }
+            let Some(pending) = journal.pending_activation.as_mut() else {
+                unreachable!("the authoritative activation is pending")
+            };
+            pending.stage = to;
             if let Some(set) = journal.set_state_mut(&prepared.set_id) {
                 set.pending_activation = true;
-                set.recovery_state = if stage == CredentialActivationStage::RecoveryRequired {
-                    CredentialSetRecoveryState::CommitUnknown
-                } else {
-                    CredentialSetRecoveryState::PendingIntent
-                };
+                set.recovery_state = CredentialSetRecoveryState::PendingIntent;
             }
             session
                 .commit_journal(&journal)
@@ -1660,13 +2187,50 @@ impl CredentialService {
             journal
         };
         self.cache_journal(committed_journal, JournalOrigin::ThisService);
+        Ok(None)
+    }
+
+    fn activation_stage(journal: &AuthorityJournal) -> Option<CredentialActivationStage> {
+        journal
+            .pending_activation
+            .as_ref()
+            .map(|pending| pending.stage)
+    }
+
+    /// Whether the set's active record is still the one `prepared` was
+    /// prepared over and the staging record is the one it staged, read in
+    /// `session`: the active record must name the set, agree with the
+    /// journal in kind and revision, and be at the expected revision; the
+    /// staging record must be this operation's proposed record for the set.
+    fn check_staged_activation(
+        &self,
+        session: &mut (dyn CredentialMutationSession + '_),
+        journal: &AuthorityJournal,
+        prepared: &PreparedCredentialActivation,
+    ) -> Result<(), ScopedRefusal> {
+        if self.read_agreed_revision(session, journal, &prepared.set_id)?
+            != prepared.expected_revision
+        {
+            return Err(CredentialStoreFailure::RevisionConflict
+                .into_public(Some(prepared.set_id.clone()))
+                .into());
+        }
+        let staged = session
+            .read_staging(&prepared.operation_id, &prepared.set_id)
+            .map_err(|failure| self.map_set_failure(failure, &prepared.set_id))?
+            .ok_or_else(|| {
+                CredentialStoreFailure::Missing.into_public(Some(prepared.set_id.clone()))
+            })?;
+        if !Self::proposed_activation_record_matches(&Self::decode_set_record(&staged)?, prepared) {
+            return Err(Self::corrupt_set_record(&prepared.set_id));
+        }
         Ok(())
     }
 
     fn commit_active_activation(
         &self,
         prepared: &PreparedCredentialActivation,
-    ) -> Result<CredentialMutationReceipt, CredentialError> {
+    ) -> Result<CredentialMutationReceipt, ScopedRefusal> {
         let _permit = self
             .worker
             .admit(&prepared.operation_id, &prepared.set_id)?;
@@ -1685,38 +2249,25 @@ impl CredentialService {
                     CredentialErrorCode::Conflict,
                     CredentialSafeRecoveryAction::Reconcile,
                     Some(prepared.set_id.clone()),
-                ));
+                )
+                .into());
             }
-            let active = session
-                .read_active(&prepared.set_id)
-                .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
-            let active_revision = active
-                .as_ref()
-                .map(CredentialRecordEnvelope::decode)
-                .transpose()?
-                .map(|record| record.revision);
-            if active_revision != prepared.expected_revision
-                || journal
-                    .set_state(&prepared.set_id)
-                    .and_then(|set| set.revision.clone())
-                    != active_revision
-            {
+            let active_revision =
+                self.read_agreed_revision(session.as_mut(), &journal, &prepared.set_id)?;
+            if active_revision != prepared.expected_revision {
                 return Err(CredentialStoreFailure::RevisionConflict
-                    .into_public(Some(prepared.set_id.clone())));
+                    .into_public(Some(prepared.set_id.clone()))
+                    .into());
             }
             let staged = session
                 .read_staging(&prepared.operation_id, &prepared.set_id)
-                .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?
+                .map_err(|failure| self.map_set_failure(failure, &prepared.set_id))?
                 .ok_or_else(|| {
                     CredentialStoreFailure::Missing.into_public(Some(prepared.set_id.clone()))
                 })?;
-            let staged_record = CredentialRecordEnvelope::decode(&staged)?;
+            let staged_record = Self::decode_set_record(&staged)?;
             if !Self::proposed_activation_record_matches(&staged_record, prepared) {
-                return Err(content_free_error(
-                    CredentialErrorCode::CorruptRecord,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(prepared.set_id.clone()),
-                ));
+                return Err(Self::corrupt_set_record(&prepared.set_id));
             }
             let expected_readback = staged.copy_for_boundary();
             session
@@ -1752,7 +2303,8 @@ impl CredentialService {
                     CredentialErrorCode::InvalidCredentialSet,
                     CredentialSafeRecoveryAction::ReenterCredential,
                     Some(prepared.set_id.clone()),
-                ));
+                )
+                .into());
             };
             set.record_state = CredentialSetRecordState::Configured;
             set.source = CredentialSetSource::NativeV2;
@@ -1772,7 +2324,7 @@ impl CredentialService {
         &self,
         prepared: &PreparedCredentialActivation,
         receipt: CredentialMutationReceipt,
-    ) -> Result<CredentialMutationReceipt, CredentialError> {
+    ) -> Result<CredentialMutationReceipt, ScopedRefusal> {
         let _permit = self
             .worker
             .admit(&prepared.operation_id, &prepared.set_id)?;
@@ -1787,63 +2339,32 @@ impl CredentialService {
                 pending.operation_id != prepared.operation_id
                     || pending.stage != CredentialActivationStage::CleanupPending
             }) {
-                return Err(content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(prepared.set_id.clone()),
-                ));
+                return Err(Self::set_recovery_required(&prepared.set_id));
             }
             let active = session
                 .read_active(&prepared.set_id)
-                .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?
-                .ok_or_else(|| {
-                    content_free_error(
-                        CredentialErrorCode::RecoveryRequired,
-                        CredentialSafeRecoveryAction::Reconcile,
-                        Some(prepared.set_id.clone()),
-                    )
-                })?;
-            let active_record = CredentialRecordEnvelope::decode(&active)?;
+                .map_err(|failure| self.map_set_failure(failure, &prepared.set_id))?
+                .ok_or_else(|| Self::set_recovery_required(&prepared.set_id))?;
+            let active_record = Self::decode_set_record(&active)?;
             if !Self::proposed_activation_record_matches(&active_record, prepared) {
-                return Err(content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(prepared.set_id.clone()),
-                ));
+                return Err(Self::set_recovery_required(&prepared.set_id));
             }
-            if self
-                .settings_activation
-                .verify_committed_settings(
-                    &prepared.operation_id,
-                    prepared.proposed_settings_revision,
-                )
-                .is_err()
-            {
-                return Err(content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(prepared.set_id.clone()),
-                ));
+            if let Err(failure) = self.settings_activation.verify_committed_settings(
+                &prepared.operation_id,
+                prepared.proposed_settings_revision,
+            ) {
+                return Err(self.settle_failure(failure, &prepared.set_id, RefusalScope::Store));
             }
-            if self
+            if let Err(failure) = self
                 .settings_activation
                 .clear_pending_settings(&prepared.operation_id, prepared.proposed_settings_revision)
-                .is_err()
             {
-                return Err(content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(prepared.set_id.clone()),
-                ));
+                return Err(self.settle_failure(failure, &prepared.set_id, RefusalScope::Store));
             }
             session
                 .delete_staging(&prepared.operation_id, &prepared.set_id)
-                .map_err(|_| {
-                    content_free_error(
-                        CredentialErrorCode::RecoveryRequired,
-                        CredentialSafeRecoveryAction::Reconcile,
-                        Some(prepared.set_id.clone()),
-                    )
+                .map_err(|failure| {
+                    self.settle_failure(failure, &prepared.set_id, RefusalScope::Set)
                 })?;
             journal.pending_activation = None;
             journal
@@ -1861,12 +2382,11 @@ impl CredentialService {
                 receipt: receipt.clone(),
             });
             journal.global_epoch = prepared.proposed_global_epoch;
-            session.commit_journal(&journal).map_err(|_| {
-                content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(prepared.set_id.clone()),
-                )
+            session.commit_journal(&journal).map_err(|failure| {
+                if failure == CredentialStoreFailure::CommitUnknown {
+                    self.remember_uncertain_commit(&receipt, prepared.proposed_global_epoch);
+                }
+                self.settle_failure(failure, &prepared.set_id, RefusalScope::Store)
             })?;
             journal
         };
@@ -1879,7 +2399,7 @@ impl CredentialService {
     fn mark_activation_recovery_required(
         &self,
         prepared: &PreparedCredentialActivation,
-    ) -> Result<(), CredentialError> {
+    ) -> Result<(), ScopedRefusal> {
         let _permit = self
             .worker
             .admit(&prepared.operation_id, &prepared.set_id)?;
@@ -1891,18 +2411,15 @@ impl CredentialService {
             let mut journal = self.load_observed_journal(session.as_mut(), &prepared.set_id)?;
             Self::require_authoritative_prepared_activation(&journal, prepared)?;
             let Some(pending) = journal.pending_activation.as_mut() else {
-                return Err(content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(prepared.set_id.clone()),
-                ));
+                return Err(Self::set_recovery_required(&prepared.set_id));
             };
             if pending.operation_id != prepared.operation_id {
                 return Err(content_free_error(
                     CredentialErrorCode::Conflict,
                     CredentialSafeRecoveryAction::Reconcile,
                     Some(prepared.set_id.clone()),
-                ));
+                )
+                .into());
             }
             pending.stage = CredentialActivationStage::RecoveryRequired;
             if let Some(set) = journal.set_state_mut(&prepared.set_id) {
@@ -1922,6 +2439,16 @@ impl CredentialService {
         &self,
         operation_id: &CredentialOperationId,
     ) -> Result<CredentialMutationReceipt, CredentialError> {
+        self.recover_settings_activation_scoped(operation_id)
+            .map_err(|refusal| refusal.error)
+    }
+
+    /// [`Self::recover_settings_activation`] with the scope of a refusal. An
+    /// activation this recovery cannot settle is set-scoped.
+    pub(crate) fn recover_settings_activation_scoped(
+        &self,
+        operation_id: &CredentialOperationId,
+    ) -> Result<CredentialMutationReceipt, ScopedRefusal> {
         let set_id_hint = {
             let journal = self
                 .journal
@@ -1964,11 +2491,7 @@ impl CredentialService {
             if completed.as_ref().is_some_and(|(set_id, receipt)| {
                 *set_id != set_id_hint || receipt.set_id != set_id_hint
             }) {
-                return Err(content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(set_id_hint),
-                ));
+                return Err(Self::set_recovery_required(&set_id_hint));
             }
             (journal, completed.map(|(_, receipt)| receipt))
         };
@@ -1991,7 +2514,8 @@ impl CredentialService {
                 CredentialErrorCode::Conflict,
                 CredentialSafeRecoveryAction::Reconcile,
                 Some(pending.set_id),
-            ));
+            )
+            .into());
         }
         let pending_stage = pending.stage;
         let prepared = PreparedCredentialActivation {
@@ -2015,23 +2539,19 @@ impl CredentialService {
         }
 
         if pending_stage == CredentialActivationStage::SettingsPending {
-            if self
-                .settings_activation
-                .verify_pending_settings(
-                    &prepared.operation_id,
-                    prepared.proposed_settings_revision,
-                )
-                .is_err()
-            {
-                let _ = self.mark_activation_recovery_required(&prepared);
-                return Err(content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(prepared.set_id),
+            if let Err(failure) = self.settings_activation.verify_pending_settings(
+                &prepared.operation_id,
+                prepared.proposed_settings_revision,
+            ) {
+                let met = ScopedRefusal::from(self.map_store_failure(failure, &prepared.set_id));
+                return Err(Self::left_for_recovery(
+                    met.wider(self.mark_activation_recovery_required(&prepared).err()),
+                    &prepared.set_id,
                 ));
             }
-            self.transition_activation_stage(
+            self.advance_activation_stage(
                 &prepared,
+                CredentialActivationStage::SettingsPending,
                 CredentialActivationStage::CredentialPending,
             )?;
         }
@@ -2067,15 +2587,13 @@ impl CredentialService {
                     CredentialErrorCode::Conflict,
                     CredentialSafeRecoveryAction::Reconcile,
                     Some(prepared.set_id.clone()),
-                ));
+                )
+                .into());
             }
             let active = session
                 .read_active(&prepared.set_id)
-                .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
-            let active_record = active
-                .as_ref()
-                .map(CredentialRecordEnvelope::decode)
-                .transpose()?;
+                .map_err(|failure| self.map_set_failure(failure, &prepared.set_id))?;
+            let active_record = active.as_ref().map(Self::decode_set_record).transpose()?;
             let proposed_active_is_authoritative = active_record
                 .as_ref()
                 .is_some_and(|record| Self::proposed_activation_record_matches(record, &prepared));
@@ -2131,7 +2649,8 @@ impl CredentialService {
                         CredentialErrorCode::InvalidCredentialSet,
                         CredentialSafeRecoveryAction::ReenterCredential,
                         Some(prepared.set_id),
-                    ));
+                    )
+                    .into());
                 };
                 set.record_state = CredentialSetRecordState::Configured;
                 set.source = CredentialSetSource::NativeV2;
@@ -2183,11 +2702,7 @@ impl CredentialService {
                 self.cache_journal(journal, JournalOrigin::ThisService);
                 Ok((receipt, false))
             } else {
-                Err(content_free_error(
-                    CredentialErrorCode::RecoveryRequired,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(prepared.set_id.clone()),
-                ))
+                Err(Self::set_recovery_required(&prepared.set_id))
             }
         }?;
         // The cache was updated above, under the permit: written after the
@@ -2205,7 +2720,7 @@ impl CredentialService {
     fn abort_settings_activation(
         &self,
         prepared: &PreparedCredentialActivation,
-    ) -> Result<(), CredentialError> {
+    ) -> Result<(), ScopedRefusal> {
         let _permit = self
             .worker
             .admit(&prepared.operation_id, &prepared.set_id)?;
@@ -2216,16 +2731,8 @@ impl CredentialService {
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
             let mut journal = self.load_observed_journal(session.as_mut(), &prepared.set_id)?;
             Self::require_authoritative_prepared_activation(&journal, prepared)?;
-            if journal
-                .pending_activation
-                .as_ref()
-                .is_none_or(|pending| pending.operation_id != prepared.operation_id)
-            {
-                return Err(content_free_error(
-                    CredentialErrorCode::Conflict,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(prepared.set_id.clone()),
-                ));
+            if !Self::activation_is_abortable(Self::activation_stage(&journal)) {
+                return Err(Self::set_recovery_required(&prepared.set_id));
             }
             session
                 .delete_staging(&prepared.operation_id, &prepared.set_id)
@@ -2244,6 +2751,10 @@ impl CredentialService {
             journal
         };
         self.cache_journal(committed_journal, JournalOrigin::ThisService);
+        self.observed_activations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|observed| observed.operation_id != prepared.operation_id);
         Ok(())
     }
 }
@@ -2251,28 +2762,31 @@ impl CredentialService {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthoritativeActiveRead, CredentialEntryStore, CredentialMutationSession,
+        AccountedChange, AuthoritativeActiveRead, CredentialEntryStore, CredentialMutationSession,
         CredentialResolution, CredentialService, CredentialSettingsActivationPort,
-        CredentialUseRequest, DeleteCredentialSet, PrepareCredentialActivation,
-        ReplaceCredentialSet, verify_exact_store_readback,
+        CredentialUseRequest, DeleteCredentialSet, ObservedActivation, PrepareCredentialActivation,
+        PreparedCredentialActivation, RefusalReach, RefusalScope, ReplaceCredentialSet,
+        ScopedRefusal, UntrackedRecordOutcome, UntrackedRecordRepair, verify_exact_store_readback,
     };
     use crate::credentials::domain::{
         AuthorityJournal, CredentialRecordEnvelope, CredentialStoreFailure,
-        EncodedCredentialRecord, StoredSecretBundle,
+        EncodedCredentialRecord, StoredSecretBundle, content_free_error,
     };
     use crate::credentials::fake::{
         FakeCredentialStore, FakeSettingsActivationPort, FakeSettingsCall, FakeStoreCall,
+        FaultPlan, FaultPoint, PlannedFault,
     };
     use crate::credentials::test_support::DeterministicTokenSource;
     use audio_graph_ipc_contract::credential_contract::{
-        AuthMethodId, AwsPartition, AwsSdkService, BuiltInCredentialSetId, CREDENTIAL_USE_POLICIES,
-        CredentialActivationStage, CredentialAudience, CredentialAudiencePolicyDefinition,
-        CredentialBackendKind, CredentialErrorCode, CredentialIdempotencyToken,
-        CredentialMutationReceipt, CredentialMutationResultCode, CredentialOperationId,
-        CredentialPurpose, CredentialRevision, CredentialSafeRecoveryAction, CredentialSetId,
-        CredentialSetRecordState, CredentialSetRecoveryState,
-        CredentialUsePolicyDecisionDefinition, CredentialWorkerState, CustomCredentialSetId,
-        PORTABLE_ENCODED_RECORD_MAX_BYTES, SecureTransportScheme,
+        AuthMethodId, AwsPartition, AwsSdkService, BUILT_IN_CREDENTIAL_SET_IDS,
+        BuiltInCredentialSetId, CREDENTIAL_USE_POLICIES, CredentialActivationStage,
+        CredentialAudience, CredentialAudiencePolicyDefinition, CredentialBackendKind,
+        CredentialErrorCode, CredentialIdempotencyToken, CredentialMutationReceipt,
+        CredentialMutationResultCode, CredentialOperationId, CredentialPurpose, CredentialRevision,
+        CredentialSafeRecoveryAction, CredentialSetId, CredentialSetRecordState,
+        CredentialSetRecoveryState, CredentialUsePolicyDecisionDefinition, CredentialWorkerState,
+        CustomCredentialSetId, ERROR_CODES, PORTABLE_ENCODED_RECORD_MAX_BYTES,
+        SecureTransportScheme,
     };
     use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::Duration;
@@ -2336,6 +2850,18 @@ mod tests {
                 inner: self.inner.begin_mutation(operation_id, set_id)?,
                 successful_commits_before_failure: &self.successful_commits_before_failure,
             }))
+        }
+
+        fn repair_untracked_records(
+            &self,
+            observed: &[ObservedActivation],
+            admit: &dyn Fn(&AuthorityJournal) -> bool,
+        ) -> Result<Option<Vec<UntrackedRecordRepair>>, CredentialStoreFailure> {
+            self.inner.repair_untracked_records(observed, admit)
+        }
+
+        fn authority_instance(&self) -> &str {
+            self.inner.authority_instance()
         }
     }
 
@@ -2422,6 +2948,34 @@ mod tests {
             *successful_commits -= 1;
             Ok(())
         }
+    }
+
+    /// A publication of this service whose outcome was unknown, found in
+    /// the journal after `after_epoch`, is accounted at its epoch both by
+    /// its receipt and as another process's commit: another process's
+    /// recovery of the same operation would leave the same journal.
+    fn assert_recovered_both_ways(
+        service: &CredentialService,
+        after_epoch: u64,
+        receipt: &CredentialMutationReceipt,
+    ) {
+        let recovered = service.events_since(after_epoch);
+        assert!(!recovered.gap_detected);
+        assert_eq!(recovered.events.len(), 1);
+        assert_eq!(recovered.events[0].global_epoch, after_epoch + 1);
+        assert_eq!(&recovered.events[0].receipt, receipt);
+        assert_eq!(
+            service.accounted_changes_since(after_epoch),
+            Some((
+                after_epoch + 1,
+                vec![
+                    AccountedChange::Local(recovered.events[0].clone()),
+                    AccountedChange::Observed {
+                        through_epoch: after_epoch + 1
+                    },
+                ]
+            ))
+        );
     }
 
     fn deepgram_use_request() -> CredentialUseRequest {
@@ -3317,10 +3871,7 @@ mod tests {
                         | FakeStoreCall::CommitJournal
                 ))
         );
-        let missed = service.events_since(u64::MAX - 1);
-        assert_eq!(missed.latest_epoch, u64::MAX);
-        assert!(missed.gap_detected);
-        assert!(missed.events.is_empty());
+        assert_recovered_both_ways(&service, u64::MAX - 1, &persisted_receipt);
         let terminal = service.events_since(u64::MAX);
         assert_eq!(terminal.latest_epoch, u64::MAX);
         assert!(!terminal.gap_detected);
@@ -3394,10 +3945,7 @@ mod tests {
                         | FakeStoreCall::CommitJournal
                 ))
         );
-        let missed = service.events_since(u64::MAX - 1);
-        assert_eq!(missed.latest_epoch, u64::MAX);
-        assert!(missed.gap_detected);
-        assert!(missed.events.is_empty());
+        assert_recovered_both_ways(&service, u64::MAX - 1, &persisted_receipt);
         assert!(service.events_since(u64::MAX).events.is_empty());
     }
 
@@ -4877,7 +5425,7 @@ mod tests {
             .commit_settings_activation(prepared)
             .expect_err("final cleanup journal readback is ambiguous");
 
-        assert_eq!(error.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(error.code, CredentialErrorCode::CommitUnknown);
         assert_eq!(service.snapshot_status().global_epoch, u64::MAX - 1);
         assert_eq!(
             service
@@ -4922,10 +5470,7 @@ mod tests {
                         | FakeStoreCall::CommitJournal
                 ))
         );
-        let missed = service.events_since(u64::MAX - 1);
-        assert_eq!(missed.latest_epoch, u64::MAX);
-        assert!(missed.gap_detected);
-        assert!(missed.events.is_empty());
+        assert_recovered_both_ways(&service, u64::MAX - 1, &persisted_receipt);
         let terminal = service.events_since(u64::MAX);
         assert_eq!(terminal.latest_epoch, u64::MAX);
         assert!(!terminal.gap_detected);
@@ -5693,5 +6238,981 @@ mod tests {
                 .code,
             CredentialErrorCode::RecoveryRequired
         );
+    }
+
+    fn activation_request(
+        set_id: BuiltInCredentialSetId,
+        token: &str,
+    ) -> PrepareCredentialActivation {
+        PrepareCredentialActivation {
+            set_id: set_id.into(),
+            auth_method_id: AuthMethodId::ApiKey,
+            material: StoredSecretBundle::api_key("repair-activation").expect("API key"),
+            expected_revision: None,
+            expected_settings_revision: 1,
+            proposed_settings_revision: 2,
+            idempotency_token: idempotency(token),
+        }
+    }
+
+    fn outcome_of(
+        sets: &[super::UntrackedRecordRepair],
+        set_id: BuiltInCredentialSetId,
+    ) -> UntrackedRecordOutcome {
+        sets.iter()
+            .find(|repaired| repaired.set_id == CredentialSetId::from(set_id))
+            .expect("every built-in set is reported")
+            .outcome
+    }
+
+    /// A staging record whose recording journal publication was lost, from
+    /// an activation this service never observed, is removed by the explicit
+    /// repair, while the staging record a pending activation still owns is
+    /// kept. Neither ordinary operations nor the repair emit an event, and
+    /// the repair itself is a single store call.
+    #[test]
+    fn explicit_repair_removes_staging_the_journal_lost_and_keeps_tracked_staging() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::Native,
+        )));
+        let service = CredentialService::new(
+            store.clone(),
+            AuthorityJournal::new(CredentialBackendKind::Native),
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        store.plant_staging(
+            CredentialOperationId::parse("60606060-6060-4060-8060-606060606060")
+                .expect("canonical operation id"),
+            BuiltInCredentialSetId::Deepgram.into(),
+        );
+        service
+            .prepare_settings_activation(activation_request(
+                BuiltInCredentialSetId::Openai,
+                "61616161-6161-4161-8161-616161616161",
+            ))
+            .expect("prepare a tracked activation");
+        assert_eq!(store.staging_count(), 2);
+        assert!(!store.calls().contains(&FakeStoreCall::RepairUntracked));
+
+        let sets = service
+            .repair_untracked_records()
+            .expect("repair untracked records");
+
+        assert_eq!(
+            outcome_of(&sets, BuiltInCredentialSetId::Deepgram),
+            UntrackedRecordOutcome::Removed
+        );
+        assert_eq!(
+            outcome_of(&sets, BuiltInCredentialSetId::Openai),
+            UntrackedRecordOutcome::Tracked
+        );
+        assert_eq!(store.staging_count(), 1);
+        assert_eq!(
+            store
+                .calls()
+                .iter()
+                .filter(|call| **call == FakeStoreCall::RepairUntracked)
+                .count(),
+            1
+        );
+        assert!(service.events_since(0).events.is_empty());
+    }
+
+    /// A journal older than the one this service observed can omit staging
+    /// that is still in use, so the repair is refused on it before any
+    /// record is touched, and runs once the authoritative journal is back.
+    /// The orphan here was staged by another process whose journal
+    /// publication was lost, so this service never observed it.
+    #[test]
+    fn explicit_repair_is_refused_on_a_rolled_back_journal_before_any_record_is_touched() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::Native,
+        )));
+        let service = CredentialService::new(
+            store.clone(),
+            AuthorityJournal::new(CredentialBackendKind::Native),
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let unrecorded = store.journal_snapshot();
+        store.plant_staging(
+            CredentialOperationId::parse("62626262-6262-4262-8262-626262626262")
+                .expect("canonical operation id"),
+            BuiltInCredentialSetId::Deepgram.into(),
+        );
+        service
+            .replace_set(ReplaceCredentialSet {
+                set_id: BuiltInCredentialSetId::Openai.into(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("advance-epoch").expect("API key"),
+                expected_revision: None,
+                idempotency_token: idempotency("63636363-6363-4363-8363-636363636363"),
+            })
+            .expect("commit the next epoch");
+        let authoritative = store.journal_snapshot();
+        store.restore_journal(unrecorded);
+
+        let refused = service
+            .repair_untracked_records()
+            .expect_err("a rolled-back journal is refused");
+        assert_eq!(refused.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(refused.set_id, None);
+        assert_eq!(store.staging_count(), 1);
+
+        store.restore_journal(authoritative);
+        let sets = service
+            .repair_untracked_records()
+            .expect("repair on the authoritative journal");
+        assert_eq!(
+            outcome_of(&sets, BuiltInCredentialSetId::Deepgram),
+            UntrackedRecordOutcome::Removed
+        );
+        assert_eq!(store.staging_count(), 0);
+    }
+
+    /// A set whose journal state and active record disagree in kind at the
+    /// same revision is refused by every write as it is by a resolution:
+    /// here the journal says configured at R while the record is a valid
+    /// tombstone at R. Delete, replace and activation prepare each refuse
+    /// the set before any write reaches its record.
+    #[test]
+    fn every_write_refuses_a_record_whose_kind_disagrees_with_the_journal() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::Native,
+        )));
+        let service = CredentialService::new(
+            store.clone(),
+            AuthorityJournal::new(CredentialBackendKind::Native),
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let deepgram = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let replace = |expected_revision, token| ReplaceCredentialSet {
+            set_id: deepgram.clone(),
+            auth_method_id: AuthMethodId::ApiKey,
+            material: StoredSecretBundle::api_key("kind-canary").expect("API key"),
+            expected_revision,
+            idempotency_token: idempotency(token),
+        };
+        let created = service
+            .replace_set(replace(None, "73737373-7373-4373-8373-737373737373"))
+            .expect("create the set");
+        let tombstone = service
+            .delete_set(DeleteCredentialSet {
+                set_id: deepgram.clone(),
+                expected_revision: created.new_revision,
+                idempotency_token: idempotency("74747474-7474-4474-8474-747474747474"),
+            })
+            .expect("delete the set")
+            .new_revision;
+        let mut configured = store.journal_snapshot();
+        configured
+            .set_state_mut(&deepgram)
+            .expect("built-in set")
+            .record_state = CredentialSetRecordState::Configured;
+        store.restore_journal(configured);
+        let writes = store.active_write_count();
+        let scope_of = |refusal: super::ScopedRefusal| (refusal.error.code, refusal.scope);
+        let refused = (
+            CredentialErrorCode::RecoveryRequired,
+            super::RefusalScope::Set,
+        );
+
+        assert_eq!(
+            scope_of(
+                service
+                    .resolve_for_use_scoped(deepgram_use_request())
+                    .expect_err("the read refuses the set")
+            ),
+            refused
+        );
+        assert_eq!(
+            scope_of(
+                service
+                    .delete_set_scoped(DeleteCredentialSet {
+                        set_id: deepgram.clone(),
+                        expected_revision: tombstone.clone(),
+                        idempotency_token: idempotency("75757575-7575-4575-8575-757575757575"),
+                    })
+                    .expect_err("a delete refuses the set")
+            ),
+            refused
+        );
+        assert_eq!(
+            scope_of(
+                service
+                    .replace_set_scoped(replace(
+                        tombstone.clone(),
+                        "76767676-7676-4676-8676-767676767676"
+                    ))
+                    .expect_err("a replace refuses the set")
+            ),
+            refused
+        );
+        assert_eq!(
+            scope_of(
+                service
+                    .prepare_settings_activation_scoped(PrepareCredentialActivation {
+                        expected_revision: tombstone,
+                        ..activation_request(
+                            BuiltInCredentialSetId::Deepgram,
+                            "77777777-7777-4777-8777-777777777777",
+                        )
+                    })
+                    .expect_err("an activation prepare refuses the set")
+            ),
+            refused
+        );
+        assert_eq!(store.active_write_count(), writes);
+    }
+
+    /// An activation whose set's active record is replaced, after the
+    /// prepare, by a valid tombstone of the same set at the expected
+    /// revision is refused at commit before any setting or record changes:
+    /// the record's kind disagrees with the journal. The activation is
+    /// aborted and its staging removed; the settings are never touched.
+    #[test]
+    fn an_activation_commit_refuses_a_changed_record_before_any_setting_changes() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::InMemory,
+        )));
+        let settings = Arc::new(FakeSettingsActivationPort::new(1));
+        let service = CredentialService::with_settings_activation_port(
+            store.clone(),
+            AuthorityJournal::new(CredentialBackendKind::InMemory),
+            Arc::new(DeterministicTokenSource::default()),
+            settings.clone(),
+        );
+        let deepgram = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let revision = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: deepgram.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("commit-target-canary").expect("API key"),
+                expected_revision: None,
+                idempotency_token: idempotency("78787878-7878-4878-8878-787878787878"),
+            })
+            .expect("create the set")
+            .new_revision
+            .expect("a created set has a revision");
+        let prepared = service
+            .prepare_settings_activation(PrepareCredentialActivation {
+                expected_revision: Some(revision.clone()),
+                ..activation_request(
+                    BuiltInCredentialSetId::Deepgram,
+                    "79797979-7979-4979-8979-797979797979",
+                )
+            })
+            .expect("prepare the activation");
+        let tombstone = CredentialRecordEnvelope::tombstone(
+            deepgram.clone(),
+            revision,
+            CredentialOperationId::parse("7a7a7a7a-7a7a-4a7a-8a7a-7a7a7a7a7a7a")
+                .expect("canonical operation id"),
+        )
+        .encode()
+        .expect("encode the tombstone");
+        store.substitute_active(&deepgram, &tombstone);
+        let writes = store.active_write_count();
+
+        let refused = service
+            .commit_settings_activation_scoped(prepared)
+            .expect_err("the record's kind changed under the activation");
+
+        assert_eq!(
+            (refused.error.code, refused.scope),
+            (
+                CredentialErrorCode::RecoveryRequired,
+                super::RefusalScope::Set
+            )
+        );
+        assert!(!settings.calls().contains(&FakeSettingsCall::PersistPending));
+        assert_eq!(settings.current_revision(), 1);
+        assert_eq!(store.active_write_count(), writes);
+        assert_eq!(store.staging_count(), 0);
+        assert!(service.snapshot_status().pending_activation.is_none());
+    }
+
+    /// Where a second failure follows a first while an activation is
+    /// compensated, what is returned reaches at least as far as either: a
+    /// terminal settings verification followed by a failed restore of the
+    /// settings backup stays terminal, and so does an unknown outcome of the
+    /// journal publication that aborts the activation.
+    #[test]
+    fn a_compensation_returns_at_least_what_it_met() {
+        for (index, case) in [
+            "terminal verification, then a failed restore",
+            "unknown outcome of the abort's publication",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+                CredentialBackendKind::InMemory,
+            )));
+            let settings = Arc::new(FakeSettingsActivationPort::new(1));
+            let service = CredentialService::with_settings_activation_port(
+                store.clone(),
+                AuthorityJournal::new(CredentialBackendKind::InMemory),
+                Arc::new(DeterministicTokenSource::default()),
+                settings.clone(),
+            );
+            let prepared = service
+                .prepare_settings_activation(activation_request(
+                    BuiltInCredentialSetId::Deepgram,
+                    &format!("7b7b7b7b-7b7b-4b7b-8b7b-7b7b7b7b7b7{index}"),
+                ))
+                .expect("prepare the activation");
+            if index == 0 {
+                settings.fail_next(
+                    FakeSettingsCall::VerifyPending,
+                    CredentialStoreFailure::CommitUnknown,
+                );
+                settings.fail_next(
+                    FakeSettingsCall::RestoreBackup,
+                    CredentialStoreFailure::Unavailable,
+                );
+            } else {
+                settings.fail_next(
+                    FakeSettingsCall::VerifyPending,
+                    CredentialStoreFailure::RevisionConflict,
+                );
+                // The stage transition publishes first; the abort second.
+                store.fail_after(
+                    FakeStoreCall::CommitJournal,
+                    1,
+                    CredentialStoreFailure::CommitUnknown,
+                );
+            }
+
+            let refused = service
+                .commit_settings_activation_scoped(prepared)
+                .expect_err(case);
+
+            assert_eq!(
+                (refused.error.code, refused.reach()),
+                (CredentialErrorCode::CommitUnknown, RefusalReach::Terminal),
+                "{case}"
+            );
+        }
+    }
+
+    /// Any two refusals combine to the same one in either order, the result
+    /// reaches as far as the further of the two, and an unknown outcome is
+    /// never combined away: not by a stalled worker, nor by anything else.
+    #[test]
+    fn refusals_combine_in_one_order_that_keeps_an_unknown_outcome() {
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let refusals: Vec<ScopedRefusal> = ERROR_CODES
+            .iter()
+            .flat_map(|code| {
+                [RefusalScope::Set, RefusalScope::Store].map(|scope| ScopedRefusal {
+                    error: content_free_error(
+                        *code,
+                        CredentialSafeRecoveryAction::None,
+                        Some(set_id.clone()),
+                    ),
+                    scope,
+                })
+            })
+            .collect();
+        for first in &refusals {
+            for second in &refusals {
+                let combined = first.clone().wider(Some(second.clone()));
+                let pair = format!("{first:?} and {second:?}");
+                assert_eq!(
+                    combined,
+                    second.clone().wider(Some(first.clone())),
+                    "{pair}"
+                );
+                assert_eq!(
+                    combined.reach(),
+                    first.reach().max(second.reach()),
+                    "{pair}"
+                );
+                if first.error.code == CredentialErrorCode::CommitUnknown
+                    || second.error.code == CredentialErrorCode::CommitUnknown
+                {
+                    assert_eq!(
+                        combined.error.code,
+                        CredentialErrorCode::CommitUnknown,
+                        "{pair}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Where the activation commit flow can fail, in the order it gets
+    /// there, with whether the call there changes state: the session that
+    /// checks the target and the staging record and records the settings
+    /// step, the settings write and its check, the step to the credential,
+    /// the active write, and the cleanup and final publication.
+    const ACTIVATION_COMMIT_STEPS: &[(FaultPoint, usize, bool)] = &[
+        (FaultPoint::Store(FakeStoreCall::LoadJournal), 0, false),
+        (
+            FaultPoint::Store(FakeStoreCall::ReadActiveInSession),
+            0,
+            false,
+        ),
+        (FaultPoint::Store(FakeStoreCall::ReadStaging), 0, false),
+        (FaultPoint::Store(FakeStoreCall::CommitJournal), 0, true),
+        (
+            FaultPoint::Settings(FakeSettingsCall::PersistPending),
+            0,
+            true,
+        ),
+        (
+            FaultPoint::Settings(FakeSettingsCall::VerifyPending),
+            0,
+            false,
+        ),
+        (FaultPoint::Store(FakeStoreCall::CommitJournal), 1, true),
+        (FaultPoint::Store(FakeStoreCall::ReadStaging), 1, false),
+        (FaultPoint::Store(FakeStoreCall::ReplaceActive), 0, true),
+        (FaultPoint::Store(FakeStoreCall::ReadbackActive), 0, false),
+        (FaultPoint::Store(FakeStoreCall::CommitJournal), 2, true),
+        (
+            FaultPoint::Settings(FakeSettingsCall::VerifyCommitted),
+            0,
+            false,
+        ),
+        (
+            FaultPoint::Settings(FakeSettingsCall::ClearPending),
+            0,
+            true,
+        ),
+        (FaultPoint::Store(FakeStoreCall::DeleteStaging), 0, true),
+        (FaultPoint::Store(FakeStoreCall::CommitJournal), 3, true),
+    ];
+
+    /// Where a compensation can fail once the flow has: the settings
+    /// restore, the abort's staging removal, and the next publication, the
+    /// abort's or the recovery mark's.
+    const COMPENSATION_STEPS: &[(FaultPoint, usize, bool)] = &[
+        (
+            FaultPoint::Settings(FakeSettingsCall::RestoreBackup),
+            0,
+            true,
+        ),
+        (FaultPoint::Store(FakeStoreCall::DeleteStaging), 0, true),
+        (FaultPoint::Store(FakeStoreCall::CommitJournal), 0, true),
+    ];
+
+    /// Each failure a step can return: definite ones before any effect, and
+    /// an unknown outcome before it or, where the step changes state, after.
+    fn step_faults(point: FaultPoint, skip: usize, changes_state: bool) -> Vec<PlannedFault> {
+        let mut faults: Vec<PlannedFault> = [
+            CredentialStoreFailure::Locked,
+            CredentialStoreFailure::Unavailable,
+            CredentialStoreFailure::StalledWorker,
+            CredentialStoreFailure::CommitUnknown,
+        ]
+        .into_iter()
+        .map(|failure| PlannedFault {
+            point,
+            skip,
+            failure,
+            after_effect: false,
+        })
+        .collect();
+        if changes_state {
+            faults.push(PlannedFault {
+                point,
+                skip,
+                failure: CredentialStoreFailure::CommitUnknown,
+                after_effect: true,
+            });
+        }
+        faults
+    }
+
+    /// A refusal after `fired` reaches at least as far as the widest of
+    /// them and is `CommitUnknown` when one of them was.
+    fn assert_refusal_keeps_what_it_met(
+        result: &Result<CredentialMutationReceipt, ScopedRefusal>,
+        fired: &[PlannedFault],
+        set_id: &CredentialSetId,
+        context: &str,
+    ) {
+        let Some(widest) = fired
+            .iter()
+            .map(|fault| {
+                ScopedRefusal::from(fault.failure.into_public(Some(set_id.clone()))).reach()
+            })
+            .max()
+        else {
+            return;
+        };
+        let refusal = result.as_ref().expect_err(context);
+        assert!(
+            refusal.reach() >= widest,
+            "{refusal:?} narrows {fired:?}: {context}"
+        );
+        if fired
+            .iter()
+            .any(|fault| fault.failure == CredentialStoreFailure::CommitUnknown)
+        {
+            assert_eq!(
+                refusal.error.code,
+                CredentialErrorCode::CommitUnknown,
+                "{context}"
+            );
+        }
+    }
+
+    /// The journal's reservation outlives the settings marker and the
+    /// staging record, and an activation the journal no longer reserves is
+    /// settled one way: completed, with the proposed settings, revision and
+    /// epoch, or cleared without effect, with the expected ones and no
+    /// active write. Returns whether the activation is still reserved.
+    fn assert_activation_state_agrees(
+        store: &FakeCredentialStore,
+        settings: &FakeSettingsActivationPort,
+        prepared: &PreparedCredentialActivation,
+        context: &str,
+    ) -> bool {
+        let journal = store.journal_snapshot();
+        let reserved = journal
+            .pending_activation
+            .as_ref()
+            .is_some_and(|pending| pending.operation_id == prepared.operation_id);
+        assert!(
+            reserved || !settings.has_pending_marker(),
+            "a settings marker outlived its reservation: {context}"
+        );
+        assert!(
+            reserved || store.staging_count() == 0,
+            "a staging record outlived its reservation: {context}"
+        );
+        if reserved {
+            return true;
+        }
+        let settled = journal
+            .idempotency_history
+            .iter()
+            .find(|entry| entry.receipt.operation_id == prepared.operation_id)
+            .map(|entry| entry.receipt.result_code);
+        let revision = journal
+            .set_state(&prepared.set_id)
+            .and_then(|set| set.revision.clone());
+        if matches!(settled, None | Some(CredentialMutationResultCode::NoChange)) {
+            assert_eq!(
+                (
+                    journal.global_epoch,
+                    settings.current_revision(),
+                    revision,
+                    store.active_write_count()
+                ),
+                (
+                    prepared.expected_global_epoch,
+                    prepared.expected_settings_revision,
+                    prepared.expected_revision.clone(),
+                    0
+                ),
+                "an activation cleared without its receipt took effect: {context}"
+            );
+        } else {
+            assert_eq!(
+                (journal.global_epoch, settings.current_revision(), revision),
+                (
+                    prepared.proposed_global_epoch,
+                    prepared.proposed_settings_revision,
+                    Some(prepared.proposed_revision.clone())
+                ),
+                "{context}"
+            );
+        }
+        false
+    }
+
+    /// One cell: a commit with `faults` planned, a retry of the same
+    /// prepared activation, then recovery without faults until it settles,
+    /// by a restarted service when this one stays stalled: a stall a
+    /// settings call raised outside any operation's admission names no
+    /// operation, so no completion signal clears it.
+    fn run_activation_commit_cell(faults: &[PlannedFault]) {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::InMemory,
+        )));
+        let settings = Arc::new(FakeSettingsActivationPort::new(1));
+        let service = CredentialService::with_settings_activation_port(
+            store.clone(),
+            AuthorityJournal::new(CredentialBackendKind::InMemory),
+            Arc::new(DeterministicTokenSource::default()),
+            settings.clone(),
+        );
+        let prepared = service
+            .prepare_settings_activation(activation_request(
+                BuiltInCredentialSetId::Deepgram,
+                "7d7d7d7d-7d7d-4d7d-8d7d-7d7d7d7d7d7d",
+            ))
+            .expect("prepare the activation");
+        let plan = FaultPlan::new(faults.iter().copied());
+        store.set_fault_plan(plan.clone());
+        settings.set_fault_plan(plan.clone());
+        let cell = format!("{faults:?}");
+
+        for attempt in ["commit", "retry"] {
+            let context = format!("{attempt} {cell}");
+            let result = service.commit_settings_activation_scoped(prepared.clone());
+            assert_refusal_keeps_what_it_met(
+                &result,
+                &plan.take_fired(),
+                &prepared.set_id,
+                &context,
+            );
+            assert_activation_state_agrees(&store, &settings, &prepared, &context);
+            service.complete_stalled_operation(&prepared.operation_id);
+        }
+        plan.disarm();
+        let restarted;
+        let recovering = if service.snapshot_status().worker.state == CredentialWorkerState::Stalled
+        {
+            restarted = CredentialService::with_settings_activation_port(
+                store.clone(),
+                store.journal_snapshot(),
+                Arc::new(DeterministicTokenSource::default()),
+                settings.clone(),
+            );
+            &restarted
+        } else {
+            &service
+        };
+        let mut reserved = true;
+        for attempt in 0..3 {
+            if !reserved {
+                break;
+            }
+            let _ = recovering.recover_settings_activation_scoped(&prepared.operation_id);
+            reserved = assert_activation_state_agrees(
+                &store,
+                &settings,
+                &prepared,
+                &format!("recovery {attempt} {cell}"),
+            );
+        }
+        assert!(!reserved, "recovery leaves the activation reserved: {cell}");
+    }
+
+    /// Every failure sequence of an activation commit: each step of the flow
+    /// failing in each way it can, alone, with a second failure in the
+    /// compensation or recovery mark that follows, and with a third in the
+    /// recovery mark after that; then a retry of the same prepared
+    /// activation, then recovery. Every refusal reaches at least as far as
+    /// the widest failure it met and is `CommitUnknown` when one was; the
+    /// journal's reservation outlives the settings marker and the staging
+    /// record; an activation cleared without its receipt never took effect;
+    /// and recovery settles each one.
+    #[test]
+    fn every_failure_sequence_of_an_activation_commit_keeps_what_it_met() {
+        for &(point, skip, changes_state) in ACTIVATION_COMMIT_STEPS {
+            let mut firsts = step_faults(point, skip, changes_state);
+            firsts.push(PlannedFault {
+                point,
+                skip,
+                failure: CredentialStoreFailure::RevisionConflict,
+                after_effect: false,
+            });
+            for first in firsts {
+                run_activation_commit_cell(&[first]);
+                for &(point, skip, changes_state) in COMPENSATION_STEPS {
+                    for second in step_faults(point, skip, changes_state) {
+                        run_activation_commit_cell(&[first, second]);
+                        for third in
+                            step_faults(FaultPoint::Store(FakeStoreCall::CommitJournal), 0, true)
+                        {
+                            run_activation_commit_cell(&[first, second, third]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A record of another operation in the prepared activation's staging
+    /// slot is refused in the session that first records the commit's
+    /// progress, before any setting changes.
+    #[test]
+    fn an_activation_commit_refuses_another_operations_staging_before_any_setting_changes() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::InMemory,
+        )));
+        let settings = Arc::new(FakeSettingsActivationPort::new(1));
+        let service = CredentialService::with_settings_activation_port(
+            store.clone(),
+            AuthorityJournal::new(CredentialBackendKind::InMemory),
+            Arc::new(DeterministicTokenSource::default()),
+            settings.clone(),
+        );
+        let prepared = service
+            .prepare_settings_activation(activation_request(
+                BuiltInCredentialSetId::Deepgram,
+                "7e7e7e7e-7e7e-4e7e-8e7e-7e7e7e7e7e7e",
+            ))
+            .expect("prepare the activation");
+        let foreign = CredentialRecordEnvelope::present(
+            prepared.set_id.clone(),
+            AuthMethodId::ApiKey,
+            prepared.proposed_revision.clone(),
+            CredentialOperationId::parse("7f7f7f7f-7f7f-4f7f-8f7f-7f7f7f7f7f7f")
+                .expect("canonical operation id"),
+            StoredSecretBundle::api_key("foreign-staging-canary").expect("API key"),
+        )
+        .expect("build the foreign record")
+        .encode()
+        .expect("encode the foreign record");
+        store.substitute_staging(&prepared.operation_id, &prepared.set_id, &foreign);
+
+        let refused = service
+            .commit_settings_activation_scoped(prepared)
+            .expect_err("another operation's staging record");
+
+        assert_eq!(
+            (refused.error.code, refused.scope),
+            (CredentialErrorCode::CorruptRecord, RefusalScope::Set)
+        );
+        assert!(!settings.calls().contains(&FakeSettingsCall::PersistPending));
+        assert_eq!(settings.current_revision(), 1);
+        assert_eq!(store.active_write_count(), 0);
+        assert!(service.snapshot_status().pending_activation.is_none());
+    }
+
+    /// A final publication that failed before taking effect is never taken
+    /// for this service's commit: when another service recovers the same
+    /// activation and publishes its epoch, this one accounts that epoch as
+    /// another process's commit only. One whose outcome was unknown is
+    /// accounted both by its receipt and as another process's commit, since
+    /// this service cannot tell the two apart.
+    #[test]
+    fn another_services_recovery_is_never_taken_for_this_services_commit() {
+        for failure in [
+            CredentialStoreFailure::Unavailable,
+            CredentialStoreFailure::CommitUnknown,
+        ] {
+            let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+                CredentialBackendKind::InMemory,
+            )));
+            let settings = Arc::new(FakeSettingsActivationPort::new(1));
+            let service = CredentialService::with_settings_activation_port(
+                store.clone(),
+                AuthorityJournal::new(CredentialBackendKind::InMemory),
+                Arc::new(DeterministicTokenSource::default()),
+                settings.clone(),
+            );
+            let prepared = service
+                .prepare_settings_activation(activation_request(
+                    BuiltInCredentialSetId::Deepgram,
+                    "80808080-8080-4080-8080-808080808080",
+                ))
+                .expect("prepare the activation");
+            // The final publication is the flow's fourth journal commit.
+            store.fail_after(FakeStoreCall::CommitJournal, 3, failure);
+            service
+                .commit_settings_activation_scoped(prepared.clone())
+                .expect_err("the final publication fails before taking effect");
+            let other = CredentialService::with_settings_activation_port(
+                store.clone(),
+                store.journal_snapshot(),
+                Arc::new(DeterministicTokenSource::default()),
+                settings.clone(),
+            );
+            let recovered = other
+                .recover_settings_activation(&prepared.operation_id)
+                .expect("the other service recovers the activation");
+
+            assert!(matches!(
+                service.resolve_for_use(deepgram_use_request()),
+                Ok(CredentialResolution::Stored(_))
+            ));
+
+            let epoch = prepared.proposed_global_epoch;
+            let external = AccountedChange::Observed {
+                through_epoch: epoch,
+            };
+            let expected = if failure == CredentialStoreFailure::CommitUnknown {
+                let receipt = CredentialService::committed_change(recovered, epoch);
+                vec![AccountedChange::Local(receipt), external]
+            } else {
+                vec![external]
+            };
+            assert_eq!(
+                service.accounted_changes_since(prepared.expected_global_epoch),
+                Some((epoch, expected)),
+                "{failure:?}"
+            );
+        }
+    }
+
+    /// A recovery-class refusal decided from one set's own journal state or
+    /// records is set-scoped; one about the authority, or a failed authority
+    /// read, is store-scoped. The unscoped methods return the same error.
+    #[test]
+    fn recovery_class_refusals_carry_the_scope_of_what_decided_them() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::Native,
+        )));
+        let service = CredentialService::new(
+            store.clone(),
+            AuthorityJournal::new(CredentialBackendKind::Native),
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let deepgram = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let replace = |expected_revision, token| ReplaceCredentialSet {
+            set_id: deepgram.clone(),
+            auth_method_id: AuthMethodId::ApiKey,
+            material: StoredSecretBundle::api_key("scope-canary").expect("API key"),
+            expected_revision,
+            idempotency_token: idempotency(token),
+        };
+        let created = service
+            .replace_set(replace(None, "70707070-7070-4070-8070-707070707070"))
+            .expect("create the set");
+        let scope_of = |refusal: super::ScopedRefusal| (refusal.error.code, refusal.scope);
+
+        let mut pending = store.journal_snapshot();
+        pending
+            .set_state_mut(&deepgram)
+            .expect("built-in set")
+            .recovery_state = CredentialSetRecoveryState::RecordJournalMismatch;
+        store.restore_journal(pending);
+        assert_eq!(
+            scope_of(
+                service
+                    .resolve_for_use_scoped(deepgram_use_request())
+                    .expect_err("the set needs reconciling")
+            ),
+            (
+                CredentialErrorCode::RecoveryRequired,
+                super::RefusalScope::Set
+            )
+        );
+        assert_eq!(
+            service
+                .resolve_for_use(deepgram_use_request())
+                .expect_err("the set needs reconciling")
+                .code,
+            CredentialErrorCode::RecoveryRequired
+        );
+
+        let mut mismatched = store.journal_snapshot();
+        let set = mismatched.set_state_mut(&deepgram).expect("built-in set");
+        set.recovery_state = CredentialSetRecoveryState::None;
+        set.revision = None;
+        store.restore_journal(mismatched);
+        assert_eq!(
+            scope_of(
+                service
+                    .replace_set_scoped(replace(None, "71717171-7171-4171-8171-717171717171"))
+                    .expect_err("the journal and the record disagree for the set")
+            ),
+            (
+                CredentialErrorCode::RecoveryRequired,
+                super::RefusalScope::Set
+            )
+        );
+
+        let mut healthy = store.journal_snapshot();
+        healthy
+            .set_state_mut(&deepgram)
+            .expect("built-in set")
+            .revision = created.new_revision.clone();
+        store.restore_journal(healthy);
+        store.fail_next(
+            FakeStoreCall::WriteStaging,
+            CredentialStoreFailure::CorruptRecord,
+        );
+        assert_eq!(
+            scope_of(
+                service
+                    .prepare_settings_activation_scoped(activation_request(
+                        BuiltInCredentialSetId::Openai,
+                        "72727272-7272-4272-8272-727272727272",
+                    ))
+                    .expect_err("an untracked record refuses staging")
+            ),
+            (CredentialErrorCode::CorruptRecord, super::RefusalScope::Set)
+        );
+
+        store.fail_next(
+            FakeStoreCall::ReadActive,
+            CredentialStoreFailure::CorruptRecord,
+        );
+        assert_eq!(
+            scope_of(
+                service
+                    .resolve_for_use_scoped(deepgram_use_request())
+                    .expect_err("the authority read failed")
+            ),
+            (
+                CredentialErrorCode::CorruptRecord,
+                super::RefusalScope::Store
+            )
+        );
+
+        store.restore_journal(AuthorityJournal::new(CredentialBackendKind::Native));
+        let rolled_back = service
+            .resolve_for_use_scoped(deepgram_use_request())
+            .expect_err("the journal went back an epoch");
+        assert_eq!(
+            rolled_back.error.set_id,
+            Some(deepgram.clone()),
+            "the floor refusal names the requesting set"
+        );
+        assert_eq!(
+            scope_of(rolled_back),
+            (
+                CredentialErrorCode::RecoveryRequired,
+                super::RefusalScope::Store
+            )
+        );
+    }
+
+    /// The repair adopts the journal it was admitted on before it removes
+    /// anything. A repair that removes an orphan from its first set and then
+    /// fails, after another process's commit raised the epoch, therefore
+    /// still leaves this service refusing a journal older than the one it
+    /// acted on.
+    #[test]
+    fn a_repair_that_fails_partway_still_refuses_an_older_journal_afterwards() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::Native,
+        )));
+        let service = CredentialService::new(
+            store.clone(),
+            AuthorityJournal::new(CredentialBackendKind::Native),
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let older = store.journal_snapshot();
+        let mut newer = older.clone();
+        newer.global_epoch = 1;
+        store.restore_journal(newer);
+        let first_set = CredentialSetId::from(BUILT_IN_CREDENTIAL_SET_IDS[0]);
+        store.plant_staging(
+            CredentialOperationId::parse("64646464-6464-4464-8464-646464646464")
+                .expect("canonical operation id"),
+            first_set,
+        );
+        store.fail_after(
+            FakeStoreCall::RepairSet,
+            1,
+            CredentialStoreFailure::Unavailable,
+        );
+
+        let failed = service
+            .repair_untracked_records()
+            .expect_err("the repair fails after its first set");
+        assert_eq!(failed.code, CredentialErrorCode::StoreUnavailable);
+        assert_eq!(
+            store.staging_count(),
+            0,
+            "the first set's orphan was removed"
+        );
+        assert_eq!(service.snapshot_status().global_epoch, 1);
+
+        store.restore_journal(older);
+        let refused = service
+            .repair_untracked_records()
+            .expect_err("the older journal is refused");
+        assert_eq!(refused.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(refused.set_id, None);
     }
 }

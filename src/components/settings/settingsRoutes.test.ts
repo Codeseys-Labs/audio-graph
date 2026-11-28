@@ -121,7 +121,7 @@ describe("credentialRouteForReadiness", () => {
     const route = credentialRouteForReadiness({
       provider_id: "asr.deepgram",
       status: "missing_credentials",
-      message: "",
+      note: { kind: "missing_credentials", keys: ["deepgram_api_key"] },
       stale: false,
       credential_epoch: 1,
       credentials: [{ key: "deepgram_api_key", present: false }],
@@ -346,7 +346,10 @@ describe("credentialRouteForKey", () => {
       return {
         provider_id: providerId,
         status: "missing_credentials" as const,
-        message: "",
+        note: {
+          kind: "missing_credentials" as const,
+          keys: ["openai_api_key"],
+        },
         stale: false,
         credential_epoch: 1,
         credentials: [{ key: "openai_api_key", present: false }],
@@ -438,7 +441,7 @@ describe("relatedReadinessForCredential", () => {
       {
         provider_id: "asr.deepgram",
         status: "ready" as const,
-        message: "",
+        note: { kind: "verified" as const },
         stale: false,
         credential_epoch: 1,
         credentials: [{ key: "deepgram_api_key", present: true }],
@@ -446,7 +449,10 @@ describe("relatedReadinessForCredential", () => {
       {
         provider_id: "llm.openrouter",
         status: "missing_credentials" as const,
-        message: "",
+        note: {
+          kind: "missing_credentials" as const,
+          keys: ["openrouter_api_key"],
+        },
         stale: false,
         credential_epoch: 1,
         credentials: [{ key: "openrouter_api_key", present: false }],

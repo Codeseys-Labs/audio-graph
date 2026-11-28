@@ -33,6 +33,8 @@ import {
   ProviderReadinessDetails,
   providerCatalogLabel,
   providerCatalogSummary,
+  providerReadinessMessage,
+  providerReadinessSentence,
   providerRecoveryAction,
 } from "../ProviderReadinessPanel";
 import { PROVIDER_DESCRIPTORS } from "../providerRegistryHelpers";
@@ -204,11 +206,18 @@ export default function CredentialsPanel() {
                 const selectedModel = isActiveReadinessProvider
                   ? selectedModelForProvider(entry.provider_id)
                   : null;
+                const message = providerReadinessMessage(entry, t);
                 const recoveryAction = providerRecoveryAction(
                   entry,
                   t,
                   PROVIDER_DESCRIPTORS.get(entry.provider_id),
                 );
+                // An expired credential or a refused permission is its own
+                // next step: its recovery copy is the sentence shown above.
+                const nextStep =
+                  recoveryAction === providerReadinessSentence(entry, t)
+                    ? null
+                    : recoveryAction;
                 const credentialRoute = credentialRouteForReadiness(entry);
                 // The tone LAW (audio-graph-2554, settings T2): this rollup
                 // deliberately keeps showing REAL blockers (missing
@@ -258,20 +267,17 @@ export default function CredentialsPanel() {
                       </p>
                     )}
                     <p className="settings-readiness__message">
-                      {entry.message}
-                      {entry.stale
-                        ? ` ${t("settings.providerReadiness.stale")}`
-                        : ""}
+                      {message}
                       {catalogSummary
                         ? ` ${providerCatalogLabel(catalogSummary, t)}`
                         : ""}
                     </p>
-                    {recoveryAction && (
+                    {nextStep && (
                       <p className="settings-readiness__recovery">
                         <span>
                           {t("settings.providerReadiness.recoveryLabel")}
                         </span>{" "}
-                        {recoveryAction}
+                        {nextStep}
                       </p>
                     )}
                     {credentialRoute && (

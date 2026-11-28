@@ -341,14 +341,17 @@ impl BedrockConverseStreamAdapter {
             match crate::aws_util::build_aws_sdk_config(&self.region, self.credential_source).await
             {
                 Ok(cfg) => cfg,
-                Err(_) => {
+                Err(error) => {
+                    // A credential-store failure keeps its closed code, so the
+                    // user is told to unlock the store or add the key rather
+                    // than that something internal failed.
+                    let diagnostic = match error {
+                        crate::error::AppError::RuntimeDiagnostic(diagnostic) => diagnostic,
+                        _ => RuntimeDiagnostic::internal(INFERENCE),
+                    };
                     send_terminal(
                         &tx,
-                        StreamTerminalEvent::failure(
-                            RuntimeDiagnostic::internal(INFERENCE),
-                            String::new(),
-                            metadata,
-                        ),
+                        StreamTerminalEvent::failure(diagnostic, String::new(), metadata),
                     )
                     .await;
                     return;

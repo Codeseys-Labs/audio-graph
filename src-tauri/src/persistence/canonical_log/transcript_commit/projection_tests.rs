@@ -33,7 +33,7 @@ fn overwrite_colliding_generation(destination: &Path, replacement: &Path) {
     assert!(SourceStamp::read(&file).unwrap() == before);
 }
 
-fn projection_patch(sequence: u64, note_id: &str) -> ProjectionPatch {
+pub(super) fn projection_patch(sequence: u64, note_id: &str) -> ProjectionPatch {
     ProjectionPatch {
         route: None,
         sequence,

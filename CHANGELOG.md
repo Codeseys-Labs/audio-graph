@@ -53,6 +53,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Upgraded audio capture to `rsac` 0.5.0 (`wasapi` 0.27.0), with Windows
   STA/COM and `SILENT` buffer fixes, PipeWire `DONT_RECONNECT` on Linux,
   and system-capture capability reporting for macOS 14.4 and later.
+- Dormant credential v2 authority journal (#521, not yet reachable from the
+  app): its roots are held for the store's lifetime and must pass the
+  filesystem evidence gate before the lock file or any native call exists,
+  which refuses every root until evidence profiles ship (#210). A lock is
+  refused once a held root is no longer at its path, and every lock also
+  locks the held journal root itself, so two writers of one journal contend
+  even after the lock directory moves. Windows replaces the journal with
+  POSIX rename semantics and flushes the file and directory afterwards. A
+  program holding the journal open without sharing delete or read no longer
+  stalls the whole process: a refusal before any native record changed is a
+  retryable `operation_in_progress` and leaves the runtime ready, and one at
+  the final journal commit leaves that operation for recovery. On every open
+  the roots' directory entries are synced into the directory that holds
+  them, reached through the held directory itself, never skipped for a
+  link; a parent that cannot be opened fails the open. A missing root is
+  created and hardened relative to the parent the open holds. Hardening
+  refuses a file with a second name and changes no existing child, and
+  neither the stray sweep nor a publication deletes or replaces anything
+  but a regular file with one name. One explicit repair takes ownership of
+  a refused journal root (Windows) only after every object it would change
+  passes those checks through its handle, holding each one so it cannot be
+  moved until it is changed, and removes staging records and guards the
+  journal does not track, except the staging of every activation the
+  service saw pending and has not seen settled. A reopen never adopts
+  another authority or an older journal.
+- Dormant credential v2 runtime (#521): a recovery-required outcome that
+  concerns only one set no longer closes the runtime; other sets stay usable
+  and the next request for that set rereads the authority, so it sees another
+  process's recovery without a restart. Store-wide outcomes, a rolled-back
+  journal met by a request for one set included, still need explicit
+  diagnosis, and an activation's cleanup or compensation never narrows a
+  store-wide failure, from the store or the settings, or an unknown outcome
+  to its set; failures met together keep the same result in either order.
+  Every write refuses a record whose kind disagrees with the journal, as
+  reads do. An open refused by contention (another program holding the
+  journal, another process holding the lock) is a retryable
+  `operation_in_progress` and leaves the runtime as it was. A commit
+  observed from another process, including one found by a reopen through
+  diagnosis or an ownership repair, now emits a content-free signal telling
+  consumers to drop resolved uses and take a fresh snapshot; a commit of
+  this process whose outcome was unknown is reported with its receipt and
+  that signal both once the journal shows it. An activation commit refuses
+  a set whose record changed, or a staging record that is not its own,
+  before any setting changes, and a retry of an activation that already
+  took a step is left for recovery instead of aborting it.
 
 ### Fixed
 

@@ -4,9 +4,10 @@ use super::domain::{
     AuthorityJournal, CredentialStoreFailure, StoredSecretBundle, content_free_error,
 };
 use super::service::{
-    CredentialChangeEvent, CredentialResolution, CredentialService, CredentialTokenSource,
-    CredentialUseRequest, DeleteCredentialSet, PrepareCredentialActivation,
-    PreparedCredentialActivation, ReplaceCredentialSet,
+    AccountedChange, CredentialChangeEvent, CredentialResolution, CredentialService,
+    CredentialTokenSource, CredentialUseRequest, DeleteCredentialSet, PrepareCredentialActivation,
+    PreparedCredentialActivation, RefusalReach, ReplaceCredentialSet, ScopedRefusal,
+    StoreOwnershipRepair, UntrackedRecordRepair,
 };
 use crate::crash_handler::{RedactedPanicOp, catch_redacted_panic};
 use audio_graph_ipc_contract::credential_contract::{
@@ -48,8 +49,21 @@ pub(crate) struct CredentialRuntimeStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CredentialEventSinkFailure;
 
+/// What the runtime tells consumers in this process, in epoch order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredentialRuntimeEvent {
+    /// This process committed a change; the receipt and invalidations say
+    /// which set changed and which uses to drop.
+    Committed(CredentialChangeEvent),
+    /// Another process committed every epoch through `through_epoch`. This
+    /// process has no receipt for those commits and cannot tell which sets
+    /// they changed, so every consumer takes a fresh status snapshot and
+    /// drops whatever it resolved before.
+    ExternallyCommitted { through_epoch: u64 },
+}
+
 pub(crate) trait CredentialRuntimeEventSink: Send + Sync + 'static {
-    fn emit(&self, event: CredentialChangeEvent) -> Result<(), CredentialEventSinkFailure>;
+    fn emit(&self, event: CredentialRuntimeEvent) -> Result<(), CredentialEventSinkFailure>;
 }
 
 pub(crate) enum CredentialRuntimeOpen {
@@ -62,6 +76,13 @@ pub(crate) enum CredentialRuntimeOpen {
 pub(crate) enum CredentialRuntimeRecovery {
     Ready,
     RecoveryRequired,
+}
+
+/// What an explicit store repair did. Content-free: closed outcomes only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CredentialStoreRepair {
+    pub(crate) ownership: StoreOwnershipRepair,
+    pub(crate) sets: Vec<UntrackedRecordRepair>,
 }
 
 /// Construction-time backend port. Concrete native factories remain in the
@@ -78,6 +99,11 @@ pub(crate) trait CredentialRuntimeBackend: Send + 'static {
     ) -> Result<CredentialRuntimeOpen, CredentialStoreFailure>;
 
     fn diagnose_or_unlock(&mut self) -> Result<CredentialRuntimeRecovery, CredentialStoreFailure>;
+
+    /// Explicit repair only: takes ownership of authority state that another
+    /// principal owns, which hardening therefore refused, where the platform
+    /// allows it. It performs no native credential I/O and never prompts.
+    fn repair_ownership(&mut self) -> Result<StoreOwnershipRepair, CredentialStoreFailure>;
 }
 
 enum CredentialSecretDraft {
@@ -444,6 +470,23 @@ impl RuntimeShared {
             operation_id: None,
             set_id: set_id.cloned(),
         };
+    }
+
+    fn status_snapshot(&self) -> CredentialRuntimeStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Puts back the status an open attempt started from. The closed error
+    /// of a closed runtime is untouched, since marking an open never clears
+    /// it.
+    fn restore_status(&self, before: CredentialRuntimeStatus) {
+        *self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = before;
     }
 
     fn mark_timed_out_if_busy(&self, set_id: Option<&CredentialSetId>) {
@@ -841,6 +884,21 @@ impl CredentialRuntime {
         })
         .await
     }
+
+    /// The one explicit, user-invoked store repair; no ordinary operation
+    /// runs any part of it. It first takes ownership of authority state that
+    /// hardening refused because another principal owns it, where the
+    /// platform allows that, and reopens without prompting if it changed an
+    /// owner. Then, on a ready store, it removes native records the authority
+    /// journal does not track. A runtime closed for any other reason stays
+    /// closed: explicit diagnosis is still the only route back.
+    pub(crate) async fn repair_store(
+        &self,
+        deadline: Duration,
+    ) -> Result<CredentialStoreRepair, CredentialError> {
+        self.dispatch(None, deadline, |reply| RuntimeRequest::Repair { reply })
+            .await
+    }
 }
 
 struct SecureUuidCredentialTokenSource;
@@ -888,6 +946,9 @@ enum RuntimeRequest {
         operation_id: CredentialOperationId,
         reply: oneshot::Sender<Result<CredentialMutationReceipt, CredentialError>>,
     },
+    Repair {
+        reply: oneshot::Sender<Result<CredentialStoreRepair, CredentialError>>,
+    },
 }
 
 struct RuntimeWorker {
@@ -896,6 +957,16 @@ struct RuntimeWorker {
     token_source: Arc<dyn CredentialTokenSource>,
     service: Option<CredentialService>,
     event_cursor: u64,
+    floor: Option<AuthorityFloor>,
+}
+
+/// What a runtime has adopted: the authority its first service was bound to
+/// and the highest journal epoch it has observed. A later service for
+/// another authority, or over an older journal, is refused, whichever route
+/// reopened it; only a restart starts without a floor.
+struct AuthorityFloor {
+    authority: String,
+    epoch: u64,
 }
 
 impl RuntimeWorker {
@@ -926,34 +997,34 @@ impl RuntimeWorker {
             RuntimeRequest::Replace { request, reply } => {
                 let set_id = request.set_id.clone();
                 let result = self.run_service_operation(shared, Some(&set_id), |service| {
-                    service.replace_set(request)
+                    service.replace_set_scoped(request)
                 });
                 let _ = reply.send(result);
             }
             RuntimeRequest::Delete { request, reply } => {
                 let set_id = request.set_id.clone();
                 let result = self.run_service_operation(shared, Some(&set_id), |service| {
-                    service.delete_set(request)
+                    service.delete_set_scoped(request)
                 });
                 let _ = reply.send(result);
             }
             RuntimeRequest::Resolve { request, reply } => {
                 let set_id = request.set_id.clone();
                 let result = self.run_service_operation(shared, Some(&set_id), |service| {
-                    service.resolve_for_use(request)
+                    service.resolve_for_use_scoped(request)
                 });
                 let _ = reply.send(result);
             }
             RuntimeRequest::PrepareActivation { request, reply } => {
                 let set_id = request.set_id.clone();
                 let result = self.run_service_operation(shared, Some(&set_id), |service| {
-                    service.prepare_settings_activation(request)
+                    service.prepare_settings_activation_scoped(request)
                 });
                 let _ = reply.send(result);
             }
             RuntimeRequest::CommitActivation { prepared, reply } => {
                 let result = self.run_service_operation(shared, None, |service| {
-                    service.commit_settings_activation(prepared)
+                    service.commit_settings_activation_scoped(prepared)
                 });
                 let _ = reply.send(result);
             }
@@ -962,9 +1033,14 @@ impl RuntimeWorker {
                 reply,
             } => {
                 let result = self.run_service_operation(shared, None, |service| {
-                    service.recover_settings_activation(&operation_id)
+                    service.recover_settings_activation_scoped(&operation_id)
                 });
                 let _ = reply.send(result);
+            }
+            RuntimeRequest::Repair { reply } => {
+                let result = self.run_repair(shared);
+                let response = self.finalize(shared, None, result);
+                let _ = reply.send(response);
             }
         }
     }
@@ -973,83 +1049,76 @@ impl RuntimeWorker {
         &mut self,
         shared: &RuntimeShared,
         set_id: Option<&CredentialSetId>,
-        operation: impl FnOnce(&CredentialService) -> Result<T, CredentialError>,
+        operation: impl FnOnce(&CredentialService) -> Result<T, ScopedRefusal>,
     ) -> Result<T, CredentialError> {
-        let result = self.ensure_ready(shared, set_id).and_then(|()| {
-            operation(
+        let result = match self.ensure_ready(shared, set_id) {
+            Ok(()) => operation(
                 self.service
                     .as_ref()
                     .expect("ready runtime owns credential service"),
-            )
-        });
-        self.finalize(shared, set_id, result)
+            ),
+            Err(error) => Err(error.into()),
+        };
+        self.finalize_scoped(shared, set_id, result)
     }
 
+    /// Finalizes a request whose failures are all store-scoped.
     fn finalize<T>(
         &mut self,
         shared: &RuntimeShared,
         set_id: Option<&CredentialSetId>,
-        mut result: Result<T, CredentialError>,
+        result: Result<T, CredentialError>,
+    ) -> Result<T, CredentialError> {
+        self.finalize_scoped(shared, set_id, result.map_err(ScopedRefusal::from))
+    }
+
+    /// Reconciles events, then decides admission by how far the refusal
+    /// reaches ([`ScopedRefusal::reach`]). A terminal one stalls the
+    /// runtime and a store-wide one closes it. A set-scoped one of the
+    /// recovery class concerns only its set: the runtime stays ready for
+    /// every other set, and the next request for that set reads the
+    /// authoritative journal and record under the lock again, so it sees
+    /// another process's recovery without a reopen. A failed
+    /// reconciliation (an event lost, or one the sink refused) stalls the
+    /// runtime; a request that failed too keeps the wider of the two (see
+    /// [`ScopedRefusal::wider`]), so an unknown outcome stays
+    /// `CommitUnknown`.
+    fn finalize_scoped<T>(
+        &mut self,
+        shared: &RuntimeShared,
+        set_id: Option<&CredentialSetId>,
+        mut result: Result<T, ScopedRefusal>,
     ) -> Result<T, CredentialError> {
         if self.service.is_some()
             && let Err(reconcile) = self.reconcile_service(shared)
         {
-            result = Err(reconcile);
+            let stalled = ScopedRefusal::from(reconcile);
+            result = Err(match result {
+                Err(refusal) => refusal.wider(Some(stalled)),
+                Ok(_) => stalled,
+            });
         }
-        if result.as_ref().is_err_and(terminal_service_error) {
-            shared.terminal_stall(set_id);
-        } else if result
-            .as_ref()
-            .err()
-            .is_some_and(|error| closed_service_projection(error.code).is_some())
-            && self.service.is_some()
-        {
-            let service = self
-                .service
-                .take()
-                .expect("closed ready runtime owns credential service");
-            let Err(error) = &result else {
-                unreachable!("closed result is an error");
-            };
-            shared.close_ready_service(service.snapshot_status(), error);
-        } else {
-            shared.release(self.service.as_ref());
+        match &result {
+            Err(refusal) if refusal.reach() == RefusalReach::Terminal => {
+                shared.terminal_stall(set_id);
+            }
+            Err(refusal) if refusal.reach() == RefusalReach::Store && self.service.is_some() => {
+                let service = self
+                    .service
+                    .take()
+                    .expect("closed ready runtime owns credential service");
+                shared.close_ready_service(service.snapshot_status(), &refusal.error);
+            }
+            _ => shared.release(self.service.as_ref()),
         }
-        result
+        result.map_err(|refusal| refusal.error)
     }
 
     fn run_diagnosis(&mut self, shared: &RuntimeShared) -> Result<(), CredentialError> {
+        let before = shared.status_snapshot();
         shared.mark_opening(None);
         match self.backend.diagnose_or_unlock() {
-            Ok(CredentialRuntimeRecovery::Ready) => {
-                self.service = None;
-                match self.backend.open(Arc::clone(&self.token_source)) {
-                    Ok(CredentialRuntimeOpen::Ready(service)) => {
-                        self.adopt_service(shared, *service);
-                        Ok(())
-                    }
-                    Ok(CredentialRuntimeOpen::Uninitialized) => {
-                        shared.cache_open_state(
-                            CredentialRuntimeLifecycle::Uninitialized,
-                            CredentialBackendAvailability::Available,
-                            None,
-                        );
-                        Ok(())
-                    }
-                    Ok(CredentialRuntimeOpen::RecoveryRequired) => {
-                        shared.cache_open_state(
-                            CredentialRuntimeLifecycle::RecoveryRequired,
-                            CredentialBackendAvailability::RecoveryRequired,
-                            None,
-                        );
-                        Ok(())
-                    }
-                    Err(failure) => {
-                        cache_open_failure(shared, failure, None);
-                        Err(failure.into_public(None))
-                    }
-                }
-            }
+            Ok(CredentialRuntimeRecovery::Ready) => self.reopen(shared, before),
             Ok(CredentialRuntimeRecovery::RecoveryRequired) => {
                 self.service = None;
                 shared.cache_open_state(
@@ -1059,11 +1128,75 @@ impl RuntimeWorker {
                 );
                 Ok(())
             }
-            Err(failure) => {
-                cache_open_failure(shared, failure, None);
-                Err(failure.into_public(None))
-            }
+            Err(failure) => Err(open_failure(shared, before, failure, None)),
         }
+    }
+
+    /// The noninteractive reopen that follows a successful recovery. An
+    /// uninitialized or recovery-required authority is a projected state,
+    /// not a failure of the recovery that preceded it. A contended open
+    /// keeps the service and status the runtime had before the attempt.
+    fn reopen(
+        &mut self,
+        shared: &RuntimeShared,
+        before: CredentialRuntimeStatus,
+    ) -> Result<(), CredentialError> {
+        let previous = self.service.take();
+        match self.backend.open(Arc::clone(&self.token_source)) {
+            Ok(CredentialRuntimeOpen::Ready(service)) => self.adopt_service(shared, *service, None),
+            Ok(CredentialRuntimeOpen::Uninitialized) => {
+                shared.cache_open_state(
+                    CredentialRuntimeLifecycle::Uninitialized,
+                    CredentialBackendAvailability::Available,
+                    None,
+                );
+                Ok(())
+            }
+            Ok(CredentialRuntimeOpen::RecoveryRequired) => {
+                shared.cache_open_state(
+                    CredentialRuntimeLifecycle::RecoveryRequired,
+                    CredentialBackendAvailability::RecoveryRequired,
+                    None,
+                );
+                Ok(())
+            }
+            Err(CredentialStoreFailure::OperationInProgress) => {
+                self.service = previous;
+                Err(open_failure(
+                    shared,
+                    before,
+                    CredentialStoreFailure::OperationInProgress,
+                    None,
+                ))
+            }
+            Err(failure) => Err(open_failure(shared, before, failure, None)),
+        }
+    }
+
+    /// Reopens without prompting before the repair only when it changed an
+    /// owner. Any other closure is store-scoped and left for explicit
+    /// diagnosis; an untracked record that blocks staging is set-scoped and
+    /// never closes the runtime, so the repair finds it ready.
+    fn run_repair(
+        &mut self,
+        shared: &RuntimeShared,
+    ) -> Result<CredentialStoreRepair, CredentialError> {
+        let ownership = self
+            .backend
+            .repair_ownership()
+            .map_err(|failure| failure.into_public(None))?;
+        if ownership == StoreOwnershipRepair::Repaired {
+            let before = shared.status_snapshot();
+            shared.mark_opening(None);
+            self.reopen(shared, before)?;
+        }
+        self.ensure_ready(shared, None)?;
+        let sets = self
+            .service
+            .as_ref()
+            .expect("ready runtime owns credential service")
+            .repair_untracked_records()?;
+        Ok(CredentialStoreRepair { ownership, sets })
     }
 
     fn initialize_service(&mut self, shared: &RuntimeShared) -> Result<(), CredentialError> {
@@ -1073,18 +1206,15 @@ impl RuntimeWorker {
         if let Some(error) = shared.cached_closed_error(None, true) {
             return Err(error);
         }
+        let before = shared.status_snapshot();
         shared.mark_opening(None);
         let opened = self.backend.open(Arc::clone(&self.token_source));
         match opened {
-            Ok(CredentialRuntimeOpen::Ready(service)) => {
-                self.adopt_service(shared, *service);
-                Ok(())
-            }
+            Ok(CredentialRuntimeOpen::Ready(service)) => self.adopt_service(shared, *service, None),
             Ok(CredentialRuntimeOpen::Uninitialized) => {
                 match self.backend.initialize(Arc::clone(&self.token_source)) {
                     Ok(CredentialRuntimeOpen::Ready(service)) => {
-                        self.adopt_service(shared, *service);
-                        Ok(())
+                        self.adopt_service(shared, *service, None)
                     }
                     Ok(CredentialRuntimeOpen::Uninitialized) => {
                         shared.cache_open_state(
@@ -1110,10 +1240,7 @@ impl RuntimeWorker {
                             None,
                         ))
                     }
-                    Err(failure) => {
-                        cache_open_failure(shared, failure, None);
-                        Err(failure.into_public(None))
-                    }
+                    Err(failure) => Err(open_failure(shared, before, failure, None)),
                 }
             }
             Ok(CredentialRuntimeOpen::RecoveryRequired) => {
@@ -1128,18 +1255,58 @@ impl RuntimeWorker {
                     None,
                 ))
             }
-            Err(failure) => {
-                cache_open_failure(shared, failure, None);
-                Err(failure.into_public(None))
-            }
+            Err(failure) => Err(open_failure(shared, before, failure, None)),
         }
     }
 
-    fn adopt_service(&mut self, shared: &RuntimeShared, service: CredentialService) {
+    /// Adopts `service` unless it is bound to another authority than the
+    /// one this runtime first adopted, or decides on a journal older than
+    /// the highest epoch the runtime observed. Either refusal is store-wide
+    /// and recovery-required, leaves the runtime closed, and is reached the
+    /// same way through every reopen: ordinary, diagnosis or repair. A
+    /// reopen past the event cursor emits one `ExternallyCommitted` for the
+    /// commits other processes made while the runtime was closed.
+    fn adopt_service(
+        &mut self,
+        shared: &RuntimeShared,
+        service: CredentialService,
+        set_id: Option<&CredentialSetId>,
+    ) -> Result<(), CredentialError> {
         let snapshot = service.snapshot_status();
-        self.event_cursor = snapshot.global_epoch;
+        if let Some(floor) = &self.floor
+            && (service.authority_instance() != floor.authority
+                || snapshot.global_epoch < floor.epoch)
+        {
+            let error = content_free_error(
+                CredentialErrorCode::RecoveryRequired,
+                CredentialSafeRecoveryAction::Reconcile,
+                set_id.cloned(),
+            );
+            shared.cache_open_state(
+                CredentialRuntimeLifecycle::RecoveryRequired,
+                CredentialBackendAvailability::RecoveryRequired,
+                set_id,
+            );
+            shared.remember_closed_error(error.clone());
+            return Err(error);
+        }
+        let epoch = snapshot.global_epoch;
+        let reopened_past_cursor = self.floor.is_some() && epoch > self.event_cursor;
+        self.floor = Some(AuthorityFloor {
+            authority: service.authority_instance().to_owned(),
+            epoch,
+        });
+        self.event_cursor = epoch;
         shared.cache_service_while_admitted(snapshot);
         self.service = Some(service);
+        if reopened_past_cursor {
+            self.event_sink
+                .emit(CredentialRuntimeEvent::ExternallyCommitted {
+                    through_epoch: epoch,
+                })
+                .map_err(|_| runtime_stalled_error(None))?;
+        }
+        Ok(())
     }
 
     fn ensure_ready(
@@ -1153,11 +1320,11 @@ impl RuntimeWorker {
         if let Some(error) = shared.cached_closed_error(set_id, false) {
             return Err(error);
         }
+        let before = shared.status_snapshot();
         shared.mark_opening(set_id);
         match self.backend.open(Arc::clone(&self.token_source)) {
             Ok(CredentialRuntimeOpen::Ready(service)) => {
-                self.adopt_service(shared, *service);
-                Ok(())
+                self.adopt_service(shared, *service, set_id)
             }
             Ok(CredentialRuntimeOpen::Uninitialized) => {
                 shared.cache_open_state(
@@ -1183,10 +1350,7 @@ impl RuntimeWorker {
                     set_id.cloned(),
                 ))
             }
-            Err(failure) => {
-                cache_open_failure(shared, failure, set_id);
-                Err(failure.into_public(set_id.cloned()))
-            }
+            Err(failure) => Err(open_failure(shared, before, failure, set_id)),
         }
     }
 
@@ -1196,17 +1360,27 @@ impl RuntimeWorker {
             .as_ref()
             .expect("reconciliation requires ready credential service");
         let snapshot = service.snapshot_status();
+        if let Some(floor) = &mut self.floor {
+            floor.epoch = floor.epoch.max(snapshot.global_epoch);
+        }
         // Every epoch since the cursor must be this service's own event, in
         // order, or a commit by another process that the service observed in
         // the authority journal. Anything else is a lost event.
-        let Some((latest_epoch, events)) = service.accounted_events_since(self.event_cursor) else {
+        let Some((latest_epoch, changes)) = service.accounted_changes_since(self.event_cursor)
+        else {
             return Err(runtime_stalled_error(None));
         };
         if latest_epoch != snapshot.global_epoch {
             return Err(runtime_stalled_error(None));
         }
         shared.cache_service_while_admitted(snapshot);
-        for event in events {
+        for change in changes {
+            let event = match change {
+                AccountedChange::Local(event) => CredentialRuntimeEvent::Committed(event),
+                AccountedChange::Observed { through_epoch } => {
+                    CredentialRuntimeEvent::ExternallyCommitted { through_epoch }
+                }
+            };
             self.event_sink
                 .emit(event)
                 .map_err(|_| runtime_stalled_error(None))?;
@@ -1229,6 +1403,7 @@ fn runtime_worker_loop(
         token_source,
         service: None,
         event_cursor: 0,
+        floor: None,
     };
     while let Ok(request) = receiver.recv() {
         let Some(shared) = shared.upgrade() else {
@@ -1286,13 +1461,6 @@ fn internal_runtime_error(set_id: Option<CredentialSetId>) -> CredentialError {
     )
 }
 
-fn terminal_service_error(error: &CredentialError) -> bool {
-    matches!(
-        error.code,
-        CredentialErrorCode::StalledWorker | CredentialErrorCode::CommitUnknown
-    )
-}
-
 fn closed_service_projection(
     code: CredentialErrorCode,
 ) -> Option<(CredentialRuntimeLifecycle, CredentialBackendAvailability)> {
@@ -1324,6 +1492,26 @@ fn closed_service_projection(
         )),
         _ => None,
     }
+}
+
+/// The public error of a failed open, and the state it leaves. Contention
+/// refuses an open before any effect (another program holding the journal
+/// without sharing it, another process holding the lock) and changes
+/// nothing, so the runtime keeps the status it had before the attempt,
+/// closed or not, and the refusal is a retryable `operation_in_progress` for
+/// this request alone. Every other failure closes the runtime.
+fn open_failure(
+    shared: &RuntimeShared,
+    before: CredentialRuntimeStatus,
+    failure: CredentialStoreFailure,
+    set_id: Option<&CredentialSetId>,
+) -> CredentialError {
+    if failure == CredentialStoreFailure::OperationInProgress {
+        shared.restore_status(before);
+    } else {
+        cache_open_failure(shared, failure, set_id);
+    }
+    failure.into_public(set_id.cloned())
 }
 
 fn cache_open_failure(
@@ -1368,25 +1556,31 @@ fn cache_open_failure(
 mod tests {
     use super::{
         AdmissionState, CredentialEventSinkFailure, CredentialReplaceDraft, CredentialRuntime,
-        CredentialRuntimeBackend, CredentialRuntimeEventSink, CredentialRuntimeLifecycle,
-        CredentialRuntimeOpen, CredentialRuntimeRecovery, RuntimeReleaseBarrier,
-        SecureUuidCredentialTokenSource,
+        CredentialRuntimeBackend, CredentialRuntimeEvent, CredentialRuntimeEventSink,
+        CredentialRuntimeLifecycle, CredentialRuntimeOpen, CredentialRuntimeRecovery,
+        RuntimeReleaseBarrier, SecureUuidCredentialTokenSource,
     };
     use crate::credentials::domain::{
-        AuthorityJournal, CredentialStoreFailure, EncodedCredentialRecord, StoredSecretBundle,
+        AuthorityJournal, CredentialMutationKind, CredentialStoreFailure, EncodedCredentialRecord,
+        PendingCredentialIntent, StoredSecretBundle,
     };
-    use crate::credentials::fake::{FakeCredentialStore, FakeStoreCall};
+    use crate::credentials::fake::{
+        FAKE_AUTHORITY, FakeCredentialStore, FakeSettingsActivationPort, FakeSettingsCall,
+        FakeStoreCall,
+    };
     use crate::credentials::service::{
         AuthoritativeActiveRead, CredentialChangeEvent, CredentialEntryStore,
         CredentialMutationSession, CredentialResolution, CredentialService, CredentialTokenSource,
-        CredentialUseRequest, DeleteCredentialSet, PrepareCredentialActivation,
+        CredentialUseRequest, DeleteCredentialSet, ObservedActivation, PrepareCredentialActivation,
+        StoreOwnershipRepair, UntrackedRecordOutcome, UntrackedRecordRepair,
     };
     use crate::credentials::test_support::DeterministicTokenSource;
     use audio_graph_ipc_contract::credential_contract::{
         AuthMethodId, BuiltInCredentialSetId, CredentialAudience, CredentialBackendAvailability,
-        CredentialBackendKind, CredentialErrorCode, CredentialIdempotencyToken,
+        CredentialBackendKind, CredentialError, CredentialErrorCode, CredentialIdempotencyToken,
         CredentialOperationId, CredentialPurpose, CredentialRevision, CredentialSetId,
-        CredentialSetRecordState, CredentialWorkerState, SecureTransportScheme,
+        CredentialSetRecordState, CredentialSetRecoveryState, CredentialWorkerState,
+        SecureTransportScheme,
     };
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1548,6 +1742,18 @@ mod tests {
                 control: Arc::clone(&self.control),
             }))
         }
+
+        fn repair_untracked_records(
+            &self,
+            _observed: &[ObservedActivation],
+            _admit: &dyn Fn(&AuthorityJournal) -> bool,
+        ) -> Result<Option<Vec<UntrackedRecordRepair>>, CredentialStoreFailure> {
+            unreachable!("no runtime test repairs through the delayed store")
+        }
+
+        fn authority_instance(&self) -> &str {
+            FAKE_AUTHORITY
+        }
     }
 
     struct DelayedMutationSession<'a> {
@@ -1692,6 +1898,10 @@ mod tests {
         ) -> Result<CredentialRuntimeRecovery, CredentialStoreFailure> {
             Ok(CredentialRuntimeRecovery::RecoveryRequired)
         }
+
+        fn repair_ownership(&mut self) -> Result<StoreOwnershipRepair, CredentialStoreFailure> {
+            Ok(StoreOwnershipRepair::Unchanged)
+        }
     }
 
     struct OpeningControl {
@@ -1799,6 +2009,10 @@ mod tests {
         ) -> Result<CredentialRuntimeRecovery, CredentialStoreFailure> {
             Ok(CredentialRuntimeRecovery::RecoveryRequired)
         }
+
+        fn repair_ownership(&mut self) -> Result<StoreOwnershipRepair, CredentialStoreFailure> {
+            Ok(StoreOwnershipRepair::Unchanged)
+        }
     }
 
     struct LockedThenRecoveredBackend {
@@ -1835,6 +2049,10 @@ mod tests {
             self.recovery_calls.fetch_add(1, Ordering::SeqCst);
             Ok(CredentialRuntimeRecovery::Ready)
         }
+
+        fn repair_ownership(&mut self) -> Result<StoreOwnershipRepair, CredentialStoreFailure> {
+            Ok(StoreOwnershipRepair::Unchanged)
+        }
     }
 
     struct AlwaysReadyBackend {
@@ -1863,6 +2081,10 @@ mod tests {
             &mut self,
         ) -> Result<CredentialRuntimeRecovery, CredentialStoreFailure> {
             Ok(CredentialRuntimeRecovery::Ready)
+        }
+
+        fn repair_ownership(&mut self) -> Result<StoreOwnershipRepair, CredentialStoreFailure> {
+            Ok(StoreOwnershipRepair::Unchanged)
         }
     }
 
@@ -1897,15 +2119,19 @@ mod tests {
             self.recovery_calls.fetch_add(1, Ordering::SeqCst);
             Ok(CredentialRuntimeRecovery::Ready)
         }
+
+        fn repair_ownership(&mut self) -> Result<StoreOwnershipRepair, CredentialStoreFailure> {
+            Ok(StoreOwnershipRepair::Unchanged)
+        }
     }
 
     struct RecordingEventSink {
-        sender: Mutex<mpsc::Sender<CredentialChangeEvent>>,
+        sender: Mutex<mpsc::Sender<CredentialRuntimeEvent>>,
         emitted: AtomicUsize,
     }
 
     impl CredentialRuntimeEventSink for RecordingEventSink {
-        fn emit(&self, event: CredentialChangeEvent) -> Result<(), CredentialEventSinkFailure> {
+        fn emit(&self, event: CredentialRuntimeEvent) -> Result<(), CredentialEventSinkFailure> {
             self.emitted.fetch_add(1, Ordering::SeqCst);
             self.sender
                 .lock()
@@ -1915,12 +2141,20 @@ mod tests {
         }
     }
 
+    /// The change event of a local commit.
+    fn committed(event: CredentialRuntimeEvent) -> CredentialChangeEvent {
+        match event {
+            CredentialRuntimeEvent::Committed(event) => event,
+            other => panic!("expected a local commit event, got {other:?}"),
+        }
+    }
+
     struct RejectingEventSink {
         emitted: Arc<AtomicUsize>,
     }
 
     impl CredentialRuntimeEventSink for RejectingEventSink {
-        fn emit(&self, _event: CredentialChangeEvent) -> Result<(), CredentialEventSinkFailure> {
+        fn emit(&self, _event: CredentialRuntimeEvent) -> Result<(), CredentialEventSinkFailure> {
             self.emitted.fetch_add(1, Ordering::SeqCst);
             Err(CredentialEventSinkFailure)
         }
@@ -1960,6 +2194,10 @@ mod tests {
             &mut self,
         ) -> Result<CredentialRuntimeRecovery, CredentialStoreFailure> {
             Ok(CredentialRuntimeRecovery::RecoveryRequired)
+        }
+
+        fn repair_ownership(&mut self) -> Result<StoreOwnershipRepair, CredentialStoreFailure> {
+            Ok(StoreOwnershipRepair::Unchanged)
         }
     }
 
@@ -2171,9 +2409,11 @@ mod tests {
         assert_eq!(store.begin_mutation_count(), begin_count);
 
         control.release();
-        let late_event = event_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("late committed change is emitted");
+        let late_event = committed(
+            event_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("late committed change is emitted"),
+        );
         assert_eq!(late_event.global_epoch, 1);
         assert!(!format!("{late_event:?}").contains("runtime-secret-canary"));
         assert_eq!(
@@ -2215,9 +2455,11 @@ mod tests {
             third.idempotency_token,
             idempotency("00000000-0000-0000-0000-000000000103")
         );
-        let third_event = event_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("third committed change event");
+        let third_event = committed(
+            event_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("third committed change event"),
+        );
         assert_eq!(third_event.global_epoch, 2);
         assert_eq!(event_sink.emitted.load(Ordering::SeqCst), 2);
         assert_eq!(open_calls.load(Ordering::SeqCst), 1);
@@ -2282,9 +2524,11 @@ mod tests {
             .expect("join raced replace")
             .expect_err("caller deadline expires at release boundary");
         assert_eq!(timeout.code, CredentialErrorCode::OperationInProgress);
-        let late_event = event_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("committed replace event precedes release");
+        let late_event = committed(
+            event_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("committed replace event precedes release"),
+        );
 
         let coherent = runtime.status();
         assert_eq!(coherent.lifecycle, CredentialRuntimeLifecycle::Ready);
@@ -2386,8 +2630,11 @@ mod tests {
         assert!(event_rx.try_recv().is_err(), "initialize is eventless");
     }
 
+    /// A store-scoped closure (here a locked backend) is left only through
+    /// explicit diagnosis: ordinary requests never reopen it, and diagnosis
+    /// reopens without an event.
     #[tokio::test]
-    async fn explicit_diagnose_is_the_only_recovery_route_and_reopens_without_an_event() {
+    async fn explicit_diagnosis_is_the_only_route_back_from_a_store_scoped_closure() {
         let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
         let store = Arc::new(FakeCredentialStore::new(journal.clone()));
         let open_calls = Arc::new(AtomicUsize::new(0));
@@ -2460,8 +2707,14 @@ mod tests {
         assert!(event_rx.try_recv().is_err(), "diagnosis is eventless");
     }
 
+    /// Every store-scoped failure closes a ready runtime: the next ordinary
+    /// request is refused from the cached closure without touching the
+    /// store, and only explicit diagnosis reopens it. That includes a
+    /// recovery-required authority: here a journal restored to an epoch
+    /// older than the one the runtime observed, which diagnosis cannot
+    /// reopen either, since no reopen goes below the runtime's floor.
     #[tokio::test]
-    async fn post_ready_closed_failures_require_diagnosis_without_further_ordinary_io() {
+    async fn store_scoped_closures_require_diagnosis_without_further_ordinary_io() {
         let cases = [
             (
                 "locked",
@@ -2485,7 +2738,7 @@ mod tests {
                 CredentialBackendAvailability::Unavailable,
             ),
             (
-                "recovery_required",
+                "rolled_back_journal",
                 None,
                 CredentialErrorCode::RecoveryRequired,
                 CredentialRuntimeLifecycle::RecoveryRequired,
@@ -2518,12 +2771,7 @@ mod tests {
 
         for (name, store_failure, expected_code, expected_lifecycle, expected_availability) in cases
         {
-            let mut journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
-            if store_failure.is_none() {
-                journal.sets.retain(|set| {
-                    set.set_id != CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram)
-                });
-            }
+            let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
             let store = Arc::new(FakeCredentialStore::new(journal.clone()));
             let open_calls = Arc::new(AtomicUsize::new(0));
             let recovery_calls = Arc::new(AtomicUsize::new(0));
@@ -2535,7 +2783,7 @@ mod tests {
             runtime
                 .configure(
                     Box::new(CountingReadyBackend {
-                        journal,
+                        journal: journal.clone(),
                         store: Arc::clone(&store),
                         open_calls: Arc::clone(&open_calls),
                         recovery_calls: Arc::clone(&recovery_calls),
@@ -2552,8 +2800,23 @@ mod tests {
                 .expect("open genuinely ready runtime");
             assert_eq!(open_calls.load(Ordering::SeqCst), 1);
 
-            if let Some(failure) = store_failure {
-                store.fail_next(FakeStoreCall::ReadActive, failure);
+            match store_failure {
+                Some(failure) => store.fail_next(FakeStoreCall::ReadActive, failure),
+                None => {
+                    runtime
+                        .replace_set(
+                            api_key_draft("00000000-0000-0000-0000-000000000301", None),
+                            Duration::from_secs(1),
+                        )
+                        .await
+                        .expect("commit an epoch the restored journal lacks");
+                    committed(
+                        event_rx
+                            .recv_timeout(Duration::from_secs(1))
+                            .expect("the commit's event"),
+                    );
+                    store.restore_journal(journal);
+                }
             }
             let first = match runtime
                 .resolve_for_use(deepgram_use_request(), Duration::from_secs(1))
@@ -2583,11 +2846,23 @@ mod tests {
                 recovery_calls.load(Ordering::SeqCst),
             ));
 
-            let reopened = runtime
-                .diagnose_or_unlock(Duration::from_secs(1))
-                .await
-                .expect("explicit payload-free diagnosis reopens the service");
-            assert_eq!(reopened.lifecycle, CredentialRuntimeLifecycle::Ready);
+            let reopened = runtime.diagnose_or_unlock(Duration::from_secs(1)).await;
+            if store_failure.is_some() {
+                let reopened =
+                    reopened.expect("explicit payload-free diagnosis reopens the service");
+                assert_eq!(reopened.lifecycle, CredentialRuntimeLifecycle::Ready);
+            } else {
+                assert_eq!(
+                    reopened
+                        .expect_err("the restored journal is below the floor")
+                        .code,
+                    CredentialErrorCode::RecoveryRequired
+                );
+                assert_eq!(
+                    runtime.status().lifecycle,
+                    CredentialRuntimeLifecycle::RecoveryRequired
+                );
+            }
             assert_eq!(open_calls.load(Ordering::SeqCst), 2);
             assert_eq!(recovery_calls.load(Ordering::SeqCst), 1);
             assert!(
@@ -2608,6 +2883,136 @@ mod tests {
             ));
         }
         assert_eq!(observed, expected_rows);
+    }
+
+    /// A refusal decided from one set's own state, here an intent another
+    /// process persisted for that set before it stopped, is set-scoped: the
+    /// runtime stays ready, every retry reads the store again, and another
+    /// set stays usable. Once that process recovers, an ordinary retry reads
+    /// the recovered journal under the lock and resolves the set, with no
+    /// reopen and no diagnosis, and consumers are told that another process
+    /// committed.
+    #[tokio::test]
+    async fn a_set_scoped_refusal_keeps_the_runtime_ready_until_another_process_recovers() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let open_calls = Arc::new(AtomicUsize::new(0));
+        let recovery_calls = Arc::new(AtomicUsize::new(0));
+        let (event_tx, event_rx) = mpsc::channel();
+        let runtime = CredentialRuntime::dormant_with_token_source(
+            CredentialBackendKind::InMemory,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        runtime
+            .configure(
+                Box::new(CountingReadyBackend {
+                    journal,
+                    store: Arc::clone(&store),
+                    open_calls: Arc::clone(&open_calls),
+                    recovery_calls: Arc::clone(&recovery_calls),
+                }),
+                Arc::new(RecordingEventSink {
+                    sender: Mutex::new(event_tx),
+                    emitted: AtomicUsize::new(0),
+                }),
+            )
+            .expect("configure runtime");
+        let deadline = Duration::from_secs(1);
+        let deepgram = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
+        let created = runtime
+            .replace_set(
+                api_key_draft("00000000-0000-0000-0000-000000000601", None),
+                deadline,
+            )
+            .await
+            .expect("create the set");
+        assert_eq!(
+            committed(event_rx.recv_timeout(deadline).expect("create event")).global_epoch,
+            1
+        );
+
+        let mut interrupted = store.journal_snapshot();
+        interrupted.pending_intents.push(PendingCredentialIntent {
+            operation_id: CredentialOperationId::parse("60606060-6060-4060-8060-606060606060")
+                .expect("canonical operation id"),
+            idempotency_token: idempotency("61616161-6161-4161-8161-616161616161"),
+            set_id: deepgram.clone(),
+            mutation_kind: CredentialMutationKind::Replace,
+            expected_revision: created.new_revision.clone(),
+            proposed_revision: CredentialRevision::parse("62626262-6262-4262-8262-626262626262")
+                .expect("canonical revision"),
+            recovery_state: CredentialSetRecoveryState::PendingIntent,
+        });
+        interrupted
+            .set_state_mut(&deepgram)
+            .expect("built-in set")
+            .recovery_state = CredentialSetRecoveryState::PendingIntent;
+        store.restore_journal(interrupted);
+
+        for _ in 0..2 {
+            let calls_before = store.calls().len();
+            let refused = runtime
+                .resolve_for_use(deepgram_use_request(), deadline)
+                .await
+                .expect_err("the set has another process's pending intent");
+            assert_eq!(refused.code, CredentialErrorCode::RecoveryRequired);
+            assert!(
+                store.calls().len() > calls_before,
+                "the retry read the store"
+            );
+            assert_eq!(
+                runtime.status().lifecycle,
+                CredentialRuntimeLifecycle::Ready
+            );
+        }
+        let other = runtime
+            .replace_set(
+                CredentialReplaceDraft::api_key(
+                    CredentialSetId::BuiltIn(BuiltInCredentialSetId::Openai),
+                    AuthMethodId::ApiKey,
+                    "runtime-secret-canary".to_owned(),
+                    None,
+                    idempotency("00000000-0000-0000-0000-000000000602"),
+                ),
+                deadline,
+            )
+            .await
+            .expect("another set stays usable");
+        assert_eq!(
+            committed(event_rx.recv_timeout(deadline).expect("other set's event")).receipt,
+            other
+        );
+
+        let mut recovered = store.journal_snapshot();
+        recovered.pending_intents.clear();
+        recovered
+            .set_state_mut(&deepgram)
+            .expect("built-in set")
+            .recovery_state = CredentialSetRecoveryState::None;
+        recovered.global_epoch += 1;
+        let recovered_epoch = recovered.global_epoch;
+        store.restore_journal(recovered);
+
+        match runtime
+            .resolve_for_use(deepgram_use_request(), deadline)
+            .await
+        {
+            Ok(CredentialResolution::Stored(lease)) => {
+                assert_eq!(Some(lease.revision.clone()), created.new_revision);
+            }
+            _ => panic!("the retry sees the other process's recovery"),
+        }
+        assert_eq!(
+            event_rx
+                .recv_timeout(deadline)
+                .expect("the signal of the recovery's commit"),
+            CredentialRuntimeEvent::ExternallyCommitted {
+                through_epoch: recovered_epoch
+            }
+        );
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(recovery_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2803,12 +3208,16 @@ mod tests {
             idempotency("00000000-0000-0000-0000-000000000402")
         );
 
-        let first = event_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("replace event");
-        let second = event_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("delete event");
+        let first = committed(
+            event_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("replace event"),
+        );
+        let second = committed(
+            event_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("delete event"),
+        );
         assert_eq!((first.global_epoch, second.global_epoch), (1, 2));
         assert!(event_rx.try_recv().is_err());
         assert_eq!(event_sink.emitted.load(Ordering::SeqCst), 2);
@@ -2822,8 +3231,9 @@ mod tests {
     /// authority journal, with no local event. A request that adopts that
     /// epoch, including one that then loses with `RevisionConflict`, leaves
     /// the runtime admitted at the new epoch: its next read and a replace on
-    /// the new revision succeed, and it emits only the event of its own
-    /// commit.
+    /// the new revision succeed. Consumers in this process are told once
+    /// that another process committed, with no receipt or set, and then get
+    /// the event of this runtime's own commit.
     #[tokio::test]
     async fn a_runtime_that_observes_another_runtimes_commit_stays_admitted() {
         let deepgram = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
@@ -2944,6 +3354,14 @@ mod tests {
                 ),
                 "{first}"
             );
+            assert_eq!(
+                loser_rx
+                    .recv_timeout(deadline)
+                    .expect("the signal of another process's commit"),
+                CredentialRuntimeEvent::ExternallyCommitted { through_epoch: 1 },
+                "{first}"
+            );
+            assert!(loser_rx.try_recv().is_err(), "{first}");
 
             match loser
                 .resolve_for_use(deepgram_use_request(), deadline)
@@ -2965,9 +3383,11 @@ mod tests {
                 .await
                 .expect("a replace on the new revision");
             assert_eq!(replaced.previous_revision, won.new_revision, "{first}");
-            let event = loser_rx
-                .recv_timeout(deadline)
-                .expect("the event of the losing runtime's own commit");
+            let event = committed(
+                loser_rx
+                    .recv_timeout(deadline)
+                    .expect("the event of the losing runtime's own commit"),
+            );
             assert_eq!(event.global_epoch, 2, "{first}");
             assert!(loser_rx.try_recv().is_err(), "{first}");
         }
@@ -2999,9 +3419,11 @@ mod tests {
             )
             .await
             .expect("replace through serialized runtime");
-        event_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("replace event");
+        committed(
+            event_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("replace event"),
+        );
 
         let resolution = runtime
             .resolve_for_use(
@@ -3207,6 +3629,51 @@ mod tests {
         assert_eq!(emitted.load(Ordering::SeqCst), 1);
     }
 
+    /// A request whose publication outcome is unknown keeps `CommitUnknown`
+    /// when the sink also refuses the signal of another process's commit
+    /// that the request observed: the runtime stalls either way, and only
+    /// the unknown outcome says that a publication needs reconciling.
+    #[tokio::test]
+    async fn an_unknown_outcome_survives_a_refused_event() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let mut external = journal.clone();
+        external.global_epoch = 1;
+        store.restore_journal(external);
+        store.fail_next(
+            FakeStoreCall::CommitJournal,
+            CredentialStoreFailure::CommitUnknown,
+        );
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let runtime = CredentialRuntime::dormant_with_token_source(
+            CredentialBackendKind::InMemory,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        runtime
+            .configure(
+                Box::new(AlwaysReadyBackend { journal, store }),
+                Arc::new(RejectingEventSink {
+                    emitted: Arc::clone(&emitted),
+                }),
+            )
+            .expect("configure runtime");
+
+        let failure = runtime
+            .replace_set(
+                api_key_draft("00000000-0000-0000-0000-000000000901", None),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("the publication's outcome is unknown");
+
+        assert_eq!(failure.code, CredentialErrorCode::CommitUnknown);
+        assert_eq!(emitted.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Stalled
+        );
+    }
+
     #[tokio::test]
     async fn disconnected_channel_is_terminal_and_has_no_locator_or_secret_artifact() {
         let runtime = CredentialRuntime::dormant_with_token_source(
@@ -3236,5 +3703,994 @@ mod tests {
         assert_eq!(cached.lifecycle, CredentialRuntimeLifecycle::Stalled);
         assert_eq!(cached.service.worker.state, CredentialWorkerState::Stalled);
         assert_eq!(cached.service.worker.set_id, None);
+    }
+
+    /// Refuses to open, as hardening refuses a root another principal owns,
+    /// until an explicit ownership repair takes ownership; then opens ready.
+    struct ForeignOwnedBackend {
+        journal: AuthorityJournal,
+        store: Arc<FakeCredentialStore>,
+        owned: bool,
+        open_calls: Arc<AtomicUsize>,
+        ownership_repairs: Arc<AtomicUsize>,
+    }
+
+    impl CredentialRuntimeBackend for ForeignOwnedBackend {
+        fn open(
+            &mut self,
+            token_source: Arc<dyn CredentialTokenSource>,
+        ) -> Result<CredentialRuntimeOpen, CredentialStoreFailure> {
+            self.open_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.owned {
+                return Err(CredentialStoreFailure::PermissionHardeningFailed);
+            }
+            Ok(CredentialRuntimeOpen::Ready(Box::new(
+                CredentialService::new(self.store.clone(), self.journal.clone(), token_source),
+            )))
+        }
+
+        fn initialize(
+            &mut self,
+            _token_source: Arc<dyn CredentialTokenSource>,
+        ) -> Result<CredentialRuntimeOpen, CredentialStoreFailure> {
+            Err(CredentialStoreFailure::RevisionConflict)
+        }
+
+        fn diagnose_or_unlock(
+            &mut self,
+        ) -> Result<CredentialRuntimeRecovery, CredentialStoreFailure> {
+            Ok(CredentialRuntimeRecovery::Ready)
+        }
+
+        fn repair_ownership(&mut self) -> Result<StoreOwnershipRepair, CredentialStoreFailure> {
+            self.ownership_repairs.fetch_add(1, Ordering::SeqCst);
+            Ok(if std::mem::replace(&mut self.owned, true) {
+                StoreOwnershipRepair::Unchanged
+            } else {
+                StoreOwnershipRepair::Repaired
+            })
+        }
+    }
+
+    /// Opens recovery-required every time and counts the opens.
+    struct RecoveryRequiredBackend {
+        open_calls: Arc<AtomicUsize>,
+    }
+
+    impl CredentialRuntimeBackend for RecoveryRequiredBackend {
+        fn open(
+            &mut self,
+            _token_source: Arc<dyn CredentialTokenSource>,
+        ) -> Result<CredentialRuntimeOpen, CredentialStoreFailure> {
+            self.open_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CredentialRuntimeOpen::RecoveryRequired)
+        }
+
+        fn initialize(
+            &mut self,
+            _token_source: Arc<dyn CredentialTokenSource>,
+        ) -> Result<CredentialRuntimeOpen, CredentialStoreFailure> {
+            Err(CredentialStoreFailure::RevisionConflict)
+        }
+
+        fn diagnose_or_unlock(
+            &mut self,
+        ) -> Result<CredentialRuntimeRecovery, CredentialStoreFailure> {
+            Ok(CredentialRuntimeRecovery::RecoveryRequired)
+        }
+
+        fn repair_ownership(&mut self) -> Result<StoreOwnershipRepair, CredentialStoreFailure> {
+            Ok(StoreOwnershipRepair::Unchanged)
+        }
+    }
+
+    fn silent_sink() -> Arc<RecordingEventSink> {
+        let (sender, _receiver) = mpsc::channel();
+        Arc::new(RecordingEventSink {
+            sender: Mutex::new(sender),
+            emitted: AtomicUsize::new(0),
+        })
+    }
+
+    fn repair_activation(
+        set_id: BuiltInCredentialSetId,
+        token: &str,
+    ) -> PrepareCredentialActivation {
+        PrepareCredentialActivation {
+            set_id: set_id.into(),
+            auth_method_id: AuthMethodId::ApiKey,
+            material: StoredSecretBundle::api_key("runtime-repair-canary").expect("API key"),
+            expected_revision: None,
+            expected_settings_revision: 1,
+            proposed_settings_revision: 2,
+            idempotency_token: idempotency(token),
+        }
+    }
+
+    /// An open that hardening refused stays refused for ordinary requests,
+    /// which never repair anything. The explicit repair takes ownership,
+    /// reopens without prompting, and reports closed outcomes only; a second
+    /// repair has nothing to change and does not reopen.
+    #[tokio::test]
+    async fn explicit_repair_takes_ownership_reopens_and_never_runs_for_ordinary_requests() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let open_calls = Arc::new(AtomicUsize::new(0));
+        let ownership_repairs = Arc::new(AtomicUsize::new(0));
+        let runtime = CredentialRuntime::dormant_with_token_source(
+            CredentialBackendKind::InMemory,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let sink = silent_sink();
+        runtime
+            .configure(
+                Box::new(ForeignOwnedBackend {
+                    journal,
+                    store: Arc::clone(&store),
+                    owned: false,
+                    open_calls: Arc::clone(&open_calls),
+                    ownership_repairs: Arc::clone(&ownership_repairs),
+                }),
+                sink.clone(),
+            )
+            .expect("configure runtime");
+
+        for _ in 0..2 {
+            let refused = runtime
+                .resolve_for_use(deepgram_use_request(), Duration::from_secs(1))
+                .await
+                .expect_err("a refused root stays refused for ordinary requests");
+            assert_eq!(refused.code, CredentialErrorCode::PermissionHardeningFailed);
+        }
+        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ownership_repairs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Unavailable
+        );
+
+        let repaired = runtime
+            .repair_store(Duration::from_secs(1))
+            .await
+            .expect("explicit repair");
+        assert_eq!(repaired.ownership, StoreOwnershipRepair::Repaired);
+        assert!(
+            repaired
+                .sets
+                .iter()
+                .all(|set| set.outcome == UntrackedRecordOutcome::Clean)
+        );
+        assert_eq!(open_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Ready
+        );
+        assert!(!format!("{repaired:?}").contains("runtime-repair-canary"));
+
+        let again = runtime
+            .repair_store(Duration::from_secs(1))
+            .await
+            .expect("a second repair");
+        assert_eq!(again.ownership, StoreOwnershipRepair::Unchanged);
+        assert_eq!(open_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store
+                .calls()
+                .iter()
+                .filter(|call| **call == FakeStoreCall::RepairUntracked)
+                .count(),
+            2
+        );
+        assert_eq!(sink.emitted.load(Ordering::SeqCst), 0);
+    }
+
+    /// A staging record the journal no longer tracks, from an activation
+    /// another process prepared and whose publication was lost, refuses
+    /// staging for its set with `CorruptRecord`. That refusal is
+    /// set-scoped, so the runtime stays ready and the next request reads the
+    /// store again. The explicit repair then removes the untracked record
+    /// without a reopen and keeps the staging a pending activation owns.
+    #[tokio::test]
+    async fn explicit_repair_removes_an_untracked_record_while_the_runtime_stays_ready() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let open_calls = Arc::new(AtomicUsize::new(0));
+        let recovery_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = CredentialRuntime::dormant_with_token_source(
+            CredentialBackendKind::InMemory,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        runtime
+            .configure(
+                Box::new(CountingReadyBackend {
+                    journal,
+                    store: Arc::clone(&store),
+                    open_calls: Arc::clone(&open_calls),
+                    recovery_calls: Arc::clone(&recovery_calls),
+                }),
+                silent_sink(),
+            )
+            .expect("configure runtime");
+        store.plant_staging(
+            CredentialOperationId::parse("00000000-0000-4000-8000-000000000901")
+                .expect("canonical operation id"),
+            BuiltInCredentialSetId::Deepgram.into(),
+        );
+        store.fail_next(
+            FakeStoreCall::WriteStaging,
+            CredentialStoreFailure::CorruptRecord,
+        );
+        let blocked = runtime
+            .prepare_settings_activation(
+                repair_activation(
+                    BuiltInCredentialSetId::Openai,
+                    "00000000-0000-4000-8000-000000000902",
+                ),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("an untracked record blocks staging");
+        assert_eq!(blocked.code, CredentialErrorCode::CorruptRecord);
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Ready
+        );
+        let calls_before_retry = store.calls().len();
+        let missing = runtime
+            .resolve_for_use(deepgram_use_request(), Duration::from_secs(1))
+            .await
+            .expect_err("the set has no active record");
+        assert_eq!(missing.code, CredentialErrorCode::Missing);
+        assert!(store.calls().len() > calls_before_retry);
+        assert_eq!(store.staging_count(), 1);
+
+        let repaired = runtime
+            .repair_store(Duration::from_secs(1))
+            .await
+            .expect("explicit repair on the ready runtime");
+
+        assert_eq!(repaired.ownership, StoreOwnershipRepair::Unchanged);
+        let outcome = |set_id: BuiltInCredentialSetId| {
+            repaired
+                .sets
+                .iter()
+                .find(|set| set.set_id == CredentialSetId::from(set_id))
+                .expect("every built-in set is reported")
+                .outcome
+        };
+        assert_eq!(
+            outcome(BuiltInCredentialSetId::Deepgram),
+            UntrackedRecordOutcome::Removed
+        );
+        assert_eq!(
+            outcome(BuiltInCredentialSetId::Openai),
+            UntrackedRecordOutcome::Tracked
+        );
+        assert_eq!(store.staging_count(), 0);
+        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(recovery_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Ready
+        );
+    }
+
+    /// A recovery-required authority is left to explicit diagnosis: the
+    /// repair does not reopen it and reports the same closure.
+    #[tokio::test]
+    async fn explicit_repair_leaves_a_recovery_required_authority_to_diagnosis() {
+        let open_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = CredentialRuntime::dormant_with_token_source(
+            CredentialBackendKind::InMemory,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        runtime
+            .configure(
+                Box::new(RecoveryRequiredBackend {
+                    open_calls: Arc::clone(&open_calls),
+                }),
+                silent_sink(),
+            )
+            .expect("configure runtime");
+        let closed = runtime
+            .resolve_for_use(deepgram_use_request(), Duration::from_secs(1))
+            .await
+            .expect_err("the authority needs recovery");
+        assert_eq!(closed.code, CredentialErrorCode::RecoveryRequired);
+
+        let refused = runtime
+            .repair_store(Duration::from_secs(1))
+            .await
+            .expect_err("the repair does not reopen a recovery-required authority");
+
+        assert_eq!(refused.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::RecoveryRequired
+        );
+    }
+
+    /// Opens a service over the current journal of `store`, as a real open
+    /// reads the authority. Each explicit ownership repair reports a changed
+    /// owner and, once, switches later opens to `rebound`, as a path that
+    /// now reaches another authority pair would.
+    struct ReopeningBackend {
+        store: Arc<FakeCredentialStore>,
+        rebound: Option<Arc<FakeCredentialStore>>,
+    }
+
+    impl CredentialRuntimeBackend for ReopeningBackend {
+        fn open(
+            &mut self,
+            token_source: Arc<dyn CredentialTokenSource>,
+        ) -> Result<CredentialRuntimeOpen, CredentialStoreFailure> {
+            Ok(CredentialRuntimeOpen::Ready(Box::new(
+                CredentialService::new(
+                    self.store.clone(),
+                    self.store.journal_snapshot(),
+                    token_source,
+                ),
+            )))
+        }
+
+        fn initialize(
+            &mut self,
+            _token_source: Arc<dyn CredentialTokenSource>,
+        ) -> Result<CredentialRuntimeOpen, CredentialStoreFailure> {
+            Err(CredentialStoreFailure::RevisionConflict)
+        }
+
+        fn diagnose_or_unlock(
+            &mut self,
+        ) -> Result<CredentialRuntimeRecovery, CredentialStoreFailure> {
+            Ok(CredentialRuntimeRecovery::Ready)
+        }
+
+        fn repair_ownership(&mut self) -> Result<StoreOwnershipRepair, CredentialStoreFailure> {
+            if let Some(rebound) = self.rebound.take() {
+                self.store = rebound;
+            }
+            Ok(StoreOwnershipRepair::Repaired)
+        }
+    }
+
+    /// Once a runtime observed an epoch, no reopen adopts an older journal
+    /// of its authority or a service bound to another authority: the reopen
+    /// the explicit repair starts is refused as recovery-required before
+    /// the repair reaches any record, and explicit diagnosis refuses the
+    /// same service. The runtime stays closed.
+    #[tokio::test]
+    async fn a_reopen_never_adopts_an_older_journal_or_another_authority() {
+        for rebind in [false, true] {
+            let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+                CredentialBackendKind::InMemory,
+            )));
+            let mut ahead = AuthorityJournal::new(CredentialBackendKind::InMemory);
+            ahead.global_epoch = 5;
+            let other = Arc::new(FakeCredentialStore::bound_to(ahead, "other-authority"));
+            let runtime = CredentialRuntime::dormant_with_token_source(
+                CredentialBackendKind::InMemory,
+                Arc::new(DeterministicTokenSource::default()),
+            );
+            let (sender, _events) = mpsc::channel();
+            runtime
+                .configure(
+                    Box::new(ReopeningBackend {
+                        store: Arc::clone(&store),
+                        rebound: rebind.then(|| Arc::clone(&other)),
+                    }),
+                    Arc::new(RecordingEventSink {
+                        sender: Mutex::new(sender),
+                        emitted: AtomicUsize::new(0),
+                    }),
+                )
+                .expect("configure runtime");
+            runtime
+                .replace_set(
+                    api_key_draft("00000000-0000-4000-8000-000000000911", None),
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect("commit epoch 1");
+            store.fail_next(
+                FakeStoreCall::ReadActive,
+                CredentialStoreFailure::PermissionHardeningFailed,
+            );
+            let closed = runtime
+                .resolve_for_use(deepgram_use_request(), Duration::from_secs(1))
+                .await
+                .expect_err("hardening refuses a record");
+            assert_eq!(closed.code, CredentialErrorCode::PermissionHardeningFailed);
+            if !rebind {
+                store.restore_journal(AuthorityJournal::new(CredentialBackendKind::InMemory));
+            }
+
+            let refused = runtime
+                .repair_store(Duration::from_secs(1))
+                .await
+                .expect_err("the reopened service is below the runtime's floor");
+            assert_eq!(
+                refused.code,
+                CredentialErrorCode::RecoveryRequired,
+                "{rebind}"
+            );
+            assert_eq!(
+                runtime.status().lifecycle,
+                CredentialRuntimeLifecycle::RecoveryRequired
+            );
+            for reached in [&store, &other] {
+                assert!(!reached.calls().contains(&FakeStoreCall::RepairUntracked));
+            }
+            let diagnosed = runtime
+                .diagnose_or_unlock(Duration::from_secs(1))
+                .await
+                .expect_err("diagnosis refuses the same service");
+            assert_eq!(diagnosed.code, CredentialErrorCode::RecoveryRequired);
+            assert_eq!(
+                runtime.status().lifecycle,
+                CredentialRuntimeLifecycle::RecoveryRequired
+            );
+        }
+    }
+
+    /// Commits another process made while the runtime was closed are not
+    /// lost across the reopen: the reopen past the event cursor emits one
+    /// `ExternallyCommitted` through the reopened epoch, with no receipt and
+    /// no set, after the runtime's own commit event.
+    #[tokio::test]
+    async fn a_reopen_past_the_cursor_signals_the_commits_it_skipped() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::InMemory,
+        )));
+        let runtime = CredentialRuntime::dormant_with_token_source(
+            CredentialBackendKind::InMemory,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let (sender, events) = mpsc::channel();
+        runtime
+            .configure(
+                Box::new(ReopeningBackend {
+                    store: Arc::clone(&store),
+                    rebound: None,
+                }),
+                Arc::new(RecordingEventSink {
+                    sender: Mutex::new(sender),
+                    emitted: AtomicUsize::new(0),
+                }),
+            )
+            .expect("configure runtime");
+        runtime
+            .replace_set(
+                api_key_draft("00000000-0000-4000-8000-000000000921", None),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("commit epoch 1");
+        assert_eq!(
+            committed(events.try_recv().expect("the local commit event")).global_epoch,
+            1
+        );
+        store.fail_next(
+            FakeStoreCall::ReadActive,
+            CredentialStoreFailure::PermissionHardeningFailed,
+        );
+        runtime
+            .resolve_for_use(deepgram_use_request(), Duration::from_secs(1))
+            .await
+            .expect_err("hardening refuses a record");
+        let mut advanced = store.journal_snapshot();
+        advanced.global_epoch = 3;
+        store.restore_journal(advanced);
+
+        runtime
+            .repair_store(Duration::from_secs(1))
+            .await
+            .expect("the repair reopens past the cursor");
+
+        assert_eq!(
+            events
+                .try_recv()
+                .expect("the skipped commits are signalled"),
+            CredentialRuntimeEvent::ExternallyCommitted { through_epoch: 3 }
+        );
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Ready
+        );
+    }
+
+    /// A journal older than the runtime observed, met by a request for one
+    /// set, carries that set's id, yet it is a refusal about the authority:
+    /// it closes the runtime, and a request for another set is refused from
+    /// that closure without reaching the store.
+    #[tokio::test]
+    async fn a_floor_refusal_for_one_set_closes_the_runtime_for_every_set() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let runtime = CredentialRuntime::dormant_with_token_source(
+            CredentialBackendKind::InMemory,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let (event_tx, _events) = mpsc::channel();
+        runtime
+            .configure(
+                Box::new(CountingReadyBackend {
+                    journal: journal.clone(),
+                    store: Arc::clone(&store),
+                    open_calls: Arc::new(AtomicUsize::new(0)),
+                    recovery_calls: Arc::new(AtomicUsize::new(0)),
+                }),
+                Arc::new(RecordingEventSink {
+                    sender: Mutex::new(event_tx),
+                    emitted: AtomicUsize::new(0),
+                }),
+            )
+            .expect("configure runtime");
+        runtime
+            .initialize(Duration::from_secs(1))
+            .await
+            .expect("open the runtime");
+        runtime
+            .replace_set(
+                api_key_draft("00000000-0000-4000-8000-000000000931", None),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("commit epoch 1");
+        store.restore_journal(journal);
+
+        let refused = runtime
+            .resolve_for_use(deepgram_use_request(), Duration::from_secs(1))
+            .await
+            .expect_err("the journal went back an epoch");
+        assert_eq!(refused.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(
+            refused.set_id,
+            Some(CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram))
+        );
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::RecoveryRequired
+        );
+
+        let calls = store.calls();
+        let other_set = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Openai);
+        let other = runtime
+            .replace_set(
+                CredentialReplaceDraft::api_key(
+                    other_set.clone(),
+                    AuthMethodId::ApiKey,
+                    "other-set-canary".to_owned(),
+                    None,
+                    idempotency("00000000-0000-4000-8000-000000000932"),
+                ),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("every set is behind the closure");
+        assert_eq!(other.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(other.set_id, Some(other_set));
+        assert_eq!(store.calls(), calls);
+    }
+
+    /// Opens a ready service over `store`'s current journal, except while
+    /// `contended` counts down: each of those opens is refused as another
+    /// program holding the journal without sharing it refuses it.
+    struct ContendedOpenBackend {
+        store: Arc<FakeCredentialStore>,
+        contended: Arc<AtomicUsize>,
+        open_calls: Arc<AtomicUsize>,
+    }
+
+    impl CredentialRuntimeBackend for ContendedOpenBackend {
+        fn open(
+            &mut self,
+            token_source: Arc<dyn CredentialTokenSource>,
+        ) -> Result<CredentialRuntimeOpen, CredentialStoreFailure> {
+            self.open_calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .contended
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(CredentialStoreFailure::OperationInProgress);
+            }
+            Ok(CredentialRuntimeOpen::Ready(Box::new(
+                CredentialService::new(
+                    self.store.clone(),
+                    self.store.journal_snapshot(),
+                    token_source,
+                ),
+            )))
+        }
+
+        fn initialize(
+            &mut self,
+            _token_source: Arc<dyn CredentialTokenSource>,
+        ) -> Result<CredentialRuntimeOpen, CredentialStoreFailure> {
+            Err(CredentialStoreFailure::RevisionConflict)
+        }
+
+        fn diagnose_or_unlock(
+            &mut self,
+        ) -> Result<CredentialRuntimeRecovery, CredentialStoreFailure> {
+            Ok(CredentialRuntimeRecovery::Ready)
+        }
+
+        fn repair_ownership(&mut self) -> Result<StoreOwnershipRepair, CredentialStoreFailure> {
+            Ok(StoreOwnershipRepair::Unchanged)
+        }
+    }
+
+    /// Contention refuses an open before any effect, so it changes nothing.
+    /// A first open, an ordinary request's open, and the reopen of a
+    /// diagnosis each return a retryable `operation_in_progress` for that
+    /// request; the runtime keeps the state it had before the attempt, a
+    /// closed runtime stays closed behind its cached refusal, and the next
+    /// attempt opens.
+    #[tokio::test]
+    async fn a_contended_open_changes_nothing_and_the_next_attempt_opens() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::InMemory,
+        )));
+        let contended = Arc::new(AtomicUsize::new(0));
+        let open_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = CredentialRuntime::dormant_with_token_source(
+            CredentialBackendKind::InMemory,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let (event_tx, _events) = mpsc::channel();
+        runtime
+            .configure(
+                Box::new(ContendedOpenBackend {
+                    store: Arc::clone(&store),
+                    contended: Arc::clone(&contended),
+                    open_calls: Arc::clone(&open_calls),
+                }),
+                Arc::new(RecordingEventSink {
+                    sender: Mutex::new(event_tx),
+                    emitted: AtomicUsize::new(0),
+                }),
+            )
+            .expect("configure runtime");
+        let contend = || contended.store(1, Ordering::SeqCst);
+        let contention = |refused: &CredentialError| {
+            assert_eq!(refused.code, CredentialErrorCode::OperationInProgress);
+            assert!(refused.retryable);
+        };
+
+        contend();
+        contention(
+            &runtime
+                .initialize(Duration::from_secs(1))
+                .await
+                .expect_err("a contended first open"),
+        );
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Dormant
+        );
+
+        contend();
+        let draft = || api_key_draft("00000000-0000-4000-8000-000000000941", None);
+        let refused = runtime
+            .replace_set(draft(), Duration::from_secs(1))
+            .await
+            .expect_err("a contended ordinary open");
+        contention(&refused);
+        assert_eq!(
+            refused.set_id,
+            Some(CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram))
+        );
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Dormant
+        );
+        runtime
+            .replace_set(draft(), Duration::from_secs(1))
+            .await
+            .expect("the same request opens and commits");
+
+        contend();
+        contention(
+            &runtime
+                .diagnose_or_unlock(Duration::from_secs(1))
+                .await
+                .expect_err("a contended reopen"),
+        );
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Ready
+        );
+        let opens = open_calls.load(Ordering::SeqCst);
+        runtime
+            .resolve_for_use(deepgram_use_request(), Duration::from_secs(1))
+            .await
+            .expect("the service the runtime had still serves");
+        assert_eq!(open_calls.load(Ordering::SeqCst), opens);
+
+        store.fail_next(FakeStoreCall::ReadActive, CredentialStoreFailure::Locked);
+        runtime
+            .resolve_for_use(deepgram_use_request(), Duration::from_secs(1))
+            .await
+            .expect_err("a locked store closes the runtime");
+        contend();
+        contention(
+            &runtime
+                .diagnose_or_unlock(Duration::from_secs(1))
+                .await
+                .expect_err("a contended reopen of a closed runtime"),
+        );
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Unavailable
+        );
+        let calls = store.calls();
+        assert_eq!(
+            runtime
+                .resolve_for_use(deepgram_use_request(), Duration::from_secs(1))
+                .await
+                .expect_err("still closed")
+                .code,
+            CredentialErrorCode::Locked
+        );
+        assert_eq!(store.calls(), calls);
+        runtime
+            .diagnose_or_unlock(Duration::from_secs(1))
+            .await
+            .expect("the next diagnosis reopens");
+        assert_eq!(
+            runtime.status().lifecycle,
+            CredentialRuntimeLifecycle::Ready
+        );
+    }
+
+    /// A runtime serving at one epoch that reopens, by explicit diagnosis
+    /// or after an ownership repair, onto an epoch another process committed
+    /// signals that advance once, through the adopted epoch.
+    #[tokio::test]
+    async fn every_reopen_route_signals_an_advance_it_adopts() {
+        for route in ["diagnosis", "ownership repair"] {
+            let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+                CredentialBackendKind::InMemory,
+            )));
+            let runtime = CredentialRuntime::dormant_with_token_source(
+                CredentialBackendKind::InMemory,
+                Arc::new(DeterministicTokenSource::default()),
+            );
+            let (sender, events) = mpsc::channel();
+            runtime
+                .configure(
+                    Box::new(ReopeningBackend {
+                        store: Arc::clone(&store),
+                        rebound: None,
+                    }),
+                    Arc::new(RecordingEventSink {
+                        sender: Mutex::new(sender),
+                        emitted: AtomicUsize::new(0),
+                    }),
+                )
+                .expect("configure runtime");
+            runtime
+                .replace_set(
+                    api_key_draft("00000000-0000-4000-8000-000000000951", None),
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect("commit epoch 1");
+            committed(events.try_recv().expect("the local commit event"));
+            let mut advanced = store.journal_snapshot();
+            advanced.global_epoch = 2;
+            store.restore_journal(advanced);
+
+            match route {
+                "diagnosis" => runtime
+                    .diagnose_or_unlock(Duration::from_secs(1))
+                    .await
+                    .map(drop),
+                _ => runtime.repair_store(Duration::from_secs(1)).await.map(drop),
+            }
+            .expect("reopen onto the advanced epoch");
+
+            assert_eq!(
+                events.try_recv().expect("the advance is signalled"),
+                CredentialRuntimeEvent::ExternallyCommitted { through_epoch: 2 },
+                "{route}"
+            );
+            assert!(events.try_recv().is_err(), "{route}");
+            assert_eq!(
+                runtime.status().lifecycle,
+                CredentialRuntimeLifecycle::Ready,
+                "{route}"
+            );
+        }
+    }
+
+    /// Opens a ready service over `store`'s current journal with a settings
+    /// port, so activations run end to end.
+    struct ActivationBackend {
+        store: Arc<FakeCredentialStore>,
+        settings: Arc<FakeSettingsActivationPort>,
+    }
+
+    impl CredentialRuntimeBackend for ActivationBackend {
+        fn open(
+            &mut self,
+            token_source: Arc<dyn CredentialTokenSource>,
+        ) -> Result<CredentialRuntimeOpen, CredentialStoreFailure> {
+            Ok(CredentialRuntimeOpen::Ready(Box::new(
+                CredentialService::with_settings_activation_port(
+                    self.store.clone(),
+                    self.store.journal_snapshot(),
+                    token_source,
+                    self.settings.clone(),
+                ),
+            )))
+        }
+
+        fn initialize(
+            &mut self,
+            _token_source: Arc<dyn CredentialTokenSource>,
+        ) -> Result<CredentialRuntimeOpen, CredentialStoreFailure> {
+            Err(CredentialStoreFailure::RevisionConflict)
+        }
+
+        fn diagnose_or_unlock(
+            &mut self,
+        ) -> Result<CredentialRuntimeRecovery, CredentialStoreFailure> {
+            Ok(CredentialRuntimeRecovery::Ready)
+        }
+
+        fn repair_ownership(&mut self) -> Result<StoreOwnershipRepair, CredentialStoreFailure> {
+            Ok(StoreOwnershipRepair::Unchanged)
+        }
+    }
+
+    /// What settling or compensating an activation meets is never narrowed
+    /// to its set. An unknown outcome at the final journal write of a
+    /// recovery stalls the runtime. A store-wide failure there, a locked
+    /// store while that recovery removes its staging, and a rolled-back
+    /// journal found by the abort of a failed commit each leave the
+    /// activation for recovery with a store-scoped refusal, which closes the
+    /// runtime until explicit diagnosis.
+    #[tokio::test]
+    async fn an_activation_never_narrows_a_store_wide_or_unknown_failure_to_its_set() {
+        let cases = [
+            (
+                "final journal write of a recovery, unknown outcome",
+                Some((
+                    FakeStoreCall::CommitJournal,
+                    CredentialStoreFailure::CommitUnknown,
+                )),
+                CredentialErrorCode::CommitUnknown,
+                CredentialRuntimeLifecycle::Stalled,
+            ),
+            (
+                "final journal write of a recovery, store unavailable",
+                Some((
+                    FakeStoreCall::CommitJournal,
+                    CredentialStoreFailure::Unavailable,
+                )),
+                CredentialErrorCode::RecoveryRequired,
+                CredentialRuntimeLifecycle::RecoveryRequired,
+            ),
+            (
+                "staging removal of a recovery, store locked",
+                Some((FakeStoreCall::DeleteStaging, CredentialStoreFailure::Locked)),
+                CredentialErrorCode::RecoveryRequired,
+                CredentialRuntimeLifecycle::RecoveryRequired,
+            ),
+            (
+                "rollback found by the abort of a failed commit",
+                None,
+                CredentialErrorCode::RecoveryRequired,
+                CredentialRuntimeLifecycle::RecoveryRequired,
+            ),
+        ];
+        for (index, (case, recovery_fault, expected_code, expected_lifecycle)) in
+            cases.into_iter().enumerate()
+        {
+            let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+                CredentialBackendKind::InMemory,
+            )));
+            let settings = Arc::new(FakeSettingsActivationPort::new(1));
+            let (sender, _events) = mpsc::channel();
+            let runtime = CredentialRuntime::dormant_with_token_source(
+                CredentialBackendKind::InMemory,
+                Arc::new(DeterministicTokenSource::default()),
+            );
+            runtime
+                .configure(
+                    Box::new(ActivationBackend {
+                        store: Arc::clone(&store),
+                        settings: Arc::clone(&settings),
+                    }),
+                    Arc::new(RecordingEventSink {
+                        sender: Mutex::new(sender),
+                        emitted: AtomicUsize::new(0),
+                    }),
+                )
+                .expect("configure runtime");
+            runtime
+                .initialize(Duration::from_secs(1))
+                .await
+                .expect("open the runtime");
+            let older = store.journal_snapshot();
+            runtime
+                .replace_set(
+                    CredentialReplaceDraft::api_key(
+                        CredentialSetId::BuiltIn(BuiltInCredentialSetId::Openai),
+                        AuthMethodId::ApiKey,
+                        "other-set-canary".to_owned(),
+                        None,
+                        idempotency(&format!("00000000-0000-4000-8000-00000000096{index}")),
+                    ),
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect("commit epoch 1 on another set");
+            let prepared = runtime
+                .prepare_settings_activation(
+                    repair_activation(
+                        BuiltInCredentialSetId::Deepgram,
+                        &format!("00000000-0000-4000-8000-00000000097{index}"),
+                    ),
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect("prepare the activation");
+
+            let refused = if let Some((call, failure)) = recovery_fault {
+                settings.fail_next(
+                    FakeSettingsCall::VerifyCommitted,
+                    CredentialStoreFailure::RevisionConflict,
+                );
+                let cleanup = runtime
+                    .commit_settings_activation(prepared, Duration::from_secs(1))
+                    .await
+                    .expect_err("the cleanup's settings check refuses");
+                assert_eq!(
+                    cleanup.code,
+                    CredentialErrorCode::RecoveryRequired,
+                    "{case}"
+                );
+                assert_eq!(
+                    runtime.status().lifecycle,
+                    CredentialRuntimeLifecycle::Ready,
+                    "a settings conflict concerns its set: {case}"
+                );
+                let operation_id = runtime
+                    .status()
+                    .service
+                    .pending_activation
+                    .expect("the activation waits for its cleanup")
+                    .operation_id;
+                store.fail_next(call, failure);
+                runtime
+                    .recover_settings_activation(operation_id, Duration::from_secs(1))
+                    .await
+                    .expect_err(case)
+            } else {
+                // The commit loads the journal to check its target and
+                // stage settings, then to check that the activation can be
+                // compensated, and then to abort.
+                store.restore_journal_before_load(2, older);
+                settings.fail_next(
+                    FakeSettingsCall::VerifyPending,
+                    CredentialStoreFailure::RevisionConflict,
+                );
+                runtime
+                    .commit_settings_activation(prepared, Duration::from_secs(1))
+                    .await
+                    .expect_err(case)
+            };
+
+            assert_eq!(refused.code, expected_code, "{case}");
+            assert_eq!(runtime.status().lifecycle, expected_lifecycle, "{case}");
+        }
     }
 }
