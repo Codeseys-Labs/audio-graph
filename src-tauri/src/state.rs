@@ -109,7 +109,7 @@ impl ChatHistory {
     }
 
     /// Append `turns`, keeping the newest [`MAX_CHAT_HISTORY`] messages.
-    pub fn append(&mut self, turns: impl IntoIterator<Item = ChatMessage>) {
+    fn append(&mut self, turns: impl IntoIterator<Item = ChatMessage>) {
         self.messages.extend(turns);
         cap_chat_messages(&mut self.messages);
     }

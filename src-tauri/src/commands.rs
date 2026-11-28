@@ -3561,7 +3561,15 @@ struct PreparedChat {
 /// either the streaming or blocking chat path. Locks are taken under short
 /// critical sections and released before any string formatting (I4 fix
 /// carried over from the legacy `send_chat_message` body).
-fn prepare_chat_request(state: &AppState, message: String) -> Result<PreparedChat, String> {
+///
+/// `history_generation` is the generation the command read on entry, before
+/// any await. If the chat was cleared since, the request is refused as
+/// `cancelled` and nothing is sent to the provider.
+fn prepare_chat_request(
+    state: &AppState,
+    message: String,
+    history_generation: u64,
+) -> AppResult<PreparedChat> {
     let snapshot = {
         let kg = state
             .knowledge_graph
@@ -3602,12 +3610,16 @@ fn prepare_chat_request(state: &AppState, message: String) -> Result<PreparedCha
         role: "user".to_string(),
         content: message,
     };
-    let (mut messages, history_generation) = {
+    let mut messages = {
         let history = state
             .chat_history
             .read()
             .map_err(|e| format!("Lock error: {}", e))?;
-        (history.messages().to_vec(), history.generation())
+        if history.generation() != history_generation {
+            log::info!("Chat history was cleared before the request was sent; it is not sent");
+            return Err(llm_cancelled_diagnostic().into());
+        }
+        history.messages().to_vec()
     };
     messages.push(user_turn.clone());
     crate::state::cap_chat_messages(&mut messages);
@@ -3617,6 +3629,30 @@ fn prepare_chat_request(state: &AppState, message: String) -> Result<PreparedCha
         user_turn,
         history_generation,
     })
+}
+
+/// The chat-history generation a chat command reads on entry, before any
+/// await, so a clear that lands while the command prepares is caught by
+/// [`prepare_chat_request`].
+fn chat_history_generation(state: &AppState) -> u64 {
+    state
+        .chat_history
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .generation()
+}
+
+/// Removes one stream's `stream_registry` entry when dropped, so every exit
+/// from a stream task, a panic included, frees the entry.
+struct StreamRegistration {
+    registry: crate::llm::streaming::StreamRegistry,
+    request_id: String,
+}
+
+impl Drop for StreamRegistration {
+    fn drop(&mut self) {
+        self.registry.finish(&self.request_id);
+    }
 }
 
 /// Record a finished request's turns, unless the chat was cleared or the
@@ -3915,7 +3951,10 @@ fn spawn_stream_task(
     let (rx, cancel) = stream_chat_with_request(request);
     state.stream_registry.register(request_id.clone(), cancel);
 
-    let registry = state.stream_registry.clone();
+    let registration = StreamRegistration {
+        registry: state.stream_registry.clone(),
+        request_id: request_id.clone(),
+    };
     let chat_history = state.chat_history.clone();
     let request_id_for_task = request_id.clone();
 
@@ -3937,6 +3976,7 @@ fn spawn_stream_task(
     let request_id_for_pipe_log = request_id.clone();
 
     tokio::spawn(async move {
+        let _registration = registration;
         let mut pipe: Option<crate::speak_aloud::SpeakAloudPipe> =
             match crate::speak_aloud::SpeakAloudPipe::maybe_new(
                 settings_snapshot.0,
@@ -3988,7 +4028,6 @@ fn spawn_stream_task(
                         if let Some(p) = pipe.take() {
                             let _ = p.cancel();
                         }
-                        registry.finish(&request_id_for_task);
                         break;
                     }
                 }
@@ -4027,7 +4066,6 @@ fn spawn_stream_task(
                             e
                         );
                     }
-                    registry.finish(&request_id_for_task);
                     break;
                 }
                 TokenDelta::Error {
@@ -4051,7 +4089,6 @@ fn spawn_stream_task(
                             e
                         );
                     }
-                    registry.finish(&request_id_for_task);
                     break;
                 }
                 TokenDelta::Cancelled { full_text } => {
@@ -4072,7 +4109,6 @@ fn spawn_stream_task(
                             e
                         );
                     }
-                    registry.finish(&request_id_for_task);
                     break;
                 }
             }
@@ -4102,6 +4138,7 @@ pub async fn start_streaming_chat(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
+    let history_generation = chat_history_generation(state.inner());
     log::info!("start_streaming_chat called");
     // audio-graph-81a5: content-free, session-scoped chat-invocation counter
     // (correlation proxy for Ask-AI on a question card; see card_telemetry's
@@ -4155,7 +4192,7 @@ pub async fn start_streaming_chat(
     }
 
     sync_llm_clients(state.inner()).await?;
-    let prepared = prepare_chat_request(state.inner(), message)?;
+    let prepared = prepare_chat_request(state.inner(), message, history_generation)?;
     let request_id = uuid::Uuid::new_v4().to_string();
     spawn_stream_task(
         app,
@@ -4206,6 +4243,7 @@ pub async fn send_chat_message(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<ChatResponse> {
+    let history_generation = chat_history_generation(state.inner());
     log::info!("send_chat_message called");
     // audio-graph-81a5: content-free, session-scoped chat-invocation counter
     // (correlation proxy for Ask-AI on a question card; see card_telemetry's
@@ -4237,7 +4275,7 @@ pub async fn send_chat_message(
         graph_context,
         user_turn,
         history_generation,
-    } = prepare_chat_request(state.inner(), message)?;
+    } = prepare_chat_request(state.inner(), message, history_generation)?;
 
     // Streaming path — accumulate to full text via the same producer the
     // event-driven command uses. The shim doesn't fire IPC events itself;
@@ -4656,6 +4694,9 @@ fn approve_agent_proposal_impl(
     app: tauri::AppHandle,
     state: &AppState,
 ) -> AppResult<events::LiveAssistCardRecord> {
+    // Read before any work, so a clear or rotation during the approval keeps
+    // this proposal out of the cleared history.
+    let history_generation = chat_history_generation(state);
     let proposal = {
         let mut pending = state
             .pending_agent_proposals
@@ -4790,16 +4831,14 @@ fn approve_agent_proposal_impl(
         format!("Approved agent proposal for review: {}", proposal.title)
     };
     let message = format!("{}\n\n{}", summary, proposal.body);
-    {
-        let mut history = state
-            .chat_history
-            .write()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        history.append([ChatMessage {
+    record_chat_turns(
+        &state.chat_history,
+        history_generation,
+        [ChatMessage {
             role: "assistant".to_string(),
             content: message.clone(),
-        }]);
-    }
+        }],
+    );
 
     events::emit_or_log(
         &app,
@@ -6193,7 +6232,10 @@ fn spawn_card_answer_stream_task(
     state.card_answer_in_flight.store(true, Ordering::SeqCst);
     let slot = CardAnswerSlot(state.card_answer_in_flight.clone());
 
-    let registry = state.stream_registry.clone();
+    let registration = StreamRegistration {
+        registry: state.stream_registry.clone(),
+        request_id: request_id.clone(),
+    };
     let request_id_for_task = request_id.clone();
 
     let settings_snapshot = (
@@ -6354,7 +6396,7 @@ fn spawn_card_answer_stream_task(
             terminal.diagnostic,
             terminal.total_tokens,
         );
-        registry.finish(&request_id_for_task);
+        drop(registration);
         drop(slot);
         if channel_alive && let Err(e) = channel.send(terminal.frame) {
             log::warn!(
@@ -26577,6 +26619,31 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// [`spawn_raw_http_mock`], plus a flag set when the provider is
+    /// contacted at all.
+    async fn spawn_contact_recording_http_mock(
+        response: String,
+    ) -> (String, Arc<std::sync::atomic::AtomicBool>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let contacted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = contacted.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                flag.store(true, Ordering::SeqCst);
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), contacted)
+    }
+
     /// The provider fails before sending a single token.
     fn http_500_response() -> String {
         let body = format!("{{\"error\":\"{CHAT_PROVIDER_CANARY}\"}}");
@@ -26615,17 +26682,35 @@ mod tests {
                 end_time: 2.0,
                 confidence: 0.9,
             });
-        state.chat_history.write().unwrap().append([
-            ChatMessage {
-                role: "user".to_string(),
-                content: "earlier question".to_string(),
-            },
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "earlier answer".to_string(),
-            },
-        ]);
+        {
+            let mut history = state.chat_history.write().unwrap();
+            let generation = history.generation();
+            history.append_if_current(
+                generation,
+                [
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: "earlier question".to_string(),
+                    },
+                    ChatMessage {
+                        role: "assistant".to_string(),
+                        content: "earlier answer".to_string(),
+                    },
+                ],
+            );
+        }
         chat_history_json(state)
+    }
+
+    /// The messages the next chat request would send.
+    fn prepare_next_chat_request(state: &AppState) -> Vec<ChatMessage> {
+        prepare_chat_request(
+            state,
+            "next question".to_string(),
+            chat_history_generation(state),
+        )
+        .expect("prepare the next request")
+        .messages
     }
 
     fn chat_history_json(state: &AppState) -> serde_json::Value {
@@ -26814,9 +26899,7 @@ mod tests {
         // Neither failed call recorded a turn, so the next request sends the
         // earlier history plus only its own question.
         assert_eq!(chat_history_json(&state), prior);
-        let next = prepare_chat_request(&state, "next question".to_string())
-            .expect("prepare the next request")
-            .messages;
+        let next = prepare_next_chat_request(&state);
         let mut expected = prior.as_array().unwrap().clone();
         expected.push(serde_json::json!({ "role": "user", "content": "next question" }));
         assert_eq!(
@@ -26920,9 +27003,7 @@ mod tests {
                 .expect("a terminal frame")
         });
         let history = chat_history_json(&state);
-        let next = prepare_chat_request(&state, "next question".to_string())
-            .expect("prepare the next request")
-            .messages;
+        let next = prepare_next_chat_request(&state);
 
         state
             .api_client
@@ -26978,6 +27059,139 @@ mod tests {
             chat_with_mid_stream_step(MidStream::CancelThenRotate, "chat-rotate-during-cancel");
         assert_eq!(frame["data"]["finish_reason"], "cancelled", "{frame}");
         assert_cleared_question_stays_gone(&history, &next);
+    }
+
+    /// Which chat command a clear races.
+    #[derive(Clone, Copy)]
+    enum ChatCommand {
+        Streaming,
+        Blocking,
+    }
+
+    /// Run `command` for [`CLEARED_QUESTION`] and clear the chat while the
+    /// command waits inside its async preparation, after it read the history
+    /// generation on entry. The test holds the session-lifecycle lock to park
+    /// the command there. Returns the command's error, whether the provider
+    /// was contacted, the history afterwards, and the next request.
+    fn chat_cleared_during_preparation(
+        command: ChatCommand,
+        dir_name: &str,
+    ) -> (serde_json::Value, bool, serde_json::Value, Vec<ChatMessage>) {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir(dir_name);
+        let _guard = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        seed_chat_session(&state);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let (error, contacted) = rt.block_on(async {
+            let (url, contacted) =
+                spawn_contact_recording_http_mock(complete_sse_response("the private answer"))
+                    .await;
+            point_state_at_mock_llm_provider(&state, url);
+            let lifecycle = state.session_lifecycle.lock().await;
+            let error = match command {
+                ChatCommand::Streaming => {
+                    let (channel, _frames) = recording_chat_channel();
+                    let mut call = std::pin::pin!(start_streaming_chat(
+                        CLEARED_QUESTION.to_string(),
+                        channel,
+                        app.clone(),
+                        manager.state(),
+                    ));
+                    tokio::select! {
+                        biased;
+                        _ = &mut call => panic!("the command must wait for the lifecycle lock"),
+                        _ = tokio::task::yield_now() => {}
+                    }
+                    clear_chat_history(manager.state()).await.expect("clear");
+                    drop(lifecycle);
+                    serde_json::to_value(call.await.expect_err("a cleared request is refused"))
+                }
+                ChatCommand::Blocking => {
+                    let mut call = std::pin::pin!(send_chat_message(
+                        CLEARED_QUESTION.to_string(),
+                        app.clone(),
+                        manager.state(),
+                    ));
+                    tokio::select! {
+                        biased;
+                        _ = &mut call => panic!("the command must wait for the lifecycle lock"),
+                        _ = tokio::task::yield_now() => {}
+                    }
+                    clear_chat_history(manager.state()).await.expect("clear");
+                    drop(lifecycle);
+                    serde_json::to_value(call.await.expect_err("a cleared request is refused"))
+                }
+            }
+            .expect("serialize the IPC error");
+            // Give a stray request time to reach the provider.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            (error, contacted.load(Ordering::SeqCst))
+        });
+        let history = chat_history_json(&state);
+        let next = prepare_next_chat_request(&state);
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(dir);
+        (error, contacted, history, next)
+    }
+
+    fn assert_cleared_request_was_never_sent(
+        error: &serde_json::Value,
+        contacted: bool,
+        history: &serde_json::Value,
+        next: &[ChatMessage],
+    ) {
+        assert_eq!(error["code"], "runtime_diagnostic", "{error}");
+        assert_eq!(
+            error["diagnostic"]["detail"]["code"], "cancelled",
+            "{error}"
+        );
+        assert!(
+            !contacted,
+            "the provider must not receive the cleared question"
+        );
+        assert_cleared_question_stays_gone(history, next);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_streaming_chat_cleared_while_it_prepares_is_never_sent() {
+        let (error, contacted, history, next) = chat_cleared_during_preparation(
+            ChatCommand::Streaming,
+            "chat-clear-during-stream-prep",
+        );
+        assert_cleared_request_was_never_sent(&error, contacted, &history, &next);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_blocking_chat_cleared_while_it_prepares_is_never_sent() {
+        let (error, contacted, history, next) = chat_cleared_during_preparation(
+            ChatCommand::Blocking,
+            "chat-clear-during-blocking-prep",
+        );
+        assert_cleared_request_was_never_sent(&error, contacted, &history, &next);
     }
 
     /// A stream whose producer queues `frames` and then drops its sender.
