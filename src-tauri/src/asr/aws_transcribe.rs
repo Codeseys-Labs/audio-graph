@@ -919,9 +919,9 @@ async fn run_streaming_session(
                     // (idle/duration limit) that warrants re-establishment.
                     break if is_transcribing.load(Ordering::Relaxed) {
                         DriveOutcome::Recoverable(sdk_runtime_diagnostic(
-                            RuntimeErrorCode::NetworkUnreachable,
+                            RuntimeErrorCode::ProviderUnavailable,
                             true,
-                            RuntimeSafeRecoveryAction::CheckNetwork,
+                            RuntimeSafeRecoveryAction::Retry,
                             None,
                         ))
                     } else {

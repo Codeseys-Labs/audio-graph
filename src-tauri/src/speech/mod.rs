@@ -527,8 +527,8 @@ fn dispatch_diarization_span_revision(
 ) -> DiarizationRevisionOutcome {
     let remap = match timeline.apply_event(revision) {
         Ok(remap) => remap,
-        Err(error) => {
-            log::warn!("Diarization revision rejected by speaker timeline: {error:?}");
+        Err(_) => {
+            log::warn!("Diarization revision rejected by speaker timeline");
             return DiarizationRevisionOutcome {
                 accepted: false,
                 retcon_fired: false,
@@ -666,8 +666,8 @@ fn emit_and_dispatch_diarization_span_revision<E: DiarizationEventSink + ?Sized>
         }
         let pos = match timeline.event_position(&revision) {
             Ok(pos) => pos,
-            Err(e) => {
-                log::warn!("speaker revision rejected: {e:?}");
+            Err(_) => {
+                log::warn!("Speaker revision rejected");
                 return rejected();
             }
         };
@@ -678,10 +678,11 @@ fn emit_and_dispatch_diarization_span_revision<E: DiarizationEventSink + ?Sized>
                 edges_retconned: 0,
             };
         }
-        if let Err(e) = FileMemoryRepository::user_data()
+        if FileMemoryRepository::user_data()
             .append_diarization_span_revision(dispatch_ctx.session_id, &revision)
+            .is_err()
         {
-            log::warn!("speaker revision not committed: {e}");
+            log::warn!("Speaker revision not committed");
             return rejected();
         }
         let remap = timeline.apply_validated_event(pos, revision);
@@ -1552,8 +1553,8 @@ fn run_agent_proposal_task_with_shadow(
             pending.insert(proposal.id.clone(), proposal.clone());
             prune_pending_agent_proposals(&mut pending);
         }
-        Err(err) => {
-            log::warn!("Failed to store pending agent proposal: {}", err);
+        Err(_) => {
+            log::warn!("Failed to store pending agent proposal");
             emit_agent_status(
                 &app_handle,
                 events::AgentStatusState::Error,
@@ -1585,14 +1586,11 @@ fn run_agent_proposal_task_with_shadow(
         signal: proposal.signal,
         decision_provenance: proposal.decision_provenance.clone(),
     };
-    if let Err(err) =
-        FileMemoryRepository::user_data().upsert_live_assist_card(&expected_session_id, &live_card)
+    if FileMemoryRepository::user_data()
+        .upsert_live_assist_card(&expected_session_id, &live_card)
+        .is_err()
     {
-        log::warn!(
-            "Failed to persist live assist card {}: {}",
-            proposal.id,
-            err
-        );
+        log::warn!("Failed to persist live assist card");
     }
 
     // audio-graph-81a5: capture what card-creation telemetry needs before
@@ -1854,12 +1852,7 @@ fn make_diarization_config(
             .join(crate::models::DIAR_SEG_PYANNOTE_FILE);
         let emb = models_dir.join(crate::models::DIAR_EMB_TITANET_FILENAME);
         if seg.exists() && emb.exists() {
-            log::info!(
-                "Clustering diarization models found (seg='{}', emb='{}') — using unbounded \
-                 sherpa-onnx clustering backend (ADR-0017).",
-                seg.display(),
-                emb.display()
-            );
+            log::info!("Clustering diarization models ready");
             return (
                 DiarizationConfig::clustering(
                     seg,
@@ -1869,12 +1862,7 @@ fn make_diarization_config(
                 None,
             );
         }
-        log::info!(
-            "Clustering diarization models not found (seg='{}', emb='{}') — falling back. \
-             Download via Settings → Models for unbounded speaker identification.",
-            seg.display(),
-            emb.display()
-        );
+        log::info!("Clustering diarization models unavailable");
         // Returns directly here (review fix, audio-graph-586b: previously
         // fell through to the `diarization`-feature check below, which
         // reported `EngineNotCompiled` — false under this exact build
@@ -1924,28 +1912,18 @@ fn make_diarization_config(
         // under THIS build that block is the function's own tail position.
         match crate::models::sortformer_readiness(models_dir) {
             crate::models::ModelReadiness::Ready => {
-                log::info!(
-                    "Sortformer model ready at '{}' — using neural diarization backend",
-                    sortformer_path.display()
-                );
+                log::info!("Sortformer model ready");
                 (DiarizationConfig::sortformer(sortformer_path), None)
             }
             crate::models::ModelReadiness::NotDownloaded => {
-                log::info!(
-                    "Sortformer model not found at '{}' — using Simple diarization backend.",
-                    sortformer_path.display()
-                );
+                log::info!("Sortformer model missing; using basic diarization");
                 (
                     DiarizationConfig::default(),
                     Some(DiarizationDegradationReason::AssetNotDownloaded),
                 )
             }
             crate::models::ModelReadiness::Invalid => {
-                log::warn!(
-                    "Sortformer model at '{}' failed size verification (corrupt or incomplete \
-                     download) — using Simple diarization backend.",
-                    sortformer_path.display()
-                );
+                log::warn!("Sortformer model failed size verification; using basic diarization");
                 (
                     DiarizationConfig::default(),
                     Some(DiarizationDegradationReason::AssetInvalid),
@@ -2119,11 +2097,8 @@ pub(crate) fn maybe_spawn_clustering_diarization(
         DEFAULT_MIN_START_SECS,
     ) {
         Ok(pair) => pair,
-        Err(e) => {
-            log::warn!(
-                "Clustering diarization: failed to build live worker ({e}); \
-                 speaker labels disabled for this session."
-            );
+        Err(_) => {
+            log::warn!("Clustering diarization worker unavailable");
             return None;
         }
     };
@@ -2165,15 +2140,12 @@ pub(crate) fn maybe_spawn_clustering_diarization(
             }
         }) {
         Ok(handle) => handle,
-        Err(e) => {
+        Err(_) => {
             // Spawn failed (e.g. OS thread-limit exhaustion). Don't abort the
             // whole session — disable speaker labels gracefully. Signal the
             // already-spawned live worker to stop so it doesn't run headless,
             // then return None (the Simple per-utterance path still runs).
-            log::warn!(
-                "Clustering diarization: failed to spawn emit consumer thread ({e}); \
-                 speaker labels disabled for this session."
-            );
+            log::warn!("Clustering diarization consumer unavailable");
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             // `seg_rx` was moved into the failed spawn closure and is now dropped,
             // disconnecting the worker's segment channel as a second stop signal.
@@ -2438,7 +2410,7 @@ fn apply_extraction_result_if_current(
                 retarget_extraction_speaker(&mut extraction_result, speaker, label);
             }
             let mut graph = deps.knowledge_graph.lock().unwrap_or_else(|e| {
-                log::warn!("Knowledge graph mutex poisoned, recovering: {}", e);
+                log::warn!("Knowledge graph mutex poisoned, recovering");
                 e.into_inner()
             });
             graph.process_extraction(&extraction_result, timestamp, label, segment_id);
@@ -2724,14 +2696,11 @@ struct FileProjectionDataMovementSink;
 impl ProjectionDataMovementSink for FileProjectionDataMovementSink {
     fn record(&self, session_id: &str, event: &crate::persistence::DataMovementEvent) {
         use crate::persistence::LocalMemoryRepository;
-        if let Err(error) =
-            FileMemoryRepository::user_data().append_data_movement_event(session_id, event)
+        if FileMemoryRepository::user_data()
+            .append_data_movement_event(session_id, event)
+            .is_err()
         {
-            log::warn!(
-                "Failed to append projection data-movement event session_id={session_id} \
-                 event_type={:?} error={error}",
-                event.event_type
-            );
+            log::warn!("Failed to append projection data-movement event");
         }
     }
 }
@@ -2865,13 +2834,8 @@ fn record_asr_span_revision_event(
     let mut next_ledger = ledger.clone();
     match next_ledger.apply_event(transcript_event.clone()) {
         Ok(()) => {}
-        Err(e) => {
-            log::warn!(
-                "Transcript ledger rejected span revision span_id={} revision={} error={:?}",
-                transcript_event.span_id,
-                transcript_event.revision_number,
-                e
-            );
+        Err(_) => {
+            log::warn!("Transcript ledger rejected span revision");
             return false;
         }
     }
@@ -3234,13 +3198,9 @@ fn spawn_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob)
             guard.push((job_kind, job_id, handle));
             let _ = registered_tx.send(());
         }
-        Err(error) => {
+        Err(_) => {
             drop(guard);
-            log::error!(
-                "Failed to spawn projection job thread job_id={} error={}",
-                job_id,
-                error
-            );
+            log::error!("Failed to spawn projection job thread");
             finish_projection_scheduler_job(
                 failure_dispatch,
                 &failure_job,
@@ -3346,7 +3306,7 @@ fn spawn_deferred_lane_observation(
             guard.push((kind, registry_id, handle));
             let _ = registered_tx.send(());
         }
-        Err(error) => {
+        Err(_) => {
             // Review note (adr0045/bf5d-deferred-retry): unlike
             // `spawn_projection_job`'s `Err` arm (which calls
             // `finish_projection_scheduler_job(Failed)` to keep scheduler
@@ -3371,7 +3331,7 @@ fn spawn_deferred_lane_observation(
             // this arm is a whole-process concern well beyond one retry
             // clock in practice.
             log::error!(
-                "Failed to spawn deferred projection retry clock thread registry_id={registry_id} error={error}"
+                "Failed to spawn deferred projection retry clock thread"
             );
         }
     }
@@ -3872,11 +3832,8 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                         }
                     );
                     log::warn!(
-                        "Projection job apply failed job_id={} kind={:?} stale_apply={} error={:?}",
-                        job.id,
-                        job.kind,
-                        stale_apply,
-                        error
+                        "Projection job apply failed kind={:?} stale_apply={stale_apply}",
+                        job.kind
                     );
                     finish_projection_scheduler_job(
                         dispatch,
@@ -3890,7 +3847,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 }
             }
         }
-        Err(error) => {
+        Err(_) => {
             let movement_facts = projection_movement_facts(
                 &dispatch,
                 &job,
@@ -3917,12 +3874,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 0,
                 false,
             );
-            log::warn!(
-                "Projection job generation failed job_id={} kind={:?} error={}",
-                job.id,
-                job.kind,
-                error
-            );
+            log::warn!("Projection job generation failed kind={:?}", job.kind);
             finish_projection_scheduler_job(dispatch, &job, ProjectionJobCompletion::Failed);
         }
     }
@@ -5320,38 +5272,17 @@ pub(crate) fn run_speech_processor(
                 "Speech processor: LLM provider is LocalLlama — will prefer native LLM engine for entity extraction."
             );
         }
-        LlmProvider::Api {
-            endpoint, model, ..
-        } => {
-            log::info!(
-                "Speech processor: LLM provider is API (endpoint={}, model={}) — will prefer API client for entity extraction.",
-                endpoint,
-                model
-            );
+        LlmProvider::Api { .. } => {
+            log::info!("Speech processor: API extraction provider selected");
         }
-        LlmProvider::OpenRouter {
-            model, base_url, ..
-        } => {
-            log::info!(
-                "Speech processor: LLM provider is OpenRouter (base_url={}, model={}) — will prefer OpenRouter client for entity extraction.",
-                base_url,
-                model
-            );
+        LlmProvider::OpenRouter { .. } => {
+            log::info!("Speech processor: OpenRouter extraction provider selected");
         }
-        LlmProvider::AwsBedrock {
-            region, model_id, ..
-        } => {
-            log::info!(
-                "Speech processor: LLM provider is AWS Bedrock (region={}, model={}) — will prefer API client for entity extraction.",
-                region,
-                model_id
-            );
+        LlmProvider::AwsBedrock { .. } => {
+            log::info!("Speech processor: AWS Bedrock extraction provider selected");
         }
-        LlmProvider::MistralRs { model_id } => {
-            log::info!(
-                "Speech processor: LLM provider is mistral.rs (model={}).",
-                model_id
-            );
+        LlmProvider::MistralRs { .. } => {
+            log::info!("Speech processor: mistral.rs extraction provider selected");
         }
     }
 
@@ -5364,12 +5295,7 @@ pub(crate) fn run_speech_processor(
         ref model,
     } = asr_provider
     {
-        log::info!(
-            "Speech processor: ASR provider is cloud API (endpoint={}, model={}) — \
-             launching cloud ASR worker.",
-            endpoint,
-            model
-        );
+        log::info!("Speech processor: starting cloud ASR");
         let cloud_config = CloudAsrConfig {
             endpoint: endpoint.clone(),
             api_key: api_key.clone(),
@@ -5390,17 +5316,8 @@ pub(crate) fn run_speech_processor(
 
     // If the user selected Deepgram streaming ASR, launch the streaming
     // WebSocket worker instead of loading local Whisper.
-    if let AsrProvider::DeepgramStreaming {
-        ref model,
-        max_speakers,
-        ..
-    } = asr_provider
-    {
-        log::info!(
-            "Speech processor: ASR provider is Deepgram streaming (model={}) — \
-             launching Deepgram streaming worker.",
-            model
-        );
+    if let AsrProvider::DeepgramStreaming { max_speakers, .. } = asr_provider {
+        log::info!("Speech processor: starting Deepgram streaming");
         let deepgram_config =
             deepgram_config_from_settings(&asr_provider, config.provider_content_egress_policy)
                 .expect("DeepgramStreaming variant checked by the enclosing if-let");
@@ -5463,11 +5380,7 @@ pub(crate) fn run_speech_processor(
         max_speakers,
     } = asr_provider
     {
-        log::info!(
-            "Speech processor: ASR provider is Soniox realtime (model={}) — \
-             launching Soniox streaming worker.",
-            model
-        );
+        log::info!("Speech processor: starting Soniox streaming");
         let soniox_config = crate::asr::soniox::SonioxConfig {
             api_key: api_key.clone(),
             model: model.clone(),
@@ -5501,11 +5414,7 @@ pub(crate) fn run_speech_processor(
         ref language,
     } = asr_provider
     {
-        log::info!(
-            "Speech processor: ASR provider is OpenAI Realtime transcription (model={}) — \
-             launching OpenAI Realtime streaming worker.",
-            model
-        );
+        log::info!("Speech processor: starting OpenAI Realtime transcription");
         let openai_config = crate::asr::openai_realtime::OpenAiRealtimeConfig {
             api_key: api_key.clone(),
             model: model.clone(),
@@ -5538,11 +5447,7 @@ pub(crate) fn run_speech_processor(
         enable_diarization,
     } = asr_provider
     {
-        log::info!(
-            "Speech processor: ASR provider is AWS Transcribe (region={}) — \
-             launching streaming session.",
-            region
-        );
+        log::info!("Speech processor: starting AWS Transcribe");
         let aws_config = crate::asr::aws_transcribe::AwsTranscribeConfig {
             region: region.clone(),
             language_code: language_code.clone(),
@@ -5569,11 +5474,7 @@ pub(crate) fn run_speech_processor(
         enable_endpoint_detection,
     } = asr_provider
     {
-        log::info!(
-            "Speech processor: ASR provider is sherpa-onnx streaming (model_dir={}) — \
-             launching streaming worker.",
-            model_dir
-        );
+        log::info!("Speech processor: starting sherpa-onnx streaming");
         let sherpa_config = crate::asr::sherpa_streaming::SherpaStreamingConfig {
             model_dir: config.models_dir.join(model_dir),
             enable_endpoint_detection,
@@ -5618,12 +5519,7 @@ pub(crate) fn run_speech_processor(
     {
         let model_path = &asr_config.model_path;
         if !model_path.exists() {
-            log::warn!(
-                "Speech processor: Whisper model not found at '{}'. \
-                 ASR disabled — running diarization-only mode. \
-                 Download the model via Settings → Models.",
-                model_path_str
-            );
+            log::warn!("Whisper model unavailable; using diarization only");
             fallback_diarization_only!();
         }
 
@@ -5631,30 +5527,13 @@ pub(crate) fn run_speech_processor(
             Ok(meta) => {
                 const MIN_MODEL_SIZE: u64 = 1_000_000;
                 if meta.len() < MIN_MODEL_SIZE {
-                    log::warn!(
-                        "Speech processor: Whisper model at '{}' appears corrupted \
-                         (size: {} bytes, expected >= {} bytes). \
-                         ASR disabled — running diarization-only mode. \
-                         Re-download the model via Settings → Models.",
-                        model_path_str,
-                        meta.len(),
-                        MIN_MODEL_SIZE
-                    );
+                    log::warn!("Whisper model failed size verification; using diarization only");
                     fallback_diarization_only!();
                 }
-                log::info!(
-                    "Speech processor: model file validated — {} ({:.1} MB)",
-                    model_path_str,
-                    meta.len() as f64 / 1_048_576.0
-                );
+                log::info!("Whisper model file validated");
             }
-            Err(e) => {
-                log::warn!(
-                    "Speech processor: cannot read model file metadata at '{}': {}. \
-                     ASR disabled — running diarization-only mode.",
-                    model_path_str,
-                    e
-                );
+            Err(_) => {
+                log::warn!("Whisper model metadata unavailable; using diarization only");
                 fallback_diarization_only!();
             }
         }
@@ -5699,8 +5578,8 @@ pub(crate) fn run_speech_processor(
             // Note: the caller in commands.rs can store the asr-worker thread
             // handle separately if needed.
         }
-        Err(e) => {
-            log::error!("Failed to spawn ASR worker thread: {}", e);
+        Err(_) => {
+            log::error!("Failed to spawn ASR worker thread");
             // Fall back to diarization-only on the current thread
             fallback_diarization_only!();
         }
@@ -5957,14 +5836,20 @@ fn run_asr_worker(
         match WhisperContext::new_with_params(&model_path_str, WhisperContextParameters::default())
         {
             Ok(ctx) => {
-                log::info!("ASR worker: Whisper model loaded from {}", model_path_str);
+                log::info!("ASR worker: Whisper model loaded");
                 ctx
             }
-            Err(e) => {
-                log::error!(
-                    "ASR worker: failed to load Whisper model from {}: {}. Exiting.",
-                    model_path_str,
-                    e
+            Err(_) => {
+                let diagnostic = RuntimeErrorDiagnostic::invalid_configuration(
+                    RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                        .with_transport(RuntimeTransport::Native),
+                )
+                .into();
+                log::error!("ASR worker: Whisper model load failed diagnostic={diagnostic}");
+                set_asr_status_and_emit(
+                    &shared.app_handle,
+                    &shared.pipeline_status,
+                    StageStatus::Error { diagnostic },
                 );
                 return;
             }
@@ -5972,8 +5857,14 @@ fn run_asr_worker(
 
     let mut whisper_state = match ctx.create_state() {
         Ok(s) => s,
-        Err(e) => {
-            log::error!("ASR worker: failed to create Whisper state: {}", e);
+        Err(_) => {
+            let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Native);
+            log::error!("ASR worker: Whisper state unavailable diagnostic={diagnostic}");
+            set_asr_status_and_emit(
+                &shared.app_handle,
+                &shared.pipeline_status,
+                StageStatus::Error { diagnostic },
+            );
             return;
         }
     };
@@ -6677,11 +6568,7 @@ fn run_cloud_asr_worker(
         "cloud_api",
     );
 
-    log::info!(
-        "Cloud ASR worker: entering processing loop (endpoint={}, model={})",
-        cloud_config.endpoint,
-        cloud_config.model
-    );
+    log::info!("Cloud ASR worker: entering processing loop");
     let cloud_config = cloud_config.with_content_egress_policy(provider_content_egress_policy);
 
     loop {
@@ -6885,8 +6772,8 @@ pub(crate) fn run_deepgram_speech_processor(
             }
         }) {
         Ok(handle) => Some(handle),
-        Err(e) => {
-            log::error!("Deepgram streaming: failed to spawn event receiver thread: {e}");
+        Err(_) => {
+            log::error!("Deepgram streaming: failed to spawn event receiver thread");
             None
         }
     };
@@ -7021,8 +6908,8 @@ fn join_worker_with_bounded_wait(
         std::thread::sleep(Duration::from_millis(20));
     }
     if handle.is_finished() {
-        if let Err(e) = handle.join() {
-            log::warn!("{label} panicked during shutdown: {e:?}");
+        if handle.join().is_err() {
+            log::warn!("{label} panicked during shutdown");
         }
         true
     } else {

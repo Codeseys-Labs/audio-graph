@@ -32,8 +32,10 @@
  * `grid-area: notice` placement (via the `.workspace-notice` class,
  * `layout.css`) is independent of DOM/tab order.
  */
+import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import type { StageStatus } from "../../types";
+import { runtimeDiagnosticPresentation } from "../../utils/runtimeDiagnostic";
 import Icon from "../Icon";
 
 export interface DiarizationDegradationNoticeProps {
@@ -43,6 +45,21 @@ export interface DiarizationDegradationNoticeProps {
    * can't silently compile; `reason` below only exists on the `Degraded`
    * arm. */
   status: Extract<StageStatus, { type: "Degraded" }>;
+}
+
+export function degradedReason(
+  status: Extract<StageStatus, { type: "Degraded" }>,
+  t: TFunction,
+): string {
+  switch (status.reason) {
+    case "engine_not_compiled":
+    case "clustering_assets_not_downloaded":
+    case "asset_not_downloaded":
+    case "asset_invalid":
+      return t(`pipeline.diarizationDegradedReason.${status.reason}`);
+    default:
+      return t(runtimeDiagnosticPresentation(status.diagnostic).translationKey);
+  }
 }
 
 export function DiarizationDegradationNotice({
@@ -63,7 +80,7 @@ export function DiarizationDegradationNotice({
         {t("workspace.notice.diarizationDegradedTitle")}
       </span>
       <span className="workspace-notice__reason">
-        {t(`pipeline.diarizationDegradedReason.${status.reason}`)}
+        {degradedReason(status, t)}
       </span>
     </div>
   );

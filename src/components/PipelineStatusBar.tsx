@@ -48,6 +48,7 @@ import { computeCompositeHealth } from "../utils/pipelineHealth";
 import { runtimeDiagnosticPresentation } from "../utils/runtimeDiagnostic";
 import Icon, { type IconName } from "./Icon";
 import Tooltip from "./Tooltip";
+import { degradedReason } from "./workspace/DiarizationDegradationNotice";
 
 // Tailwind utility groups (ADR-0016), faithfully translated from the former
 // pipeline-status.css module. Colors/borders resolve through design tokens via
@@ -100,21 +101,6 @@ const PIPELINE_STAGES = [
     icon: "graph" as IconName,
   },
 ] as const;
-
-function degradedReason(
-  status: Extract<StageStatus, { type: "Degraded" }>,
-  t: TFunction,
-): string {
-  switch (status.reason) {
-    case "engine_not_compiled":
-    case "clustering_assets_not_downloaded":
-    case "asset_not_downloaded":
-    case "asset_invalid":
-      return t(`pipeline.diarizationDegradedReason.${status.reason}`);
-    default:
-      return t(runtimeDiagnosticPresentation(status.diagnostic).translationKey);
-  }
-}
 
 /** Map StageStatus to a CSS modifier and tooltip. */
 function stageStatusInfo(

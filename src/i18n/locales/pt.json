@@ -1430,7 +1430,6 @@
     "statusCredentialRejected": "O provedor rejeitou a credencial.",
     "statusCredentialExpired": "A credencial do provedor expirou.",
     "statusReconnecting": "Reconectando ao provedor.",
-    "statusError": "Erro: {{message}}",
     "statusDegraded": "Degradado: {{reason}}",
     "diarizationDegradedReason": {
       "engine_not_compiled": "A detecção de locutor está em modo básico — esta versão não inclui o motor neural de diarização.",
