@@ -182,3 +182,23 @@ fn predecessor_misreads_pinned_timestamps_and_confidences() {
         verify("predecessor regression", [number]);
     }
 }
+
+#[test]
+fn exponent_formatter_payload_digest_goldens() {
+    for (value, token, expected) in [
+        (
+            1e16_f64,
+            "1e+16",
+            "33492c63fe0a487bf7e0fe6c44ae14d7cb3c66a89494536c90ed907b75ebae1a",
+        ),
+        (
+            1e-20_f64,
+            "1e-20",
+            "fcaa4abc94a41de2b30f13eda0a3c57c207a0bc7d8322b0eaac49af17a47f888",
+        ),
+    ] {
+        let payload = Value::from(value);
+        assert_eq!(serde_json::to_string(&payload).unwrap(), token);
+        assert_eq!(payload_digest(&payload).unwrap(), expected);
+    }
+}
