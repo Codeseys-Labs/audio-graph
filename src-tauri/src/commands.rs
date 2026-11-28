@@ -4312,13 +4312,10 @@ pub async fn synthesize_notes(
         executor.chat_with_history(messages, graph_context, llm_provider)
     })
     .await
-    .map_err(|e| format!("notes synthesis task join failed: {}", e))?
-    .map_err(|e| {
-        format!(
-            "Failed to synthesize notes (LLM error: {}). Check the LLM provider \
-             configuration.",
-            e
-        )
+    .map_err(|_| AppError::from(llm_internal_diagnostic()))?
+    .map_err(|diagnostic| {
+        log::warn!("synthesize_notes failed: {diagnostic}");
+        AppError::from(diagnostic)
     })?;
 
     // Notes synthesis only needs the generated Markdown; the token usage on the
