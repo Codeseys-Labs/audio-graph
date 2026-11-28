@@ -389,29 +389,31 @@ pub fn purge_expired_sessions_excluding(
         .map_err(|e| format!("index lock poisoned: {}", e))?;
     let mut index = load_index_checked()?;
     let now = now_millis();
-    let candidates = index
-        .iter()
-        .filter(|entry| {
-            !protected_session_ids.contains(&entry.id)
-                && entry.deleted
-                && entry
-                    .deleted_at
-                    .is_some_and(|ts| now.saturating_sub(ts) >= TRASH_RETENTION_MILLIS)
-        })
-        .map(|entry| (entry.id.clone(), session_artifact_paths(entry)))
-        .collect::<Vec<_>>();
+    let candidates = index.iter().filter(|entry| {
+        !protected_session_ids.contains(&entry.id)
+            && entry.deleted
+            && entry
+                .deleted_at
+                .is_some_and(|ts| now.saturating_sub(ts) >= TRASH_RETENTION_MILLIS)
+    });
 
     let mut purged = Vec::new();
     let mut residual_failures = Vec::new();
-    for (session_id, paths) in candidates {
-        let report = remove_artifact_paths(&session_id, &paths);
+    for entry in candidates {
+        let session_id = &entry.id;
+        if let Err(error) = check_session_before_unlink(session_id) {
+            residual_failures.push(format!("session {session_id}: {error}"));
+            continue;
+        }
+        let paths = session_artifact_paths(entry);
+        let report = remove_artifact_paths(session_id, &paths);
         if !report.failed_files.is_empty() {
             residual_failures.extend(report.failed_files);
             continue;
         }
-        let control_failures = retire_session_control_plane_residue(&session_id);
+        let control_failures = retire_session_control_plane_residue(session_id);
         if control_failures.is_empty() {
-            purged.push(session_id);
+            purged.push(session_id.clone());
         } else {
             residual_failures.extend(control_failures);
         }
@@ -461,6 +463,69 @@ pub fn session_file_paths(entry: &SessionMetadata) -> (PathBuf, PathBuf) {
         PathBuf::from(&entry.graph_path)
     };
     (transcript, graph)
+}
+
+/// Resolve only the legacy filenames the writers and recovery scan own. A
+/// historical timestamp is part of the session ID, not a filename alias.
+pub(crate) fn resolve_indexed_session_paths(
+    root: &Path,
+    session_id: &str,
+    entry: Option<&SessionMetadata>,
+) -> Result<(PathBuf, PathBuf), String> {
+    validate_session_id(session_id)?;
+    let transcripts = root.join("transcripts");
+    let graphs = root.join("graphs");
+    let transcript = transcripts.join(format!("{session_id}.jsonl"));
+    let graph = graphs.join(format!("{session_id}.json"));
+    if let Some(entry) = entry {
+        for (value, owned) in [
+            (&entry.transcript_path, &transcript),
+            (&entry.graph_path, &graph),
+        ] {
+            let indexed = Path::new(value);
+            if !value.trim().is_empty()
+                && (indexed != owned.as_path()
+                    || indexed
+                        .components()
+                        .any(|part| part == std::path::Component::ParentDir))
+            {
+                return Err(INVALID_INDEXED_ARTIFACT_PATH.to_owned());
+            }
+        }
+    }
+    for dir in [root, &transcripts, &graphs] {
+        check_legacy_artifact_entry(dir, fs::Metadata::is_dir)?;
+    }
+    for path in [&transcript, &graph] {
+        check_legacy_artifact_entry(path, fs::Metadata::is_file)?;
+    }
+    Ok((transcript, graph))
+}
+
+const INVALID_INDEXED_ARTIFACT_PATH: &str = "Invalid historical session artifact path";
+
+fn check_legacy_artifact_entry(
+    path: &Path,
+    expected_kind: fn(&fs::Metadata) -> bool,
+) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if expected_kind(&metadata) && !is_reparse_point(&metadata) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(INVALID_INDEXED_ARTIFACT_PATH.to_owned()),
+    }
+}
+
+pub(crate) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
 fn push_artifact_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -572,22 +637,18 @@ pub fn session_artifact_paths(entry: &SessionMetadata) -> Vec<PathBuf> {
     paths
 }
 
-pub fn session_artifact_paths_for_id(session_id: &str) -> Vec<PathBuf> {
-    find_session(session_id)
-        .as_ref()
-        .map(session_artifact_paths)
-        .unwrap_or_else(|| default_session_artifact_paths(session_id))
-}
-
-fn default_session_artifact_paths_resolve_only(session_id: &str) -> Result<Vec<PathBuf>, String> {
-    validate_session_id(session_id)?;
+/// Resolve the complete current artifact inventory for a nominal read without
+/// creating directories or invoking malformed-index repair.
+pub(crate) fn session_artifact_paths_for_id_resolve_only(
+    session_id: &str,
+) -> Result<Vec<PathBuf>, String> {
     let root = crate::user_data::resolve_data_root()?;
+    let entry = find_session_resolve_only(session_id);
+    let (transcript, graph) = resolve_indexed_session_paths(&root, session_id, entry.as_ref())?;
     let mut paths = Vec::new();
 
-    push_artifact_path(
-        &mut paths,
-        root.join("transcripts").join(format!("{session_id}.jsonl")),
-    );
+    push_artifact_path(&mut paths, transcript);
+    push_atomic_json_artifact(&mut paths, graph);
     push_artifact_path(
         &mut paths,
         root.join("transcripts")
@@ -611,10 +672,6 @@ fn default_session_artifact_paths_resolve_only(session_id: &str) -> Result<Vec<P
     push_atomic_json_artifact(
         &mut paths,
         root.join("notes").join(format!("{session_id}.json")),
-    );
-    push_atomic_json_artifact(
-        &mut paths,
-        root.join("graphs").join(format!("{session_id}.json")),
     );
     push_atomic_json_artifact(
         &mut paths,
@@ -645,33 +702,6 @@ fn default_session_artifact_paths_resolve_only(session_id: &str) -> Result<Vec<P
             .join(format!("{session_id}.current.json")),
     );
 
-    Ok(paths)
-}
-
-/// Resolve the complete current artifact inventory for a nominal read without
-/// creating directories or invoking malformed-index repair.
-pub(crate) fn session_artifact_paths_for_id_resolve_only(
-    session_id: &str,
-) -> Result<Vec<PathBuf>, String> {
-    let mut paths = Vec::new();
-    if let Some(entry) = find_session_resolve_only(session_id) {
-        let root = crate::user_data::resolve_data_root()?;
-        let transcript = if entry.transcript_path.trim().is_empty() {
-            root.join("transcripts").join(format!("{session_id}.jsonl"))
-        } else {
-            PathBuf::from(&entry.transcript_path)
-        };
-        let graph = if entry.graph_path.trim().is_empty() {
-            root.join("graphs").join(format!("{session_id}.json"))
-        } else {
-            PathBuf::from(&entry.graph_path)
-        };
-        push_artifact_path(&mut paths, transcript);
-        push_atomic_json_artifact(&mut paths, graph);
-    }
-    for path in default_session_artifact_paths_resolve_only(session_id)? {
-        push_artifact_path(&mut paths, path);
-    }
     Ok(paths)
 }
 
@@ -757,6 +787,11 @@ fn retire_session_control_plane_residue(session_id: &str) -> Vec<String> {
     }
 }
 
+fn check_session_before_unlink(session_id: &str) -> Result<(), String> {
+    let root = crate::user_data::resolve_data_root()?;
+    crate::persistence::session_semantics::ensure_session_delete_compatible(&root, session_id)
+}
+
 /// Permanently delete one session using the same retry-safe ordering as
 /// retention purge: remove the complete managed artifact inventory first and
 /// publish the index removal only after every unlink succeeds or is already
@@ -776,6 +811,11 @@ pub fn permanently_delete_session(
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
     let mut index = load_index_checked()?;
+    check_session_before_unlink(session_id).map_err(|error| {
+        format!(
+            "session deletion refused for {session_id}; no files unlinked and the index entry was preserved for retry: {error}"
+        )
+    })?;
     let artifact_paths = index
         .iter()
         .find(|entry| entry.id == session_id)
@@ -1379,6 +1419,386 @@ mod tests {
             fs::create_dir_all(parent).expect("create artifact parent");
         }
         fs::write(path, contents).expect("write session artifact");
+    }
+
+    fn seed_legacy_artifacts(session_id: &str) -> (PathBuf, PathBuf) {
+        let transcript = write_transcript(session_id, None);
+        let graph = crate::user_data::graph_path(session_id).unwrap();
+        crate::graph::temporal::TemporalKnowledgeGraph::new()
+            .save_to_file(&graph)
+            .unwrap();
+        (transcript, graph)
+    }
+
+    fn assert_historical_paths_refused(root: &Path, id: &str) {
+        use crate::commands::{
+            build_session_timeline_cmd, export_session_bundle, load_session,
+            load_session_transcript,
+        };
+        use crate::persistence::{FileMemoryRepository, LocalMemoryRepository};
+
+        let refusals = tauri::async_runtime::block_on(async {
+            [
+                load_session(id.into()).await.expect_err("Review refusal"),
+                load_session_transcript(id.into())
+                    .await
+                    .expect_err("transcript refusal"),
+                export_session_bundle(id.into())
+                    .await
+                    .expect_err("export refusal"),
+                build_session_timeline_cmd(id.into(), None)
+                    .await
+                    .expect_err("timeline refusal"),
+            ]
+        });
+        for error in refusals {
+            assert!(
+                matches!(&error, crate::error::AppError::Unknown(reason)
+                    if reason == INVALID_INDEXED_ARTIFACT_PATH),
+                "expected a redacted path refusal, got {error}"
+            );
+        }
+        for repository in [
+            FileMemoryRepository::user_data(),
+            FileMemoryRepository::with_data_root(root),
+        ] {
+            assert_eq!(
+                repository.session_artifacts(id).unwrap_err(),
+                INVALID_INDEXED_ARTIFACT_PATH,
+            );
+        }
+    }
+
+    #[test]
+    fn historical_surfaces_require_the_same_session_and_managed_root() {
+        use crate::commands::{build_session_timeline_cmd, export_session_bundle, load_session};
+        use crate::persistence::{FileMemoryRepository, LocalMemoryRepository};
+
+        let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("indexed-artifact-containment");
+        let root = dir.join("store");
+        let _home = HomeGuard::set(&root);
+        let id = "2026-08-19_12-37-42";
+        let other_id = "other-session";
+        let (owned_transcript, owned_graph) = seed_legacy_artifacts(id);
+        let (other_transcript, other_graph) = seed_legacy_artifacts(other_id);
+        register_session(id).unwrap();
+        let mut entry = find_session(id).unwrap();
+
+        let (review, export) = tauri::async_runtime::block_on(async {
+            let review = load_session(id.into()).await.expect("historical Review");
+            let export = export_session_bundle(id.into())
+                .await
+                .expect("historical export");
+            build_session_timeline_cmd(id.into(), None)
+                .await
+                .expect("historical timeline");
+            (review, export)
+        });
+        assert_eq!(review.transcript[0].text, "Recovered transcript");
+        assert!(export.graph.is_some());
+        for repository in [
+            FileMemoryRepository::user_data(),
+            FileMemoryRepository::with_data_root(&root),
+        ] {
+            let paths = repository.session_artifact_paths(id).unwrap();
+            assert!(paths.contains(&owned_transcript));
+            assert!(paths.contains(&owned_graph));
+        }
+
+        let outside_transcript = dir.join(owned_transcript.file_name().unwrap());
+        let outside_graph = dir.join(owned_graph.file_name().unwrap());
+        fs::copy(&owned_transcript, &outside_transcript).unwrap();
+        fs::copy(&owned_graph, &outside_graph).unwrap();
+        write_artifact(
+            &crate::user_data::transcript_events_path(id).unwrap(),
+            b"malformed canonical log",
+        );
+        let with_parent_component = |path: &Path| {
+            let parent = path.parent().unwrap();
+            let sep = std::path::MAIN_SEPARATOR;
+            PathBuf::from(format!(
+                "{}{sep}..{sep}{}{sep}{}",
+                parent.display(),
+                parent.file_name().unwrap().to_string_lossy(),
+                path.file_name().unwrap().to_string_lossy(),
+            ))
+        };
+        for (bad_transcript, bad_graph) in [
+            (
+                with_parent_component(&owned_transcript),
+                with_parent_component(&owned_graph),
+            ),
+            (outside_transcript, outside_graph),
+            (other_transcript, other_graph),
+        ] {
+            entry.transcript_path = bad_transcript.to_string_lossy().into_owned();
+            save_index(std::slice::from_ref(&entry)).unwrap();
+            assert_historical_paths_refused(&root, id);
+            entry.transcript_path = owned_transcript.to_string_lossy().into_owned();
+            entry.graph_path = bad_graph.to_string_lossy().into_owned();
+            save_index(std::slice::from_ref(&entry)).unwrap();
+            assert_historical_paths_refused(&root, id);
+            entry.graph_path = owned_graph.to_string_lossy().into_owned();
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn historical_surfaces_refuse_linked_legacy_artifacts_and_parents() {
+        let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("indexed-artifact-link");
+        let root = dir.join("store");
+        let _home = HomeGuard::set(&root);
+        let id = "linked-legacy";
+        let artifacts = seed_legacy_artifacts(id);
+        register_session(id).unwrap();
+
+        #[cfg(unix)]
+        {
+            let transcript = artifacts.0;
+            let target = transcript.with_extension("original");
+            fs::rename(&transcript, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &transcript).unwrap();
+            assert_historical_paths_refused(&root, id);
+            fs::remove_file(&transcript).unwrap();
+            fs::rename(target, transcript).unwrap();
+        }
+        let managed_parent = artifacts.1.parent().unwrap();
+        let relocated_parent = dir.join("relocated-graphs");
+        fs::rename(managed_parent, &relocated_parent).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&relocated_parent, managed_parent).unwrap();
+        #[cfg(windows)]
+        {
+            // Junction creation does not need Windows Developer Mode.
+            let output = std::process::Command::new("cmd")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(managed_parent)
+                .arg(&relocated_parent)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        assert_historical_paths_refused(&root, id);
+        #[cfg(unix)]
+        fs::remove_file(managed_parent).unwrap();
+        #[cfg(windows)]
+        fs::remove_dir(managed_parent).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn seed_control_plane(
+        root: &Path,
+        session_id: &str,
+        v2: bool,
+    ) -> (
+        crate::persistence::session_artifact_manifest::SessionArtifactManifestV1,
+        Vec<u8>,
+    ) {
+        use crate::persistence::session_artifact_manifest::{
+            ArtifactAvailability, ArtifactContentIdentity, ArtifactPrivacyClass,
+            SessionArtifactEntry, SessionArtifactKind, SessionSemanticsTransitionProofV1,
+            session_control_identities_for,
+        };
+        use crate::persistence::session_semantics::{
+            HistoricalOriginalAudio, SessionSemanticsVersion,
+            historical_session_bootstrap_candidate, session_control_plane_paths,
+            store_coordination_path,
+        };
+
+        let idempotency_id = "seed-control-plane";
+        let mut manifest = historical_session_bootstrap_candidate(
+            session_id,
+            idempotency_id,
+            Vec::new(),
+            HistoricalOriginalAudio::NoObservableBytes,
+        )
+        .unwrap();
+        let (proof, sha256) =
+            SessionSemanticsTransitionProofV1::v1_to_v2(session_id, idempotency_id)
+                .unwrap()
+                .canonical_bytes_and_digest()
+                .unwrap();
+        manifest.generation = 1;
+        if v2 {
+            manifest.session_semantics_version = SessionSemanticsVersion::V2;
+            manifest.transition.fingerprint = sha256.clone();
+            manifest.artifacts.push(SessionArtifactEntry {
+                kind: SessionArtifactKind::SessionProvenanceEvents,
+                privacy_class: ArtifactPrivacyClass::CanonicalSessionMemory,
+                managed_identity: session_control_identities_for(session_id)
+                    .unwrap()
+                    .provenance,
+                availability: ArtifactAvailability::Present {
+                    content: ArtifactContentIdentity {
+                        sha256,
+                        byte_length: proof.len() as u64,
+                    },
+                },
+            });
+        }
+        let paths = session_control_plane_paths(root, session_id).unwrap();
+        write_artifact(&paths.manifest, &serde_json::to_vec(&manifest).unwrap());
+        write_artifact(&paths.provenance, &proof);
+        write_artifact(&store_coordination_path(root, session_id).unwrap(), b"");
+        (manifest, proof)
+    }
+
+    fn guarded_control_plane_read_supported(root: &Path, id: &str) -> bool {
+        use crate::persistence::canonical_durability::CanonicalFilesystemQualificationError;
+        use crate::persistence::session_artifact_manifest::{
+            ManifestStoreError, SessionArtifactManifestStore,
+        };
+
+        match SessionArtifactManifestStore::qualified_existing_session(root, id) {
+            Ok(_)
+            | Err(ManifestStoreError::Qualification(
+                CanonicalFilesystemQualificationError::NamespaceDurabilityUnsupported { .. },
+            )) => true,
+            Err(ManifestStoreError::Qualification(_)) => false,
+            Err(error) => panic!("fixture store could not be opened: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn predecessor_delete_and_purge_keep_all_files_for_incompatible_control_state() {
+        use crate::persistence::session_semantics::session_control_plane_paths;
+
+        let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = unique_tempdir("delete-incompatible-floor");
+        let _home = HomeGuard::set(&root);
+        let id = "guard-ahead";
+        let mut entry = make_meta(id);
+        entry.deleted = true;
+        entry.deleted_at = Some(0);
+        save_index(&[entry]).unwrap();
+        let index_path = sessions_index_path().unwrap();
+        let index_bytes = fs::read(&index_path).unwrap();
+        let content = default_session_artifact_paths(id);
+        for path in &content {
+            write_artifact(path, b"v1 content");
+        }
+        let (mut manifest, _) = seed_control_plane(&root, id, true);
+        let paths = session_control_plane_paths(&root, id).unwrap();
+        let v2 = serde_json::to_vec(&manifest).unwrap();
+        manifest.schema_version += 1;
+        let unknown_schema = serde_json::to_vec(&manifest).unwrap();
+        let read_supported = guarded_control_plane_read_supported(&root, id);
+        for (head, reason) in [
+            (v2, "requires semantics floor v2"),
+            (unknown_schema, "UnsupportedSchema"),
+            (b"invalid manifest".to_vec(), "Malformed"),
+        ] {
+            write_artifact(&paths.manifest, &head);
+            let reason = if read_supported {
+                reason
+            } else {
+                "Session control plane unavailable: Qualification"
+            };
+            let delete_error = permanently_delete_session(id).unwrap_err();
+            assert!(delete_error.contains(reason), "{delete_error}");
+            let purge_error = purge_expired_sessions().unwrap_err();
+            assert!(
+                purge_error.contains(id) && purge_error.contains(reason),
+                "{purge_error}"
+            );
+            assert_eq!(fs::read(&index_path).unwrap(), index_bytes);
+            assert_eq!(fs::read(&paths.manifest).unwrap(), head);
+            for path in &content {
+                assert_eq!(fs::read(path).unwrap(), b"v1 content");
+            }
+        }
+
+        if read_supported {
+            let mut compatible = make_meta("compatible");
+            compatible.deleted = true;
+            compatible.deleted_at = Some(0);
+            let compatible_path = crate::user_data::transcript_path(&compatible.id).unwrap();
+            write_artifact(&compatible_path, b"purgeable");
+            let mut index = load_index();
+            index.push(compatible);
+            save_index(&index).unwrap();
+            purge_expired_sessions().expect_err("only the incompatible session is retained");
+            assert!(!compatible_path.exists());
+            let index = load_index();
+            assert_eq!(index.len(), 1);
+            assert_eq!(index[0].id, id);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn historical_reads_refuse_v2_before_side_artifact_parsing() {
+        use crate::commands::{
+            export_session_bundle, load_session, load_session_data_movement_cmd,
+        };
+        use crate::error::AppError;
+
+        let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = unique_tempdir("guard-ahead-side-reads");
+        let _home = HomeGuard::set(&root);
+        let id = "v2-side-reads";
+        for path in default_session_artifact_paths(id) {
+            write_artifact(&path, b"malformed private artifact");
+        }
+        seed_control_plane(&root, id, true);
+        let reason = if guarded_control_plane_read_supported(&root, id) {
+            "requires semantics floor v2"
+        } else {
+            "Session control plane unavailable: Qualification"
+        };
+        let refusals = tauri::async_runtime::block_on(async {
+            [
+                load_session(id.into()).await.expect_err("Review refusal"),
+                load_session_data_movement_cmd(id.into())
+                    .await
+                    .expect_err("ledger refusal"),
+                export_session_bundle(id.into())
+                    .await
+                    .expect_err("export refusal"),
+            ]
+        });
+        for error in refusals {
+            assert!(
+                matches!(&error, AppError::SessionInvalid { reason: message } if message.contains(reason)),
+                "expected control-plane refusal, got {error}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn historical_bundle_serializes_available_control_evidence_without_the_lock() {
+        use crate::commands::export_session_bundle;
+
+        let _lock = TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = unique_tempdir("historical-bundle-control-evidence");
+        let _home = HomeGuard::set(&root);
+        let id = "v1-export-proof";
+        seed_legacy_artifacts(id);
+        let (manifest, proof) = seed_control_plane(&root, id, false);
+        let export = tauri::async_runtime::block_on(export_session_bundle(id.into()));
+        if guarded_control_plane_read_supported(&root, id) {
+            let bundle = serde_json::to_value(export.expect("guarded export")).unwrap();
+            assert_eq!(bundle["transcript"][0]["text"], "Recovered transcript");
+            assert_eq!(
+                bundle["control_plane"],
+                serde_json::json!({
+                    "manifest": manifest,
+                    "proof": proof,
+                    "temporary_residual": false,
+                })
+            );
+        } else {
+            assert!(matches!(
+                export,
+                Err(crate::error::AppError::SessionInvalid { reason })
+                    if reason.starts_with("Session control plane unavailable: Qualification")
+            ));
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

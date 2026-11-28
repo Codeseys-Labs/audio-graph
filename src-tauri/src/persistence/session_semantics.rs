@@ -1,15 +1,8 @@
 //! Session-semantics compatibility-floor kernel.
 //!
-//! NOT dormant, as of seed audio-graph-e8e7. Two entry points are on production
-//! paths: `open_session_for_content` gates the transcript fork reached from the
-//! `load_session`, `load_session_transcript`, and `export_session_bundle`
-//! commands, and `retire_session_control_plane` runs inside
-//! `permanently_delete_session` and retention purge. Changing either one's
-//! branch policy or residual classification is user-visible.
-//!
-//! Every other item here — the v1-to-v2 admission, the control-plane export
-//! surface, and the historical bootstrap builder — still has no production
-//! caller.
+//! Historical content reads and exports admit the floor before opening content.
+//! Permanent delete and retention purge check the same floor before unlinking.
+//! Session-owned control-plane export and retirement exclude the store lock.
 
 use std::fmt;
 use std::fs::File;
@@ -404,6 +397,16 @@ pub fn guarded_session_open<T, E>(
     maximum_supported: SessionSemanticsVersion,
     content_reader: impl FnOnce(AdmittedSessionFloor) -> Result<T, E>,
 ) -> Result<T, GuardedSessionOpenError<E>> {
+    guarded_session_open_with_head(store, maximum_supported, |floor, _| content_reader(floor))
+}
+
+type GuardedControlPlane<'a> = (&'a SessionArtifactManifestStore, ManifestLoadOutcome);
+
+fn guarded_session_open_with_head<T, E>(
+    store: &SessionArtifactManifestStore,
+    maximum_supported: SessionSemanticsVersion,
+    content_reader: impl FnOnce(AdmittedSessionFloor, Option<GuardedControlPlane<'_>>) -> Result<T, E>,
+) -> Result<T, GuardedSessionOpenError<E>> {
     if !maximum_supported.is_supported() {
         return Err(GuardedSessionOpenError::UnsupportedReaderFloor {
             actual: maximum_supported.as_u32(),
@@ -415,8 +418,8 @@ pub fn guarded_session_open<T, E>(
             let reader = pending
                 .take()
                 .expect("checked_read invokes its reader at most once");
-            checked_session_open(&manifest, maximum_supported, || {
-                reader(AdmittedSessionFloor {
+            let floor = checked_session_open(&manifest, maximum_supported, || {
+                Ok::<_, E>(AdmittedSessionFloor {
                     floor: manifest.session_semantics_version,
                     evidence: SessionFloorEvidence::GuardedManifest,
                 })
@@ -438,16 +441,21 @@ pub fn guarded_session_open<T, E>(
                 CheckedSessionOpenError::ContentReader(error) => {
                     GuardedSessionOpenError::ContentReader(error)
                 }
-            })
+            })?;
+            reader(floor, Some((store, ManifestLoadOutcome::Present(manifest))))
+                .map_err(GuardedSessionOpenError::ContentReader)
         }
         ManifestLoadOutcome::Absent => {
             let reader = pending
                 .take()
                 .expect("checked_read invokes its reader at most once");
-            reader(AdmittedSessionFloor {
-                floor: SessionSemanticsVersion::V1,
-                evidence: SessionFloorEvidence::GuardedAbsence,
-            })
+            reader(
+                AdmittedSessionFloor {
+                    floor: SessionSemanticsVersion::V1,
+                    evidence: SessionFloorEvidence::GuardedAbsence,
+                },
+                Some((store, ManifestLoadOutcome::Absent)),
+            )
             .map_err(GuardedSessionOpenError::ContentReader)
         }
     });
@@ -472,7 +480,7 @@ pub fn guarded_session_open<T, E>(
             let root = store.managed_root();
             let paths = control_plane_paths_from(root, identities);
             let coordination = root.join(identities.coordination.as_str());
-            unguarded_absence_admission(&paths, &coordination, reader)
+            unguarded_absence_admission(&paths, &coordination, |floor| reader(floor, None))
         }
     }
 }
@@ -529,6 +537,17 @@ pub fn open_session_for_content<T, E>(
     maximum_supported: SessionSemanticsVersion,
     content_reader: impl FnOnce(AdmittedSessionFloor) -> Result<T, E>,
 ) -> Result<T, GuardedSessionOpenError<E>> {
+    open_session_for_content_with_head(data_root, session_id, maximum_supported, |floor, _| {
+        content_reader(floor)
+    })
+}
+
+fn open_session_for_content_with_head<T, E>(
+    data_root: &Path,
+    session_id: &str,
+    maximum_supported: SessionSemanticsVersion,
+    content_reader: impl FnOnce(AdmittedSessionFloor, Option<GuardedControlPlane<'_>>) -> Result<T, E>,
+) -> Result<T, GuardedSessionOpenError<E>> {
     // Refuse an unsupported reader floor here, not only inside
     // `guarded_session_open`: otherwise the same caller error is classified two
     // different ways depending on whether control-plane bytes happen to exist.
@@ -544,10 +563,12 @@ pub fn open_session_for_content<T, E>(
     if !any_control_entry_present(&paths, &coordination)
         .map_err(GuardedSessionOpenError::ControlPlaneObservation)?
     {
-        return unguarded_absence_admission(&paths, &coordination, content_reader);
+        return unguarded_absence_admission(&paths, &coordination, |floor| {
+            content_reader(floor, None)
+        });
     }
     match SessionArtifactManifestStore::qualified_existing_session(data_root, session_id) {
-        Ok(store) => guarded_session_open(&store, maximum_supported, content_reader),
+        Ok(store) => guarded_session_open_with_head(&store, maximum_supported, content_reader),
         // The production namespace policy makes manifest mutation unavailable on
         // this platform, which is exactly ADR-0044 §5's read-only branch.
         Err(ManifestStoreError::Qualification(
@@ -555,7 +576,7 @@ pub fn open_session_for_content<T, E>(
         )) => {
             let store = SessionArtifactManifestStore::for_session(data_root, session_id)
                 .map_err(GuardedSessionOpenError::ControlPlaneStore)?;
-            guarded_session_open(&store, maximum_supported, content_reader)
+            guarded_session_open_with_head(&store, maximum_supported, content_reader)
         }
         // Every other refusal is a refusal. A control plane that exists and
         // cannot be read under a guard is never admitted as historical v1.
@@ -683,7 +704,7 @@ fn any_control_entry_present(
 /// The store-owned lock is absent by construction, and the manifest temporary is
 /// reported as residue rather than exported: a staged intent is recovery
 /// material, not Session evidence.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionControlPlaneExport {
     pub manifest: Option<SessionArtifactManifestV1>,
     pub proof: Option<Vec<u8>>,
@@ -733,71 +754,7 @@ pub enum SessionControlPlaneExportError {
 pub fn export_session_control_plane(
     store: &SessionArtifactManifestStore,
 ) -> Result<SessionControlPlaneExport, SessionControlPlaneExportError> {
-    let Some(identities) = store.addressed_control_identities() else {
-        return Err(SessionControlPlaneExportError::ControlPlaneStore(
-            ManifestStoreError::InvalidSessionAddress,
-        ));
-    };
-    let paths = control_plane_paths_from(store.managed_root(), identities);
-    let read = store.checked_read(|head| {
-        let temporary_residual = control_entry_present(&paths.temporary)
-            .map_err(SessionControlPlaneExportError::ControlPlaneObservation)?;
-        let observed = read_session_transition_proof(&paths.provenance)?;
-        if let Some((_, _, proof)) = observed.as_ref() {
-            let derived = session_control_identities_for(proof.session_id())
-                .map_err(SessionControlPlaneExportError::ControlPlaneStore)?;
-            if derived.provenance != identities.provenance {
-                return Err(SessionControlPlaneExportError::ProofSessionMismatch);
-            }
-        }
-        let manifest = match head {
-            ManifestLoadOutcome::Absent => {
-                return Ok(SessionControlPlaneExport {
-                    manifest: None,
-                    proof: observed.map(|(bytes, _, _)| bytes),
-                    temporary_residual,
-                });
-            }
-            ManifestLoadOutcome::Present(manifest) => *manifest,
-        };
-        if manifest.session_semantics_version != SessionSemanticsVersion::V2 {
-            return Ok(SessionControlPlaneExport {
-                manifest: Some(manifest),
-                proof: observed.map(|(bytes, _, _)| bytes),
-                temporary_residual,
-            });
-        }
-        validate_v2_session_provenance(&manifest)
-            .map_err(SessionControlPlaneExportError::V2ProvenanceEntryInvalid)?;
-        let entry = manifest
-            .artifacts
-            .iter()
-            .find(|artifact| artifact.kind == SessionArtifactKind::SessionProvenanceEvents)
-            .ok_or(SessionControlPlaneExportError::V2ProvenanceEntryInvalid(
-                V2SessionProvenanceError::Missing,
-            ))?;
-        let ArtifactAvailability::Present { content } = &entry.availability else {
-            return Err(SessionControlPlaneExportError::V2ProvenanceEntryInvalid(
-                V2SessionProvenanceError::Unavailable,
-            ));
-        };
-        let Some((bytes, digest, _)) = observed else {
-            return Err(SessionControlPlaneExportError::V2ProofMissing);
-        };
-        if entry.managed_identity != identities.provenance {
-            return Err(SessionControlPlaneExportError::V2ProvenanceIdentityMismatch);
-        }
-        if content.sha256 != digest
-            || content.byte_length != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
-        {
-            return Err(SessionControlPlaneExportError::V2ProofContentMismatch);
-        }
-        Ok(SessionControlPlaneExport {
-            manifest: Some(manifest),
-            proof: Some(bytes),
-            temporary_residual,
-        })
-    });
+    let read = store.checked_read(|head| export_guarded_session_control_plane((store, head)));
     match read {
         Ok(export) => Ok(export),
         Err(CheckedManifestReadError::Reader(error)) => Err(error),
@@ -811,6 +768,89 @@ pub fn export_session_control_plane(
             Err(SessionControlPlaneExportError::UncoordinatedControlPlaneAbsence)
         }
     }
+}
+
+fn export_guarded_session_control_plane(
+    (store, head): GuardedControlPlane<'_>,
+) -> Result<SessionControlPlaneExport, SessionControlPlaneExportError> {
+    let Some(identities) = store.addressed_control_identities() else {
+        return Err(SessionControlPlaneExportError::ControlPlaneStore(
+            ManifestStoreError::InvalidSessionAddress,
+        ));
+    };
+    let paths = control_plane_paths_from(store.managed_root(), identities);
+    let temporary_residual = control_entry_present(&paths.temporary)
+        .map_err(SessionControlPlaneExportError::ControlPlaneObservation)?;
+    let observed = read_session_transition_proof(&paths.provenance)?;
+    if let Some((_, _, proof)) = observed.as_ref() {
+        let derived = session_control_identities_for(proof.session_id())
+            .map_err(SessionControlPlaneExportError::ControlPlaneStore)?;
+        if derived.provenance != identities.provenance {
+            return Err(SessionControlPlaneExportError::ProofSessionMismatch);
+        }
+    }
+    let manifest = match head {
+        ManifestLoadOutcome::Absent => None,
+        ManifestLoadOutcome::Present(manifest) => Some(*manifest),
+    };
+    if let Some(manifest) = &manifest
+        && manifest.session_semantics_version == SessionSemanticsVersion::V2
+    {
+        validate_v2_session_provenance(manifest)
+            .map_err(SessionControlPlaneExportError::V2ProvenanceEntryInvalid)?;
+        let entry = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == SessionArtifactKind::SessionProvenanceEvents)
+            .ok_or(SessionControlPlaneExportError::V2ProvenanceEntryInvalid(
+                V2SessionProvenanceError::Missing,
+            ))?;
+        let ArtifactAvailability::Present { content } = &entry.availability else {
+            return Err(SessionControlPlaneExportError::V2ProvenanceEntryInvalid(
+                V2SessionProvenanceError::Unavailable,
+            ));
+        };
+        let Some((bytes, digest, _)) = &observed else {
+            return Err(SessionControlPlaneExportError::V2ProofMissing);
+        };
+        if entry.managed_identity != identities.provenance {
+            return Err(SessionControlPlaneExportError::V2ProvenanceIdentityMismatch);
+        }
+        if content.sha256 != *digest
+            || content.byte_length != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+        {
+            return Err(SessionControlPlaneExportError::V2ProofContentMismatch);
+        }
+    }
+    Ok(SessionControlPlaneExport {
+        manifest,
+        proof: observed.map(|(bytes, _, _)| bytes),
+        temporary_residual,
+    })
+}
+
+/// Export control-plane evidence and content from the same admitted snapshot.
+pub(crate) fn open_v1_session_for_export<T, E>(
+    data_root: &Path,
+    session_id: &str,
+    export_error: impl FnOnce(SessionControlPlaneExportError) -> E,
+    content_reader: impl FnOnce(Option<SessionControlPlaneExport>) -> Result<T, E>,
+) -> Result<T, GuardedSessionOpenError<E>> {
+    open_session_for_content_with_head(
+        data_root,
+        session_id,
+        SessionSemanticsVersion::V1,
+        |_, guarded| {
+            let control_plane = guarded
+                .map(export_guarded_session_control_plane)
+                .transpose()
+                .map_err(export_error)?
+                .filter(|export| {
+                    export.manifest.is_some() || export.proof.is_some() || export.temporary_residual
+                });
+            content_reader(control_plane)
+        },
+    )
 }
 
 /// Read and authenticate the durable transition-proof record, if one exists.
@@ -833,7 +873,7 @@ fn read_session_transition_proof(
         )
     };
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.file_type().is_file() => {
+        Ok(metadata) if !metadata.is_file() || crate::sessions::is_reparse_point(&metadata) => {
             return Err(SessionControlPlaneExportError::ProofNonRegular);
         }
         Ok(_) => {}
@@ -872,6 +912,39 @@ fn read_session_transition_proof(
 // ---------------------------------------------------------------------------
 // Per-Session control-plane retirement (ADR-0044 §3 delete parity).
 // ---------------------------------------------------------------------------
+
+/// Check the authoritative head before deletion, not after the first unlink.
+/// As with the historical read preflight, this relies on the V2 writer being
+/// dormant. Deletion must coordinate the unlinks with admission before that
+/// writer can run concurrently.
+pub(crate) fn ensure_session_delete_compatible(
+    data_root: &Path,
+    session_id: &str,
+) -> Result<(), String> {
+    open_session_for_content_with_head(
+        data_root,
+        session_id,
+        SessionSemanticsVersion::V1,
+        |_, guarded| {
+            if let Some((store, head)) = guarded {
+                let export = export_guarded_session_control_plane((store, head))
+                    .map_err(|error| format!("Session control plane unreadable: {error:?}"))?;
+                if export.temporary_residual {
+                    let temporary = store
+                        .managed_root()
+                        .join(store.control_identities().temporary.as_str());
+                    let metadata = std::fs::symlink_metadata(temporary)
+                        .map_err(|_| "Session manifest temporary is unobservable".to_owned())?;
+                    if !metadata.is_file() || crate::sessions::is_reparse_point(&metadata) {
+                        return Err("Session manifest temporary is not a regular file".to_owned());
+                    }
+                }
+            }
+            Ok(())
+        },
+    )
+    .map_err(|error| error.to_string())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionControlPlaneRetirement {
