@@ -1106,6 +1106,8 @@ pub struct SchedulerQueueState {
 pub struct ProjectionSchedulers {
     notes: ProjectionScheduler,
     graph: ProjectionScheduler,
+    coverage_check: Option<std::sync::Arc<()>>,
+    observed_while_checking: bool,
 }
 
 impl ProjectionSchedulers {
@@ -1114,6 +1116,8 @@ impl ProjectionSchedulers {
         Self {
             notes: ProjectionScheduler::new(session_id.clone(), ProjectionKind::Notes),
             graph: ProjectionScheduler::new(session_id, ProjectionKind::Graph),
+            coverage_check: None,
+            observed_while_checking: false,
         }
     }
 
@@ -1136,6 +1140,13 @@ impl ProjectionSchedulers {
         ledger: &TranscriptLedger,
         now_ms: u64,
     ) -> ProjectionSchedulersObservation {
+        if self.coverage_check.is_some() {
+            self.observed_while_checking = true;
+            return ProjectionSchedulersObservation {
+                notes: ProjectionSchedulerDecision::Idle,
+                graph: ProjectionSchedulerDecision::Idle,
+            };
+        }
         ProjectionSchedulersObservation {
             notes: self.notes.observe_ledger(ledger, now_ms),
             graph: self.graph.observe_ledger(ledger, now_ms),
@@ -1366,7 +1377,53 @@ impl ProjectionSchedulers {
         }
     }
 
+    pub(crate) fn begin_coverage_check(&mut self) -> std::sync::Arc<()> {
+        self.clear_orphaned_deferred_retries();
+        self.notes.resume_gaps.clear();
+        self.graph.resume_gaps.clear();
+        self.observed_while_checking = false;
+        let check = std::sync::Arc::new(());
+        self.coverage_check = Some(check.clone());
+        check
+    }
+
+    pub(crate) fn owns_coverage_check(&self, session: &str, check: &std::sync::Arc<()>) -> bool {
+        self.notes.session_id == session && self.coverage_check.as_ref().is_some_and(|active| std::sync::Arc::ptr_eq(active, check))
+    }
+
+    pub(crate) fn cancel_coverage_check(&mut self) {
+        self.coverage_check = None;
+        self.observed_while_checking = false;
+    }
+
+    /// The capture starts only after old workers drain. While the check is
+    /// pending, observations queue one fresh evaluation instead of launching jobs.
+    pub(crate) fn finish_coverage_check(
+        &mut self,
+        heads: (Option<ProjectionBasis>, Option<ProjectionBasis>),
+        notes_gaps: &[String],
+        graph_gaps: &[String],
+        verified: bool,
+    ) -> bool {
+        self.coverage_check = None;
+        for (lane, head, gaps) in [(&mut self.notes, heads.0, notes_gaps), (&mut self.graph, heads.1, graph_gaps)] {
+            lane.last_completed_basis = head;
+            lane.resume_gaps = gaps.to_vec();
+            if !verified {
+                lane.last_failed_basis = None;
+                lane.failed_attempts = 0;
+                lane.deferred_retry_at_ms = None;
+                lane.pending_since_ms = None;
+                lane.in_flight = None;
+                lane.pending_basis = None;
+                lane.repair_job = None;
+            }
+        }
+        std::mem::take(&mut self.observed_while_checking)
+    }
+
     /// Seed the live session from one read of its accepted patches and recovery gaps.
+    #[cfg(test)]
     pub(crate) fn attach_capture(
         &mut self,
         session: &str,

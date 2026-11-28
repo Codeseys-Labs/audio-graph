@@ -2886,7 +2886,6 @@ fn shared_to_transcript_context(
         pending_agent_proposals: shared.pending_agent_proposals,
         pending_extraction: Arc::new(Mutex::new(None)),
     };
-    start_capture_projection_repairs(ctx.projection_dispatch_context());
     ctx
 }
 
@@ -3369,6 +3368,12 @@ fn log_attempt_budget_exhausted(decision: &ProjectionSchedulerDecision, attempts
     }
 }
 
+mod capture_coverage;
+pub(crate) use capture_coverage::spawn_capture_verification;
+#[cfg(test)]
+pub(crate) use capture_coverage::test_probe;
+
+#[cfg(test)]
 fn start_capture_projection_repairs(dispatch: ProjectionDispatchContext) {
     let observation = {
         let ledger = dispatch
@@ -6750,7 +6755,6 @@ pub(crate) fn run_speech_processor_diarization_only(
         llm_allow_cloud_fallbacks: config.llm_allow_cloud_fallbacks,
         data_movement_sink: Arc::new(FileProjectionDataMovementSink),
     };
-    start_capture_projection_repairs(projection_dispatch.clone());
 
     // Register the AppHandle with the persistence module (see note in
     // `run_speech_processor`). Diarization-only may be entered directly when
@@ -15342,8 +15346,8 @@ mod tests_status {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        crate::persistence::reseed_projection_capture(&app);
-        super::start_capture_projection_repairs(dispatch.clone());
+        let check = crate::persistence::begin_projection_capture(&app);
+        super::capture_coverage::launch(&app, check, dispatch.clone());
         running.recv_timeout(Duration::from_secs(60)).unwrap();
         super::start_capture_projection_repairs(dispatch);
         let workers = std::mem::take(&mut *app.projection_job_workers.lock().unwrap());

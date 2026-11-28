@@ -1,0 +1,138 @@
+//! Projection history verification belongs to the capture that requested it.
+use super::*;
+use crate::persistence::{FileMemoryRepository, VerifiedCaptureCoverage};
+use crate::projections::{ProjectionCoverageStatus::BehindTranscript, ProjectionKind};
+
+pub(crate) fn spawn_capture_verification(
+    state: &crate::state::AppState,
+    app: &AppHandle,
+    settings: &crate::settings::AppSettings,
+    check: Arc<()>,
+) {
+    let provider = settings.llm_provider.clone();
+    let dispatch = ProjectionDispatchContext {
+        speaker_timeline: state.speaker_timeline.clone(),
+        transcript_ledger: state.transcript_ledger.clone(),
+        projection_schedulers: state.projection_schedulers.clone(),
+        projection_runtime: state.projection_runtime_handle(),
+        projection_job_workers: state.projection_job_workers.clone(),
+        projection_lane_stopping: state.projection_lane_stopping.clone(),
+        event_sink: Arc::new(TauriProjectionRuntimeEventSink { app_handle: app.clone() }),
+        patch_generator: Arc::new(ExecutorProjectionPatchGenerator {
+            llm_executor: state.llm_executor.clone(),
+            llm_provider: provider.clone(),
+        }),
+        llm_provider: provider,
+        llm_allow_cloud_fallbacks: settings.privacy_mode.allows_session_cloud_content_transfer(),
+        data_movement_sink: Arc::new(FileProjectionDataMovementSink),
+    };
+    launch(state, check, dispatch);
+}
+
+pub(super) fn launch(state: &crate::state::AppState, check: Arc<()>, dispatch: ProjectionDispatchContext) {
+    let session = state.current_session_id();
+    let lifecycle = state.session_lifecycle.clone();
+    let view = state.materialized_projection_state.clone();
+    let publication = state.transcript_publication.clone();
+    #[cfg(test)]
+    let probe = test_probe::take();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Start owns this mutex until ASR has started. Release it before
+        // reading any history or acquiring any filesystem coordination guard.
+        {
+            let _lifecycle = lifecycle.blocking_lock();
+            if !dispatch.projection_schedulers.lock().unwrap_or_else(|p| p.into_inner()).owns_coverage_check(&session, &check) {
+                return;
+            }
+        }
+        #[cfg(test)]
+        let _probe = test_probe::enter(probe);
+        #[cfg(test)]
+        test_probe::point(test_probe::Phase::BeforeRead);
+        let verified = FileMemoryRepository::user_data().verify_capture_coverage(&session);
+        #[cfg(test)]
+        test_probe::point(test_probe::Phase::BeforeInstall);
+
+        // Serialize acceptance and dispatch against Stop, and against the
+        // session swap. A new visit to the same session gets a different token.
+        let _lifecycle = lifecycle.blocking_lock();
+        let _epoch = publication.read().unwrap_or_else(|p| p.into_inner());
+        let (repairs, observations) = {
+            let ledger = dispatch.transcript_ledger.lock().unwrap_or_else(|p| p.into_inner());
+            let mut lanes = dispatch.projection_schedulers.lock().unwrap_or_else(|p| p.into_inner());
+            if !lanes.owns_coverage_check(&session, &check) || ledger.session_id != session {
+                return;
+            }
+            let ok = verified.is_ok();
+            let (coverage, behind) = match verified {
+                Ok(VerifiedCaptureCoverage { coverage, transcript_count, behind }) => {
+                    (coverage, if transcript_count == ledger.accepted_event_count { behind } else { [true, true] })
+                }
+                Err(_) => {
+                    log::warn!("projection_capture.coverage_unverified");
+                    (Default::default(), [true, true])
+                }
+            };
+            let (heads, gaps) = coverage;
+            let observe = lanes.finish_coverage_check(heads, gaps.for_kind(&ProjectionKind::Notes), gaps.for_kind(&ProjectionKind::Graph), ok);
+            {
+                let mut view = view.lock().unwrap_or_else(|p| p.into_inner());
+                view.notes.transcript_coverage = behind[0].then_some(BehindTranscript);
+                view.graph.transcript_coverage = behind[1].then_some(BehindTranscript);
+            }
+            let now = current_unix_millis();
+            (lanes.take_capture_repairs(&ledger, now), observe.then(|| lanes.observe_ledger(&ledger, now)))
+        };
+        dispatch_projection_observation(dispatch.clone(), repairs);
+        if let Some(observation) = observations {
+            dispatch_projection_observation(dispatch, observation);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) mod test_probe {
+    use std::{cell::RefCell, sync::{Arc, atomic::{AtomicUsize, Ordering}, mpsc}, time::Duration};
+    const HANG: Duration = Duration::from_secs(60);
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub(crate) enum Phase { BeforeRead, BeforeInstall, Done }
+    pub(super) struct Probe {
+        arrived: mpsc::Sender<Phase>,
+        resume: mpsc::Receiver<()>,
+        reads: Arc<AtomicUsize>,
+    }
+    thread_local! {
+        static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) };
+        static READS: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
+    }
+    pub(crate) struct Control { arrived: mpsc::Receiver<Phase>, resume: mpsc::Sender<()>, reads: Arc<AtomicUsize> }
+    impl Control {
+        pub(crate) fn arm() -> Self {
+            let (arrived, events) = mpsc::channel();
+            let (next, resume) = mpsc::channel();
+            let reads = Arc::new(AtomicUsize::new(0));
+            READS.replace(Some(reads.clone()));
+            PROBE.replace(Some(Probe { arrived, resume, reads: reads.clone() }));
+            Self { arrived: events, resume: next, reads }
+        }
+        pub(crate) fn wait(&self, phase: Phase) { assert_eq!(self.arrived.recv_timeout(HANG).unwrap(), phase); }
+        pub(crate) fn resume(&self) { self.resume.send(()).unwrap(); }
+        pub(crate) fn reads(&self) -> usize { self.reads.load(Ordering::SeqCst) }
+    }
+    impl Drop for Control { fn drop(&mut self) { READS.take(); PROBE.take(); } }
+    pub(super) fn take() -> Option<Probe> { PROBE.take() }
+    pub(super) struct Worker;
+    pub(super) fn enter(probe: Option<Probe>) -> Worker {
+        READS.replace(probe.as_ref().map(|p| p.reads.clone()));
+        PROBE.replace(probe); Worker
+    }
+    impl Drop for Worker {
+        fn drop(&mut self) { if let Some(p) = PROBE.take() { let _ = p.arrived.send(Phase::Done); } READS.take(); }
+    }
+    pub(super) fn point(phase: Phase) {
+        PROBE.with_borrow(|p| if let Some(p) = p { p.arrived.send(phase).unwrap(); p.resume.recv_timeout(HANG).unwrap(); });
+    }
+    pub(crate) fn record_read() {
+        READS.with_borrow(|r| if let Some(n) = r { n.fetch_add(1, Ordering::SeqCst); });
+    }
+}
