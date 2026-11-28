@@ -41,7 +41,10 @@ import type {
   AudioSourceInfo,
   SourceId,
 } from "../generated/audioSource";
-import type { RuntimeDiagnostic } from "../generated/runtimeDiagnostic";
+import type {
+  RuntimeDiagnostic,
+  RuntimeRetryDelayBucket,
+} from "../generated/runtimeDiagnostic";
 // AnswerDrafts (audio-graph-83cc T4): per-card transient answer-stream
 // progress state. Defined in `store/` (not here) for the same reason
 // `ShellNav` is — it ships with the slice creator `store/index.ts` spreads
@@ -1824,7 +1827,7 @@ export interface UsageMetadata {
 export type GeminiErrorCategory =
   | { kind: "auth" }
   | { kind: "auth_expired" }
-  | { kind: "rate_limit"; retry_after_secs?: number }
+  | { kind: "rate_limit"; retry_delay?: RuntimeRetryDelayBucket }
   | { kind: "server" }
   | { kind: "network" }
   | { kind: "unknown" };
@@ -1838,6 +1841,12 @@ export interface GeminiStatusEvent {
     | "reconnecting"
     | "reconnected"
     | "turn_complete";
+  /**
+   * Stable closed site token (`GeminiErrorSite::token`, issue #145) present
+   * on `error` events — never provider text, a WebSocket close reason, a
+   * request id, or a payload length. The UI router ignores it in favor of
+   * `diagnostic`.
+   */
   message?: string;
   /**
    * Present on `error` events. Carries the structured classification
@@ -1845,6 +1854,14 @@ export interface GeminiStatusEvent {
    * correct i18n key + toast severity without re-parsing `message`.
    */
   category?: GeminiErrorCategory;
+  /**
+   * Present on `error` events (issue #145): the closed
+   * [`RuntimeDiagnostic`](../generated/runtimeDiagnostic) envelope the
+   * frontend routes through `runtimeDiagnosticPresentation`. This is the
+   * only field the UI consumes — `message` is a closed site token and raw
+   * provider text never crosses IPC.
+   */
+  diagnostic?: RuntimeDiagnostic;
   /** Present on `reconnecting` events — 1-based retry number. */
   attempt?: number;
   /** Present on `reconnecting` events — seconds until the next retry. */
@@ -1895,7 +1912,7 @@ export interface OpenAiRealtimeResponseEvent {
 export type OpenAiRealtimeErrorCategory =
   | { kind: "auth" }
   | { kind: "auth_expired" }
-  | { kind: "rate_limit"; retry_after_secs?: number }
+  | { kind: "rate_limit"; retry_delay?: RuntimeRetryDelayBucket }
   | { kind: "server" }
   | { kind: "network" }
   | { kind: "unknown" };
@@ -1909,8 +1926,21 @@ export type OpenAiRealtimeErrorCategory =
  */
 export interface OpenAiRealtimeStatusEvent {
   type: "connected" | "disconnected" | "error" | "reconnecting" | "reconnected";
+  /**
+   * Stable closed site token (`OpenAiRealtimeErrorSite::token`, issue #145)
+   * present on `error` events — never provider text, a WebSocket close
+   * reason, a request id, or a payload length. The UI router ignores it in
+   * favor of `diagnostic`.
+   */
   message?: string;
   category?: OpenAiRealtimeErrorCategory;
+  /**
+   * Present on `error` events (issue #145): the closed
+   * [`RuntimeDiagnostic`](../generated/runtimeDiagnostic) envelope the
+   * frontend routes through `runtimeDiagnosticPresentation` — same contract
+   * as {@link GeminiStatusEvent.diagnostic}.
+   */
+  diagnostic?: RuntimeDiagnostic;
   attempt?: number;
   backoff_secs?: number;
   resumed?: boolean;

@@ -7292,6 +7292,53 @@ fn sanitize_frontend_id(s: &str) -> Option<String> {
 // Gemini Live dual-pipeline commands
 // ---------------------------------------------------------------------------
 
+/// Closed diagnostic for a failed realtime worker-thread spawn (issue #145).
+/// The `io::Error` (OS prose, possibly paths) is discarded — `AppError::
+/// from_unclassified_runtime_error` keeps nothing from it — so the command
+/// result is a closed `internal` runtime diagnostic localized by the UI.
+fn realtime_worker_spawn_error(source: &std::io::Error) -> AppError {
+    use audio_graph_ipc_contract::runtime_diagnostic::{
+        RuntimeDiagnosticContext, RuntimeOperation, RuntimeTransport,
+    };
+    AppError::from_unclassified_runtime_error(
+        source,
+        RuntimeDiagnosticContext::new(RuntimeOperation::RealtimeConversation)
+            .with_transport(RuntimeTransport::Native),
+    )
+}
+
+/// Notes-mode `TurnComplete` handler body (issue #145): log a fixed label,
+/// then persist the per-session token totals from the turn's `usageMetadata`
+/// on the DATA path. Diagnostic logs carry no token counts, and a persistence
+/// failure logs a fixed label (the error text can carry private paths /
+/// session ids).
+fn persist_gemini_turn_usage(
+    session_id_handle: &Arc<RwLock<String>>,
+    usage: Option<&crate::gemini::UsageMetadata>,
+) {
+    log::debug!("Gemini: turn complete");
+
+    // Persist per-session token totals (loop 19). Before this, turn counts +
+    // token totals only lived in the frontend's localStorage and did not
+    // survive an app restart.
+    let count = |value: Option<u32>| u64::from(value.unwrap_or(0));
+    let delta = crate::sessions::usage::TurnDelta {
+        prompt: count(usage.and_then(|u| u.prompt_token_count)),
+        response: count(usage.and_then(|u| u.response_token_count)),
+        cached: count(usage.and_then(|u| u.cached_content_token_count)),
+        thoughts: count(usage.and_then(|u| u.thoughts_token_count)),
+        tool_use: count(usage.and_then(|u| u.tool_use_prompt_token_count)),
+        total: count(usage.and_then(|u| u.total_token_count)),
+    };
+    let current_sid = match session_id_handle.read() {
+        Ok(g) => g.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if crate::sessions::usage::append_turn(&current_sid, delta).is_err() {
+        log::warn!("Failed to persist turn usage");
+    }
+}
+
 /// Start the Gemini Live pipeline.
 ///
 /// Reads Gemini settings (API key, model) from `AppSettings`, creates a
@@ -7353,29 +7400,10 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
     )?;
     let gemini_settings = settings.gemini.clone();
 
-    // Validate auth configuration early.
-    match &gemini_settings.auth {
-        crate::settings::GeminiAuthMode::ApiKey { api_key } => {
-            if api_key.is_empty() {
-                return Err(AppError::CredentialMissing {
-                    key: "gemini_api_key".to_string(),
-                });
-            }
-        }
-        crate::settings::GeminiAuthMode::VertexAI {
-            project_id,
-            location,
-            ..
-        } => {
-            if project_id.is_empty() || location.is_empty() {
-                return Err(AppError::CredentialFileError {
-                    reason:
-                        "Vertex AI project_id and location must be configured in Settings → Gemini."
-                            .to_string(),
-                });
-            }
-        }
-    }
+    // Validate auth configuration early. Issue #145: blank fields are the
+    // closed `invalid_configuration` diagnostic, the same one `connect()`
+    // returns, not a legacy local error.
+    crate::gemini::validate_auth_configuration(&gemini_settings.auth)?;
 
     // Reap finished notes-mode handles before registering a new runtime
     // consumer. If either handle is still running while the active flag is
@@ -7424,7 +7452,9 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
             &state.processed_audio_consumers,
             GEMINI_NOTES_AUDIO_CONSUMER_ID,
         );
-        return Err(AppError::Unknown(err));
+        // Issue #145: `connect()` already returns the closed typed
+        // `RuntimeDiagnostic` AppError — forward it unchanged.
+        return Err(err);
     }
 
     let event_rx = client.event_rx();
@@ -7521,10 +7551,7 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                         }
                         *client_guard = None;
                     }
-                    return Err(AppError::Unknown(format!(
-                        "Failed to spawn Gemini audio thread: {}",
-                        e
-                    )));
+                    return Err(realtime_worker_spawn_error(&e));
                 }
             };
             *audio_handle = Some(handle);
@@ -7638,6 +7665,7 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                             GeminiEvent::Error {
                                 ref category,
                                 ref message,
+                                ..
                             } => {
                                 log::error!("Gemini error event ({:?}): {}", category, message,);
                                 let _ = app_handle.emit(events::GEMINI_STATUS, &event);
@@ -7650,60 +7678,11 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                                 // on GEMINI_STATUS so the UI can surface
                                 // per-turn token accounting from
                                 // `usageMetadata` (see gemini::UsageMetadata).
-                                if let Some(u) = usage {
-                                    log::debug!(
-                                        "Gemini: turn complete (tokens total={:?})",
-                                        u.total_token_count
-                                    );
-                                } else {
-                                    log::debug!("Gemini: turn complete");
-                                }
-
-                                // Persist per-session token totals (loop 19).
-                                // Before this, turn counts + token totals only
-                                // lived in the frontend's localStorage and did
-                                // not survive an app restart.
-                                let delta = crate::sessions::usage::TurnDelta {
-                                    prompt: usage
-                                        .as_ref()
-                                        .and_then(|u| u.prompt_token_count)
-                                        .unwrap_or(0)
-                                        as u64,
-                                    response: usage
-                                        .as_ref()
-                                        .and_then(|u| u.response_token_count)
-                                        .unwrap_or(0)
-                                        as u64,
-                                    cached: usage
-                                        .as_ref()
-                                        .and_then(|u| u.cached_content_token_count)
-                                        .unwrap_or(0)
-                                        as u64,
-                                    thoughts: usage
-                                        .as_ref()
-                                        .and_then(|u| u.thoughts_token_count)
-                                        .unwrap_or(0)
-                                        as u64,
-                                    tool_use: usage
-                                        .as_ref()
-                                        .and_then(|u| u.tool_use_prompt_token_count)
-                                        .unwrap_or(0)
-                                        as u64,
-                                    total: usage
-                                        .as_ref()
-                                        .and_then(|u| u.total_token_count)
-                                        .unwrap_or(0)
-                                        as u64,
-                                };
-                                let current_sid = match session_id_handle.read() {
-                                    Ok(g) => g.clone(),
-                                    Err(poisoned) => poisoned.into_inner().clone(),
-                                };
-                                if let Err(e) =
-                                    crate::sessions::usage::append_turn(&current_sid, delta)
-                                {
-                                    log::warn!("Failed to persist turn usage: {}", e);
-                                }
+                                // Issue #145: usage accounting stays on the
+                                // DATA path (the forwarded `turn_complete`
+                                // event + persisted usage below); diagnostic
+                                // logs carry no token counts.
+                                persist_gemini_turn_usage(&session_id_handle, usage.as_ref());
 
                                 let _ = app_handle.emit(events::GEMINI_STATUS, &event);
                             }
@@ -7740,10 +7719,10 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                             // TurnMachine) consumes them via `gemini_event_to_signal`.
                             // We log + ignore here so the notes path stays
                             // exhaustive without taking on converse wiring.
-                            GeminiEvent::AudioChunk { ref data_base64, .. } => {
+                            GeminiEvent::AudioChunk { .. } => {
+                                // Issue #145: fixed label — no payload size.
                                 log::debug!(
-                                    "Gemini: unexpected AudioChunk ({} b64 chars) on notes-mode path; ignoring",
-                                    data_base64.len()
+                                    "Gemini: unexpected AudioChunk on notes-mode path; ignoring"
                                 );
                             }
                             GeminiEvent::OutputTranscription { .. } => {
@@ -7794,10 +7773,7 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                             &state.retired_session_workers,
                         );
                     }
-                    return Err(AppError::Unknown(format!(
-                        "Failed to spawn Gemini event thread: {}",
-                        e
-                    )));
+                    return Err(realtime_worker_spawn_error(&e));
                 }
             };
             *event_handle = Some(handle);
@@ -7967,11 +7943,19 @@ impl crate::converse::ConverseSink for GeminiConverseSink {
         log::debug!("converse: barge-in suppressed ({reason:?})");
     }
 
-    fn report_error(&mut self, category: crate::converse::TurnErrorCategory, message: &str) {
-        log::warn!("converse: engine error ({category:?}): {message}");
+    fn report_error(
+        &mut self,
+        category: crate::converse::TurnErrorCategory,
+        _message: &str,
+        diagnostic: Option<&audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic>,
+    ) {
+        // Issue #145: forward the engine's ORIGINAL closed diagnostic (a quota
+        // close stays `rate_limited`, never an outage); the raw engine
+        // message never crosses IPC. Log the closed category only.
+        log::warn!("converse: engine error ({category:?})");
         let _ = self.app_handle.emit(
             events::GEMINI_STATUS,
-            serde_json::json!({ "type": "error", "message": message }),
+            crate::gemini::converse_error_status_payload(category, diagnostic),
         );
     }
 }
@@ -8110,14 +8094,10 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
     )?;
     let gemini_settings = settings.gemini.clone();
 
-    // Validate auth early (same checks as start_gemini).
-    if let crate::settings::GeminiAuthMode::ApiKey { api_key } = &gemini_settings.auth
-        && api_key.is_empty()
-    {
-        return Err(AppError::CredentialMissing {
-            key: "gemini_api_key".to_string(),
-        });
-    }
+    // Validate auth early (same checks as start_gemini). Issue #145: blank
+    // fields are the closed `invalid_configuration` diagnostic, the same one
+    // `connect()` returns, not a legacy local error.
+    crate::gemini::validate_auth_configuration(&gemini_settings.auth)?;
 
     let gemini_rx = register_runtime_processed_audio_consumer(
         &state.processed_audio_consumers,
@@ -8166,7 +8146,8 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
             &state.processed_audio_consumers,
             GEMINI_CONVERSE_AUDIO_CONSUMER_ID,
         );
-        return Err(AppError::Unknown(err));
+        // Issue #145: forward the closed typed RuntimeDiagnostic AppError.
+        return Err(err);
     }
     let event_rx = client.event_rx();
 
@@ -8253,10 +8234,7 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
                         *client_guard = None;
                     }
                     let _ = state.audio_player.stop();
-                    return Err(AppError::Unknown(format!(
-                        "Failed to spawn converse audio thread: {}",
-                        e
-                    )));
+                    return Err(realtime_worker_spawn_error(&e));
                 }
             };
             *audio_handle = Some(handle);
@@ -8396,10 +8374,7 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
                             &state.retired_session_workers,
                         );
                     }
-                    return Err(AppError::Unknown(format!(
-                        "Failed to spawn converse driver thread: {}",
-                        e
-                    )));
+                    return Err(realtime_worker_spawn_error(&e));
                 }
             };
             *conv_handle = Some(handle);
@@ -8559,11 +8534,19 @@ impl crate::converse::ConverseSink for OpenAiRealtimeConverseSink {
         log::debug!("openai-realtime: barge-in suppressed ({reason:?})");
     }
 
-    fn report_error(&mut self, category: crate::converse::TurnErrorCategory, message: &str) {
-        log::warn!("openai-realtime: engine error ({category:?}): {message}");
+    fn report_error(
+        &mut self,
+        category: crate::converse::TurnErrorCategory,
+        _message: &str,
+        diagnostic: Option<&audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic>,
+    ) {
+        // Issue #145: forward the engine's ORIGINAL closed diagnostic (a rate
+        // limit stays `rate_limited`, never an outage); the raw engine
+        // message never crosses IPC. Log the closed category only.
+        log::warn!("openai-realtime: engine error ({category:?})");
         let _ = self.app_handle.emit(
             events::OPENAI_REALTIME_STATUS,
-            serde_json::json!({ "type": "error", "message": message }),
+            crate::gemini::converse_error_status_payload(category, diagnostic),
         );
     }
 }
@@ -8686,11 +8669,11 @@ pub async fn start_openai_realtime(
     // Validate auth early. The credential maps to `openai_api_key` (same key as
     // the OpenAI Realtime STT provider) — see the credential mapping in
     // `credential_keys_for_provider` (`realtime_agent.openai_realtime`).
+    // Issue #145: an empty key is the closed `invalid_configuration`
+    // diagnostic, the same one `connect()` returns, not a legacy local error.
     let api_key = agent_settings.api_key();
     if api_key.trim().is_empty() {
-        return Err(AppError::CredentialMissing {
-            key: "openai_api_key".to_string(),
-        });
+        return Err(crate::gemini::invalid_configuration_error());
     }
 
     let audio_rx = register_runtime_processed_audio_consumer(
@@ -8736,7 +8719,8 @@ pub async fn start_openai_realtime(
             &state.processed_audio_consumers,
             OPENAI_REALTIME_AUDIO_CONSUMER_ID,
         );
-        return Err(AppError::Unknown(err));
+        // Issue #145: forward the closed typed RuntimeDiagnostic AppError.
+        return Err(err);
     }
     let event_rx = client.event_rx();
 
@@ -8822,10 +8806,7 @@ pub async fn start_openai_realtime(
                         *client_guard = None;
                     }
                     let _ = state.audio_player.stop();
-                    return Err(AppError::Unknown(format!(
-                        "Failed to spawn openai-realtime audio thread: {}",
-                        e
-                    )));
+                    return Err(realtime_worker_spawn_error(&e));
                 }
             };
             *audio_handle = Some(handle);
@@ -8955,10 +8936,7 @@ pub async fn start_openai_realtime(
                             &state.retired_session_workers,
                         );
                     }
-                    return Err(AppError::Unknown(format!(
-                        "Failed to spawn openai-realtime driver thread: {}",
-                        e
-                    )));
+                    return Err(realtime_worker_spawn_error(&e));
                 }
             };
             *event_handle = Some(handle);
@@ -14100,6 +14078,183 @@ mod tests {
     use super::*;
     use tauri::Listener;
 
+    /// Issue #145: all six realtime worker-spawn failures return this closed
+    /// diagnostic instead of a formatted `io::Error` in `AppError::Unknown`.
+    /// The OS error text (and any private path in it) must not survive.
+    #[test]
+    fn realtime_worker_spawn_error_is_a_closed_internal_diagnostic() {
+        const CANARY: &str = "canary-spawn-failure /home/private-user/audio-graph";
+        let source = std::io::Error::other(CANARY);
+
+        let error = realtime_worker_spawn_error(&source);
+
+        let wire = serde_json::to_value(&error).expect("AppError serializes");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "code": "runtime_diagnostic",
+                "diagnostic": {
+                    "kind": "runtime",
+                    "detail": {
+                        "code": "internal",
+                        "retryable": false,
+                        "recovery_action": "none",
+                        "context": {
+                            "operation": "realtime_conversation",
+                            "transport": "native"
+                        }
+                    }
+                }
+            })
+        );
+        for surface in [wire.to_string(), format!("{error:?}"), error.to_string()] {
+            assert!(
+                !surface.contains("canary-spawn-failure"),
+                "leaked: {surface}"
+            );
+            assert!(!surface.contains("private-user"), "leaked: {surface}");
+            assert!(
+                !surface.to_lowercase().contains("spawn"),
+                "leaked: {surface}"
+            );
+        }
+    }
+
+    /// Issue #145: pins the IPC boundary of the REAL OpenAI Realtime converse
+    /// sink (not the recording double): a Tauri listener on the real status
+    /// event receives only `{type, diagnostic}`. The engine's own diagnostic
+    /// (a rate limit with its delay bucket) crosses untouched, the engine
+    /// prose never does, and a signal with no diagnosis falls back to the
+    /// closed category mapping. Uses the shared Wry test app (like the other
+    /// emit/listen tests), so macOS skips it: Tao must run on the main thread.
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn openai_converse_sink_emits_only_the_closed_diagnostic_over_tauri() {
+        use crate::converse::{ConverseSink, TurnErrorCategory};
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeRetryDelayBucket;
+
+        const ENGINE_PROSE: &str = "canary-engine-prose /home/private-user/audio-graph";
+        let app_handle = crate::speech::shared_test_app_handle();
+        let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
+        let listener_id = app_handle.listen_any(events::OPENAI_REALTIME_STATUS, move |event| {
+            let _ = status_tx.send(event.payload().to_owned());
+        });
+        let mut sink = OpenAiRealtimeConverseSink {
+            client: Arc::new(Mutex::new(None)),
+            audio_player: crate::playback::AudioPlayer::new(),
+            capture_gate: Arc::new(AtomicBool::new(false)),
+            app_handle: app_handle.clone(),
+        };
+        let next_payload = || -> serde_json::Value {
+            let payload = status_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the sink must emit the status event");
+            serde_json::from_str(&payload).expect("status payload is JSON")
+        };
+
+        // The engine's own diagnosis (rate limit + bucket) crosses untouched.
+        let rate_limited = crate::openai_realtime::OpenAiRealtimeErrorCategory::RateLimit {
+            retry_delay: Some(RuntimeRetryDelayBucket::Long),
+        }
+        .runtime_diagnostic();
+        sink.report_error(TurnErrorCategory::Server, ENGINE_PROSE, Some(&rate_limited));
+        let delivered = next_payload();
+        assert_eq!(
+            delivered,
+            serde_json::json!({ "type": "error", "diagnostic": rate_limited })
+        );
+        assert!(
+            !delivered.to_string().contains("canary-engine-prose"),
+            "engine prose crossed IPC: {delivered}"
+        );
+
+        // No diagnosis → the closed category fallback, still nothing else.
+        sink.report_error(TurnErrorCategory::Server, ENGINE_PROSE, None);
+        let fallback = next_payload();
+        assert_eq!(
+            fallback,
+            serde_json::json!({
+                "type": "error",
+                "diagnostic": crate::gemini::GeminiErrorCategory::Server.runtime_diagnostic()
+            })
+        );
+        assert!(!fallback.to_string().contains("canary-engine-prose"));
+
+        app_handle.unlisten(listener_id);
+    }
+
+    /// Issue #145 (B3): the notes-mode `TurnComplete` handler body. Exact
+    /// usage is persisted on the data path, while the handler's logs carry no
+    /// token count. Exercises the same function the event-receiver thread
+    /// calls, so the production handler path (not only the parser) is covered.
+    #[test]
+    fn gemini_turn_complete_handler_persists_exact_usage_and_logs_no_counts() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("gemini-turn-usage");
+        let _guard = HomeGuard::set(&dir);
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+
+        let session_id = Arc::new(RwLock::new("b3-notes-handler-session".to_string()));
+        let usage = crate::gemini::UsageMetadata {
+            prompt_token_count: Some(918_273),
+            response_token_count: Some(645_192),
+            total_token_count: Some(1_563_465),
+            ..Default::default()
+        };
+        persist_gemini_turn_usage(&session_id, Some(&usage));
+
+        let persisted = crate::sessions::usage::load_usage("b3-notes-handler-session");
+        assert_eq!(persisted.prompt, 918_273);
+        assert_eq!(persisted.response, 645_192);
+        assert_eq!(persisted.total, 1_563_465);
+        assert_eq!(persisted.turns, 1);
+
+        let logs = crate::test_log_capture::render(&capture.finish());
+        assert!(logs.contains("Gemini: turn complete"), "{logs}");
+        for count in ["918273", "645192", "1563465"] {
+            assert!(
+                !logs.contains(count),
+                "usage count `{count}` logged: {logs}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The persistence-failure half of the notes `TurnComplete` handler: with
+    /// an unusable data root (planted under a regular file) the handler logs
+    /// ONLY the fixed `Failed to persist turn usage` label, with no session id,
+    /// path, OS error text or token count.
+    #[test]
+    fn gemini_turn_complete_handler_logs_a_fixed_label_when_persistence_fails() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("gemini-turn-usage-failure");
+        let blocker = dir.join("canary-private-blocker");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let _guard = HomeGuard::set(&blocker.join("canary-private-root"));
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+
+        let session_id = Arc::new(RwLock::new("canary-private-session-id".to_string()));
+        let usage = crate::gemini::UsageMetadata {
+            total_token_count: Some(5_550_123),
+            ..Default::default()
+        };
+        persist_gemini_turn_usage(&session_id, Some(&usage));
+
+        let logs = crate::test_log_capture::render(&capture.finish());
+        assert!(logs.contains("Failed to persist turn usage"), "{logs}");
+        for leaked in ["canary-private", "5550123"] {
+            assert!(!logs.contains(leaked), "`{leaked}` logged: {logs}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn transcript_event_fixture(
         span_id: &str,
         transcript_segment_id: &str,
@@ -17861,12 +18016,9 @@ mod tests {
     /// replaces the `if !abandoned_kinds.is_empty() { log::warn!(...) }`
     /// block inside `log_abandoned_deferred_retries_after_stop` with a
     /// no-op (e.g. `let _ = abandoned_kinds;`) makes every behavioral test
-    /// in this file pass, since none of them observe log output (no
-    /// log-capture harness exists in this repo — see
-    /// `logging::tests` for the only `log::set_logger` call, which is
-    /// production init, not a test capture sink). Source-text inspection is
-    /// the cheapest mutation-proof available without adding that
-    /// infrastructure.
+    /// in this file pass, since none of them observe log output (they do not
+    /// install the shared `crate::test_log_capture` sink). Source-text
+    /// inspection is the cheapest mutation-proof for this call site.
     #[test]
     fn log_abandoned_deferred_retries_after_stop_emits_the_documented_warn_key() {
         let commands_source = include_str!("commands.rs");
@@ -17942,7 +18094,7 @@ mod tests {
 
     /// audio-graph-64e3: same mutation-proof rationale as
     /// `log_abandoned_deferred_retries_after_stop_emits_the_documented_warn_key`
-    /// above — no log-capture harness exists in this repo, so source-text
+    /// above — this test installs no `crate::test_log_capture` sink, so source-text
     /// inspection is the cheapest way to pin that the WARN body (not just the
     /// call site) has not been gutted, and that it is still gated on a
     /// non-zero mismatch rather than firing unconditionally.
@@ -24661,8 +24813,8 @@ mod tests {
         // source-text pin closes that gap the same way this file's other
         // `include_str!` pins do (`prepare_card_answer_request_never_touches_chat_history`
         // et al.): a future edit that adds ANY `log::*` call inside this
-        // function's body now fails here directly, without needing a
-        // log-capture harness this crate doesn't have.
+        // function's body now fails here directly, without installing the
+        // shared `crate::test_log_capture` sink.
         let source = include_str!("commands.rs");
         let start = source
             .find("fn is_duplicate_answered_question(")
@@ -26027,10 +26179,11 @@ mod tests {
             );
 
             // Ledger fires the same way it does for the with-span round trip.
-            // No dynamic telemetry assertion here: this crate has no
-            // log-capture harness by design (see `card_telemetry.rs`'s
-            // `public_log_functions_still_call_log_info` test comment), so
-            // telemetry is pinned via source-text inspection, not execution.
+            // No dynamic telemetry assertion here: this test does not install
+            // the shared `crate::test_log_capture` sink (see
+            // `card_telemetry.rs`'s `public_log_functions_still_call_log_info`
+            // test comment), so telemetry is pinned via source-text
+            // inspection, not execution.
             // `mint_user_question_card`'s `card_telemetry::log_card_event(..,
             // Created { .. })` call (commands.rs, just above the upsert) is
             // unconditional — the spanless branch this test exercises only

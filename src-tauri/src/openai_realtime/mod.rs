@@ -72,6 +72,14 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{self, Message, client::IntoClientRequest},
 };
+// Closed, content-free runtime diagnostics (issue #145). Every error this
+// module logs or emits carries one of these typed envelopes instead of raw
+// provider / transport text.
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeRetryDelayBucket, RuntimeSafeRecoveryAction, RuntimeStatusClass,
+    RuntimeTransport,
+};
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -109,12 +117,16 @@ static OPENAI_S2S_AUDIO_DROPS: AtomicU64 = AtomicU64::new(0);
 pub enum OpenAiRealtimeErrorCategory {
     /// Invalid / missing API key — reauthentication required.
     Auth,
-    /// Token / session credential expired (distinct remediation from `Auth`).
+    /// The realtime session window ended (`session_expired`). Terminal
+    /// session-end category; the diagnosis is a retryable `timeout`, not a
+    /// credential problem.
     AuthExpired,
-    /// Quota / rate-limit exceeded.
+    /// Quota / rate-limit exceeded. `retry_delay` is the closed bucket a
+    /// numeric `Retry-After` header reduces to (issue #145); exact seconds are
+    /// never retained. Absent when no usable hint arrived.
     RateLimit {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        retry_after_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_delay: Option<RuntimeRetryDelayBucket>,
     },
     /// Server-side failure (5xx / WS close 1011).
     Server,
@@ -122,6 +134,127 @@ pub enum OpenAiRealtimeErrorCategory {
     Network,
     /// Anything we could not positively classify.
     Unknown,
+}
+
+impl OpenAiRealtimeErrorCategory {
+    /// Closed [`RuntimeDiagnostic`] envelope for this category (issue #145).
+    /// Every branch discards the raw signal and keeps only closed values, so
+    /// no provider text, close reason, status number, or exact retry-seconds
+    /// survives onto logs, IPC events, or UI error state. `pub(crate)` so
+    /// the converse layer's tests can build typed fixtures.
+    pub(crate) fn runtime_diagnostic(&self) -> RuntimeDiagnostic {
+        match self {
+            Self::Auth => RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::credential_rejected(
+                realtime_context().with_status_class(RuntimeStatusClass::ClientError),
+            )),
+            // `AuthExpired` is the provider's session-window expiry
+            // (`session_expired`), never a credential diagnosis: a retryable
+            // timeout. Teardown keys off the category, not this diagnostic.
+            Self::AuthExpired => realtime_diagnostic(
+                RuntimeErrorCode::Timeout,
+                true,
+                RuntimeSafeRecoveryAction::Retry,
+                None,
+                None,
+            ),
+            Self::RateLimit { retry_delay } => realtime_diagnostic(
+                RuntimeErrorCode::RateLimited,
+                true,
+                RuntimeSafeRecoveryAction::RetryAfterDelay,
+                Some(RuntimeStatusClass::ClientError),
+                // Absence stays absent — never mapped to a bucket.
+                *retry_delay,
+            ),
+            Self::Server => realtime_diagnostic(
+                RuntimeErrorCode::ProviderUnavailable,
+                true,
+                RuntimeSafeRecoveryAction::Retry,
+                Some(RuntimeStatusClass::ServerError),
+                None,
+            ),
+            Self::Network => realtime_diagnostic(
+                RuntimeErrorCode::NetworkUnreachable,
+                true,
+                RuntimeSafeRecoveryAction::CheckNetwork,
+                None,
+                None,
+            ),
+            Self::Unknown => realtime_diagnostic(
+                RuntimeErrorCode::Internal,
+                false,
+                RuntimeSafeRecoveryAction::None,
+                None,
+                None,
+            ),
+        }
+    }
+}
+
+/// Fixed context for every OpenAI Realtime S2S diagnostic: the realtime S2S
+/// operation over a WebSocket transport.
+fn realtime_context() -> RuntimeDiagnosticContext {
+    RuntimeDiagnosticContext::new(RuntimeOperation::RealtimeConversation)
+        .with_transport(RuntimeTransport::Websocket)
+}
+
+/// Build the closed [`RuntimeDiagnostic`] every OpenAI Realtime S2S error
+/// carries (issue #145). Context is fixed to the realtime S2S operation over
+/// a WebSocket transport; only the closed code / retryability / recovery
+/// action / optional coarse status class vary.
+fn realtime_diagnostic(
+    code: RuntimeErrorCode,
+    retryable: bool,
+    recovery_action: RuntimeSafeRecoveryAction,
+    status_class: Option<RuntimeStatusClass>,
+    retry_delay: Option<RuntimeRetryDelayBucket>,
+) -> RuntimeDiagnostic {
+    let mut context = realtime_context();
+    if let Some(status_class) = status_class {
+        context = context.with_status_class(status_class);
+    }
+    if let Some(retry_delay) = retry_delay {
+        context = context.with_retry_delay(retry_delay);
+    }
+    RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::new(
+        code,
+        retryable,
+        recovery_action,
+        context,
+    ))
+}
+
+/// Closed site identifier carried on [`OpenAiRealtimeEvent::Error::message`]
+/// (issue #145). The serialized `message` string is *only* one of these stable
+/// tokens — never provider text, a WebSocket close reason, a request id, or
+/// an exact payload length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiRealtimeErrorSite {
+    /// Server sent a Close frame (classified close code).
+    ServerClose,
+    /// A top-level `error` frame arrived (provider-reported).
+    ErrorFrame,
+    /// A server JSON frame failed to parse.
+    InvalidJson,
+    /// The reconnect budget (1/2/5/10s ladder) is exhausted.
+    ReconnectExhausted,
+    /// A single reconnect attempt failed (session keeps retrying).
+    ReconnectFailed,
+    /// Runtime privacy policy blocked the session (steady-state).
+    PolicyBlocked,
+}
+
+impl OpenAiRealtimeErrorSite {
+    /// Stable snake_case token for the serialized event `message` field.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::ServerClose => "server_close",
+            Self::ErrorFrame => "error_frame",
+            Self::InvalidJson => "invalid_json",
+            Self::ReconnectExhausted => "reconnect_exhausted",
+            Self::ReconnectFailed => "reconnect_failed",
+            Self::PolicyBlocked => "policy_blocked",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,10 +297,18 @@ pub enum OpenAiRealtimeEvent {
     TurnComplete { usage: Option<UsageMetadata> },
     /// A non-fatal error occurred (top-level `error` frame or a local parse
     /// failure). The socket stays open.
+    ///
+    /// `category` is the structured classification derived at the error
+    /// site; `diagnostic` is the closed [`RuntimeDiagnostic`] envelope (issue
+    /// #145) the frontend routes through `runtimeDiagnosticPresentation` for
+    /// a localized, closed-key toast. `message` is a stable
+    /// [`OpenAiRealtimeErrorSite::token`] site identifier — it never carries
+    /// provider text, close reasons, request ids, or payload lengths.
     #[serde(rename = "error")]
     Error {
         category: OpenAiRealtimeErrorCategory,
         message: String,
+        diagnostic: RuntimeDiagnostic,
     },
     /// The connection has been established and the session has been confirmed
     /// (`session.updated`/`session.created` received).
@@ -192,6 +333,24 @@ pub enum OpenAiRealtimeEvent {
     /// code path for both engines.
     #[serde(rename = "reconnected")]
     Reconnected { resumed: bool },
+}
+
+impl OpenAiRealtimeEvent {
+    /// The only constructor for the [`OpenAiRealtimeEvent::Error`] payload
+    /// (issue #145): the serialized `message` is pinned to the closed site
+    /// token so raw provider / transport text can never reach logs, IPC, or
+    /// the UI.
+    fn error(
+        site: OpenAiRealtimeErrorSite,
+        category: OpenAiRealtimeErrorCategory,
+        diagnostic: RuntimeDiagnostic,
+    ) -> Self {
+        Self::Error {
+            category,
+            message: site.token().to_string(),
+            diagnostic,
+        }
+    }
 }
 
 /// Token usage metadata parsed from a `response.done` frame.
@@ -406,18 +565,36 @@ impl OpenAiRealtimeClient {
     /// tokio runtime. The session task handles audio writing, server message
     /// reading, and automatic reconnect with exponential backoff (re-sending
     /// `session.update` on each reconnect — there is no server-side resume).
-    pub fn connect(&mut self) -> Result<(), String> {
+    /// Issue #145: `connect` returns a closed [`AppError`] (typed
+    /// `RuntimeDiagnostic` variant) — never a raw provider or transport
+    /// string.
+    pub fn connect(&mut self) -> Result<(), crate::error::AppError> {
         if self.config.api_key.trim().is_empty() {
-            return Err("OpenAI API key is not configured".to_string());
+            // Issue #145: closed `invalid_configuration` diagnostic, no
+            // prose.
+            return Err(
+                RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::invalid_configuration(
+                    realtime_context(),
+                ))
+                .into(),
+            );
         }
 
         // Build a dedicated multi-threaded (1 worker) tokio runtime for the WS.
+        // Issue #145: unclassified native failure → closed `internal`
+        // diagnostic; the source error is dropped, never logged.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .thread_name("openai-realtime-s2s-rt")
             .build()
-            .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
+            .map_err(|e| {
+                crate::error::AppError::from_unclassified_runtime_error(
+                    &e,
+                    RuntimeDiagnosticContext::new(RuntimeOperation::RealtimeConversation)
+                        .with_transport(RuntimeTransport::Native),
+                )
+            })?;
 
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
@@ -438,7 +615,13 @@ impl OpenAiRealtimeClient {
         // sent-but-not-acked; the session task emits `Connected` once the
         // server confirms with `session.updated`.
         let (audio_tx, session_handle) = rt.block_on(async move {
-            let (writer, reader) = open_ws(&config).await?;
+            let (writer, reader) = open_ws(&config).await.map_err(|e| {
+                // Issue #145: log only the closed category and return the
+                // closed diagnostic envelope; the connect error's raw source
+                // never crossed this boundary.
+                log::warn!("OpenAI Realtime S2S: connect failed ({:?})", e.category);
+                crate::error::AppError::from(e.diagnostic)
+            })?;
 
             log::info!("OpenAI Realtime S2S: WebSocket open; awaiting session.updated");
 
@@ -459,7 +642,7 @@ impl OpenAiRealtimeClient {
                 run_io_entries: None,
             }));
 
-            Ok::<_, String>((atx, session_handle))
+            Ok::<_, crate::error::AppError>((atx, session_handle))
         })?;
 
         self.audio_tx = Some(audio_tx);
@@ -620,17 +803,131 @@ impl Drop for OpenAiRealtimeClient {
 // ===========================================================================
 
 /// Classifies *why* the session dropped so downstream logs / events can be
-/// precise. The inner `String` is consumed through `Debug` formatting, which
-/// the dead-code lint doesn't track, hence the allow.
+/// precise. Every payload-carrying variant holds a closed
+/// [`RuntimeDiagnostic`] (issue #145) — never a raw reason string. The
+/// `Debug` render of this enum therefore only ever shows closed enum tokens.
 #[derive(Debug)]
 #[allow(dead_code)]
 enum DisconnectKind {
-    ServerClose(String),
-    NetworkError(String),
-    ProtocolError(String),
-    PolicyBlocked(String),
+    /// Remote server sent a Close frame. `category` is `None` for normal /
+    /// unclassified closes (which do not surface an error event).
+    ServerClose {
+        category: Option<OpenAiRealtimeErrorCategory>,
+        diagnostic: RuntimeDiagnostic,
+    },
+    /// Transport-level error (TLS, TCP reset, DNS flap, tungstenite I/O).
+    NetworkError(RuntimeDiagnostic),
+    /// Protocol violation — malformed frame, invalid sequence, etc.
+    ProtocolError(RuntimeDiagnostic),
+    /// Runtime privacy policy blocked the session (steady-state, no
+    /// reconnect).
+    PolicyBlocked(RuntimeDiagnostic),
+    /// User called `disconnect()`. No reconnect attempt should be made.
     UserRequested,
+    /// Writer task exhausted the audio command stream (caller dropped the
+    /// sender). No reconnect — session is genuinely over.
     WriterEnded,
+}
+
+/// Closed diagnostic for a content-egress policy block (issue #145).
+fn policy_blocked_diagnostic() -> RuntimeDiagnostic {
+    realtime_diagnostic(
+        RuntimeErrorCode::PolicyBlocked,
+        false,
+        RuntimeSafeRecoveryAction::ReviewPolicy,
+        None,
+        None,
+    )
+}
+
+/// Classify a `tungstenite::Error` into the closed
+/// [`OpenAiRealtimeErrorCategory`] + [`RuntimeDiagnostic`] pair (issue #145 —
+/// sibling of `crate::gemini::classify_tungstenite_error`). The raw error
+/// display text (which can echo the request, including the auth header) is
+/// dropped at the call site.
+fn classify_tungstenite_error(
+    err: &tokio_tungstenite::tungstenite::Error,
+) -> OpenAiRealtimeErrorCategory {
+    use tokio_tungstenite::tungstenite::Error as E;
+    match err {
+        E::Http(response) => {
+            let status = response.status().as_u16();
+            if status == 429 {
+                // Issue #145: numeric `Retry-After` → closed bucket; exact
+                // seconds dropped, absence stays absent.
+                OpenAiRealtimeErrorCategory::RateLimit {
+                    retry_delay: crate::gemini::retry_delay_bucket_from_headers(response.headers()),
+                }
+            } else if (500..600).contains(&status) {
+                OpenAiRealtimeErrorCategory::Server
+            } else if status == 401 || status == 403 {
+                OpenAiRealtimeErrorCategory::Auth
+            } else {
+                OpenAiRealtimeErrorCategory::Unknown
+            }
+        }
+        E::Io(_) | E::Tls(_) | E::ConnectionClosed | E::AlreadyClosed | E::Url(_) => {
+            OpenAiRealtimeErrorCategory::Network
+        }
+        _ => OpenAiRealtimeErrorCategory::Unknown,
+    }
+}
+
+/// A classified connect failure surfaced from [`open_ws`] (issue #145). The
+/// raw source (HTTP status, transport error) is inspected at the
+/// construction site to pick `category` and then **discarded** — it is never
+/// retained, logged, or serialized. The closed [`RuntimeDiagnostic`] is the
+/// only thing that crosses to events and the returned
+/// [`AppError`](crate::error::AppError).
+#[derive(Debug, Clone)]
+struct OpenAiRealtimeConnectError {
+    category: OpenAiRealtimeErrorCategory,
+    diagnostic: RuntimeDiagnostic,
+}
+
+impl OpenAiRealtimeConnectError {
+    fn new(category: OpenAiRealtimeErrorCategory) -> Self {
+        Self {
+            diagnostic: category.runtime_diagnostic(),
+            category,
+        }
+    }
+
+    /// Connect failure from a tungstenite error. Category comes from
+    /// `classify_tungstenite_error`. An HTTP 401/403 handshake rejection is
+    /// typed through `from_http_status` (the bearer credential was sent), so
+    /// a 401 is `credential_rejected` and a 403 is `permission_denied`. Only
+    /// the status class survives; the response is dropped.
+    fn from_tungstenite(err: &tokio_tungstenite::tungstenite::Error) -> Self {
+        let category = classify_tungstenite_error(err);
+        let diagnostic = match err {
+            tokio_tungstenite::tungstenite::Error::Http(response)
+                if matches!(response.status().as_u16(), 401 | 403) =>
+            {
+                RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::from_http_status(
+                    response.status().as_u16(),
+                    true,
+                    realtime_context(),
+                ))
+            }
+            _ => category.runtime_diagnostic(),
+        };
+        Self {
+            category,
+            diagnostic,
+        }
+    }
+
+    /// `Auth` failure caused by local configuration: the saved key cannot be
+    /// encoded as an `Authorization` header value.
+    fn invalid_configuration() -> Self {
+        Self {
+            category: OpenAiRealtimeErrorCategory::Auth,
+            diagnostic: RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::invalid_configuration(
+                realtime_context(),
+            )),
+        }
+    }
 }
 
 /// Build the `session.update` client event that configures a **realtime voice
@@ -677,7 +974,9 @@ fn realtime_url(model: &str) -> String {
 /// `session.update`. Used both for the initial connect and for each reconnect
 /// attempt — realtime sessions cannot resume, so the voice config must be
 /// re-sent on every (re)connect.
-async fn open_ws(config: &OpenAiRealtimeConfig) -> Result<(WsWriter, WsReader), String> {
+async fn open_ws(
+    config: &OpenAiRealtimeConfig,
+) -> Result<(WsWriter, WsReader), OpenAiRealtimeConnectError> {
     let url = realtime_url(&config.model);
     open_ws_url(config, &url).await
 }
@@ -685,51 +984,51 @@ async fn open_ws(config: &OpenAiRealtimeConfig) -> Result<(WsWriter, WsReader), 
 async fn open_ws_url(
     config: &OpenAiRealtimeConfig,
     url_str: &str,
-) -> Result<(WsWriter, WsReader), String> {
+) -> Result<(WsWriter, WsReader), OpenAiRealtimeConnectError> {
     // `IntoClientRequest` fills in the mandatory WebSocket upgrade headers; we
     // only layer `Authorization` on top. NO `OpenAI-Beta` header (GA only).
+    // Issue #145: every failure below classifies structurally into the
+    // closed category + diagnostic; the raw source text is dropped at the
+    // site and never logged or serialized.
     let mut request = url_str
         .into_client_request()
-        .map_err(|e| format!("Failed to build WebSocket request: {e}"))?;
+        .map_err(|_| OpenAiRealtimeConnectError::new(OpenAiRealtimeErrorCategory::Unknown))?;
     request.headers_mut().insert(
         "Authorization",
         format!("Bearer {}", config.api_key)
             .parse()
-            .map_err(|e| format!("Invalid Authorization header: {e}"))?,
+            .map_err(|_| OpenAiRealtimeConnectError::invalid_configuration())?,
     );
 
-    let (ws_stream, _response) = connect_async(request).await.map_err(|e| {
-        crate::error::redacted_provider_diagnostic(
-            &format!("WebSocket connect failed: {e}"),
-            [&config.api_key],
-        )
-    })?;
+    let (ws_stream, _response) = connect_async(request)
+        .await
+        .map_err(|e| OpenAiRealtimeConnectError::from_tungstenite(&e))?;
 
     let (mut writer, reader) = ws_stream.split();
 
     // Configure the voice session immediately after connect, behind the egress
     // guard so a blocked privacy policy cannot leak the session config.
+    // Issue #145: the policy reason text is dropped; only the closed
+    // `policy_blocked` diagnostic crosses.
     config
         .content_egress_policy
         .check_json(PROVIDER)
-        .map_err(|e| crate::error::redacted_provider_diagnostic(&e, [&config.api_key]))?;
+        .map_err(|_| OpenAiRealtimeConnectError {
+            category: OpenAiRealtimeErrorCategory::Unknown,
+            diagnostic: policy_blocked_diagnostic(),
+        })?;
     let update = session_update_payload(config).to_string();
     writer
         .send(Message::Text(update.into()))
         .await
-        .map_err(|e| {
-            crate::error::redacted_provider_diagnostic(
-                &format!("Failed to send session.update: {e}"),
-                [&config.api_key],
-            )
-        })?;
+        .map_err(|e| OpenAiRealtimeConnectError::new(classify_tungstenite_error(&e)))?;
 
     Ok((writer, reader))
 }
 
 #[cfg(test)]
 type ReconnectOpenFuture =
-    Pin<Box<dyn Future<Output = Result<(WsWriter, WsReader), String>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<(WsWriter, WsReader), OpenAiRealtimeConnectError>> + Send>>;
 
 #[cfg(test)]
 type ReconnectOpener = Arc<dyn Fn(OpenAiRealtimeConfig) -> ReconnectOpenFuture + Send + Sync>;
@@ -738,7 +1037,7 @@ type ReconnectOpener = Arc<dyn Fn(OpenAiRealtimeConfig) -> ReconnectOpenFuture +
 async fn open_reconnect_ws(
     config: &OpenAiRealtimeConfig,
     opener: Option<&ReconnectOpener>,
-) -> Result<(WsWriter, WsReader), String> {
+) -> Result<(WsWriter, WsReader), OpenAiRealtimeConnectError> {
     if let Some(opener) = opener {
         opener(config.clone()).await
     } else {
@@ -840,12 +1139,15 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                 emit_disconnected_once(&event_tx, &disconnected_emitted);
                 break;
             }
-            DisconnectKind::PolicyBlocked(message) => {
-                log::warn!("OpenAI Realtime S2S session: content egress blocked: {message}");
-                let _ = event_tx.send(OpenAiRealtimeEvent::Error {
-                    category: OpenAiRealtimeErrorCategory::Unknown,
-                    message,
-                });
+            DisconnectKind::PolicyBlocked(diagnostic) => {
+                // Issue #145: log + emit only the closed diagnostic envelope;
+                // the policy reason text never crossed `run_io`.
+                log::warn!("OpenAI Realtime S2S session: content egress blocked");
+                let _ = event_tx.send(OpenAiRealtimeEvent::error(
+                    OpenAiRealtimeErrorSite::PolicyBlocked,
+                    OpenAiRealtimeErrorCategory::Unknown,
+                    diagnostic,
+                ));
                 emit_disconnected_once(&event_tx, &disconnected_emitted);
                 break;
             }
@@ -861,14 +1163,16 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                 let reconnected = loop {
                     reconnect_attempts += 1;
                     let Some(backoff) = backoff_for_attempt(reconnect_attempts) else {
-                        log::error!(
-                            "OpenAI Realtime S2S session: reconnect budget exhausted after {} attempts",
-                            reconnect_attempts - 1
+                        // Issue #145: closed fatal event — site token +
+                        // diagnostic envelope, no reconnect prose.
+                        log::warn!(
+                            "OpenAI Realtime S2S session: reconnect budget exhausted ({reconnect_attempts} attempts)"
                         );
-                        let _ = event_tx.send(OpenAiRealtimeEvent::Error {
-                            category: OpenAiRealtimeErrorCategory::Network,
-                            message: "OpenAI Realtime S2S reconnect attempts exhausted".into(),
-                        });
+                        let _ = event_tx.send(OpenAiRealtimeEvent::error(
+                            OpenAiRealtimeErrorSite::ReconnectExhausted,
+                            OpenAiRealtimeErrorCategory::Network,
+                            OpenAiRealtimeErrorCategory::Network.runtime_diagnostic(),
+                        ));
                         break false;
                     };
 
@@ -928,15 +1232,19 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                             break true;
                         }
                         Err(e) => {
+                            // Issue #145: log + emit only the closed category
+                            // and diagnostic envelope; the event `message` is
+                            // a stable site token, never the connect error
+                            // text.
                             log::warn!(
-                                "OpenAI Realtime S2S session: reconnect attempt {reconnect_attempts} failed: {e}"
+                                "OpenAI Realtime S2S session: reconnect attempt {reconnect_attempts} failed ({:?})",
+                                e.category,
                             );
-                            let _ = event_tx.send(OpenAiRealtimeEvent::Error {
-                                category: OpenAiRealtimeErrorCategory::Network,
-                                message: format!(
-                                    "Reconnect attempt {reconnect_attempts} failed: {e}"
-                                ),
-                            });
+                            let _ = event_tx.send(OpenAiRealtimeEvent::error(
+                                OpenAiRealtimeErrorSite::ReconnectFailed,
+                                e.category.clone(),
+                                e.diagnostic.clone(),
+                            ));
                             // Stay in the reconnect ladder; do not re-enter
                             // run_io with the previous closed socket.
                             continue;
@@ -1001,8 +1309,11 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                     Some(AudioCmd::Chunk(b64)) => {
                         let payload = json!({ "type": "input_audio_buffer.append", "audio": b64 });
                         if let Err(e) = writer.send(Message::Text(payload.to_string().into())).await {
-                            log::error!("OpenAI Realtime S2S: failed to send audio: {e}");
-                            return DisconnectKind::NetworkError(format!("send failed: {e}"));
+                            // Issue #145: classify structurally; drop the
+                            // transport text from logs + the payload.
+                            let category = classify_tungstenite_error(&e);
+                            log::warn!("OpenAI Realtime S2S: audio send failed ({category:?})");
+                            return DisconnectKind::NetworkError(category.runtime_diagnostic());
                         }
                     }
                     Some(AudioCmd::EndTurn) => {
@@ -1011,11 +1322,15 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                         // the assistant reply + the next turn).
                         let commit = json!({ "type": "input_audio_buffer.commit" });
                         if let Err(e) = writer.send(Message::Text(commit.to_string().into())).await {
-                            return DisconnectKind::NetworkError(format!("commit failed: {e}"));
+                            let category = classify_tungstenite_error(&e);
+                            log::warn!("OpenAI Realtime S2S: commit send failed ({category:?})");
+                            return DisconnectKind::NetworkError(category.runtime_diagnostic());
                         }
                         let create = json!({ "type": "response.create" });
                         if let Err(e) = writer.send(Message::Text(create.to_string().into())).await {
-                            return DisconnectKind::NetworkError(format!("response.create failed: {e}"));
+                            let category = classify_tungstenite_error(&e);
+                            log::warn!("OpenAI Realtime S2S: response.create send failed ({category:?})");
+                            return DisconnectKind::NetworkError(category.runtime_diagnostic());
                         }
                     }
                     Some(AudioCmd::Stop) => {
@@ -1037,7 +1352,9 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
 
             result = reader.next() => {
                 let Some(result) = result else {
-                    return DisconnectKind::NetworkError("reader stream ended".into());
+                    return DisconnectKind::NetworkError(
+                        OpenAiRealtimeErrorCategory::Network.runtime_diagnostic(),
+                    );
                 };
 
                 match result {
@@ -1049,13 +1366,18 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                             let _ = event_tx.send(ready_event.clone());
                         }
                     }
-                    Ok(Message::Close(frame)) => {
-                        let diagnostic = close_frame_diagnostic(frame.as_ref());
-                        log::info!("OpenAI Realtime S2S: server closed connection {diagnostic}");
+                    Ok(Message::Close(_)) => {
+                        // Issue #145: the close frame is not logged or
+                        // retained — only the closed Network diagnostic
+                        // crosses (uncategorized close; no error event).
+                        log::info!("OpenAI Realtime S2S: server closed connection");
                         if user_disconnected.load(Ordering::SeqCst) {
                             return DisconnectKind::UserRequested;
                         }
-                        return DisconnectKind::ServerClose(diagnostic);
+                        return DisconnectKind::ServerClose {
+                            category: None,
+                            diagnostic: OpenAiRealtimeErrorCategory::Network.runtime_diagnostic(),
+                        };
                     }
                     Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {
                         // Protocol-level frames; nothing to do.
@@ -1065,14 +1387,21 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                     }
                     Err(tungstenite::Error::ConnectionClosed)
                     | Err(tungstenite::Error::AlreadyClosed) => {
-                        return DisconnectKind::NetworkError("connection closed".into());
+                        return DisconnectKind::NetworkError(
+                            OpenAiRealtimeErrorCategory::Network.runtime_diagnostic(),
+                        );
                     }
-                    Err(tungstenite::Error::Protocol(e)) => {
-                        return DisconnectKind::ProtocolError(e.to_string());
+                    Err(tungstenite::Error::Protocol(_)) => {
+                        return DisconnectKind::ProtocolError(
+                            OpenAiRealtimeErrorCategory::Unknown.runtime_diagnostic(),
+                        );
                     }
                     Err(e) => {
-                        log::error!("OpenAI Realtime S2S: WebSocket read error: {e}");
-                        return DisconnectKind::NetworkError(format!("{e}"));
+                        // Issue #145: classify structurally; drop the
+                        // transport error text from logs + the payload.
+                        let category = classify_tungstenite_error(&e);
+                        log::warn!("OpenAI Realtime S2S: WebSocket read error ({category:?})");
+                        return DisconnectKind::NetworkError(category.runtime_diagnostic());
                     }
                 }
             }
@@ -1089,15 +1418,22 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
 /// readiness *event* is emitted by the caller (so the once-only gating lives
 /// next to the `connected` flag), keeping this parser free of cross-message
 /// state.
-fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>) -> bool {
+pub(crate) fn handle_server_message(
+    text: &str,
+    tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>,
+) -> bool {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
-        Err(e) => {
-            log::warn!("OpenAI Realtime S2S: invalid JSON: {e}");
-            let _ = tx.send(OpenAiRealtimeEvent::Error {
-                category: OpenAiRealtimeErrorCategory::Unknown,
-                message: format!("Invalid server JSON: {e}"),
-            });
+        Err(_) => {
+            // Issue #145: classify structurally (unparseable frame → closed
+            // internal code); the serde error text (which quotes the raw
+            // frame) is dropped here and never logged.
+            log::warn!("OpenAI Realtime S2S: invalid server JSON");
+            let _ = tx.send(OpenAiRealtimeEvent::error(
+                OpenAiRealtimeErrorSite::InvalidJson,
+                OpenAiRealtimeErrorCategory::Unknown,
+                OpenAiRealtimeErrorCategory::Unknown.runtime_diagnostic(),
+            ));
             return false;
         }
     };
@@ -1146,88 +1482,56 @@ fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<OpenAiRealti
             false
         }
         "error" => {
-            let (category, message) = classify_error_frame(parsed.get("error"));
-            let _ = tx.send(OpenAiRealtimeEvent::Error { category, message });
+            // Issue #145: classify structurally; the event message is the
+            // closed site token and the provider body is never echoed.
+            let (category, diagnostic) = classify_error_frame(parsed.get("error"));
+            let _ = tx.send(OpenAiRealtimeEvent::error(
+                OpenAiRealtimeErrorSite::ErrorFrame,
+                category,
+                diagnostic,
+            ));
             false
         }
         "session.updated" | "session.created" => {
             log::debug!("OpenAI Realtime S2S: {msg_type} (session configured)");
             true
         }
-        other => {
+        _ => {
             // Many informational events (response.created, output_item.added,
             // rate_limits.updated, etc.) are expected and not actionable here.
-            log::debug!("OpenAI Realtime S2S: unhandled message type '{other}'");
+            // Issue #145: fixed label — the provider-controlled `type` string
+            // is never logged.
+            log::debug!("OpenAI Realtime S2S: unhandled message type unknown");
             false
         }
     }
 }
 
-/// Classify a top-level `error` frame's `error` object into a category +
-/// redacted diagnostic message. Never echoes the provider message verbatim
-/// (which may contain user content / secrets); reports `type`/`code`/length.
-fn classify_error_frame(error: Option<&Value>) -> (OpenAiRealtimeErrorCategory, String) {
+/// Classify a top-level `error` frame's `error` object into the closed
+/// category + [`RuntimeDiagnostic`] pair (issue #145). The provider `type` /
+/// `code` / `message` fields are inspected **only** to pick the category and
+/// are then discarded — never echoed, length-reported, or retained, so no
+/// provider error body, request id, or exact length can reach logs, IPC
+/// events, or UI error state.
+fn classify_error_frame(error: Option<&Value>) -> (OpenAiRealtimeErrorCategory, RuntimeDiagnostic) {
     let error_type = error.and_then(|e| e.get("type")).and_then(Value::as_str);
     let code = error.and_then(|e| e.get("code")).and_then(Value::as_str);
-    let message_len = error
-        .and_then(|e| e.get("message"))
-        .and_then(Value::as_str)
-        .map(|m| m.chars().count())
-        .map(|len| len.to_string())
-        .unwrap_or_else(|| "none".to_string());
 
+    // Exact structured codes only — never substring or provider prose.
+    // `session_expired` is the realtime session-duration cap (master's STT
+    // classifier maps it to `timeout` too); it keeps the terminal
+    // `AuthExpired` session-end category but is NOT a credential problem.
     let category = match (error_type, code) {
-        (_, Some(c)) if c.contains("rate_limit") => OpenAiRealtimeErrorCategory::RateLimit {
-            retry_after_secs: None,
-        },
-        (_, Some(c)) if c.contains("expired") => OpenAiRealtimeErrorCategory::AuthExpired,
-        (Some(t), _) if t.contains("authentication") || t.contains("invalid_request_error") => {
-            // invalid_request_error covers bad keys / params; treat unqualified
-            // ones as Auth-adjacent only when the code also signals it.
-            if code
-                .map(|c| c.contains("auth") || c.contains("api_key"))
-                .unwrap_or(false)
-            {
-                OpenAiRealtimeErrorCategory::Auth
-            } else {
-                OpenAiRealtimeErrorCategory::Unknown
-            }
+        (_, Some("rate_limit_exceeded")) => {
+            OpenAiRealtimeErrorCategory::RateLimit { retry_delay: None }
         }
-        (Some(t), _) if t.contains("server_error") => OpenAiRealtimeErrorCategory::Server,
+        (_, Some("session_expired")) => OpenAiRealtimeErrorCategory::AuthExpired,
+        (_, Some("invalid_api_key")) => OpenAiRealtimeErrorCategory::Auth,
+        (Some("server_error"), _) => OpenAiRealtimeErrorCategory::Server,
         _ => OpenAiRealtimeErrorCategory::Unknown,
     };
 
-    let message = format!(
-        "OpenAI Realtime S2S provider_error type={} code={} message_len={message_len}",
-        safe_diagnostic_token(error_type),
-        safe_diagnostic_token(code),
-    );
-    (category, message)
-}
-
-fn close_frame_diagnostic(
-    frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
-) -> String {
-    let Some(frame) = frame else {
-        return "code=none reason_len=0".to_string();
-    };
-    let code: u16 = frame.code.into();
-    format!("code={code} reason_len={}", frame.reason.chars().count())
-}
-
-fn safe_diagnostic_token(value: Option<&str>) -> String {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return "none".to_string();
-    };
-    if value.len() <= 128
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
-    {
-        value.to_string()
-    } else {
-        format!("present_len_{}", value.chars().count())
-    }
+    (category.clone(), category.runtime_diagnostic())
 }
 
 // ---------------------------------------------------------------------------
@@ -1495,7 +1799,92 @@ mod tests {
         let mut client = OpenAiRealtimeClient::new(config);
         let result = client.connect();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("API key"));
+        // Issue #145: closed `invalid_configuration` diagnostic, never prose.
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::error::AppError::RuntimeDiagnostic(
+                audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic::Runtime(
+                    audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorDiagnostic {
+                        code: audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode::InvalidConfiguration,
+                        ..
+                    }
+                )
+            )
+        ));
+    }
+
+    /// Provider-auth typing (#518): closed code + recovery action per auth
+    /// path, with the category (terminal-auth teardown) unchanged.
+    #[test]
+    fn auth_paths_use_provider_auth_codes() {
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeDiagnostic as D, RuntimeErrorCode as Code, RuntimeSafeRecoveryAction as Action,
+        };
+        fn tuple(d: &RuntimeDiagnostic) -> (Code, bool, Action) {
+            match d {
+                D::Runtime(e) => (e.code, e.retryable, e.recovery_action),
+                other => panic!("expected runtime diagnostic, got {other:?}"),
+            }
+        }
+        fn http(status: u16) -> tokio_tungstenite::tungstenite::Error {
+            tokio_tungstenite::tungstenite::Error::Http(Box::new(
+                tokio_tungstenite::tungstenite::http::Response::builder()
+                    .status(status)
+                    .body(None)
+                    .expect("response builds"),
+            ))
+        }
+
+        assert_eq!(
+            tuple(&OpenAiRealtimeErrorCategory::Auth.runtime_diagnostic()),
+            (Code::CredentialRejected, false, Action::ReenterCredential)
+        );
+        assert_eq!(
+            tuple(&OpenAiRealtimeErrorCategory::AuthExpired.runtime_diagnostic()),
+            // Session-window expiry, not a credential failure.
+            (Code::Timeout, true, Action::Retry)
+        );
+        // Error-frame auth codes route through the category.
+        let (category, diagnostic) = classify_error_frame(Some(&json!({
+            "type": "invalid_request_error", "code": "invalid_api_key"
+        })));
+        assert_eq!(category, OpenAiRealtimeErrorCategory::Auth);
+        assert_eq!(
+            tuple(&diagnostic),
+            (Code::CredentialRejected, false, Action::ReenterCredential)
+        );
+
+        // Handshake 401 rejects the credential; 403 is a permission failure.
+        let unauthorized = OpenAiRealtimeConnectError::from_tungstenite(&http(401));
+        assert_eq!(unauthorized.category, OpenAiRealtimeErrorCategory::Auth);
+        assert_eq!(
+            tuple(&unauthorized.diagnostic),
+            (Code::CredentialRejected, false, Action::ReenterCredential)
+        );
+        let forbidden = OpenAiRealtimeConnectError::from_tungstenite(&http(403));
+        assert_eq!(forbidden.category, OpenAiRealtimeErrorCategory::Auth);
+        assert_eq!(
+            tuple(&forbidden.diagnostic),
+            (Code::PermissionDenied, false, Action::ReviewConfiguration)
+        );
+
+        // A key that cannot be sent as a header is a configuration failure.
+        let malformed = OpenAiRealtimeConnectError::invalid_configuration();
+        assert_eq!(malformed.category, OpenAiRealtimeErrorCategory::Auth);
+        assert_eq!(
+            tuple(&malformed.diagnostic),
+            (
+                Code::InvalidConfiguration,
+                false,
+                Action::ReviewConfiguration
+            )
+        );
+
+        // Non-auth handshake statuses keep their category mapping.
+        assert_eq!(
+            tuple(&OpenAiRealtimeConnectError::from_tungstenite(&http(503)).diagnostic),
+            (Code::ProviderUnavailable, true, Action::Retry)
+        );
     }
 
     #[test]
@@ -1608,13 +1997,18 @@ mod tests {
             OpenAiRealtimeEvent::TurnComplete { usage: None },
             OpenAiRealtimeEvent::Error {
                 category: OpenAiRealtimeErrorCategory::Unknown,
-                message: "oops".into(),
+                message: "invalid_json".into(),
+                diagnostic: OpenAiRealtimeErrorCategory::Unknown.runtime_diagnostic(),
             },
             OpenAiRealtimeEvent::Error {
                 category: OpenAiRealtimeErrorCategory::RateLimit {
-                    retry_after_secs: Some(30),
+                    retry_delay: Some(RuntimeRetryDelayBucket::Medium),
                 },
-                message: "429".into(),
+                message: "error_frame".into(),
+                diagnostic: OpenAiRealtimeErrorCategory::RateLimit {
+                    retry_delay: Some(RuntimeRetryDelayBucket::Medium),
+                }
+                .runtime_diagnostic(),
             },
             OpenAiRealtimeEvent::Connected,
             OpenAiRealtimeEvent::Disconnected,
@@ -1647,12 +2041,10 @@ mod tests {
 
     #[test]
     fn error_category_serializes_with_kind_tag() {
-        let rl = serde_json::to_value(OpenAiRealtimeErrorCategory::RateLimit {
-            retry_after_secs: None,
-        })
-        .unwrap();
+        let rl = serde_json::to_value(OpenAiRealtimeErrorCategory::RateLimit { retry_delay: None })
+            .unwrap();
         assert_eq!(rl["kind"], "rate_limit");
-        assert!(rl.get("retry_after_secs").is_none());
+        assert!(rl.get("retry_delay").is_none());
         let auth = serde_json::to_value(OpenAiRealtimeErrorCategory::AuthExpired).unwrap();
         assert_eq!(auth["kind"], "auth_expired");
     }
@@ -1754,39 +2146,178 @@ mod tests {
 
     #[test]
     fn error_frame_redacts_message_and_classifies() {
-        let (tx, rx) = crossbeam_channel::bounded(16);
-        handle_server_message(
-            r#"{"type":"error","error":{"type":"invalid_request_error","code":"rate_limit_exceeded","message":"Rate limit reached for key openai-leak-sentinel"}}"#,
-            &tx,
-        );
-        match rx.try_recv().unwrap() {
-            OpenAiRealtimeEvent::Error { category, message } => {
-                assert_eq!(
-                    category,
-                    OpenAiRealtimeErrorCategory::RateLimit {
-                        retry_after_secs: None
-                    }
-                );
-                assert!(!message.contains("Rate limit reached"));
-                assert!(!message.contains("openai-leak-sentinel"));
-                assert!(message.contains("OpenAI Realtime S2S provider_error"));
-                assert!(message.contains("type=invalid_request_error"));
-                assert!(message.contains("code=rate_limit_exceeded"));
-                assert!(message.contains("message_len="));
+        crate::test_log_capture::install();
+        const KEY_CANARY: &str = "canary-credential-value";
+        const BODY: &str = "canary-provider-body-text";
+        const REQUEST_ID: &str = "canary-request-identifier-openai";
+        const EXACT_LEN: &str = "48213";
+
+        let frame = json!({
+            "type": "error",
+            "event_id": REQUEST_ID,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "rate_limit_exceeded",
+                "event_id": REQUEST_ID,
+                "message": format!(
+                    "{BODY} for key {KEY_CANARY} (request {REQUEST_ID}), {EXACT_LEN} tokens"
+                ),
             }
-            other => panic!("expected Error, got {other:?}"),
+        })
+        .to_string();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        handle_server_message(&frame, &tx);
+        let event = rx.try_recv().unwrap();
+
+        // Issue #145: the FULL wire shape — closed site token, structural
+        // category, closed diagnostic, and nothing else.
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "type": "error",
+                "category": { "kind": "rate_limit" },
+                "message": "error_frame",
+                "diagnostic": {
+                    "kind": "runtime",
+                    "detail": {
+                        "code": "rate_limited",
+                        "retryable": true,
+                        "recovery_action": "retry_after_delay",
+                        "context": {
+                            "operation": "realtime_conversation",
+                            "transport": "websocket",
+                            "status_class": "client_error"
+                        }
+                    }
+                }
+            })
+        );
+        let serialized = wire.to_string();
+        for forbidden in [
+            KEY_CANARY,
+            BODY,
+            REQUEST_ID,
+            EXACT_LEN,
+            "invalid_request_error",
+            "rate_limit_exceeded",
+            "_len",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "serialized error event leaked `{forbidden}`: {serialized}"
+            );
         }
+        // The planted values must not have reached any log line either.
+        crate::test_log_capture::assert_process_logs_exclude(&[
+            KEY_CANARY, BODY, REQUEST_ID, EXACT_LEN,
+        ]);
+    }
+
+    /// Issue #145: a valid JSON frame whose top-level `type` is unrecognized
+    /// is provider-controlled text; it must never be logged verbatim.
+    #[test]
+    fn unknown_event_type_is_logged_with_a_fixed_label_only() {
+        const SENTINEL: &str = "canary-unknown-event-type";
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let frame = json!({ "type": SENTINEL, "delta": "x" }).to_string();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        assert!(!handle_server_message(&frame, &tx));
+        assert!(rx.try_recv().is_err(), "unknown frames emit no event");
+
+        let logs = crate::test_log_capture::render(&capture.finish());
+        assert!(
+            logs.contains("unhandled message type unknown"),
+            "the fixed label must be logged so the canary is not vacuous: {logs}"
+        );
+        assert!(!logs.contains(SENTINEL), "{logs}");
+        crate::test_log_capture::assert_process_logs_exclude(&[SENTINEL]);
     }
 
     #[test]
     fn invalid_json_emits_error() {
+        const SENTINEL: &str = "canary-not-json-body";
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
         let (tx, rx) = crossbeam_channel::bounded(16);
-        handle_server_message("not json", &tx);
+        handle_server_message(&format!("not json {SENTINEL}"), &tx);
         match rx.try_recv().unwrap() {
-            OpenAiRealtimeEvent::Error { message, .. } => {
-                assert!(message.contains("Invalid server JSON"))
+            OpenAiRealtimeEvent::Error {
+                message,
+                diagnostic,
+                ..
+            } => {
+                // Issue #145: closed site token; the serde error text (which
+                // quotes the raw frame) is never surfaced.
+                assert_eq!(message, "invalid_json");
+                let serialized = serde_json::to_string(&diagnostic).unwrap();
+                assert!(serialized.contains("internal"));
+                assert!(!serialized.contains("not json"));
+                assert!(!serialized.contains(SENTINEL));
             }
             other => panic!("expected Error, got {other:?}"),
+        }
+        let logs = crate::test_log_capture::render(&capture.finish());
+        assert!(logs.contains("invalid server JSON"), "{logs}");
+        assert!(!logs.contains(SENTINEL), "{logs}");
+        crate::test_log_capture::assert_process_logs_exclude(&[SENTINEL]);
+    }
+
+    fn http_429(retry_after: Option<&str>) -> tokio_tungstenite::tungstenite::Error {
+        let mut builder = tokio_tungstenite::tungstenite::http::Response::builder().status(429);
+        if let Some(value) = retry_after {
+            builder = builder.header("retry-after", value);
+        }
+        tokio_tungstenite::tungstenite::Error::Http(Box::new(
+            builder.body(None).expect("build 429 response"),
+        ))
+    }
+
+    /// Issue #145 canary (sibling of the Gemini test): a numeric
+    /// `Retry-After` is reduced to a closed bucket at classification and the
+    /// exact seconds never reach the category (wire or the `Debug` form the
+    /// connect/reconnect logs print), the connect error, or the diagnostic.
+    #[test]
+    fn numeric_retry_after_is_bucketed_and_the_exact_value_never_survives() {
+        const EXACT: &str = "7391";
+        let category = classify_tungstenite_error(&http_429(Some(EXACT)));
+        assert_eq!(
+            category,
+            OpenAiRealtimeErrorCategory::RateLimit {
+                retry_delay: Some(RuntimeRetryDelayBucket::Long)
+            }
+        );
+        let surfaces = [
+            format!("{category:?}"),
+            serde_json::to_string(&category).unwrap(),
+            serde_json::to_string(&category.runtime_diagnostic()).unwrap(),
+            format!("{:?}", OpenAiRealtimeConnectError::new(category.clone())),
+        ];
+        for surface in &surfaces {
+            assert!(
+                !surface.contains(EXACT),
+                "exact Retry-After leaked into {surface}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(&category).unwrap(),
+            json!({ "kind": "rate_limit", "retry_delay": "long" })
+        );
+    }
+
+    /// Absent or non-numeric `Retry-After` leaves the bucket absent.
+    #[test]
+    fn absent_or_unparseable_retry_after_leaves_the_bucket_absent() {
+        for header in [None, Some("Wed, 21 Oct 2026 07:28:00 GMT")] {
+            let category = classify_tungstenite_error(&http_429(header));
+            assert_eq!(
+                category,
+                OpenAiRealtimeErrorCategory::RateLimit { retry_delay: None }
+            );
+            let diagnostic = serde_json::to_value(category.runtime_diagnostic()).unwrap();
+            assert!(
+                diagnostic["detail"]["context"].get("retry_delay").is_none(),
+                "absence must not map to a bucket: {diagnostic}"
+            );
         }
     }
 
@@ -1837,15 +2368,24 @@ mod tests {
         })));
         assert_eq!(
             cat,
-            OpenAiRealtimeErrorCategory::RateLimit {
-                retry_after_secs: None
-            }
+            OpenAiRealtimeErrorCategory::RateLimit { retry_delay: None }
         );
 
-        let (cat, _) = classify_error_frame(Some(&json!({
+        // `session_expired` is the realtime session-DURATION cap, not a
+        // credential problem: the diagnosis is a retryable timeout while the
+        // terminal session-end category is unchanged.
+        let (cat, diagnostic) = classify_error_frame(Some(&json!({
             "type": "invalid_request_error", "code": "session_expired"
         })));
         assert_eq!(cat, OpenAiRealtimeErrorCategory::AuthExpired);
+        match diagnostic {
+            RuntimeDiagnostic::Runtime(e) => {
+                assert_eq!(e.code, RuntimeErrorCode::Timeout);
+                assert!(e.retryable);
+                assert_eq!(e.recovery_action, RuntimeSafeRecoveryAction::Retry);
+            }
+            other => panic!("expected runtime diagnostic, got {other:?}"),
+        }
 
         let (cat, _) = classify_error_frame(Some(&json!({
             "type": "invalid_request_error", "code": "invalid_api_key"
@@ -1857,6 +2397,20 @@ mod tests {
 
         let (cat, _) = classify_error_frame(None);
         assert_eq!(cat, OpenAiRealtimeErrorCategory::Unknown);
+
+        // Exact structured codes only: look-alike codes and types never
+        // classify by substring.
+        for look_alike in [
+            json!({ "type": "invalid_request_error", "code": "my_rate_limit_check" }),
+            json!({ "type": "invalid_request_error", "code": "token_expired" }),
+            json!({ "type": "invalid_request_error", "code": "expired_signature" }),
+            json!({ "type": "invalid_request_error", "code": "no_api_key_here" }),
+            json!({ "type": "authentication_failed" }),
+            json!({ "type": "not_a_server_error" }),
+        ] {
+            let (cat, _) = classify_error_frame(Some(&look_alike));
+            assert_eq!(cat, OpenAiRealtimeErrorCategory::Unknown, "{look_alike}");
+        }
     }
 
     // -- emit_disconnected_once ---------------------------------------------
@@ -1897,21 +2451,74 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn open_ws_blocked_policy_writes_no_session_update_frame() {
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
         let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
         let (url, server) = ws_fixture::spawn_server(move |websocket| async move {
             let _ = frame_tx.send(first_client_content_frame(websocket).await);
         })
         .await;
 
-        let config = with_blocked_content_egress(test_config());
+        // Key unique to this test (the shared fixture's key is also planted by
+        // other tests, which would make a process-wide exclusion ambiguous).
+        const BLOCKED_KEY: &str = "canary-blocked-policy-credential";
+        let mut config = with_blocked_content_egress(test_config());
+        config.api_key = BLOCKED_KEY.into();
         let error = open_ws_url(&config, &url)
             .await
             .expect_err("blocked policy should reject S2S session.update write");
 
-        assert!(error.contains("Privacy policy blocked"));
-        assert!(error.contains(PROVIDER));
-        assert!(error.contains("local_only"));
-        assert!(!error.contains("openai-private-s2s-key-sentinel"));
+        // Issue #145: the failure is the closed `policy_blocked` diagnostic
+        // — the raw policy reason (which quotes the provider and mode) is
+        // dropped at the classify site, and the sentinel key cannot leak.
+        // Assert the FULL wire shape of the `AppError` the command layer
+        // returns (`connect()` converts the connect error exactly this way).
+        // (the log capture was started before the action, above)
+        let wire = serde_json::to_value(crate::error::AppError::from(error.diagnostic.clone()))
+            .expect("AppError serializes");
+        assert_eq!(
+            wire,
+            json!({
+                "code": "runtime_diagnostic",
+                "diagnostic": {
+                    "kind": "runtime",
+                    "detail": {
+                        "code": "policy_blocked",
+                        "retryable": false,
+                        "recovery_action": "review_policy",
+                        "context": {
+                            "operation": "realtime_conversation",
+                            "transport": "websocket"
+                        }
+                    }
+                }
+            })
+        );
+        let serialized = wire.to_string();
+        for forbidden in [
+            BLOCKED_KEY,
+            PROVIDER,
+            "local_only",
+            "Privacy policy blocked",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "returned error leaked `{forbidden}`: {serialized}"
+            );
+        }
+        // The connect error's `Debug` form (what any `{:?}` log would print)
+        // is closed too.
+        let debug = format!("{error:?}");
+        for forbidden in [BLOCKED_KEY, "local_only"] {
+            assert!(
+                !debug.contains(forbidden),
+                "connect error Debug leaked `{forbidden}`: {debug}"
+            );
+        }
+        // The thread-scoped capture was started BEFORE the action; the
+        // process-wide exclusion uses a key unique to this test.
+        let logs = crate::test_log_capture::render(&capture.finish());
+        assert!(!logs.contains(BLOCKED_KEY), "{logs}");
+        crate::test_log_capture::assert_process_logs_exclude(&[BLOCKED_KEY]);
 
         let observed = tokio::time::timeout(Duration::from_secs(1), frame_rx)
             .await
@@ -1988,7 +2595,9 @@ mod tests {
                 let opener_calls = Arc::clone(&opener_calls);
                 Box::pin(async move {
                     opener_calls.fetch_add(1, Ordering::SeqCst);
-                    Err("fake reconnect failure".to_string())
+                    Err(OpenAiRealtimeConnectError::new(
+                        OpenAiRealtimeErrorCategory::Network,
+                    ))
                 })
             })
         };
@@ -2023,8 +2632,13 @@ mod tests {
         assert_eq!(run_io_entries.load(Ordering::SeqCst), 1);
 
         match recv_event(&event_rx, Duration::from_secs(2)).await {
-            OpenAiRealtimeEvent::Error { message, .. } => {
-                assert!(message.contains("Reconnect attempt 1 failed"))
+            OpenAiRealtimeEvent::Error {
+                category, message, ..
+            } => {
+                // Issue #145: closed site token + structural category; the
+                // connect error text never crosses.
+                assert_eq!(message, "reconnect_failed");
+                assert_eq!(category, OpenAiRealtimeErrorCategory::Network);
             }
             other => panic!("expected reconnect failure error, got {other:?}"),
         }
@@ -2140,18 +2754,16 @@ mod tests {
                     config
                         .content_egress_policy
                         .check_json(PROVIDER)
-                        .map_err(|e| {
-                            crate::error::redacted_provider_diagnostic(&e, [&config.api_key])
+                        .map_err(|_| OpenAiRealtimeConnectError {
+                            category: OpenAiRealtimeErrorCategory::Unknown,
+                            diagnostic: policy_blocked_diagnostic(),
                         })?;
                     let update = session_update_payload(&config).to_string();
                     writer
                         .send(Message::Text(update.into()))
                         .await
                         .map_err(|e| {
-                            crate::error::redacted_provider_diagnostic(
-                                &format!("fake session.update failed: {e}"),
-                                [&config.api_key],
-                            )
+                            OpenAiRealtimeConnectError::new(classify_tungstenite_error(&e))
                         })?;
                     Ok((writer, reader))
                 })

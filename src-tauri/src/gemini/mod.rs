@@ -63,6 +63,14 @@ use tokio_tungstenite::tungstenite::{self, Message};
 // place for every transport.
 use crate::reconnect::backoff_for_attempt;
 
+// Closed, content-free runtime diagnostics (issue #145). Every error this
+// module logs or emits carries one of these typed envelopes instead of raw
+// provider / transport text.
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeRetryDelayBucket, RuntimeSafeRecoveryAction, RuntimeStatusClass,
+    RuntimeTransport,
+};
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -97,31 +105,215 @@ static GEMINI_AUDIO_DROPS: AtomicU64 = AtomicU64::new(0);
 /// appropriate i18n key + toast severity without re-parsing error strings.
 /// Every variant except `Unknown` corresponds to a *classified* failure the
 /// backend has positively identified (close frame code + reason, or a
-/// specific transport error); `Unknown` carries the original message for
-/// debugging when nothing else matches.
+/// specific transport error). Issue #145 pairs every category with a closed
+/// [`RuntimeDiagnostic`] — no raw provider or transport text is retained
+/// anywhere on the event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GeminiErrorCategory {
     /// Invalid / missing API key — reauthentication required.
     Auth,
-    /// Token / session credential has expired and needs refreshing. Distinct
-    /// from [`Self::Auth`] because the remediation differs (refresh vs. reconfigure).
+    /// Credential expiry. No production path emits this today: the close
+    /// reason is provider prose and the Vertex SDK offers no structural
+    /// expiry signal, so it is retained only as part of the wire contract.
+    /// Distinct from [`Self::Auth`] because the remediation differs.
     AuthExpired,
-    /// Quota / rate-limit exceeded. `retry_after_secs` mirrors the HTTP
-    /// `Retry-After` header (or close-frame hint) when the server includes
-    /// one; absent otherwise.
+    /// Quota / rate-limit exceeded. `retry_delay` is the closed bucket a
+    /// numeric `Retry-After` header reduces to (issue #145); the exact seconds
+    /// are never retained. Absent when the server sent no usable hint.
     RateLimit {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        retry_after_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_delay: Option<RuntimeRetryDelayBucket>,
     },
     /// Server-side failure (5xx response or WS close code 1011).
     Server,
     /// Transport-layer failure — TLS, TCP, DNS, socket reset, etc. These are
     /// the ones our reconnect loop is expected to recover from.
     Network,
-    /// Anything we could not positively classify. The enclosing event's
-    /// `message` field preserves the original string for logs and bug reports.
+    /// Anything we could not positively classify.
     Unknown,
+}
+
+impl GeminiErrorCategory {
+    /// Closed [`RuntimeDiagnostic`] envelope for this category (issue #145).
+    /// Every branch discards the raw signal and keeps only closed values, so
+    /// no provider text, close reason, status number, or exact retry-seconds
+    /// survives onto logs, IPC events, or UI error state. `pub(crate)` so
+    /// the converse layer's tests can build typed fixtures.
+    pub(crate) fn runtime_diagnostic(&self) -> RuntimeDiagnostic {
+        match self {
+            Self::Auth => RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::credential_rejected(
+                realtime_context().with_status_class(RuntimeStatusClass::ClientError),
+            )),
+            Self::AuthExpired => {
+                RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::credential_expired(
+                    realtime_context().with_status_class(RuntimeStatusClass::ClientError),
+                ))
+            }
+            Self::RateLimit { retry_delay } => realtime_diagnostic(
+                RuntimeErrorCode::RateLimited,
+                true,
+                RuntimeSafeRecoveryAction::RetryAfterDelay,
+                Some(RuntimeStatusClass::ClientError),
+                // Absence stays absent — never mapped to a bucket.
+                *retry_delay,
+            ),
+            Self::Server => realtime_diagnostic(
+                RuntimeErrorCode::ProviderUnavailable,
+                true,
+                RuntimeSafeRecoveryAction::Retry,
+                Some(RuntimeStatusClass::ServerError),
+                None,
+            ),
+            Self::Network => realtime_diagnostic(
+                RuntimeErrorCode::NetworkUnreachable,
+                true,
+                RuntimeSafeRecoveryAction::CheckNetwork,
+                None,
+                None,
+            ),
+            Self::Unknown => realtime_diagnostic(
+                RuntimeErrorCode::Internal,
+                false,
+                RuntimeSafeRecoveryAction::None,
+                None,
+                None,
+            ),
+        }
+    }
+}
+
+/// Closed site identifier carried on [`GeminiEvent::Error::message`] (issue
+/// #145). The serialized `message` string is *only* one of these stable
+/// tokens — never provider text, a WebSocket close reason, a request id, or
+/// an exact payload length. The structured classification lives in the
+/// event's `diagnostic` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeminiErrorSite {
+    /// Server sent a Close frame (classified close code).
+    ServerClose,
+    /// A server JSON frame failed to parse.
+    InvalidJson,
+    /// Server pushed `goAway` (graceful shutdown notice).
+    GoAway,
+    /// The reconnect budget (1/2/5/10s ladder) is exhausted.
+    ReconnectExhausted,
+    /// A single reconnect attempt failed (session keeps retrying).
+    ReconnectFailed,
+}
+
+impl GeminiErrorSite {
+    /// Stable snake_case token for the serialized event `message` field.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::ServerClose => "server_close",
+            Self::InvalidJson => "invalid_json",
+            Self::GoAway => "go_away",
+            Self::ReconnectExhausted => "reconnect_exhausted",
+            Self::ReconnectFailed => "reconnect_failed",
+        }
+    }
+}
+
+/// Fixed context for every Gemini realtime diagnostic: the realtime S2S
+/// operation over a WebSocket transport.
+fn realtime_context() -> RuntimeDiagnosticContext {
+    RuntimeDiagnosticContext::new(RuntimeOperation::RealtimeConversation)
+        .with_transport(RuntimeTransport::Websocket)
+}
+
+/// Build the closed [`RuntimeDiagnostic`] every Gemini error carries (issue
+/// #145). The context is fixed to the realtime S2S operation over a
+/// WebSocket transport; only the closed code / retryability / recovery
+/// action / optional coarse status class + retry-delay bucket vary.
+fn realtime_diagnostic(
+    code: RuntimeErrorCode,
+    retryable: bool,
+    recovery_action: RuntimeSafeRecoveryAction,
+    status_class: Option<RuntimeStatusClass>,
+    retry_delay: Option<RuntimeRetryDelayBucket>,
+) -> RuntimeDiagnostic {
+    let mut context = realtime_context();
+    if let Some(status_class) = status_class {
+        context = context.with_status_class(status_class);
+    }
+    if let Some(retry_delay) = retry_delay {
+        context = context.with_retry_delay(retry_delay);
+    }
+    RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::new(
+        code,
+        retryable,
+        recovery_action,
+        context,
+    ))
+}
+
+/// The closed `invalid_configuration` error for a realtime provider whose
+/// local configuration is unusable (empty key, blank Vertex project or
+/// location). The IPC commands' early guards and `connect()` return this same
+/// typed error instead of legacy local prose errors.
+pub(crate) fn invalid_configuration_error() -> crate::error::AppError {
+    RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::invalid_configuration(
+        realtime_context(),
+    ))
+    .into()
+}
+
+/// Local empty-input guard for the Gemini auth mode (whitespace-only counts as
+/// empty). Shared by `start_gemini`, `start_converse` and `connect()` so a
+/// blank field reads the same typed `invalid_configuration` everywhere.
+pub(crate) fn validate_auth_configuration(
+    auth: &crate::settings::GeminiAuthMode,
+) -> Result<(), crate::error::AppError> {
+    let blank = match auth {
+        crate::settings::GeminiAuthMode::ApiKey { api_key } => api_key.trim().is_empty(),
+        crate::settings::GeminiAuthMode::VertexAI {
+            project_id,
+            location,
+            ..
+        } => project_id.trim().is_empty() || location.trim().is_empty(),
+    };
+    if blank {
+        Err(invalid_configuration_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Map the FSM's coarse [`crate::converse::TurnErrorCategory`] onto the
+/// closed runtime diagnostic envelope (issue #145). This is only the FALLBACK
+/// for engine signals that carry no diagnosis of their own (the STT adapter);
+/// engine-supplied diagnostics are forwarded untouched. Delegates to
+/// [`GeminiErrorCategory::runtime_diagnostic`] so the mapping lives in one
+/// place.
+fn turn_error_runtime_diagnostic(
+    category: crate::converse::TurnErrorCategory,
+) -> RuntimeDiagnostic {
+    use crate::converse::TurnErrorCategory as C;
+    match category {
+        C::Auth => GeminiErrorCategory::Auth,
+        C::Server => GeminiErrorCategory::Server,
+        C::Network => GeminiErrorCategory::Network,
+        C::Unknown => GeminiErrorCategory::Unknown,
+    }
+    .runtime_diagnostic()
+}
+
+/// The `GEMINI_STATUS` / `OPENAI_REALTIME_STATUS` payload both converse sinks
+/// emit for an engine error (issue #145). It carries ONLY the closed
+/// `diagnostic` — the engine's own diagnosis when it supplied one (so a rate
+/// limit stays `rate_limited`, never an outage), else the fallback derived
+/// from the coarse category. No message string, no coarse category: nothing
+/// provider-controlled and nothing misleading crosses IPC. Pure so the sinks'
+/// wire shape is unit-testable without an `AppHandle`.
+pub(crate) fn converse_error_status_payload(
+    category: crate::converse::TurnErrorCategory,
+    diagnostic: Option<&RuntimeDiagnostic>,
+) -> Value {
+    let diagnostic = diagnostic
+        .cloned()
+        .unwrap_or_else(|| turn_error_runtime_diagnostic(category));
+    json!({ "type": "error", "diagnostic": diagnostic })
 }
 
 /// Events emitted by the Gemini Live client to downstream consumers.
@@ -148,16 +340,19 @@ pub enum GeminiEvent {
     /// A non-fatal error occurred.
     ///
     /// `category` is the structured classification derived at the error site
-    /// (close-frame code + reason, tungstenite error kind, HTTP status). The
-    /// `message` string carries the original human-readable context for
-    /// logs / debugging — the frontend should prefer `category` for routing
-    /// (i18n key, toast severity) and only fall back to `message` when the
-    /// category is [`GeminiErrorCategory::Unknown`].
+    /// (close-frame code + reason, tungstenite error kind, HTTP status);
+    /// `diagnostic` is the closed [`RuntimeDiagnostic`] envelope (issue #145)
+    /// the frontend routes through `runtimeDiagnosticPresentation` for a
+    /// localized, closed-key toast. `message` is a stable
+    /// [`GeminiErrorSite::token`] site identifier — it never carries
+    /// provider text, close reasons, request ids, or payload lengths.
     #[serde(rename = "error")]
     Error {
         category: GeminiErrorCategory,
         message: String,
+        diagnostic: RuntimeDiagnostic,
     },
+
     /// The connection has been established.
     #[serde(rename = "connected")]
     Connected,
@@ -229,6 +424,23 @@ pub enum GeminiEvent {
     /// playback-drain → `Listening`).
     #[serde(rename = "generation_complete")]
     GenerationComplete,
+}
+
+impl GeminiEvent {
+    /// The only constructor for the [`GeminiEvent::Error`] payload (issue
+    /// #145): the serialized `message` is pinned to the closed site token so
+    /// raw provider / transport text can never reach logs, IPC, or the UI.
+    fn error(
+        site: GeminiErrorSite,
+        category: GeminiErrorCategory,
+        diagnostic: RuntimeDiagnostic,
+    ) -> Self {
+        Self::Error {
+            category,
+            message: site.token().to_string(),
+            diagnostic,
+        }
+    }
 }
 
 /// Token usage metadata parsed from a Gemini Live server message.
@@ -499,32 +711,30 @@ impl GeminiLiveClient {
     /// tokio runtime. The session task handles audio writing, server message
     /// reading, and automatic reconnection with exponential backoff if the
     /// WebSocket drops mid-session (see `session_task` in this module).
-    pub fn connect(&mut self) -> Result<(), String> {
-        // Validate auth configuration before proceeding.
-        match &self.config.auth {
-            crate::settings::GeminiAuthMode::ApiKey { api_key } => {
-                if api_key.is_empty() {
-                    return Err("Gemini API key is not configured".to_string());
-                }
-            }
-            crate::settings::GeminiAuthMode::VertexAI {
-                project_id,
-                location,
-                ..
-            } => {
-                if project_id.is_empty() || location.is_empty() {
-                    return Err("Vertex AI project_id and location must be configured".to_string());
-                }
-            }
-        }
+    /// Issue #145: `connect` returns a closed [`AppError`] (typed
+    /// `RuntimeDiagnostic` variant) — never a raw provider or transport
+    /// string. The command layer forwards it to the frontend, which routes
+    /// it through `runtimeDiagnosticPresentation` for localized copy.
+    pub fn connect(&mut self) -> Result<(), crate::error::AppError> {
+        // Validate auth configuration before proceeding. Issue #145: closed
+        // `invalid_configuration` diagnostic, no prose.
+        validate_auth_configuration(&self.config.auth)?;
 
         // Build a dedicated single-threaded tokio runtime for the WebSocket.
+        // Issue #145: unclassified native failure → closed `internal`
+        // diagnostic; the source error is dropped, never logged.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .thread_name("gemini-ws-rt")
             .build()
-            .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
+            .map_err(|e| {
+                crate::error::AppError::from_unclassified_runtime_error(
+                    &e,
+                    RuntimeDiagnosticContext::new(RuntimeOperation::RealtimeConversation)
+                        .with_transport(RuntimeTransport::Native),
+                )
+            })?;
 
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
@@ -548,12 +758,13 @@ impl GeminiLiveClient {
             // No handle on the very first connect — request resumption so
             // the server will start sending `sessionResumptionUpdate` frames.
             let (writer, reader) = open_ws(&config, None).await.map_err(|e| {
-                // Synchronous connect surfaces as Result<(), String> for
-                // backwards compat with the command layer — the richer
-                // category is only observable through `GeminiEvent::Error`
-                // emitted from reconnect paths. A connect failure here
-                // means the caller never reaches event_rx() anyway.
-                e.message
+                // Issue #145: log only the closed category; the connect
+                // error's raw source never crossed this boundary (it was
+                // dropped inside `open_ws`). Return the closed diagnostic
+                // envelope so the command layer / frontend classify
+                // structurally.
+                log::warn!("Gemini Live: connect failed ({:?})", e.category);
+                crate::error::AppError::from(e.diagnostic)
             })?;
 
             log::info!("Gemini Live: setup complete");
@@ -577,7 +788,7 @@ impl GeminiLiveClient {
                 resumption_handle,
             ));
 
-            Ok::<_, String>((atx, session_handle))
+            Ok::<_, crate::error::AppError>((atx, session_handle))
         })?;
 
         self.audio_tx = Some(audio_tx);
@@ -764,20 +975,25 @@ impl Drop for GeminiLiveClient {
 /// Classifies *why* the session dropped so downstream logs / events can be
 /// precise without the caller re-parsing error strings.
 ///
-/// The inner `String` on the network variants carries the human-readable
-/// reason for logging and telemetry. It is consumed through `Debug`
-/// formatting on `{kind:?}`, which the dead-code lint does not track, hence
-/// the allow.
+/// Every payload-carrying variant holds a closed [`RuntimeDiagnostic`] (issue
+/// #145) — never a raw reason string. The `Debug` render of this enum (which
+/// is what `log::info!("… ({disconnect:?})")` prints) therefore only ever
+/// shows closed enum tokens.
 #[derive(Debug)]
 #[allow(dead_code)]
 enum DisconnectKind {
     /// Remote server sent a Close frame. Typically a graceful server-side
-    /// teardown (e.g. `goAway`, idle timeout).
-    ServerClose(String),
+    /// teardown (e.g. `goAway`, idle timeout). Carries the closed
+    /// classification for the frame (issue #145) — `category` is `None` for
+    /// normal / unclassified closes, which do not surface an error event.
+    ServerClose {
+        category: Option<GeminiErrorCategory>,
+        diagnostic: RuntimeDiagnostic,
+    },
     /// Transport-level error (TLS, TCP reset, DNS flap, tungstenite I/O).
-    NetworkError(String),
+    NetworkError(RuntimeDiagnostic),
     /// Protocol violation — malformed frame, invalid sequence, etc.
-    ProtocolError(String),
+    ProtocolError(RuntimeDiagnostic),
     /// User called `disconnect()`. No reconnect attempt should be made.
     UserRequested,
     /// Writer task exhausted the audio command stream (caller dropped the
@@ -863,9 +1079,11 @@ fn build_setup_message(config: &GeminiConfig, resumption_handle: Option<&str>) -
 /// `CloseFrame.code` + `CloseFrame.reason`. We key off the numeric code
 /// (1008 = policy violation, 1011 = server error) and then scan the reason
 /// string (lowercased) for the signal words that tell the Auth vs.
-/// AuthExpired vs. RateLimit variants apart. A bare 1008 with none of the
-/// known markers falls through to [`GeminiErrorCategory::Unknown`] so we
-/// don't lie about remediation.
+/// RateLimit variants apart. The reason is provider prose, so it is never
+/// taken as evidence of credential EXPIRY: an "expired" reason is just an
+/// unrecognized 1008 and falls through to [`GeminiErrorCategory::Unknown`],
+/// like any bare 1008 with none of the known markers, so we don't lie about
+/// remediation.
 ///
 /// Returns `None` if the frame is a normal close (code 1000) or any code
 /// we don't want to surface as an error (transient server restarts do not
@@ -877,14 +1095,10 @@ fn classify_close_frame(code: u16, reason: &str) -> Option<GeminiErrorCategory> 
         1000 => None, // normal closure — not an error
         1008 => {
             // Policy violation — auth / quota family.
-            if r.contains("token expired") {
-                Some(GeminiErrorCategory::AuthExpired)
-            } else if r.contains("api key") {
+            if r.contains("api key") {
                 Some(GeminiErrorCategory::Auth)
             } else if r.contains("quota") {
-                Some(GeminiErrorCategory::RateLimit {
-                    retry_after_secs: None,
-                })
+                Some(GeminiErrorCategory::RateLimit { retry_delay: None })
             } else {
                 Some(GeminiErrorCategory::Unknown)
             }
@@ -892,6 +1106,42 @@ fn classify_close_frame(code: u16, reason: &str) -> Option<GeminiErrorCategory> 
         1011 => Some(GeminiErrorCategory::Server),
         _ => None,
     }
+}
+
+/// Closed diagnostic for a category derived from a WebSocket close frame.
+/// The close REASON is provider prose, so a prose-derived `Auth` /
+/// `AuthExpired` category must not manufacture a credential diagnosis
+/// (`credential_rejected` / `credential_expired`): a 1008 close is the
+/// generic closed `request_rejected` / `review_configuration` code. The
+/// category itself is unchanged, so terminal-auth teardown still fires.
+/// Credential codes come only from structured signals (an HTTP 401 on the
+/// handshake, an OpenAI `invalid_api_key` error code).
+fn close_frame_diagnostic(category: &GeminiErrorCategory) -> RuntimeDiagnostic {
+    match category {
+        GeminiErrorCategory::Auth | GeminiErrorCategory::AuthExpired => realtime_diagnostic(
+            RuntimeErrorCode::RequestRejected,
+            false,
+            RuntimeSafeRecoveryAction::ReviewConfiguration,
+            Some(RuntimeStatusClass::ClientError),
+            None,
+        ),
+        other => other.runtime_diagnostic(),
+    }
+}
+
+/// Reduce a numeric `Retry-After` header to a closed
+/// [`RuntimeRetryDelayBucket`] (issue #145). The exact seconds are dropped;
+/// an absent, non-UTF-8, or non-numeric (HTTP-date) header yields `None` —
+/// absence is never mapped to a bucket. Shared with the OpenAI Realtime S2S
+/// classifier.
+pub(crate) fn retry_delay_bucket_from_headers(
+    headers: &tungstenite::http::HeaderMap,
+) -> Option<RuntimeRetryDelayBucket> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(RuntimeRetryDelayBucket::from_seconds)
 }
 
 /// Classify a `tungstenite::Error` encountered while connecting or reading
@@ -911,15 +1161,13 @@ fn classify_tungstenite_error(err: &tungstenite::Error) -> GeminiErrorCategory {
         tungstenite::Error::Http(response) => {
             let status = response.status().as_u16();
             if status == 429 {
-                // Try to extract Retry-After (may be "<seconds>" or an
-                // HTTP-date; we only parse the numeric form — the Gemini
-                // service uses seconds).
-                let retry_after_secs = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.trim().parse::<u64>().ok());
-                GeminiErrorCategory::RateLimit { retry_after_secs }
+                // Issue #145: the numeric `Retry-After` value is reduced to a
+                // closed delay bucket here and the exact seconds are dropped —
+                // they never reach the category, logs, or the wire. An absent
+                // or non-numeric header leaves the bucket absent.
+                GeminiErrorCategory::RateLimit {
+                    retry_delay: retry_delay_bucket_from_headers(response.headers()),
+                }
             } else if (500..600).contains(&status) {
                 GeminiErrorCategory::Server
             } else if status == 401 || status == 403 {
@@ -940,17 +1188,90 @@ fn classify_tungstenite_error(err: &tungstenite::Error) -> GeminiErrorCategory {
 /// A classified failure surfaced from [`open_ws`] to its caller so the
 /// session task can emit a correctly-categorized `GeminiEvent::Error`
 /// without string-parsing the display form.
+///
+/// Issue #145: the raw source (HTTP status, close reason, tungstenite /
+/// `gcp_auth` error) is inspected at the construction site to pick
+/// `category` and then **discarded** — it is never retained, logged, or
+/// serialized. The closed [`RuntimeDiagnostic`] is the only thing that
+/// crosses to events, the returned [`AppError`](crate::error::AppError),
+/// and the frontend.
 #[derive(Debug, Clone)]
 struct GeminiConnectError {
     category: GeminiErrorCategory,
-    message: String,
+    diagnostic: RuntimeDiagnostic,
 }
 
 impl GeminiConnectError {
-    fn new(category: GeminiErrorCategory, message: impl Into<String>) -> Self {
+    /// Build a classified connect failure from a positively-identified
+    /// category. The raw source error stays at the call site.
+    fn new(category: GeminiErrorCategory) -> Self {
+        Self {
+            diagnostic: category.runtime_diagnostic(),
+            category,
+        }
+    }
+
+    /// Connect failure from a tungstenite error. Category comes from
+    /// `classify_tungstenite_error`. An HTTP 401/403 handshake rejection is
+    /// typed through `from_http_status` (the credential was sent), so a 401
+    /// is `credential_rejected` and a 403 is `permission_denied`. Only the
+    /// status class survives; the response is dropped.
+    fn from_tungstenite(err: &tungstenite::Error) -> Self {
+        let category = classify_tungstenite_error(err);
+        let diagnostic = match err {
+            tungstenite::Error::Http(response)
+                if matches!(response.status().as_u16(), 401 | 403) =>
+            {
+                RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::from_http_status(
+                    response.status().as_u16(),
+                    true,
+                    realtime_context(),
+                ))
+            }
+            _ => category.runtime_diagnostic(),
+        };
         Self {
             category,
-            message: message.into(),
+            diagnostic,
+        }
+    }
+
+    /// `Auth` failure caused by local credential configuration (unreadable
+    /// service-account file, no application default credentials).
+    fn auth_configuration() -> Self {
+        Self {
+            category: GeminiErrorCategory::Auth,
+            diagnostic: RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::invalid_configuration(
+                realtime_context(),
+            )),
+        }
+    }
+
+    /// The saved API key cannot be encoded as a header value: a local
+    /// configuration problem. The category stays `Unknown` (unchanged
+    /// teardown behavior); only the diagnostic is the honest code.
+    fn unencodable_api_key() -> Self {
+        Self {
+            category: GeminiErrorCategory::Unknown,
+            diagnostic: RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::invalid_configuration(
+                realtime_context(),
+            )),
+        }
+    }
+
+    /// Vertex token acquisition failure. The SDK exposes no structural
+    /// "credential rejected" signal (a non-success token response is a
+    /// static message regardless of status), so this never emits
+    /// `credential_rejected`. A transport-level error is a `Network`
+    /// failure; anything else keeps the terminal `Auth` session-end category
+    /// with the generic closed `internal` diagnostic.
+    fn from_gcp_token_error(err: &gcp_auth::Error) -> Self {
+        match err {
+            gcp_auth::Error::Http(..) => Self::new(GeminiErrorCategory::Network),
+            _ => Self {
+                category: GeminiErrorCategory::Auth,
+                diagnostic: GeminiErrorCategory::Unknown.runtime_diagnostic(),
+            },
         }
     }
 }
@@ -992,15 +1313,8 @@ fn gemini_api_key_connect_headers(
     )>,
     GeminiConnectError,
 > {
-    let api_key_value = tungstenite::http::HeaderValue::from_str(api_key).map_err(|e| {
-        GeminiConnectError::new(
-            GeminiErrorCategory::Unknown,
-            crate::error::redacted_provider_diagnostic(
-                &format!("Invalid x-goog-api-key header: {e}"),
-                [api_key],
-            ),
-        )
-    })?;
+    let api_key_value = tungstenite::http::HeaderValue::from_str(api_key)
+        .map_err(|_| GeminiConnectError::unencodable_api_key())?;
     Ok(vec![
         (
             tungstenite::http::HeaderName::from_static("x-goog-api-key"),
@@ -1015,11 +1329,9 @@ fn gemini_api_key_connect_headers(
 
 /// The auth/content header pairs the VertexAI branch of [`open_ws`] layers
 /// onto the upgrade request. Same test-seam rationale as
-/// [`gemini_api_key_connect_headers`]. `secrets` are the credential strings in
-/// scope at the call site, forwarded to the redactor.
+/// [`gemini_api_key_connect_headers`].
 fn gemini_vertex_connect_headers(
     bearer_token: &str,
-    secrets: &[&str],
 ) -> Result<
     Vec<(
         tungstenite::http::HeaderName,
@@ -1028,14 +1340,9 @@ fn gemini_vertex_connect_headers(
     GeminiConnectError,
 > {
     let bearer = tungstenite::http::HeaderValue::from_str(&format!("Bearer {bearer_token}"))
-        .map_err(|e| {
-            GeminiConnectError::new(
-                GeminiErrorCategory::Unknown,
-                crate::error::redacted_provider_diagnostic(
-                    &format!("Invalid Authorization header: {e}"),
-                    secrets.iter().copied(),
-                ),
-            )
+        .map_err(|_| {
+            // Issue #145: classify structurally; drop the unencodable source.
+            GeminiConnectError::new(GeminiErrorCategory::Unknown)
         })?;
     Ok(vec![
         (tungstenite::http::header::AUTHORIZATION, bearer),
@@ -1052,39 +1359,30 @@ fn gemini_vertex_connect_headers(
 ///
 /// Both Gemini auth branches funnel through here so the mandatory-WS-header fix
 /// (audio-graph-7086 / review B2) lives in exactly one place and a test can
-/// exercise the *production* request shape against a local fixture. `secrets`
-/// are the credential strings in scope, forwarded to the redactor so no key can
-/// leak into a connect diagnostic.
+/// exercise the *production* request shape against a local fixture. Issue
+/// #145: the tungstenite error is inspected only to classify; its display text
+/// (which can echo the full request, including the auth header) is dropped
+/// here and never logged or serialized.
 async fn connect_gemini_ws(
     url_str: &str,
     headers: Vec<(
         tungstenite::http::HeaderName,
         tungstenite::http::HeaderValue,
     )>,
-    secrets: &[&str],
 ) -> Result<(WsWriter, WsReader), GeminiConnectError> {
-    let request = crate::ws_request::build_ws_upgrade_request(url_str, headers).map_err(|e| {
-        GeminiConnectError::new(
-            GeminiErrorCategory::Unknown,
-            crate::error::redacted_provider_diagnostic(&e, secrets.iter().copied()),
-        )
-    })?;
+    let request = crate::ws_request::build_ws_upgrade_request(url_str, headers)
+        .map_err(|_| GeminiConnectError::new(GeminiErrorCategory::Unknown))?;
 
     // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
     // ordinary connect error (classified as a transport error, driving the
     // reconnect ladder) instead of hanging this future forever — this is the
     // single seam for both the ApiKey and Vertex auth modes (PR #79 note).
+    // Issue #145: the tungstenite error is inspected only to classify; its
+    // display text (which can echo the full request, including the auth
+    // header) is dropped here.
     let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
         .await
-        .map_err(|e| {
-            GeminiConnectError::new(
-                classify_tungstenite_error(&e),
-                crate::error::redacted_provider_diagnostic(
-                    &format!("WebSocket connect failed: {e}"),
-                    secrets.iter().copied(),
-                ),
-            )
-        })?;
+        .map_err(|e| GeminiConnectError::from_tungstenite(&e))?;
 
     Ok(ws_stream.split())
 }
@@ -1103,20 +1401,16 @@ async fn open_ws(
                  google.ai.generativelanguage.v1beta.\
                  GenerativeService.BidiGenerateContent";
 
-            // Secrets in scope at the ApiKey connect site: the API key is sent
-            // as the `x-goog-api-key` header and a transport error can echo the
-            // request back. Route every diagnostic through the redactor.
-            let secrets = [api_key.as_str()];
-
             // Build via the shared helper so the five mandatory WS upgrade
             // headers are injected; the old hand-built request set only the
             // API-key + content-type headers and never handshook (see
             // audio-graph-7086 / review B2). Key stays in the header, per the
-            // security comment above. The header assembly lives in
-            // `gemini_api_key_connect_headers` so the production-path test
-            // exercises the exact same construction.
+            // security comment above; issue #145 drops the transport-error
+            // display text entirely at the classify site. The header assembly
+            // lives in `gemini_api_key_connect_headers` so the
+            // production-path test exercises the exact same construction.
             let headers = gemini_api_key_connect_headers(api_key)?;
-            connect_gemini_ws(url_str, headers, &secrets).await?
+            connect_gemini_ws(url_str, headers).await?
         }
         crate::settings::GeminiAuthMode::VertexAI {
             project_id,
@@ -1127,32 +1421,28 @@ async fn open_ws(
             let token = if let Some(sa_path) = service_account_path.as_deref().map(str::trim)
                 && !sa_path.is_empty()
             {
-                let service_account =
-                    gcp_auth::CustomServiceAccount::from_file(sa_path).map_err(|e| {
-                        GeminiConnectError::new(
-                            GeminiErrorCategory::Auth,
-                            format!("GCP service account init failed: {e}"),
-                        )
-                    })?;
-                service_account.token(scopes).await.map_err(|e| {
-                    GeminiConnectError::new(
-                        GeminiErrorCategory::Auth,
-                        format!("Failed to obtain GCP bearer token: {e}"),
-                    )
-                })?
+                // Issue #145: `gcp_auth` failures classify structurally and the
+                // provider's own error text is dropped at the site. An
+                // unreadable service-account file or missing application
+                // default credentials is `invalid_configuration`. A failed
+                // token request is classified by error KIND only
+                // (`from_gcp_token_error`): the SDK cannot tell a rejected
+                // credential from any other non-success token response, so it
+                // never claims `credential_rejected`.
+                let service_account = gcp_auth::CustomServiceAccount::from_file(sa_path)
+                    .map_err(|_| GeminiConnectError::auth_configuration())?;
+                service_account
+                    .token(scopes)
+                    .await
+                    .map_err(|e| GeminiConnectError::from_gcp_token_error(&e))?
             } else {
-                let provider = gcp_auth::provider().await.map_err(|e| {
-                    GeminiConnectError::new(
-                        GeminiErrorCategory::Auth,
-                        format!("GCP auth provider init failed: {e}"),
-                    )
-                })?;
-                provider.token(scopes).await.map_err(|e| {
-                    GeminiConnectError::new(
-                        GeminiErrorCategory::Auth,
-                        format!("Failed to obtain GCP bearer token: {e}"),
-                    )
-                })?
+                let provider = gcp_auth::provider()
+                    .await
+                    .map_err(|_| GeminiConnectError::auth_configuration())?;
+                provider
+                    .token(scopes)
+                    .await
+                    .map_err(|e| GeminiConnectError::from_gcp_token_error(&e))?
             };
 
             let url_str = format!(
@@ -1162,21 +1452,16 @@ async fn open_ws(
                  alt=proto&key={project_id}",
             );
 
-            // Secrets in scope at the Vertex connect site: the bearer token is
-            // sent as the `Authorization` header and the project id is embedded
-            // in the URL query string (`?…&key={project_id}`). A transport
-            // error display can echo either back, so scrub both.
-            let secrets = [token.as_str(), project_id.as_str()];
-
             // Build via the shared helper so the five mandatory WS upgrade
             // headers are injected; the old hand-built request set only the
             // bearer + content-type headers and never handshook (see
             // audio-graph-7086 / review B2, Vertex path). The bearer token
-            // stays in the header. The header assembly lives in
-            // `gemini_vertex_connect_headers` so the production-path test
-            // exercises the exact same construction.
-            let headers = gemini_vertex_connect_headers(token.as_str(), &secrets)?;
-            connect_gemini_ws(&url_str, headers, &secrets).await?
+            // stays in the header; issue #145 drops the transport-error
+            // display text entirely at the classify site. The header assembly
+            // lives in `gemini_vertex_connect_headers` so the production-path
+            // test exercises the exact same construction.
+            let headers = gemini_vertex_connect_headers(token.as_str())?;
+            connect_gemini_ws(&url_str, headers).await?
         }
     };
 
@@ -1186,17 +1471,9 @@ async fn open_ws(
         .send(Message::Text(setup_msg.to_string().into()))
         .await
         .map_err(|e| {
-            // Auth secrets are no longer in local scope here (the connect match
-            // dropped them), so route through the pattern-based redactor with
-            // empty explicit secrets to still scrub bearer/token/key-query
-            // shapes that a transport error display may echo back.
-            GeminiConnectError::new(
-                classify_tungstenite_error(&e),
-                crate::error::redacted_provider_diagnostic(
-                    &format!("Failed to send setup: {e}"),
-                    std::iter::empty::<&str>(),
-                ),
-            )
+            // Issue #145: classify from the tungstenite error kind only; the
+            // display text (which may echo auth-header shapes) is dropped.
+            GeminiConnectError::new(classify_tungstenite_error(&e))
         })?;
 
     // ── Wait for setupComplete ─────────────────────────────────────────
@@ -1217,59 +1494,38 @@ async fn wait_for_setup_complete(mut reader: WsReader) -> Result<WsReader, Gemin
     loop {
         let frame = tokio::time::timeout(timeout, reader.next())
             .await
-            .map_err(|_| {
-                GeminiConnectError::new(
-                    GeminiErrorCategory::Network,
-                    "Timed out waiting for setupComplete",
-                )
-            })?
-            .ok_or_else(|| {
-                GeminiConnectError::new(
-                    GeminiErrorCategory::Network,
-                    "WebSocket closed before setupComplete",
-                )
-            })?;
+            .map_err(|_| GeminiConnectError::new(GeminiErrorCategory::Network))?
+            .ok_or_else(|| GeminiConnectError::new(GeminiErrorCategory::Network))?;
 
         let msg = match frame {
             Ok(m) => m,
             Err(e) => {
-                return Err(GeminiConnectError::new(
-                    classify_tungstenite_error(&e),
-                    crate::error::redacted_provider_diagnostic(
-                        &format!("WebSocket error waiting for setup: {e}"),
-                        std::iter::empty::<&str>(),
-                    ),
-                ));
+                // Issue #145: classify structurally; drop the transport text.
+                return Err(GeminiConnectError::from_tungstenite(&e));
             }
         };
 
-        // If the server rejects the setup with a close frame, surface its
-        // reason through the close-frame classifier so auth / quota /
-        // server-error signals land on the right category even pre-handshake.
+        // If the server rejects the setup with a close frame, surface it
+        // through the close-frame classifier so auth / quota / server-error
+        // signals land on the right category even pre-handshake. Issue #145:
+        // the close *reason string* is inspected for classification only —
+        // it is never retained, logged, or serialized.
         if let Message::Close(frame) = &msg {
             if let Some(f) = frame {
                 let code: u16 = f.code.into();
                 let category = classify_close_frame(code, f.reason.as_ref())
                     .unwrap_or(GeminiErrorCategory::Unknown);
-                let diagnostic = close_frame_diagnostic(code, f.reason.as_ref());
-                return Err(GeminiConnectError::new(
+                return Err(GeminiConnectError {
+                    diagnostic: close_frame_diagnostic(&category),
                     category,
-                    format!("Server closed WebSocket during setup: {diagnostic}"),
-                ));
+                });
             }
-            return Err(GeminiConnectError::new(
-                GeminiErrorCategory::Network,
-                "Server closed WebSocket during setup (no frame)",
-            ));
+            return Err(GeminiConnectError::new(GeminiErrorCategory::Network));
         }
 
         if let Message::Text(text) = msg {
-            let parsed: Value = serde_json::from_str(&text).map_err(|e| {
-                GeminiConnectError::new(
-                    GeminiErrorCategory::Unknown,
-                    format!("Invalid JSON from server: {e}"),
-                )
-            })?;
+            let parsed: Value = serde_json::from_str(&text)
+                .map_err(|_| GeminiConnectError::new(GeminiErrorCategory::Unknown))?;
 
             if parsed.get("setupComplete").is_some() {
                 return Ok(reader);
@@ -1366,15 +1622,18 @@ async fn session_task(
 
                 reconnect_attempts += 1;
                 let Some(backoff) = backoff_for_attempt(reconnect_attempts) else {
-                    // Budget exhausted — surface a fatal error and stop.
-                    log::error!(
-                        "Gemini session: reconnect budget exhausted after {} attempts",
-                        reconnect_attempts - 1
+                    // Budget exhausted — surface a closed fatal error and stop.
+                    // Issue #145: the event `message` is a stable site token,
+                    // and the diagnostic envelope carries the closed
+                    // classification; no reconnect prose crosses.
+                    log::warn!(
+                        "Gemini session: reconnect budget exhausted ({reconnect_attempts} attempts)"
                     );
-                    let _ = event_tx.send(GeminiEvent::Error {
-                        category: GeminiErrorCategory::Network,
-                        message: "Gemini reconnect attempts exhausted".into(),
-                    });
+                    let _ = event_tx.send(GeminiEvent::error(
+                        GeminiErrorSite::ReconnectExhausted,
+                        GeminiErrorCategory::Network,
+                        GeminiErrorCategory::Network.runtime_diagnostic(),
+                    ));
                     break;
                 };
 
@@ -1436,18 +1695,18 @@ async fn session_task(
                         // Loop around to resume run_io with the new halves.
                     }
                     Err(e) => {
+                        // Issue #145: log + emit only the closed category and
+                        // diagnostic envelope; the event `message` is a
+                        // stable site token, never the connect error text.
                         log::warn!(
-                            "Gemini session: reconnect attempt {reconnect_attempts} failed: {} ({:?})",
-                            e.message,
+                            "Gemini session: reconnect attempt {reconnect_attempts} failed ({:?})",
                             e.category,
                         );
-                        let _ = event_tx.send(GeminiEvent::Error {
-                            category: e.category,
-                            message: format!(
-                                "Reconnect attempt {reconnect_attempts} failed: {}",
-                                e.message,
-                            ),
-                        });
+                        let _ = event_tx.send(GeminiEvent::error(
+                            GeminiErrorSite::ReconnectFailed,
+                            e.category.clone(),
+                            e.diagnostic.clone(),
+                        ));
                         // Skip run_io next iteration — just try the next
                         // backoff step directly.
                         continue;
@@ -1508,13 +1767,12 @@ async fn run_io(
                             .send(Message::Text(payload.to_string().into()))
                             .await
                         {
-                            log::error!("Gemini: failed to send audio: {e}");
-                            return DisconnectKind::NetworkError(
-                                crate::error::redacted_provider_diagnostic(
-                                    &format!("send failed: {e}"),
-                                    std::iter::empty::<&str>(),
-                                ),
-                            );
+                            // Issue #145: classify structurally; drop the
+                            // transport text from logs and the disconnect
+                            // payload.
+                            let category = classify_tungstenite_error(&e);
+                            log::warn!("Gemini: audio send failed ({category:?})");
+                            return DisconnectKind::NetworkError(category.runtime_diagnostic());
                         }
                     }
                     Some(AudioCmd::EndTurn) => {
@@ -1525,8 +1783,10 @@ async fn run_io(
                             .send(Message::Text(audio_stream_end_frame().into()))
                             .await
                         {
-                            log::error!("Gemini: failed to send audioStreamEnd: {e}");
-                            return DisconnectKind::NetworkError(format!("end-turn send failed: {e}"));
+                            // Issue #145: classify structurally; drop the text.
+                            let category = classify_tungstenite_error(&e);
+                            log::warn!("Gemini: end-turn send failed ({category:?})");
+                            return DisconnectKind::NetworkError(category.runtime_diagnostic());
                         }
                     }
                     Some(AudioCmd::Stop) => {
@@ -1551,7 +1811,9 @@ async fn run_io(
                 let Some(result) = result else {
                     // Reader stream ended without a Close frame — treat as a
                     // network-layer drop.
-                    return DisconnectKind::NetworkError("reader stream ended".into());
+                    return DisconnectKind::NetworkError(
+                        GeminiErrorCategory::Network.runtime_diagnostic(),
+                    );
                 };
 
                 match result {
@@ -1567,29 +1829,37 @@ async fn run_io(
                         // an auth / quota / server toast before the
                         // reconnect loop kicks in. `classify_close_frame`
                         // returns None for code 1000 / unclassified codes —
-                        // in that case we fall back to the generic
-                        // Disconnected signal below without a toast.
-                        let reason = match frame {
-                            Some(f) => {
-                                let code: u16 = f.code.into();
-                                let diagnostic = close_frame_diagnostic(code, f.reason.as_ref());
-                                log::info!("Gemini: server closed connection {diagnostic}");
-                                if let Some(category) =
-                                    classify_close_frame(code, f.reason.as_ref())
-                                {
-                                    let _ = event_tx.send(GeminiEvent::Error {
-                                        category,
-                                        message: format!("Server closed WebSocket: {diagnostic}"),
-                                    });
-                                }
-                                diagnostic
+                        // in that case the generic Disconnected signal
+                        // carries no toast. Issue #145: the close *reason
+                        // string* is inspected for classification only — it
+                        // is never retained, logged, or serialized; the
+                        // emitted event carries the closed site token +
+                        // diagnostic envelope instead.
+                        let category = frame.as_ref().and_then(|f| {
+                            let code: u16 = f.code.into();
+                            classify_close_frame(code, f.reason.as_ref())
+                        });
+                        match category {
+                            Some(category) => {
+                                log::warn!("Gemini: server closed connection ({category:?})");
+                                let _ = event_tx.send(GeminiEvent::error(
+                                    GeminiErrorSite::ServerClose,
+                                    category.clone(),
+                                    close_frame_diagnostic(&category),
+                                ));
+                                return DisconnectKind::ServerClose {
+                                    category: Some(category),
+                                    diagnostic: GeminiErrorCategory::Network.runtime_diagnostic(),
+                                };
                             }
                             None => {
-                                log::info!("Gemini: server closed connection no_frame");
-                                "no_frame".into()
+                                log::info!("Gemini: server closed connection (uncategorized)");
+                                return DisconnectKind::ServerClose {
+                                    category: None,
+                                    diagnostic: GeminiErrorCategory::Network.runtime_diagnostic(),
+                                };
                             }
-                        };
-                        return DisconnectKind::ServerClose(reason);
+                        }
                     }
                     Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {
                         // Protocol-level frames; nothing to do.
@@ -1600,19 +1870,21 @@ async fn run_io(
                     }
                     Err(tungstenite::Error::ConnectionClosed)
                     | Err(tungstenite::Error::AlreadyClosed) => {
-                        return DisconnectKind::NetworkError("connection closed".into());
+                        return DisconnectKind::NetworkError(
+                            GeminiErrorCategory::Network.runtime_diagnostic(),
+                        );
                     }
-                    Err(tungstenite::Error::Protocol(e)) => {
-                        return DisconnectKind::ProtocolError(e.to_string());
+                    Err(tungstenite::Error::Protocol(_)) => {
+                        return DisconnectKind::ProtocolError(
+                            GeminiErrorCategory::Unknown.runtime_diagnostic(),
+                        );
                     }
                     Err(e) => {
-                        log::error!("Gemini: WebSocket read error: {e}");
-                        return DisconnectKind::NetworkError(
-                            crate::error::redacted_provider_diagnostic(
-                                &format!("{e}"),
-                                std::iter::empty::<&str>(),
-                            ),
-                        );
+                        // Issue #145: classify structurally; drop the
+                        // transport error text from logs + the payload.
+                        let category = classify_tungstenite_error(&e);
+                        log::warn!("Gemini: WebSocket read error ({category:?})");
+                        return DisconnectKind::NetworkError(category.runtime_diagnostic());
                     }
                 }
             }
@@ -1628,15 +1900,16 @@ fn handle_server_message(
 ) {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
-        Err(e) => {
-            log::warn!("Gemini Live: invalid JSON: {e}");
-            let _ = tx.send(GeminiEvent::Error {
-                category: GeminiErrorCategory::Unknown,
-                message: crate::error::redacted_provider_diagnostic(
-                    &format!("Invalid server JSON: {e}"),
-                    std::iter::empty::<&str>(),
-                ),
-            });
+        Err(_) => {
+            // Issue #145: classify structurally (unparseable frame → closed
+            // internal code); the serde error text (which quotes the raw
+            // frame) is dropped here and never logged.
+            log::warn!("Gemini Live: invalid server JSON");
+            let _ = tx.send(GeminiEvent::error(
+                GeminiErrorSite::InvalidJson,
+                GeminiErrorCategory::Unknown,
+                GeminiErrorCategory::Unknown.runtime_diagnostic(),
+            ));
             return;
         }
     };
@@ -1730,14 +2003,8 @@ fn handle_server_message(
 
         // --- turnComplete ──────────────────────────────────────────────
         if server_content.get("turnComplete").is_some() {
-            if let Some(u) = &usage {
-                log::debug!(
-                    "Gemini Live: turn complete with usage (total={:?} prompt={:?} response={:?})",
-                    u.total_token_count,
-                    u.prompt_token_count,
-                    u.response_token_count
-                );
-            }
+            // Issue #145: no token counts in diagnostic logs; usage rides the
+            // `TurnComplete` data event below.
             let _ = tx.send(GeminiEvent::TurnComplete {
                 usage: usage.clone(),
             });
@@ -1752,10 +2019,9 @@ fn handle_server_message(
     // `TurnComplete` with usage populated — same path the frontend already
     // listens on for per-turn accounting.
     if let Some(u) = usage {
-        log::debug!(
-            "Gemini Live: standalone usage frame (total={:?})",
-            u.total_token_count
-        );
+        // Issue #145: no token counts in diagnostic logs; usage rides the
+        // `TurnComplete` data event below.
+        log::debug!("Gemini Live: standalone usage frame");
         let _ = tx.send(GeminiEvent::TurnComplete { usage: Some(u) });
         return;
     }
@@ -1763,10 +2029,12 @@ fn handle_server_message(
     // ── goAway ─────────────────────────────────────────────────────────
     if parsed.get("goAway").is_some() {
         log::warn!("Gemini Live: received goAway — server is shutting down");
-        let _ = tx.send(GeminiEvent::Error {
-            category: GeminiErrorCategory::Server,
-            message: "Server sent goAway; reconnection recommended".to_string(),
-        });
+        // Issue #145: site token + closed diagnostic, no reconnect prose.
+        let _ = tx.send(GeminiEvent::error(
+            GeminiErrorSite::GoAway,
+            GeminiErrorCategory::Server,
+            GeminiErrorCategory::Server.runtime_diagnostic(),
+        ));
         return;
     }
 
@@ -1807,6 +2075,9 @@ fn handle_server_message(
     );
 }
 
+/// Closed frame summary for debug logs (issue #145): only the closed
+/// top-level frame type token and a bounded field-count bucket — no field
+/// values, request ids, or payload lengths.
 fn gemini_frame_diagnostic(parsed: &Value) -> String {
     let top_level_type = if parsed.get("serverContent").is_some() {
         "serverContent"
@@ -1821,27 +2092,16 @@ fn gemini_frame_diagnostic(parsed: &Value) -> String {
     } else {
         "unknown"
     };
-    let request_id = json_string_field(parsed, &["request_id", "requestId"])
-        .unwrap_or_else(|| "none".to_string());
-    format!(
-        "type={top_level_type} request_id={request_id} fields={}",
-        json_field_count(parsed)
-    )
-}
-
-fn json_string_field(parsed: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| parsed.get(*key).and_then(|value| value.as_str()))
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+    let fields_bucket = match json_field_count(parsed) {
+        0 => "zero",
+        1..=8 => "few",
+        _ => "many",
+    };
+    format!("type={top_level_type} fields={fields_bucket}")
 }
 
 fn json_field_count(parsed: &Value) -> usize {
     parsed.as_object().map_or(0, serde_json::Map::len)
-}
-
-fn close_frame_diagnostic(code: u16, reason: &str) -> String {
-    format!("code={code} reason_len={}", reason.chars().count())
 }
 
 // ---------------------------------------------------------------------------
@@ -1924,7 +2184,7 @@ mod tests {
             crate::ws_request::test_support::spawn_header_capturing_ws_server().await;
 
         let url = format!("ws://{addr}/ws/gemini.BidiGenerateContent");
-        let (mut writer, _reader) = connect_gemini_ws(&url, headers, &[secret])
+        let (mut writer, _reader) = connect_gemini_ws(&url, headers)
             .await
             .expect("production Gemini connect must handshake against the fixture");
         writer.close().await.expect("close client socket");
@@ -1976,8 +2236,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn open_ws_vertex_production_headers_handshake_with_mandatory_headers() {
         let token = "test-token-not-real";
-        let headers = gemini_vertex_connect_headers(token, &[token])
-            .expect("production Vertex header assembly builds");
+        let headers =
+            gemini_vertex_connect_headers(token).expect("production Vertex header assembly builds");
         assert_gemini_connect_handshake(
             headers,
             token,
@@ -2234,29 +2494,38 @@ mod tests {
             GeminiEvent::TurnComplete { usage: None },
             GeminiEvent::Error {
                 category: GeminiErrorCategory::Unknown,
-                message: "oops".into(),
+                message: "invalid_json".into(),
+                diagnostic: GeminiErrorCategory::Unknown.runtime_diagnostic(),
             },
             GeminiEvent::Error {
                 category: GeminiErrorCategory::Auth,
-                message: "bad key".into(),
+                message: "server_close".into(),
+                diagnostic: GeminiErrorCategory::Auth.runtime_diagnostic(),
             },
             GeminiEvent::Error {
                 category: GeminiErrorCategory::AuthExpired,
-                message: "token expired".into(),
+                message: "server_close".into(),
+                diagnostic: GeminiErrorCategory::AuthExpired.runtime_diagnostic(),
             },
             GeminiEvent::Error {
                 category: GeminiErrorCategory::Network,
-                message: "dns flap".into(),
+                message: "reconnect_failed".into(),
+                diagnostic: GeminiErrorCategory::Network.runtime_diagnostic(),
             },
             GeminiEvent::Error {
                 category: GeminiErrorCategory::RateLimit {
-                    retry_after_secs: Some(30),
+                    retry_delay: Some(RuntimeRetryDelayBucket::Medium),
                 },
-                message: "429".into(),
+                message: "server_close".into(),
+                diagnostic: GeminiErrorCategory::RateLimit {
+                    retry_delay: Some(RuntimeRetryDelayBucket::Medium),
+                }
+                .runtime_diagnostic(),
             },
             GeminiEvent::Error {
                 category: GeminiErrorCategory::Server,
-                message: "5xx".into(),
+                message: "go_away".into(),
+                diagnostic: GeminiErrorCategory::Server.runtime_diagnostic(),
             },
             GeminiEvent::Connected,
             GeminiEvent::Disconnected,
@@ -2514,7 +2783,19 @@ mod tests {
         ));
         let result = client.connect();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("API key"));
+        // Issue #145: the failure is the closed `invalid_configuration`
+        // diagnostic — never a prose string.
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::error::AppError::RuntimeDiagnostic(
+                audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic::Runtime(
+                    audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorDiagnostic {
+                        code: audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode::InvalidConfiguration,
+                        ..
+                    }
+                )
+            )
+        ));
     }
 
     #[test]
@@ -2529,7 +2810,54 @@ mod tests {
         ));
         let result = client.connect();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("project_id"));
+        // Issue #145: same closed `invalid_configuration` diagnostic.
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::error::AppError::RuntimeDiagnostic(
+                audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic::Runtime(
+                    audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorDiagnostic {
+                        code: audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode::InvalidConfiguration,
+                        ..
+                    }
+                )
+            )
+        ));
+    }
+
+    /// The shared local guard the IPC commands also call: blank (including
+    /// whitespace-only) fields are the typed `invalid_configuration`, and a
+    /// filled configuration passes.
+    #[test]
+    fn validate_auth_configuration_trims_blank_fields() {
+        use crate::settings::GeminiAuthMode as Mode;
+        let invalid = |auth: Mode| {
+            matches!(
+                validate_auth_configuration(&auth),
+                Err(crate::error::AppError::RuntimeDiagnostic(
+                    audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic::Runtime(
+                        audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorDiagnostic {
+                            code:
+                                audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode::InvalidConfiguration,
+                            ..
+                        }
+                    )
+                ))
+            )
+        };
+        let vertex = |project: &str, location: &str| Mode::VertexAI {
+            project_id: project.into(),
+            location: location.into(),
+            service_account_path: None,
+        };
+        assert!(invalid(Mode::ApiKey {
+            api_key: "   ".into()
+        }));
+        assert!(invalid(vertex("  ", "us-central1")));
+        assert!(invalid(vertex("project", "\t")));
+        assert!(!invalid(Mode::ApiKey {
+            api_key: "key".into()
+        }));
+        assert!(validate_auth_configuration(&vertex("project", "us-central1")).is_ok());
     }
 
     /// Sibling of the OpenAI Realtime
@@ -2598,10 +2926,19 @@ mod tests {
 
     /// Mock-WS harness (modelled on `session_task_cancels_during_reconnect_backoff`):
     /// drives a real client socket against a local server that closes with a
-    /// 1008 auth code, and asserts the resulting `GeminiEvent::Error` carries a
-    /// non-empty, classified message that does not leak the configured api key.
+    /// 1008 auth code whose REASON carries the configured api key, a request
+    /// id, and a sentinel. `user_disconnected` starts `false` so `run_io`
+    /// really classifies the close frame (setting it `true` would skip
+    /// classification and make this canary vacuous). The test requires the
+    /// full serialized error event, then cancels the reconnect ladder.
     #[tokio::test(flavor = "current_thread")]
     async fn server_close_error_event_does_not_leak_api_key() {
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        // Unique to this test: the error-frame test plants a different key.
+        const API_KEY: &str = "canary-close-test-credential";
+        const SENTINEL: &str = "canary-close-reason-text";
+        const REQUEST_ID: &str = "canary-request-identifier-gemini";
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local websocket server");
@@ -2611,11 +2948,11 @@ mod tests {
             let mut websocket = tokio_tungstenite::accept_async(stream)
                 .await
                 .expect("server websocket handshake");
-            // Close with an auth code so the run_io close-frame path emits a
-            // classified GeminiEvent::Error before the session ends.
+            // Close with an auth code whose reason echoes every leak class,
+            // so the run_io close-frame path emits a classified error.
             let close = tungstenite::protocol::CloseFrame {
                 code: tungstenite::protocol::frame::coding::CloseCode::Library(1008),
-                reason: "invalid api key".into(),
+                reason: format!("invalid api key {API_KEY} {SENTINEL} {REQUEST_ID}").into(),
             };
             let _ = websocket.send(Message::Close(Some(close))).await;
             let _ = websocket.next().await;
@@ -2628,17 +2965,18 @@ mod tests {
         let (_audio_tx, audio_rx) = tokio_mpsc::channel(8);
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
         let connected = Arc::new(AtomicBool::new(true));
-        let user_disconnected = Arc::new(AtomicBool::new(true)); // skip reconnect
+        // `false`: the close MUST be classified. Flipped to `true` below once
+        // the error event is captured, to cancel the reconnect ladder.
+        let user_disconnected = Arc::new(AtomicBool::new(false));
         let resumption_handle = Arc::new(std::sync::Mutex::new(None));
 
-        let api_key = "gemini-live-key-sentinel";
         let handle = tokio::spawn(session_task(
             writer,
             reader,
             audio_rx,
             GeminiConfig::text(
                 crate::settings::GeminiAuthMode::ApiKey {
-                    api_key: api_key.into(),
+                    api_key: API_KEY.into(),
                 },
                 "gemini-3.1-flash-live-preview",
             ),
@@ -2648,34 +2986,76 @@ mod tests {
             resumption_handle.clone(),
         ));
 
-        // Drain events; any Error message must never contain the api key.
+        // Require the full error event before cancelling.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let mut saw_error = false;
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
+        let mut error_event = None;
+        while tokio::time::Instant::now() < deadline {
             match event_rx.try_recv() {
-                Ok(GeminiEvent::Error { category, message }) => {
-                    saw_error = true;
-                    assert_eq!(category, GeminiErrorCategory::Auth, "1008 → Auth");
-                    assert!(
-                        !message.contains(api_key),
-                        "error event leaked api key: {message}"
-                    );
-                    assert!(!message.is_empty());
+                Ok(event @ GeminiEvent::Error { .. }) => {
+                    error_event = Some(event);
+                    break;
                 }
-                Ok(GeminiEvent::Disconnected) => break,
                 Ok(_) => {}
                 Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
             }
         }
+        user_disconnected.store(true, Ordering::SeqCst);
+        let error_event = error_event.expect("close frame must surface a classified error event");
+
+        // Full wire assertion: closed site token, structural category,
+        // closed diagnostic — nothing derived from the close reason.
+        let wire = serde_json::to_value(&error_event).expect("event serializes");
+        assert_eq!(
+            wire,
+            json!({
+                "type": "error",
+                "category": { "kind": "auth" },
+                "message": "server_close",
+                "diagnostic": {
+                    "kind": "runtime",
+                    "detail": {
+                        "code": "request_rejected",
+                        "retryable": false,
+                        "recovery_action": "review_configuration",
+                        "context": {
+                            "operation": "realtime_conversation",
+                            "transport": "websocket",
+                            "status_class": "client_error"
+                        }
+                    }
+                }
+            })
+        );
+        let serialized = wire.to_string();
+        for forbidden in [
+            API_KEY,
+            SENTINEL,
+            REQUEST_ID,
+            "invalid api key",
+            "reason_len",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "serialized error event leaked `{forbidden}`: {serialized}"
+            );
+        }
 
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
-        // The close-frame classifier path is exercised regardless of timing;
-        // the key assertion (no leak) holds for every emitted error.
-        let _ = saw_error;
+
+        // The close path really logged — asserted on the capture started
+        // BEFORE the action, on this (current-thread) runtime, so no other
+        // test's log can satisfy it — and none of the planted values (a key
+        // and sentinels unique to this test) reached a log line.
+        let logs = crate::test_log_capture::render(&capture.finish());
+        assert!(
+            logs.contains("Gemini: server closed connection"),
+            "the close-frame log site must have fired: {logs}"
+        );
+        for planted in [API_KEY, SENTINEL, REQUEST_ID] {
+            assert!(!logs.contains(planted), "`{planted}` was logged: {logs}");
+        }
+        crate::test_log_capture::assert_process_logs_exclude(&[API_KEY, SENTINEL, REQUEST_ID]);
     }
 
     #[test]
@@ -2979,12 +3359,66 @@ mod tests {
         handle_server_message(msg, &tx, &handle);
 
         match rx.try_recv().unwrap() {
-            GeminiEvent::Error { category, message } => {
-                assert!(message.contains("goAway"));
+            GeminiEvent::Error {
+                category, message, ..
+            } => {
+                // Issue #145: message is the closed site token.
+                assert_eq!(message, "go_away");
                 assert_eq!(category, GeminiErrorCategory::Server);
             }
             _ => panic!("Expected Error event for goAway"),
         }
+    }
+
+    /// Issue #145: usage accounting is product DATA (the `turn_complete`
+    /// event carries it and the command layer persists it), but diagnostic
+    /// logs must not print exact token counts. Covers both usage log sites
+    /// (turn-complete and standalone usage frame).
+    #[test]
+    fn usage_token_counts_ride_the_event_but_never_the_logs() {
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(None));
+
+        // Sentinel counts, deliberately unlike any other test's numbers.
+        let turn_frame = r#"{
+            "serverContent": { "turnComplete": true },
+            "usageMetadata": {
+                "promptTokenCount": 918273,
+                "responseTokenCount": 645192,
+                "totalTokenCount": 1563465
+            }
+        }"#;
+        handle_server_message(turn_frame, &tx, &handle);
+        let standalone_frame = r#"{ "usageMetadata": { "totalTokenCount": 7340211 } }"#;
+        handle_server_message(standalone_frame, &tx, &handle);
+
+        // The DATA path still carries the exact usage.
+        let mut totals = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let GeminiEvent::TurnComplete { usage: Some(u) } = event {
+                totals.push(u.total_token_count);
+            }
+        }
+        assert_eq!(totals, vec![Some(1_563_465), Some(7_340_211)]);
+
+        // …while the diagnostic logs (captured on THIS thread, started before
+        // the action) carry neither the counts nor their parts. The positive
+        // assertion can only be satisfied by this test's own frames.
+        let logs = crate::test_log_capture::render(&capture.finish());
+        assert!(
+            logs.contains("Gemini Live: standalone usage frame"),
+            "the standalone usage log site must have fired: {logs}"
+        );
+        for count in ["918273", "645192", "1563465", "7340211"] {
+            assert!(
+                !logs.contains(count),
+                "usage count `{count}` logged: {logs}"
+            );
+        }
+        crate::test_log_capture::assert_process_logs_exclude(&[
+            "918273", "645192", "1563465", "7340211",
+        ]);
     }
 
     #[test]
@@ -3216,7 +3650,7 @@ mod tests {
     //
     // Coverage matrix:
     //   close-frame 1008 + "API key"       → Auth
-    //   close-frame 1008 + "token expired" → AuthExpired
+    //   close-frame 1008 + "token expired" → Unknown (prose is never a signal)
     //   close-frame 1008 + "quota"         → RateLimit (no retry-after hint)
     //   close-frame 1011                   → Server
     //   close-frame 1000                   → None (normal closure)
@@ -3231,9 +3665,64 @@ mod tests {
     }
 
     #[test]
-    fn close_frame_1008_token_expired_maps_to_auth_expired() {
+    fn close_frame_1008_token_expired_prose_is_not_credential_expiry() {
+        // The close REASON is provider prose, never evidence of credential
+        // expiry: an "expired" reason on a 1008 close is the generic closed
+        // category (internal), not `credential_expired`.
         let cat = classify_close_frame(1008, "token expired, please refresh");
-        assert_eq!(cat, Some(GeminiErrorCategory::AuthExpired));
+        assert_eq!(cat, Some(GeminiErrorCategory::Unknown));
+    }
+
+    /// A prose-derived close-frame category never yields a credential
+    /// diagnosis: both `Auth` and `AuthExpired` close categories are the
+    /// generic closed `request_rejected` / `review_configuration`, while the
+    /// category (teardown) is unchanged and other categories keep their own
+    /// mapping.
+    #[test]
+    fn close_frame_diagnostic_never_claims_a_credential_code() {
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode as Code;
+        let code_of = |d: RuntimeDiagnostic| match d {
+            RuntimeDiagnostic::Runtime(e) => (e.code, e.recovery_action),
+            other => panic!("expected runtime diagnostic, got {other:?}"),
+        };
+        for category in [GeminiErrorCategory::Auth, GeminiErrorCategory::AuthExpired] {
+            assert_eq!(
+                code_of(close_frame_diagnostic(&category)),
+                (
+                    Code::RequestRejected,
+                    RuntimeSafeRecoveryAction::ReviewConfiguration
+                )
+            );
+        }
+        assert_eq!(
+            code_of(close_frame_diagnostic(&GeminiErrorCategory::Server)),
+            (Code::ProviderUnavailable, RuntimeSafeRecoveryAction::Retry)
+        );
+    }
+
+    /// Vertex token acquisition (#145): only a transport-level `Http` error
+    /// reads as network failure; everything else is the generic closed
+    /// diagnostic. No `gcp_auth` error ever claims `credential_rejected`
+    /// because the SDK does not structurally distinguish a rejected
+    /// credential from any other non-success token response.
+    #[test]
+    fn vertex_token_failures_never_claim_credential_rejection() {
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode as Code;
+        for err in [
+            gcp_auth::Error::Str("token request failed"),
+            gcp_auth::Error::Io(
+                "failed to open application credentials file",
+                std::io::Error::other("x"),
+            ),
+        ] {
+            let failure = GeminiConnectError::from_gcp_token_error(&err);
+            // Terminal session-end category is kept; the diagnosis is generic.
+            assert_eq!(failure.category, GeminiErrorCategory::Auth);
+            match failure.diagnostic {
+                RuntimeDiagnostic::Runtime(e) => assert_eq!(e.code, Code::Internal),
+                other => panic!("expected runtime diagnostic, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -3241,9 +3730,7 @@ mod tests {
         let cat = classify_close_frame(1008, "Quota exceeded for project");
         assert_eq!(
             cat,
-            Some(GeminiErrorCategory::RateLimit {
-                retry_after_secs: None,
-            })
+            Some(GeminiErrorCategory::RateLimit { retry_delay: None })
         );
     }
 
@@ -3266,6 +3753,86 @@ mod tests {
         // doesn't lie about remediation.
         let cat = classify_close_frame(1008, "something else entirely");
         assert_eq!(cat, Some(GeminiErrorCategory::Unknown));
+    }
+
+    /// Provider-auth typing (#518): the closed code and recovery action per
+    /// auth path, with the category (terminal-auth teardown) unchanged.
+    #[test]
+    fn auth_paths_use_provider_auth_codes() {
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeDiagnostic as D, RuntimeErrorCode as Code, RuntimeSafeRecoveryAction as Action,
+        };
+        fn tuple(d: &RuntimeDiagnostic) -> (Code, bool, Action) {
+            match d {
+                D::Runtime(e) => (e.code, e.retryable, e.recovery_action),
+                other => panic!("expected runtime diagnostic, got {other:?}"),
+            }
+        }
+        fn http(status: u16) -> tungstenite::Error {
+            tungstenite::Error::Http(Box::new(
+                tungstenite::http::Response::builder()
+                    .status(status)
+                    .body(None)
+                    .expect("response builds"),
+            ))
+        }
+
+        // Close-frame categories.
+        assert_eq!(
+            tuple(&GeminiErrorCategory::Auth.runtime_diagnostic()),
+            (Code::CredentialRejected, false, Action::ReenterCredential)
+        );
+        assert_eq!(
+            tuple(&GeminiErrorCategory::AuthExpired.runtime_diagnostic()),
+            (Code::CredentialExpired, false, Action::RefreshCredential)
+        );
+
+        // Handshake 401 rejects the credential; 403 is a permission failure.
+        // Both stay in the `Auth` category.
+        let unauthorized = GeminiConnectError::from_tungstenite(&http(401));
+        assert_eq!(unauthorized.category, GeminiErrorCategory::Auth);
+        assert_eq!(
+            tuple(&unauthorized.diagnostic),
+            (Code::CredentialRejected, false, Action::ReenterCredential)
+        );
+        let forbidden = GeminiConnectError::from_tungstenite(&http(403));
+        assert_eq!(forbidden.category, GeminiErrorCategory::Auth);
+        assert_eq!(
+            tuple(&forbidden.diagnostic),
+            (Code::PermissionDenied, false, Action::ReviewConfiguration)
+        );
+
+        // Local credential configuration failure (gcp_auth setup).
+        let misconfigured = GeminiConnectError::auth_configuration();
+        assert_eq!(misconfigured.category, GeminiErrorCategory::Auth);
+        assert_eq!(
+            tuple(&misconfigured.diagnostic),
+            (
+                Code::InvalidConfiguration,
+                false,
+                Action::ReviewConfiguration
+            )
+        );
+
+        // A key that cannot be encoded as a header is a local configuration
+        // failure (not a rejected credential); the category is unchanged.
+        let unencodable = gemini_api_key_connect_headers("bad\nkey")
+            .expect_err("a newline cannot be a header value");
+        assert_eq!(unencodable.category, GeminiErrorCategory::Unknown);
+        assert_eq!(
+            tuple(&unencodable.diagnostic),
+            (
+                Code::InvalidConfiguration,
+                false,
+                Action::ReviewConfiguration
+            )
+        );
+
+        // Non-auth handshake statuses keep their category mapping.
+        assert_eq!(
+            tuple(&GeminiConnectError::from_tungstenite(&http(503)).diagnostic),
+            (Code::ProviderUnavailable, true, Action::Retry)
+        );
     }
 
     #[test]
@@ -3291,27 +3858,80 @@ mod tests {
     #[test]
     fn gemini_error_category_serializes_with_kind_tag() {
         // The frontend branches on `category.kind`, so the tag must be
-        // stable and snake_cased. Rate-limit's retry_after is optional
-        // and must be omitted when absent.
-        let rl_none = serde_json::to_value(GeminiErrorCategory::RateLimit {
-            retry_after_secs: None,
-        })
-        .unwrap();
+        // stable and snake_cased. Rate-limit's closed retry bucket is
+        // optional and must be omitted when absent.
+        let rl_none =
+            serde_json::to_value(GeminiErrorCategory::RateLimit { retry_delay: None }).unwrap();
         assert_eq!(rl_none["kind"], "rate_limit");
         assert!(
-            rl_none.get("retry_after_secs").is_none(),
+            rl_none.get("retry_delay").is_none(),
             "absent retry-after must not serialize as null — got {rl_none:?}"
         );
 
         let rl_some = serde_json::to_value(GeminiErrorCategory::RateLimit {
-            retry_after_secs: Some(42),
+            retry_delay: Some(RuntimeRetryDelayBucket::Medium),
         })
         .unwrap();
         assert_eq!(rl_some["kind"], "rate_limit");
-        assert_eq!(rl_some["retry_after_secs"], 42);
+        assert_eq!(rl_some["retry_delay"], "medium");
 
         let auth = serde_json::to_value(GeminiErrorCategory::AuthExpired).unwrap();
         assert_eq!(auth["kind"], "auth_expired");
+    }
+
+    fn http_429(retry_after: Option<&str>) -> tungstenite::Error {
+        let mut builder = tungstenite::http::Response::builder().status(429);
+        if let Some(value) = retry_after {
+            builder = builder.header("retry-after", value);
+        }
+        tungstenite::Error::Http(Box::new(builder.body(None).expect("build 429 response")))
+    }
+
+    /// Issue #145 canary: a numeric `Retry-After` is reduced to a closed
+    /// bucket at classification; the exact seconds never reach the category
+    /// (wire or `Debug`, which the connect/reconnect logs print) nor the
+    /// diagnostic envelope.
+    #[test]
+    fn numeric_retry_after_is_bucketed_and_the_exact_value_never_survives() {
+        const EXACT: &str = "7391";
+        let category = classify_tungstenite_error(&http_429(Some(EXACT)));
+        assert_eq!(
+            category,
+            GeminiErrorCategory::RateLimit {
+                retry_delay: Some(RuntimeRetryDelayBucket::Long)
+            }
+        );
+        let surfaces = [
+            format!("{category:?}"),
+            serde_json::to_string(&category).unwrap(),
+            serde_json::to_string(&category.runtime_diagnostic()).unwrap(),
+            format!("{:?}", GeminiConnectError::new(category.clone())),
+        ];
+        for surface in &surfaces {
+            assert!(
+                !surface.contains(EXACT),
+                "exact Retry-After leaked into {surface}"
+            );
+        }
+        assert!(surfaces[2].contains("\"retry_delay\":\"long\""));
+    }
+
+    /// An absent, or non-numeric (HTTP-date), `Retry-After` must leave the
+    /// bucket absent — never `immediate`.
+    #[test]
+    fn absent_or_unparseable_retry_after_leaves_the_bucket_absent() {
+        for header in [None, Some("Wed, 21 Oct 2026 07:28:00 GMT")] {
+            let category = classify_tungstenite_error(&http_429(header));
+            assert_eq!(
+                category,
+                GeminiErrorCategory::RateLimit { retry_delay: None }
+            );
+            let diagnostic = serde_json::to_value(category.runtime_diagnostic()).unwrap();
+            assert!(
+                diagnostic["detail"]["context"].get("retry_delay").is_none(),
+                "absence must not map to a bucket: {diagnostic}"
+            );
+        }
     }
 
     /// `TurnComplete { usage: Some(..) }` must round-trip through the

@@ -184,10 +184,9 @@ fn sanitize_id(raw: &str) -> String {
 }
 
 /// Render one structured, single-line telemetry record. Pure and
-/// side-effect-free so its output can be pinned directly in tests without a
-/// log-capture harness (this crate deliberately has none — see
-/// `logging::tests` for the only `log::set_logger` call, which is production
-/// init, not a test sink).
+/// side-effect-free so its output can be pinned directly in tests without
+/// installing a capture logger (`crate::test_log_capture` is the shared
+/// test sink; this formatter needs none).
 fn format_line(
     event_name: &str,
     session_id: &str,

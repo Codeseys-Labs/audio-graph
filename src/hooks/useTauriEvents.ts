@@ -46,8 +46,8 @@
  * so tests can assert on them; they must stay in sync with the Rust
  * constants in `src-tauri/src/events.rs`.
  *
- * Error-routing helpers `routeGeminiError` and `awsErrorToMessage` are
- * exported so unit tests and potential future diagnostics surfaces can
+ * Error-routing helpers `routeRealtimeDiagnostic` and `awsErrorToMessage`
+ * are exported so unit tests and potential future diagnostics surfaces can
  * reuse the exact same classification without duplicating the switch
  * statements.
  */
@@ -55,6 +55,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { useEffect } from "react";
 import { publishStorageFull } from "../components/StorageBanner";
+import type { RuntimeErrorCode } from "../generated/runtimeDiagnostic";
 import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
 import type {
@@ -68,7 +69,6 @@ import type {
   CaptureStorageFullPayload,
   DiarizationSpanRevisionEvent,
   DownloadProgress,
-  GeminiErrorCategory,
   GeminiResponseEvent,
   GeminiStatusEvent,
   GeminiTranscriptionEvent,
@@ -78,7 +78,6 @@ import type {
   MaterializedGraph,
   MaterializedNotes,
   NotificationSeverity,
-  OpenAiRealtimeErrorCategory,
   OpenAiRealtimeResponseEvent,
   OpenAiRealtimeStatusEvent,
   PersistenceQueueBackpressurePayload,
@@ -90,53 +89,71 @@ import type {
   TranscriptSegment,
   TurnLifecycleEvent,
 } from "../types";
+import { runtimeDiagnosticPresentation } from "../utils/runtimeDiagnostic";
 
 /**
- * Map a classified Gemini error category to its i18n key + toast variant.
+ * Route a realtime S2S engine error (issue #145 / ag#10 successor).
  *
- * Routing rules (ag#10 spec):
- *   auth, auth_expired, rate_limit → warning (user action required,
- *                                             not a crash)
- *   network                        → info     (likely transient; the
- *                                              reconnect loop will retry)
- *   server, unknown                → error    (genuinely broken)
- *
- * Keys live under `gemini.error.*` so translators can group them.
+ * The backend attaches a closed `RuntimeDiagnostic` envelope to every
+ * Gemini Live / OpenAI Realtime status event of type `"error"` (and to the
+ * AppError the start commands return). This helper normalizes the payload
+ * through `runtimeDiagnosticPresentation` — fail-closed to the fixed
+ * internal tuple for malformed values — and produces only a closed
+ * translation key + toast severity. No raw provider text, WebSocket close
+ * reason, request id, or exact length ever reaches a toast or the sticky
+ * error banner.
  */
-export function routeGeminiError(category: GeminiErrorCategory): {
+export function routeRealtimeDiagnostic(diagnostic: unknown): {
   key: string;
   variant: NotificationSeverity;
 } {
-  switch (category.kind) {
-    case "auth":
-      return { key: "gemini.error.auth", variant: "warning" };
-    case "auth_expired":
-      return { key: "gemini.error.authExpired", variant: "warning" };
-    case "rate_limit":
-      return { key: "gemini.error.rateLimit", variant: "warning" };
-    case "network":
-      return { key: "gemini.error.network", variant: "info" };
-    case "server":
-      return { key: "gemini.error.server", variant: "error" };
-    default:
-      return { key: "gemini.error.unknown", variant: "error" };
-  }
+  const presentation = runtimeDiagnosticPresentation(diagnostic);
+  return {
+    key: presentation.translationKey,
+    variant:
+      presentation.diagnostic.kind === "runtime"
+        ? REALTIME_SEVERITY_BY_CODE[presentation.diagnostic.detail.code]
+        : "error",
+  };
 }
 
 /**
- * Map a classified OpenAI Realtime S2S error category to its i18n key + toast
- * variant. The category union is identical in shape to {@link GeminiErrorCategory},
- * and the routing rules + user-facing copy are provider-agnostic, so this
- * reuses the shared `gemini.error.*` keys rather than duplicating the table.
+ * Toast severity by CLOSED runtime error code (issue #145). Keyed by the
+ * closed vocabulary — not by `retryable`/recovery action — so a rate limit
+ * stays a warning and a provider outage stays an error even though both are
+ * retryable. Exhaustive (`Record`), so a new code fails type-check until
+ * routed.
+ *   rate_limited / request_rejected / policy_blocked / unsupported
+ *                       → warning (user action or wait, not a crash)
+ *   network_unreachable / timeout / cancelled
+ *                       → info    (likely transient; reconnect retries)
+ *   credential_rejected / credential_expired / permission_denied /
+ *   invalid_configuration
+ *                       → error   (the session cannot proceed until the user
+ *                                  fixes credentials or settings; never info)
+ *   everything else     → error   (genuinely broken)
  */
-export function routeOpenAiRealtimeError(
-  category: OpenAiRealtimeErrorCategory,
-): {
-  key: string;
-  variant: NotificationSeverity;
-} {
-  return routeGeminiError(category as GeminiErrorCategory);
-}
+const REALTIME_SEVERITY_BY_CODE: Record<
+  RuntimeErrorCode,
+  NotificationSeverity
+> = {
+  rate_limited: "warning",
+  request_rejected: "warning",
+  policy_blocked: "warning",
+  unsupported: "warning",
+  network_unreachable: "info",
+  timeout: "info",
+  cancelled: "info",
+  credential_rejected: "error",
+  credential_expired: "error",
+  permission_denied: "error",
+  invalid_configuration: "error",
+  provider_unavailable: "error",
+  capacity_exhausted: "error",
+  protocol_error: "error",
+  invalid_response: "error",
+  internal: "error",
+};
 
 // Event name constants — must match src-tauri/src/events.rs
 const TRANSCRIPT_UPDATE = "transcript-update";
@@ -427,41 +444,25 @@ export function useTauriEvents(): void {
           latencyThrottle.push(event.payload);
         }),
         safeListen<GeminiStatusEvent>(GEMINI_STATUS, (event) => {
-          const {
-            type: statusType,
-            message,
-            resumed,
-            category,
-          } = event.payload;
+          const { type: statusType, diagnostic, resumed } = event.payload;
           if (statusType === "error") {
-            // Structured routing: prefer the classified
-            // `category` (ag#10) to pick the i18n key + toast
-            // severity. Fall back to the raw `message` in the
-            // error banner for unclassified or legacy events.
-            if (category) {
-              const { key, variant } = routeGeminiError(category);
-              const extra =
-                category.kind === "rate_limit" &&
-                typeof category.retry_after_secs === "number"
-                  ? { retry: category.retry_after_secs }
-                  : undefined;
-              notify({
-                severity: variant,
-                message: i18n.t(key, extra),
-              });
-            } else if (message) {
-              setError(`Gemini: ${message}`);
-            }
+            // Issue #145: route strictly through the closed
+            // `RuntimeDiagnostic` envelope. `runtimeDiagnosticPresentation`
+            // fail-closes malformed payloads to the fixed internal tuple,
+            // so the raw `message` string (a closed site token) is never
+            // consulted and no provider text, close reason, or request id
+            // can reach a toast or the sticky error banner.
+            const { key, variant } = routeRealtimeDiagnostic(diagnostic);
+            notify({
+              severity: variant,
+              message: i18n.t(key),
+            });
           } else if (statusType === "disconnected") {
             useAudioGraphStore.setState({ isGeminiActive: false });
           } else if (statusType === "reconnected") {
-            // Recovery clears the sticky legacy error banner. An earlier
-            // unclassified Gemini error (or a transient network/server
-            // blip) routes through setError; nothing else clears it, so it
-            // lingers as a stale banner long after the link is healthy
-            // again. Now that we're reconnected the banner is wrong —
-            // clear it (FINDING #56 P2). Classified errors that went
-            // through the auto-dismissing notify queue are unaffected.
+            // Recovery clears the sticky legacy error banner (FINDING #56
+            // P2) — nothing else clears it, so it would otherwise linger
+            // long after the link is healthy again.
             setError(null);
             notify({
               severity: resumed ? "success" : "info",
@@ -490,30 +491,16 @@ export function useTauriEvents(): void {
         safeListen<OpenAiRealtimeStatusEvent>(
           OPENAI_REALTIME_STATUS,
           (event) => {
-            const {
-              type: statusType,
-              message,
-              resumed,
-              category,
-            } = event.payload;
+            const { type: statusType, diagnostic, resumed } = event.payload;
             if (statusType === "error") {
-              // The OpenAI Realtime S2S error category mirrors the Gemini one
-              // (same `kind` union), so route through the same i18n keys + toast
-              // severities rather than duplicating the translation table.
-              if (category) {
-                const { key, variant } = routeOpenAiRealtimeError(category);
-                const extra =
-                  category.kind === "rate_limit" &&
-                  typeof category.retry_after_secs === "number"
-                    ? { retry: category.retry_after_secs }
-                    : undefined;
-                notify({
-                  severity: variant,
-                  message: i18n.t(key, extra),
-                });
-              } else if (message) {
-                setError(`OpenAI Realtime: ${message}`);
-              }
+              // Issue #145: same closed-envelope routing as the Gemini
+              // handler above — no raw `message` fallback, no provider
+              // text, close reasons, or request ids.
+              const { key, variant } = routeRealtimeDiagnostic(diagnostic);
+              notify({
+                severity: variant,
+                message: i18n.t(key),
+              });
             } else if (statusType === "disconnected") {
               useAudioGraphStore.setState({ isGeminiActive: false });
             } else if (statusType === "reconnected") {

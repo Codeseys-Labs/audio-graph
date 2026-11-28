@@ -43,6 +43,9 @@
 //! a sibling function that returns the same enum.
 
 use crate::gemini::GeminiEvent;
+use audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic;
+#[cfg(test)]
+use audio_graph_ipc_contract::runtime_diagnostic::RuntimeRetryDelayBucket;
 
 // ---------------------------------------------------------------------------
 // States
@@ -111,6 +114,10 @@ pub enum TurnSignal {
     Error {
         category: TurnErrorCategory,
         message: String,
+        /// The engine's original closed diagnosis, when it supplied one
+        /// (issue #145). The FSM forwards it untouched so the sink never has
+        /// to re-derive a diagnosis from the coarse `category`.
+        diagnostic: Option<RuntimeDiagnostic>,
     },
 }
 
@@ -155,6 +162,8 @@ pub enum TurnAction {
     ReportError {
         category: TurnErrorCategory,
         message: String,
+        /// The engine's original closed diagnosis, when it supplied one.
+        diagnostic: Option<RuntimeDiagnostic>,
     },
 }
 
@@ -392,8 +401,19 @@ impl TurnMachine {
             (St::Interrupted, S::Interrupted) => vec![],
 
             // ── Errors (any state) ──────────────────────────────────────
-            (_, S::Error { category, message }) => {
-                vec![TurnAction::ReportError { category, message }]
+            (
+                _,
+                S::Error {
+                    category,
+                    message,
+                    diagnostic,
+                },
+            ) => {
+                vec![TurnAction::ReportError {
+                    category,
+                    message,
+                    diagnostic,
+                }]
             }
 
             // ── Catch-all: ignore signals that don't apply in this state ─
@@ -498,9 +518,15 @@ pub fn gemini_event_to_signal(event: GeminiEvent) -> Option<TurnSignal> {
         GeminiEvent::GenerationComplete => Some(TurnSignal::GenerationComplete),
         GeminiEvent::TurnComplete { .. } => Some(TurnSignal::TurnComplete),
         GeminiEvent::Interrupted => Some(TurnSignal::Interrupted),
-        GeminiEvent::Error { category, message } => Some(TurnSignal::Error {
+        GeminiEvent::Error {
+            category,
+            message,
+            diagnostic,
+        } => Some(TurnSignal::Error {
             category: gemini_error_category(category),
             message,
+            // Issue #145: carry the engine's ORIGINAL diagnosis through the FSM.
+            diagnostic: Some(diagnostic),
         }),
         // Input transcription is routed to the graph by the caller, not the
         // FSM; turn boundaries come from server VAD signals supplied directly.
@@ -557,6 +583,9 @@ pub fn openai_event_to_signal(
         E::Error { message } => Some(TurnSignal::Error {
             category: TurnErrorCategory::Server,
             message: message.to_string(),
+            // The STT client now classifies errors into a closed diagnostic
+            // (#515); carry it through so the sink forwards it untouched.
+            diagnostic: Some(message),
         }),
         // Connection lifecycle — handled at the transport layer, not the FSM.
         E::Connected | E::Disconnected | E::Reconnecting { .. } | E::Reconnected => None,
@@ -605,9 +634,15 @@ pub fn openai_realtime_event_to_signal(
         E::UserSpeechStarted => Some(TurnSignal::UserSpeechStarted),
         E::UserSpeechStopped => Some(TurnSignal::UserSpeechEnded),
         E::TurnComplete { .. } => Some(TurnSignal::TurnComplete),
-        E::Error { category, message } => Some(TurnSignal::Error {
+        E::Error {
+            category,
+            message,
+            diagnostic,
+        } => Some(TurnSignal::Error {
             category: openai_realtime_error_category(category),
             message,
+            // Issue #145: carry the engine's ORIGINAL diagnosis through the FSM.
+            diagnostic: Some(diagnostic),
         }),
         E::Connected | E::Disconnected | E::Reconnecting { .. } | E::Reconnected { .. } => None,
     }
@@ -679,8 +714,17 @@ pub trait ConverseSink {
     fn emit_transcript(&mut self, text: &str, final_: bool);
     /// A barge-in candidate was suppressed by the gate (informational).
     fn suppressed_barge_in(&mut self, reason: SuppressedReason);
-    /// Surface a (non-fatal) engine error to the caller.
-    fn report_error(&mut self, category: TurnErrorCategory, message: &str);
+    /// Surface a (non-fatal) engine error to the caller. `diagnostic` is the
+    /// engine's ORIGINAL closed [`RuntimeDiagnostic`] when it supplied one
+    /// (issue #145) — the sink must forward it rather than re-deriving a
+    /// diagnosis from the coarse `category`, which loses distinctions such as
+    /// rate limit vs. outage.
+    fn report_error(
+        &mut self,
+        category: TurnErrorCategory,
+        message: &str,
+        diagnostic: Option<&RuntimeDiagnostic>,
+    );
 }
 
 /// Drives the pure [`TurnMachine`] from live engine signals, supplying the
@@ -836,7 +880,11 @@ fn dispatch_action(action: TurnAction, sink: &mut impl ConverseSink) {
         TurnAction::CancelGeneration => sink.cancel_generation(),
         TurnAction::CancelToken => sink.cancel_token(),
         TurnAction::SuppressedBargeIn { reason } => sink.suppressed_barge_in(reason),
-        TurnAction::ReportError { category, message } => sink.report_error(category, &message),
+        TurnAction::ReportError {
+            category,
+            message,
+            diagnostic,
+        } => sink.report_error(category, &message, diagnostic.as_ref()),
     }
 }
 
@@ -1156,20 +1204,24 @@ mod tests {
     #[test]
     fn error_reports_without_changing_state() {
         let mut m = machine_speaking();
+        let diagnostic = crate::gemini::GeminiErrorCategory::Network.runtime_diagnostic();
         let actions = m.on_signal(TurnSignal::Error {
             category: TurnErrorCategory::Network,
-            message: "socket reset".into(),
+            message: "reconnect_failed".into(),
+            diagnostic: Some(diagnostic.clone()),
         });
         assert_eq!(
             m.state(),
             TurnState::Speaking,
             "non-fatal error keeps state"
         );
+        // The original diagnostic travels with the action untouched.
         assert_eq!(
             actions,
             vec![TurnAction::ReportError {
                 category: TurnErrorCategory::Network,
-                message: "socket reset".into()
+                message: "reconnect_failed".into(),
+                diagnostic: Some(diagnostic),
             }]
         );
     }
@@ -1377,29 +1429,37 @@ mod tests {
     fn gemini_error_category_normalized() {
         let sig = gemini_event_to_signal(GeminiEvent::Error {
             category: crate::gemini::GeminiErrorCategory::AuthExpired,
-            message: "token expired".into(),
+            message: "server_close".into(),
+            diagnostic: crate::gemini::GeminiErrorCategory::AuthExpired.runtime_diagnostic(),
         });
         assert_eq!(
             sig,
             Some(TurnSignal::Error {
                 category: TurnErrorCategory::Auth,
-                message: "token expired".into()
+                message: "server_close".into(),
+                diagnostic: Some(
+                    crate::gemini::GeminiErrorCategory::AuthExpired.runtime_diagnostic()
+                ),
             })
         );
-        // RateLimit folds into Server (recoverable backpressure category).
+        // RateLimit folds into Server for the FSM, but the ORIGINAL closed
+        // diagnostic (`rate_limited`) rides through unchanged (issue #145).
+        let rate_limit = crate::gemini::GeminiErrorCategory::RateLimit {
+            retry_delay: Some(RuntimeRetryDelayBucket::Short),
+        };
         let sig = gemini_event_to_signal(GeminiEvent::Error {
-            category: crate::gemini::GeminiErrorCategory::RateLimit {
-                retry_after_secs: Some(5),
-            },
-            message: "429".into(),
+            category: rate_limit.clone(),
+            message: "server_close".into(),
+            diagnostic: rate_limit.runtime_diagnostic(),
         });
-        assert!(matches!(
+        assert_eq!(
             sig,
             Some(TurnSignal::Error {
                 category: TurnErrorCategory::Server,
-                ..
+                message: "server_close".into(),
+                diagnostic: Some(rate_limit.runtime_diagnostic()),
             })
-        ));
+        );
     }
 
     #[test]
@@ -1495,6 +1555,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         log: Vec<String>,
+        last_diagnostic: Option<RuntimeDiagnostic>,
     }
     impl ConverseSink for RecordingSink {
         fn start_capture(&mut self) {
@@ -1527,9 +1588,93 @@ mod tests {
         fn suppressed_barge_in(&mut self, reason: SuppressedReason) {
             self.log.push(format!("suppressed({reason:?})"));
         }
-        fn report_error(&mut self, category: TurnErrorCategory, message: &str) {
+        fn report_error(
+            &mut self,
+            category: TurnErrorCategory,
+            message: &str,
+            diagnostic: Option<&RuntimeDiagnostic>,
+        ) {
             self.log.push(format!("error({category:?},{message})"));
+            self.last_diagnostic = diagnostic.cloned();
         }
+    }
+
+    /// The wire `code` of a converse error status payload built by the same
+    /// production helper both realtime sinks call.
+    fn payload_code(sink: &RecordingSink, category: TurnErrorCategory) -> (String, String) {
+        let payload =
+            crate::gemini::converse_error_status_payload(category, sink.last_diagnostic.as_ref());
+        let code = payload["diagnostic"]["detail"]["code"]
+            .as_str()
+            .expect("closed code")
+            .to_string();
+        (code, payload.to_string())
+    }
+
+    /// Issue #145: an OpenAI `rate_limit_exceeded` error frame must reach the
+    /// UI as `rate_limited`. The adapter folds it into the coarse `Server`
+    /// FSM category, but the engine's ORIGINAL diagnostic travels through
+    /// `TurnSignal`/`TurnAction` to the sink, so no outage is reported for a
+    /// quota hit. Runs the real parser → adapter → driver → payload chain.
+    #[test]
+    fn openai_rate_limit_frame_reaches_the_sink_as_rate_limited_not_an_outage() {
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        crate::openai_realtime::handle_server_message(
+            r#"{"type":"error","error":{"type":"invalid_request_error","code":"rate_limit_exceeded","message":"quota text"}}"#,
+            &tx,
+        );
+        let event = rx.try_recv().expect("error event");
+
+        let mut d = ConverseDriver::new(InterruptionGate::default());
+        let mut s = RecordingSink::default();
+        d.on_openai_realtime_event(event, 0, 0, &mut s);
+
+        let (code, payload) = payload_code(&s, TurnErrorCategory::Server);
+        assert_eq!(code, "rate_limited", "payload: {payload}");
+        assert!(!payload.contains("provider_unavailable"), "{payload}");
+        // Closed: only the diagnostic crosses — no message, no coarse category.
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["diagnostic", "type"]);
+    }
+
+    /// Gemini's quota close (1008 "quota") takes the same path.
+    #[test]
+    fn gemini_quota_close_reaches_the_sink_as_rate_limited_not_an_outage() {
+        let category = crate::gemini::GeminiErrorCategory::RateLimit { retry_delay: None };
+        let mut d = ConverseDriver::new(InterruptionGate::default());
+        let mut s = RecordingSink::default();
+        d.on_gemini_event(
+            GeminiEvent::Error {
+                category: category.clone(),
+                message: "server_close".into(),
+                diagnostic: category.runtime_diagnostic(),
+            },
+            0,
+            0,
+            &mut s,
+        );
+        let (code, payload) = payload_code(&s, TurnErrorCategory::Server);
+        assert_eq!(code, "rate_limited", "payload: {payload}");
+    }
+
+    /// A signal that carries no diagnosis (the STT adapter) falls back to the
+    /// closed mapping from the coarse category.
+    #[test]
+    fn signal_without_a_diagnostic_falls_back_to_the_category_mapping() {
+        let mut s = RecordingSink::default();
+        dispatch_action(
+            TurnAction::ReportError {
+                category: TurnErrorCategory::Network,
+                message: "boom".into(),
+                diagnostic: None,
+            },
+            &mut s,
+        );
+        assert!(s.last_diagnostic.is_none());
+        let (code, _) = payload_code(&s, TurnErrorCategory::Network);
+        assert_eq!(code, "network_unreachable");
     }
 
     #[test]
@@ -1726,7 +1871,10 @@ mod tests {
             }),
             Some(TurnSignal::Error {
                 category: TurnErrorCategory::Server,
-                message: "runtime/internal".into()
+                message: "runtime/internal".into(),
+                diagnostic: Some(RuntimeDiagnostic::internal(RuntimeDiagnosticContext::new(
+                    RuntimeOperation::Transcription,
+                ))),
             })
         );
         // Transport/lifecycle frames are handled at the connection layer.
@@ -1816,25 +1964,33 @@ mod tests {
         assert_eq!(
             openai_realtime_event_to_signal(E::Error {
                 category: O::AuthExpired,
-                message: "token expired".into(),
+                message: "server_close".into(),
+                diagnostic: O::AuthExpired.runtime_diagnostic(),
             }),
             Some(TurnSignal::Error {
                 category: TurnErrorCategory::Auth,
-                message: "token expired".into()
+                message: "server_close".into(),
+                diagnostic: Some(O::AuthExpired.runtime_diagnostic()),
             })
         );
-        assert!(matches!(
+        // Issue #145: a rate limit folds into the coarse `Server` category for
+        // the FSM, but the ORIGINAL closed diagnostic (`rate_limited`) rides
+        // through unchanged so the UI never reports an outage for a quota hit.
+        let rate_limit = O::RateLimit {
+            retry_delay: Some(RuntimeRetryDelayBucket::Short),
+        };
+        assert_eq!(
             openai_realtime_event_to_signal(E::Error {
-                category: O::RateLimit {
-                    retry_after_secs: Some(5)
-                },
-                message: "429".into(),
+                category: rate_limit.clone(),
+                message: "error_frame".into(),
+                diagnostic: rate_limit.runtime_diagnostic(),
             }),
             Some(TurnSignal::Error {
                 category: TurnErrorCategory::Server,
-                ..
+                message: "error_frame".into(),
+                diagnostic: Some(rate_limit.runtime_diagnostic()),
             })
-        ));
+        );
         assert_eq!(openai_realtime_event_to_signal(E::Connected), None);
         assert_eq!(openai_realtime_event_to_signal(E::Disconnected), None);
         assert_eq!(
