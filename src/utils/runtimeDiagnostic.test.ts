@@ -77,6 +77,7 @@ describe("generated runtime diagnostic contract", () => {
     expectTypeOf<RuntimeDiagnosticTranslationKey>().toEqualTypeOf<
       | `runtimeDiagnostics.credential.${(typeof CREDENTIAL_CONTRACT.vocabulary.error_codes)[number]}`
       | `runtimeDiagnostics.runtime.${(typeof RUNTIME_DIAGNOSTIC_CONTRACT.error_codes)[number]}`
+      | `runtimeDiagnostics.native.${keyof typeof en.runtimeDiagnostics.native}`
     >();
   });
 
@@ -87,6 +88,9 @@ describe("generated runtime diagnostic contract", () => {
     expectTypeOf<
       keyof typeof pt.runtimeDiagnostics.runtime
     >().toEqualTypeOf<RuntimeErrorCode>();
+    expectTypeOf<keyof typeof pt.runtimeDiagnostics.native>().toEqualTypeOf<
+      keyof typeof en.runtimeDiagnostics.native
+    >();
     expectTypeOf<RuntimeRecoveryTranslationKey>().toEqualTypeOf<`runtimeDiagnostics.recovery.${keyof typeof en.runtimeDiagnostics.recovery}`>();
     expectTypeOf<RuntimeRecoveryTranslationKey>().toEqualTypeOf<`runtimeDiagnostics.recovery.${keyof typeof pt.runtimeDiagnostics.recovery}`>();
   });
@@ -330,39 +334,79 @@ describe("runtime diagnostic trust boundary", () => {
     const error = (
       code: string,
       recovery_action: RuntimeSafeRecoveryAction,
+      retryable = false,
+      transport = "native",
     ) => ({
       code: "runtime_diagnostic",
       diagnostic: {
         kind: "runtime",
         detail: {
           code,
-          retryable: false,
+          retryable,
           recovery_action,
-          context: { operation: "speech_synthesis", transport: "native" },
+          context: { operation: "provider_request", transport },
         },
       },
     });
     const driverProse = "driver says device no longer available in violet room";
-    for (const [payload, expectedCode, recoveryAction] of [
+    for (const [
+      payload,
+      translationKey,
+      english,
+      portuguese,
+      recoveryAction,
+      retryable,
+    ] of [
       [
         error("invalid_configuration", "review_configuration"),
-        "invalid_configuration",
+        "runtimeDiagnostics.native.invalid_configuration",
+        en.runtimeDiagnostics.native.invalid_configuration,
+        pt.runtimeDiagnostics.native.invalid_configuration,
         "review_configuration",
+        false,
       ],
-      [error("internal", "none"), "internal", "none"],
-      [error(driverProse, "none"), "internal", "none"],
+      [
+        error("provider_unavailable", "retry", true),
+        "runtimeDiagnostics.native.provider_unavailable",
+        en.runtimeDiagnostics.native.provider_unavailable,
+        pt.runtimeDiagnostics.native.provider_unavailable,
+        "retry",
+        true,
+      ],
+      [
+        error("provider_unavailable", "retry", true, "websocket"),
+        "runtimeDiagnostics.runtime.provider_unavailable",
+        en.runtimeDiagnostics.runtime.provider_unavailable,
+        pt.runtimeDiagnostics.runtime.provider_unavailable,
+        "retry",
+        true,
+      ],
+      [
+        error("internal", "none"),
+        "runtimeDiagnostics.runtime.internal",
+        en.runtimeDiagnostics.runtime.internal,
+        pt.runtimeDiagnostics.runtime.internal,
+        "none",
+        false,
+      ],
+      [
+        error(driverProse, "none"),
+        "runtimeDiagnostics.runtime.internal",
+        en.runtimeDiagnostics.runtime.internal,
+        pt.runtimeDiagnostics.runtime.internal,
+        "none",
+        false,
+      ],
     ] as const) {
       const presentation = runtimeDiagnosticPresentation(payload);
       expect(presentation).toMatchObject({
-        translationKey: `runtimeDiagnostics.runtime.${expectedCode}`,
-        retryable: false,
+        translationKey,
+        retryable,
         recoveryAction,
       });
-      expect(i18n.t(presentation.translationKey, { lng: "en" })).toBe(
-        en.runtimeDiagnostics.runtime[expectedCode],
-      );
+      expect(i18n.t(presentation.translationKey, { lng: "en" })).toBe(english);
       expect(i18n.t(presentation.translationKey, { lng: "pt" })).toBe(
-        pt.runtimeDiagnostics.runtime[expectedCode],
+        portuguese,
       );
       expect(JSON.stringify(presentation)).not.toContain(driverProse);
     }

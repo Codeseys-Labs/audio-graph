@@ -155,8 +155,9 @@ fn audio_player_cancel_resets_16k_resampler_state_before_resume() {
     let player = AudioPlayer::with_capacity(50_000);
     let rb = HeapRb::<i16>::new(50_000);
     let (prod, mut cons) = rb.split();
-    *player.producer.lock().unwrap_or_else(|p| p.into_inner()) =
-        Some(PlaybackProducer::new(prod, 16_000, 48_000).unwrap());
+    *player.producer.lock().unwrap_or_else(|p| p.into_inner()) = Some(
+        PlaybackProducer::new(prod, 16_000, 48_000, RuntimeOperation::SpeechSynthesis).unwrap(),
+    );
 
     assert_eq!(player.push_samples(&[i16::MAX; 400]), 0);
     assert_eq!(cons.occupied_len(), 0);
@@ -184,7 +185,8 @@ fn audio_player_cancel_resets_16k_resampler_state_before_resume() {
 fn playback_producer_resamples_before_ring_buffer() {
     let rb = HeapRb::<i16>::new(50_000);
     let (prod, mut cons) = rb.split();
-    let mut producer = PlaybackProducer::new(prod, 24_000, 48_000).unwrap();
+    let mut producer =
+        PlaybackProducer::new(prod, 24_000, 48_000, RuntimeOperation::SpeechSynthesis).unwrap();
     let input = vec![0i16; 24_000];
 
     let pushed = producer.push_source_samples(&input);
@@ -197,10 +199,11 @@ fn playback_producer_resamples_before_ring_buffer() {
     assert!(drained.iter().all(|sample| *sample == 0));
 }
 
-/// Smoke test for hosts with working audio services.
+/// Smoke test for the real default-device path, including headless hosts.
+/// Windows CI lacks a working audio service and can crash inside the WASAPI
+/// default device probe before CPAL returns an error.
 #[cfg(not(target_os = "windows"))]
 #[test]
-#[ignore = "opens the host output stream and requires a working audio service"]
 fn open_default_handles_missing_device_gracefully() {
     let player = AudioPlayer::new();
     match player.open_default(PlaybackConfig::default()) {
@@ -230,12 +233,16 @@ pub(crate) fn command_canary_player() -> (AudioPlayer, std::thread::JoinHandle<(
     let (cmd_tx, cmd_rx) = unbounded();
     let worker = std::thread::spawn(move || {
         let Ok(AudioCommand::OpenStream {
-            device_name, reply, ..
+            device_name,
+            operation,
+            reply,
+            ..
         }) = cmd_rx.recv()
         else {
             panic!("expected named device request");
         };
         assert_eq!(device_name.as_deref(), Some(DEVICE_CANARY));
+        assert_eq!(operation, RuntimeOperation::ProviderRequest);
         let missing =
             find_named_output(["different output"].into_iter(), DEVICE_CANARY, |device| {
                 Ok((*device).to_owned())
@@ -244,12 +251,16 @@ pub(crate) fn command_canary_player() -> (AudioPlayer, std::thread::JoinHandle<(
         reply.send(Err(missing)).unwrap();
 
         let Ok(AudioCommand::OpenStream {
-            device_name, reply, ..
+            device_name,
+            operation,
+            reply,
+            ..
         }) = cmd_rx.recv()
         else {
             panic!("expected default device request");
         };
         assert!(device_name.is_none());
+        assert_eq!(operation, RuntimeOperation::ProviderRequest);
         reply
             .send(Err(BuildStreamError::from(backend_error()).into()))
             .unwrap();
@@ -274,9 +285,9 @@ fn playback_diagnostic_mapping_uses_closed_native_codes() {
     for (error, code, retryable, recovery_action) in [
         (
             PlaybackError::NoDefaultDevice,
-            Code::InvalidConfiguration,
-            false,
-            Action::ReviewConfiguration,
+            Code::ProviderUnavailable,
+            true,
+            Action::Retry,
         ),
         (
             PlaybackError::DeviceNotFound,
@@ -286,9 +297,9 @@ fn playback_diagnostic_mapping_uses_closed_native_codes() {
         ),
         (
             PlaybackError::DeviceUnavailable,
-            Code::InvalidConfiguration,
-            false,
-            Action::ReviewConfiguration,
+            Code::ProviderUnavailable,
+            true,
+            Action::Retry,
         ),
         (
             PlaybackError::NoSupportedFormat,
@@ -328,53 +339,82 @@ fn playback_diagnostic_mapping_uses_closed_native_codes() {
             Action::None,
         ),
     ] {
-        let RuntimeDiagnostic::Runtime(diagnostic) = error.to_runtime_diagnostic() else {
-            panic!("expected runtime diagnostic");
-        };
-        assert_eq!(diagnostic.code, code, "{error:?}");
-        assert_eq!(diagnostic.retryable, retryable, "{error:?}");
-        assert_eq!(diagnostic.recovery_action, recovery_action, "{error:?}");
-        assert_eq!(
-            diagnostic.context.operation,
-            RuntimeOperation::SpeechSynthesis
-        );
-        assert_eq!(diagnostic.context.transport, Some(RuntimeTransport::Native));
-        assert_eq!(diagnostic.context.status_class, None);
-        assert_eq!(diagnostic.context.retry_delay, None);
+        for operation in [
+            RuntimeOperation::SpeechSynthesis,
+            RuntimeOperation::RealtimeConversation,
+            RuntimeOperation::ProviderRequest,
+        ] {
+            let RuntimeDiagnostic::Runtime(diagnostic) = error.to_runtime_diagnostic(operation)
+            else {
+                panic!("expected runtime diagnostic");
+            };
+            assert_eq!(diagnostic.code, code, "{error:?}");
+            assert_eq!(diagnostic.retryable, retryable, "{error:?}");
+            assert_eq!(diagnostic.recovery_action, recovery_action, "{error:?}");
+            assert_eq!(diagnostic.context.operation, operation);
+            assert_eq!(diagnostic.context.transport, Some(RuntimeTransport::Native));
+            assert_eq!(diagnostic.context.status_class, None);
+            assert_eq!(diagnostic.context.retry_delay, None);
+        }
     }
 }
 
 #[test]
 fn classifies_cpal_kinds_without_reading_backend_prose() {
-    assert_eq!(
-        PlaybackError::from(DefaultStreamConfigError::DeviceNotAvailable),
-        PlaybackError::DeviceUnavailable,
-    );
-    assert_eq!(
-        PlaybackError::from(BuildStreamError::DeviceNotAvailable),
-        PlaybackError::DeviceUnavailable,
-    );
-    assert_eq!(
-        PlaybackError::from(PlayStreamError::DeviceNotAvailable),
-        PlaybackError::DeviceUnavailable,
-    );
-    assert_eq!(
-        PlaybackError::from(DefaultStreamConfigError::from(backend_error())),
-        PlaybackError::BuildStream,
-    );
-    assert_eq!(
-        PlaybackError::from(BuildStreamError::from(backend_error())),
-        PlaybackError::BuildStream,
-    );
-    assert_eq!(
-        PlaybackError::from(PlayStreamError::from(backend_error())),
-        PlaybackError::PlayStream,
-    );
+    for (actual, expected) in [
+        (
+            DefaultStreamConfigError::DeviceNotAvailable.into(),
+            PlaybackError::DeviceUnavailable,
+        ),
+        (
+            DefaultStreamConfigError::StreamTypeNotSupported.into(),
+            PlaybackError::NoSupportedFormat,
+        ),
+        (
+            DefaultStreamConfigError::from(backend_error()).into(),
+            PlaybackError::BuildStream,
+        ),
+        (
+            BuildStreamError::DeviceNotAvailable.into(),
+            PlaybackError::DeviceUnavailable,
+        ),
+        (
+            BuildStreamError::StreamConfigNotSupported.into(),
+            PlaybackError::NoSupportedFormat,
+        ),
+        (
+            BuildStreamError::InvalidArgument.into(),
+            PlaybackError::BuildStream,
+        ),
+        (
+            BuildStreamError::StreamIdOverflow.into(),
+            PlaybackError::BuildStream,
+        ),
+        (
+            BuildStreamError::from(backend_error()).into(),
+            PlaybackError::BuildStream,
+        ),
+        (
+            PlayStreamError::DeviceNotAvailable.into(),
+            PlaybackError::DeviceUnavailable,
+        ),
+        (
+            PlayStreamError::from(backend_error()).into(),
+            PlaybackError::PlayStream,
+        ),
+    ] {
+        let actual: PlaybackError = actual;
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn named_output_ignores_unreadable_device_names() {
     assert_eq!(
         find_named_output([()].into_iter(), DEVICE_CANARY, |_| Err(
             backend_error().into()
         )),
-        Err(PlaybackError::BuildStream),
+        Err(PlaybackError::DeviceNotFound),
     );
     let named = find_named_output([0, 1].into_iter(), DEVICE_CANARY, |device| match device {
         0 => Err(backend_error().into()),
@@ -389,12 +429,19 @@ fn stream_callback_and_resampler_logs_export_only_codes() {
     use rubato::PolynomialDegree;
 
     let capture = ThreadLogCapture::start();
-    // CPAL registers this function directly as the stream error callback.
-    log_stream_error(backend_error().into());
-    log_stream_error(StreamError::DeviceNotAvailable);
+    // Drive the same handler as the CPAL callback without opening a device.
+    for error in [
+        backend_error().into(),
+        StreamError::DeviceNotAvailable,
+        StreamError::StreamInvalidated,
+        StreamError::BufferUnderrun,
+    ] {
+        log_stream_error(error, RuntimeOperation::SpeechSynthesis);
+    }
 
     let (prod, mut cons) = HeapRb::<i16>::new(8_192).split();
-    let mut producer = PlaybackProducer::new(prod, 24_000, 48_000).unwrap();
+    let mut producer =
+        PlaybackProducer::new(prod, 24_000, 48_000, RuntimeOperation::SpeechSynthesis).unwrap();
     let resampler = producer.resampler.as_mut().unwrap();
     // The playback adapter is mono, so a two-channel resampler yields a real
     // rubato WrongNumberOfInputChannels error before writing any samples.
@@ -425,7 +472,8 @@ fn stream_callback_and_resampler_logs_export_only_codes() {
         playback,
         [
             "cpal stream error: runtime/internal",
-            "cpal stream error: runtime/invalid_configuration",
+            "cpal stream error: runtime/provider_unavailable",
+            "cpal stream error: runtime/internal",
             "playback resampling failed: runtime/internal",
             "playback resampler flush failed: runtime/internal",
         ],

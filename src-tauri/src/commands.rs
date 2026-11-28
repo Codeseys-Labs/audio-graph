@@ -8154,16 +8154,14 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
     // Open the 24 kHz mono playback stream for assistant audio (step 4).
     let _ = state
         .audio_player
-        .open_default(crate::playback::PlaybackConfig {
-            source_sample_rate: 24_000,
-            source_channels: 1,
-        })
-        .map_err(|error| {
-            log::warn!(
-                "converse: failed to open playback stream: {}",
-                error.to_runtime_diagnostic()
-            );
-        });
+        .open_default_for(
+            crate::playback::PlaybackConfig {
+                source_sample_rate: 24_000,
+                source_channels: 1,
+            },
+            RuntimeOperation::RealtimeConversation,
+        )
+        .map_err(|error| warn_converse_playback_open("converse", error));
 
     match state.is_converse_active.write() {
         Ok(mut active) => {
@@ -8732,16 +8730,14 @@ pub async fn start_openai_realtime(
     // Open the 24 kHz mono playback stream for assistant audio.
     let _ = state
         .audio_player
-        .open_default(crate::playback::PlaybackConfig {
-            source_sample_rate: 24_000,
-            source_channels: 1,
-        })
-        .map_err(|error| {
-            log::warn!(
-                "openai-realtime: failed to open playback stream: {}",
-                error.to_runtime_diagnostic()
-            );
-        });
+        .open_default_for(
+            crate::playback::PlaybackConfig {
+                source_sample_rate: 24_000,
+                source_channels: 1,
+            },
+            RuntimeOperation::RealtimeConversation,
+        )
+        .map_err(|error| warn_converse_playback_open("openai-realtime", error));
 
     match state.is_openai_realtime_active.write() {
         Ok(mut active) => {
@@ -14040,6 +14036,13 @@ pub async fn test_tts_connection_cmd(
 // reserved infrastructure, not dead code.
 // ---------------------------------------------------------------------------
 
+fn warn_converse_playback_open(label: &str, error: crate::playback::PlaybackError) {
+    log::warn!(
+        "{label}: failed to open playback stream: {}",
+        error.to_runtime_diagnostic(RuntimeOperation::RealtimeConversation)
+    );
+}
+
 /// List the host's available output audio devices.
 ///
 /// First entry (if any) has `is_default: true`. Returns an empty list on
@@ -14066,17 +14069,18 @@ pub async fn start_audio_playback_cmd(
         None => state.audio_player.open_default(config),
         Some(name) => state.audio_player.open_named(name, config),
     };
-    result.map_err(|e| AppError::RuntimeDiagnostic(e.to_runtime_diagnostic()))
+    result.map_err(|e| {
+        AppError::RuntimeDiagnostic(e.to_runtime_diagnostic(RuntimeOperation::ProviderRequest))
+    })
 }
 
 /// Stop the active playback stream. Subsequent `push_samples` calls return
 /// 0 (no producer) until a stream is reopened. Cancel is implicit.
 #[tauri::command]
 pub async fn stop_audio_playback_cmd(state: State<'_, AppState>) -> AppResult<()> {
-    state
-        .audio_player
-        .stop()
-        .map_err(|e| AppError::RuntimeDiagnostic(e.to_runtime_diagnostic()))
+    state.audio_player.stop().map_err(|e| {
+        AppError::RuntimeDiagnostic(e.to_runtime_diagnostic(RuntimeOperation::ProviderRequest))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -14130,7 +14134,7 @@ mod tests {
                             "code": code,
                             "retryable": false,
                             "recovery_action": recovery,
-                            "context": {"operation": "speech_synthesis", "transport": "native"}
+                            "context": {"operation": "provider_request", "transport": "native"}
                         }
                     }
                 }),
@@ -14143,6 +14147,37 @@ mod tests {
         let logs = crate::test_log_capture::render(&capture.finish());
         assert!(!logs.contains(DEVICE_CANARY));
         assert!(!logs.contains(DRIVER_CANARY));
+    }
+
+    #[test]
+    fn converse_playback_open_warnings_export_only_closed_codes() {
+        use crate::playback::PlaybackError;
+        use crate::playback::tests::{DEVICE_CANARY, DRIVER_CANARY};
+
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let driver_error = cpal::BuildStreamError::from(cpal::BackendSpecificError {
+            description: format!("{DRIVER_CANARY}: {DEVICE_CANARY}"),
+        });
+        warn_converse_playback_open("converse", driver_error.into());
+        warn_converse_playback_open("openai-realtime", PlaybackError::DeviceUnavailable);
+        let records = capture.finish();
+        let warnings: Vec<_> = records
+            .iter()
+            .map(|record| (record.level, record.message.as_str()))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                (
+                    log::Level::Warn,
+                    "converse: failed to open playback stream: runtime/internal"
+                ),
+                (
+                    log::Level::Warn,
+                    "openai-realtime: failed to open playback stream: runtime/provider_unavailable"
+                ),
+            ]
+        );
     }
 
     /// Issue #145: all six realtime worker-spawn failures return this closed

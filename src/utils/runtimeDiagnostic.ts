@@ -221,9 +221,15 @@ export function normalizeRuntimeDiagnostic(value: unknown): RuntimeDiagnostic {
   );
 }
 
+const NATIVE_RUNTIME_CODES = [
+  "invalid_configuration",
+  "provider_unavailable",
+] as const satisfies readonly RuntimeErrorCode[];
+
 export type RuntimeDiagnosticTranslationKey =
   | `runtimeDiagnostics.credential.${CredentialErrorCode}`
-  | `runtimeDiagnostics.runtime.${RuntimeErrorCode}`;
+  | `runtimeDiagnostics.runtime.${RuntimeErrorCode}`
+  | `runtimeDiagnostics.native.${(typeof NATIVE_RUNTIME_CODES)[number]}`;
 
 export type RuntimeRecoveryTranslationKey =
   `runtimeDiagnostics.recovery.${Extract<RuntimeSafeRecoveryAction, "reenter_credential" | "refresh_credential">}`;
@@ -253,13 +259,17 @@ export function runtimeDiagnosticPresentation(
       recoveryAction: diagnostic.detail.recovery_action,
     };
   }
-  const recoveryAction = diagnostic.detail.recovery_action;
+  const { code, context, recovery_action: recoveryAction } = diagnostic.detail;
+  const translationKey: RuntimeDiagnosticTranslationKey =
+    context.transport === "native" && isClosedValue(NATIVE_RUNTIME_CODES, code)
+      ? `runtimeDiagnostics.native.${code}`
+      : `runtimeDiagnostics.runtime.${code}`;
   const presentation: RuntimeDiagnosticPresentation = {
     diagnostic,
-    translationKey: `runtimeDiagnostics.runtime.${diagnostic.detail.code}`,
+    translationKey,
     retryable: diagnostic.detail.retryable,
     recoveryAction,
-    operation: diagnostic.detail.context.operation,
+    operation: context.operation,
   };
   if (
     recoveryAction === "reenter_credential" ||

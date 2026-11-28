@@ -32,8 +32,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use audio_graph_ipc_contract::runtime_diagnostic::{
-    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorDiagnostic, RuntimeOperation,
-    RuntimeTransport,
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeTransport,
 };
 use audioadapter_buffers::direct::SequentialSlice;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -110,26 +110,25 @@ pub enum PlaybackError {
 }
 
 impl PlaybackError {
-    pub fn to_runtime_diagnostic(self) -> RuntimeDiagnostic {
-        const CONTEXT: RuntimeDiagnosticContext =
-            RuntimeDiagnosticContext::new(RuntimeOperation::SpeechSynthesis)
-                .with_transport(RuntimeTransport::Native);
-
+    pub fn to_runtime_diagnostic(self, operation: RuntimeOperation) -> RuntimeDiagnostic {
+        let context =
+            RuntimeDiagnosticContext::new(operation).with_transport(RuntimeTransport::Native);
         match self {
-            // A removed or unsupported local device requires selecting a
-            // working device or changing settings before playback can resume.
-            Self::NoDefaultDevice
-            | Self::DeviceNotFound
-            | Self::DeviceUnavailable
-            | Self::NoSupportedFormat
-            | Self::InvalidConfiguration => {
-                RuntimeErrorDiagnostic::invalid_configuration(CONTEXT).into()
+            Self::NoDefaultDevice | Self::DeviceUnavailable => RuntimeErrorDiagnostic::new(
+                RuntimeErrorCode::ProviderUnavailable,
+                true,
+                RuntimeSafeRecoveryAction::Retry,
+                context,
+            )
+            .into(),
+            Self::DeviceNotFound | Self::NoSupportedFormat | Self::InvalidConfiguration => {
+                RuntimeErrorDiagnostic::invalid_configuration(context).into()
             }
             Self::BuildStream
             | Self::PlayStream
             | Self::Stream
             | Self::Resampler
-            | Self::ThreadDead => RuntimeDiagnostic::internal(CONTEXT),
+            | Self::ThreadDead => RuntimeDiagnostic::internal(context),
         }
     }
 }
@@ -163,12 +162,16 @@ impl From<PlayStreamError> for PlaybackError {
     }
 }
 
-fn log_stream_error(error: StreamError) {
+fn log_stream_error(error: StreamError, operation: RuntimeOperation) {
     let error = match error {
+        StreamError::BufferUnderrun => return,
         StreamError::DeviceNotAvailable => PlaybackError::DeviceUnavailable,
         _ => PlaybackError::Stream,
     };
-    log::warn!("cpal stream error: {}", error.to_runtime_diagnostic());
+    log::warn!(
+        "cpal stream error: {}",
+        error.to_runtime_diagnostic(operation)
+    );
 }
 
 /// Default ring-buffer capacity in samples (mono i16). 192 000 ≈ 4 s of
@@ -184,6 +187,7 @@ enum AudioCommand {
     OpenStream {
         device_name: Option<String>,
         config: PlaybackConfig,
+        operation: RuntimeOperation,
         /// New consumer for the per-stream ring buffer. The corresponding
         /// producer was sent to `AudioPlayer` over the reply channel
         /// before this command was issued.
@@ -274,18 +278,28 @@ impl AudioPlayer {
 
     /// Open the host's default output device with the given source config.
     pub fn open_default(&self, config: PlaybackConfig) -> Result<(), PlaybackError> {
-        self.open_inner(None, config)
+        self.open_default_for(config, RuntimeOperation::ProviderRequest)
+    }
+
+    /// Open the default device and associate subsequent diagnostics with its caller.
+    pub(crate) fn open_default_for(
+        &self,
+        config: PlaybackConfig,
+        operation: RuntimeOperation,
+    ) -> Result<(), PlaybackError> {
+        self.open_inner(None, config, operation)
     }
 
     /// Open a specific device by name (as listed by [`list_output_devices`]).
     pub fn open_named(&self, name: String, config: PlaybackConfig) -> Result<(), PlaybackError> {
-        self.open_inner(Some(name), config)
+        self.open_inner(Some(name), config, RuntimeOperation::ProviderRequest)
     }
 
     fn open_inner(
         &self,
         device_name: Option<String>,
         config: PlaybackConfig,
+        operation: RuntimeOperation,
     ) -> Result<(), PlaybackError> {
         validate_playback_config(config)?;
 
@@ -307,6 +321,7 @@ impl AudioPlayer {
             .send(AudioCommand::OpenStream {
                 device_name,
                 config,
+                operation,
                 consumer: cons,
                 reply: reply_tx,
             })
@@ -314,8 +329,12 @@ impl AudioPlayer {
         let info = reply_rx
             .recv_timeout(std::time::Duration::from_millis(2_000))
             .map_err(|_| PlaybackError::ThreadDead)??;
-        let producer =
-            PlaybackProducer::new(prod, config.source_sample_rate, info.device_sample_rate)?;
+        let producer = PlaybackProducer::new(
+            prod,
+            config.source_sample_rate,
+            info.device_sample_rate,
+            operation,
+        )?;
         *self.producer.lock().unwrap_or_else(|p| p.into_inner()) = Some(producer);
         Ok(())
     }
@@ -446,11 +465,12 @@ fn audio_thread_main(cmd_rx: Receiver<AudioCommand>, cancel: Arc<AtomicBool>) {
             AudioCommand::OpenStream {
                 device_name,
                 config,
+                operation,
                 consumer,
                 reply,
             } => {
                 drop(active_stream.take());
-                let result = build_stream(device_name, config, consumer, cancel.clone());
+                let result = build_stream(device_name, config, operation, consumer, cancel.clone());
                 match result {
                     Ok(built) => match built.stream.play() {
                         Ok(()) => {
@@ -489,6 +509,7 @@ struct BuiltPlaybackStream {
 fn build_stream(
     device_name: Option<String>,
     config: PlaybackConfig,
+    operation: RuntimeOperation,
     consumer: HeapCons<i16>,
     cancel: Arc<AtomicBool>,
 ) -> Result<BuiltPlaybackStream, PlaybackError> {
@@ -515,6 +536,7 @@ fn build_stream(
         buffer_size: BufferSize::Default,
     };
     let source_channels = config.source_channels.max(1);
+    let err_cb = move |error| log_stream_error(error, operation);
 
     // Three branches because cpal's build_output_stream is sample-format-
     // generic — we have to materialise the right type. Each branch shares
@@ -532,7 +554,7 @@ fn build_stream(
                 move |data: &mut [i16], _info| {
                     state.fill_i16(data);
                 },
-                log_stream_error,
+                err_cb,
                 None,
             )?
         }
@@ -548,7 +570,7 @@ fn build_stream(
                 move |data: &mut [f32], _info| {
                     state.fill_f32(data);
                 },
-                log_stream_error,
+                err_cb,
                 None,
             )?
         }
@@ -564,7 +586,7 @@ fn build_stream(
                 move |data: &mut [u16], _info| {
                     state.fill_u16(data);
                 },
-                log_stream_error,
+                err_cb,
                 None,
             )?
         }
@@ -578,30 +600,30 @@ fn build_stream(
 }
 
 fn find_named_output<D>(
-    devices: impl Iterator<Item = D>,
+    mut devices: impl Iterator<Item = D>,
     requested: &str,
     name: impl Fn(&D) -> Result<String, DeviceNameError>,
 ) -> Result<D, PlaybackError> {
-    let mut missing = PlaybackError::DeviceNotFound;
-    for device in devices {
-        match name(&device) {
-            Ok(candidate) if candidate == requested => return Ok(device),
-            Ok(_) => {}
-            Err(_) => missing = PlaybackError::BuildStream,
-        }
-    }
-    Err(missing)
+    devices
+        .find(|device| name(device).is_ok_and(|candidate| candidate == requested))
+        .ok_or(PlaybackError::DeviceNotFound)
 }
 
 struct PlaybackProducer {
     prod: HeapProd<i16>,
     resampler: Option<MonoI16OutputResampler>,
+    operation: RuntimeOperation,
     source_rate: u32,
     device_rate: u32,
 }
 
 impl PlaybackProducer {
-    fn new(prod: HeapProd<i16>, source_rate: u32, output_rate: u32) -> Result<Self, PlaybackError> {
+    fn new(
+        prod: HeapProd<i16>,
+        source_rate: u32,
+        output_rate: u32,
+        operation: RuntimeOperation,
+    ) -> Result<Self, PlaybackError> {
         let resampler = if source_rate == output_rate {
             None
         } else {
@@ -610,6 +632,7 @@ impl PlaybackProducer {
         Ok(Self {
             prod,
             resampler,
+            operation,
             source_rate,
             device_rate: output_rate,
         })
@@ -626,7 +649,7 @@ impl PlaybackProducer {
                 if let Err(err) = resampler.process(samples, &mut output) {
                     log::warn!(
                         "playback resampling failed: {}",
-                        err.to_runtime_diagnostic()
+                        err.to_runtime_diagnostic(self.operation)
                     );
                     resampler.reset();
                     return 0;
@@ -644,7 +667,7 @@ impl PlaybackProducer {
         if let Err(err) = resampler.finish(&mut output) {
             log::warn!(
                 "playback resampler flush failed: {}",
-                err.to_runtime_diagnostic()
+                err.to_runtime_diagnostic(self.operation)
             );
             resampler.reset();
             return 0;
