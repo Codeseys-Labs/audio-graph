@@ -97,9 +97,16 @@ fn valid_authority_instance_id(value: &str) -> bool {
 
 pub(super) trait AuthorityMutationLock: Send {}
 
+/// Every method but `acquire_mutation_lock` runs with the mutation lock
+/// held.
 pub(super) trait AuthorityJournalBoundary: Send + Sync {
     fn read(&self) -> Result<Option<Vec<u8>>, CredentialStoreFailure>;
+    /// `Ok` means these exact bytes were read back from the place they were
+    /// published, so the caller need not read them again.
     fn replace(&self, bytes: &[u8]) -> Result<(), CredentialStoreFailure>;
+    /// Removes what an earlier replace failed to discard, or fails closed
+    /// when it cannot. Run when a store opens.
+    fn remove_stray_staged(&self) -> Result<(), CredentialStoreFailure>;
     fn acquire_mutation_lock(
         &self,
     ) -> Result<Box<dyn AuthorityMutationLock>, CredentialStoreFailure>;
@@ -279,6 +286,13 @@ impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
         }
     }
 
+    fn remove_stray_staged(&self) -> Result<(), CredentialStoreFailure> {
+        match HeldDirectory::open_existing(&self.root)? {
+            Some(directory) => directory.sweep_staged(JOURNAL_FILE_NAME),
+            None => Ok(()),
+        }
+    }
+
     fn acquire_mutation_lock(
         &self,
     ) -> Result<Box<dyn AuthorityMutationLock>, CredentialStoreFailure> {
@@ -298,7 +312,7 @@ impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{
         AtomicJournalFileSystem, AtomicJournalWriter, AuthorityJournalBoundary,
         FileAuthorityJournalBoundary, HeldDirectory, JOURNAL_FILE_NAME,
@@ -310,6 +324,8 @@ mod tests {
     use std::io::{BufRead, Read, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    #[cfg(windows)]
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     const CHILD_MODE_ENV: &str = "AUDIO_GRAPH_FB2B_LOCK_CHILD_MODE";
@@ -1417,6 +1433,101 @@ mod tests {
 
         std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
         std::fs::remove_dir_all(&base).expect("remove isolated Windows publish-swap directory");
+    }
+
+    /// Between flush and rename of the next publication after it is armed,
+    /// swaps the `parent` junction from the held root to a decoy that has no
+    /// journal root, and leaves it there.
+    #[cfg(windows)]
+    struct ArmedSwapBetweenFlushAndRename {
+        base: PathBuf,
+        armed: Arc<AtomicBool>,
+    }
+
+    #[cfg(windows)]
+    struct ArmedSwapWriter<'directory> {
+        staged: super::held_directory::StagedFile<'directory>,
+        swap_in: Option<PathBuf>,
+    }
+
+    #[cfg(windows)]
+    impl AtomicJournalWriter for ArmedSwapWriter<'_> {
+        fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.staged.write_all(bytes)
+        }
+
+        fn commit(self: Box<Self>) -> std::io::Result<()> {
+            let Self {
+                mut staged,
+                swap_in,
+            } = *self;
+            staged.sync()?;
+            if let Some(base) = swap_in {
+                point_parent_junction(&base, "decoy");
+            }
+            staged.publish()
+        }
+    }
+
+    #[cfg(windows)]
+    impl AtomicJournalFileSystem for ArmedSwapBetweenFlushAndRename {
+        fn open_atomic<'directory>(
+            &self,
+            directory: &'directory HeldDirectory,
+            name: &str,
+        ) -> Result<Box<dyn AtomicJournalWriter + 'directory>, CredentialStoreFailure> {
+            Ok(Box::new(ArmedSwapWriter {
+                staged: directory.create_staged(name)?,
+                swap_in: self
+                    .armed
+                    .swap(false, Ordering::SeqCst)
+                    .then(|| self.base.clone()),
+            }))
+        }
+
+        fn read(
+            &self,
+            directory: &HeldDirectory,
+            name: &str,
+            limit: usize,
+        ) -> Result<Option<Vec<u8>>, CredentialStoreFailure> {
+            super::SystemAtomicJournalFileSystem.read(directory, name, limit)
+        }
+    }
+
+    /// A journal boundary reached through a `parent` junction, with a switch
+    /// that arms one ancestor swap during its next publication. Returns the
+    /// scratch base, the held journal root, the switch and the boundary.
+    #[cfg(windows)]
+    pub(in crate::credentials::adapters) fn armed_ancestor_swap_boundary(
+        label: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        Arc<AtomicBool>,
+        FileAuthorityJournalBoundary,
+    ) {
+        let base = scratch(label);
+        let held = base.join("held").join("journal");
+        std::fs::create_dir_all(&held).expect("create held journal root");
+        std::fs::create_dir_all(base.join("decoy")).expect("create decoy without a journal root");
+        point_parent_junction(&base, "held");
+        let armed = Arc::new(AtomicBool::new(false));
+        let boundary = FileAuthorityJournalBoundary::with_file_system(
+            base.join("parent").join("journal"),
+            base.join("namespace"),
+            Arc::new(ArmedSwapBetweenFlushAndRename {
+                base: base.clone(),
+                armed: armed.clone(),
+            }),
+        );
+        (base, held, armed, boundary)
+    }
+
+    #[cfg(windows)]
+    pub(in crate::credentials::adapters) fn remove_ancestor_swap_fixture(base: &Path) {
+        std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
+        std::fs::remove_dir_all(base).expect("remove isolated ancestor-swap directory");
     }
 
     /// Points the ancestor at the decoy, then fails the write, so the staged

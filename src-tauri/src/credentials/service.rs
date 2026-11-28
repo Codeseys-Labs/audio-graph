@@ -61,9 +61,7 @@ pub(crate) trait CredentialMutationSession {
 /// pair, rather than on a journal cached earlier, keeps another process's
 /// persisted intent or a restored older journal from being missed.
 pub(crate) struct AuthoritativeActiveRead {
-    /// `None` only when the store has never had an authority, in which case
-    /// `record` is `None` too.
-    pub(crate) journal: Option<AuthorityJournal>,
+    pub(crate) journal: AuthorityJournal,
     pub(crate) record: Option<EncodedCredentialRecord>,
 }
 
@@ -936,20 +934,7 @@ impl CredentialService {
             .store
             .read_active(&request.set_id)
             .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-        let Some(journal) = read.journal else {
-            return Err(match read.record {
-                None => content_free_error(
-                    CredentialErrorCode::Missing,
-                    CredentialSafeRecoveryAction::ReenterCredential,
-                    Some(request.set_id),
-                ),
-                Some(_) => content_free_error(
-                    CredentialErrorCode::CorruptRecord,
-                    CredentialSafeRecoveryAction::Reconcile,
-                    Some(request.set_id),
-                ),
-            });
-        };
+        let journal = read.journal;
         self.reconcile_authoritative_journal(&journal, &request.set_id)?;
         if !Self::journal_allows_entry_read(&journal, &request.set_id) {
             return Err(Self::recovery_required(&request.set_id));

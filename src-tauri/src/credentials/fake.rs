@@ -186,7 +186,7 @@ impl CredentialEntryStore for FakeCredentialStore {
                 EncodedCredentialRecord::from_boundary_bytes(bytes.as_slice().to_vec())
             });
         Ok(AuthoritativeActiveRead {
-            journal: Some(state.journal.clone()),
+            journal: state.journal.clone(),
             record,
         })
     }

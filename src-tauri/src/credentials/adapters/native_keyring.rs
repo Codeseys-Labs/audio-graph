@@ -21,6 +21,8 @@ use audio_graph_ipc_contract::credential_contract::{
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// A store bound to one authority. Only opening a ready authority or
+/// initializing a fresh one produces it, so it is never unbound.
 pub(crate) struct NativeKeyringCredentialStore {
     entries: KeyringEntryAdapter,
     journal: Arc<dyn AuthorityJournalBoundary>,
@@ -28,11 +30,21 @@ pub(crate) struct NativeKeyringCredentialStore {
     /// The authority this store was opened or initialized against. Every
     /// later read and mutation must find this same pair, so a journal lost or
     /// replaced under an open store stops it instead of being trusted.
-    bound_authority: Option<String>,
+    bound_authority: String,
+}
+
+/// A store opened where no authority ever existed. It serves no reads or
+/// mutations, and it is the only type with `initialize`: a bound store,
+/// which holds positive evidence of the authority it was bound to, can
+/// never authorize a new authority over a lost one.
+pub(crate) struct UninitializedNativeCredentialStore {
+    entries: KeyringEntryAdapter,
+    journal: Arc<dyn AuthorityJournalBoundary>,
+    interaction_gate: &'static NativeInteractionGate,
 }
 
 pub(crate) enum NativeCredentialStoreOpen {
-    Uninitialized(NativeKeyringCredentialStore),
+    Uninitialized(UninitializedNativeCredentialStore),
     Ready {
         store: NativeKeyringCredentialStore,
         journal: Box<AuthorityJournal>,
@@ -53,7 +65,7 @@ struct NativeCredentialMutationSession<'a> {
     store: &'a NativeKeyringCredentialStore,
     operation_id: CredentialOperationId,
     set_id: CredentialSetId,
-    authority_instance_id: Option<String>,
+    journal_loaded: bool,
     interaction: NativeInteractionLease<'static>,
     expected_active_readback: Option<(CredentialSetId, EncodedCredentialRecord)>,
     expected_staging_readback: Option<(
@@ -113,20 +125,15 @@ impl NativeKeyringCredentialStore {
         journal: Arc<dyn AuthorityJournalBoundary>,
         interaction_gate: &'static NativeInteractionGate,
     ) -> Result<NativeCredentialStoreOpen, CredentialStoreFailure> {
-        let mut store = Self {
-            entries,
-            journal,
-            interaction_gate,
-            bound_authority: None,
-        };
-
         let (authority_state, fresh) = {
-            let mut interaction = store.interaction_gate.acquire()?;
-            let _mutation_lock = store.journal.acquire_mutation_lock()?;
-            let state = store.read_authority_state_unlocked(&mut interaction)?;
+            let mut interaction = interaction_gate.acquire()?;
+            let _mutation_lock = journal.acquire_mutation_lock()?;
+            journal.remove_stray_staged()?;
+            let state =
+                read_authority_state_unlocked(&entries, journal.as_ref(), &mut interaction)?;
             let fresh = match state {
                 AuthorityPairState::Uninitialized => {
-                    store.no_authority_ever_existed_unlocked(&mut interaction)?
+                    no_authority_ever_existed_unlocked(&entries, &mut interaction)?
                 }
                 AuthorityPairState::Ready { .. } | AuthorityPairState::RecoveryRequired => false,
             };
@@ -134,135 +141,47 @@ impl NativeKeyringCredentialStore {
         };
 
         match authority_state {
-            AuthorityPairState::Uninitialized if fresh => {
-                Ok(NativeCredentialStoreOpen::Uninitialized(store))
-            }
+            AuthorityPairState::Uninitialized if fresh => Ok(
+                NativeCredentialStoreOpen::Uninitialized(UninitializedNativeCredentialStore {
+                    entries,
+                    journal,
+                    interaction_gate,
+                }),
+            ),
             AuthorityPairState::Uninitialized => Ok(NativeCredentialStoreOpen::RecoveryRequired),
             AuthorityPairState::Ready {
                 authority_instance_id,
-                journal,
-            } => {
-                store.bound_authority = Some(authority_instance_id);
-                Ok(NativeCredentialStoreOpen::Ready { store, journal })
-            }
+                journal: authority_journal,
+            } => Ok(NativeCredentialStoreOpen::Ready {
+                store: Self {
+                    entries,
+                    journal,
+                    interaction_gate,
+                    bound_authority: authority_instance_id,
+                },
+                journal: authority_journal,
+            }),
             AuthorityPairState::RecoveryRequired => Ok(NativeCredentialStoreOpen::RecoveryRequired),
-        }
-    }
-
-    pub(crate) fn initialize(
-        mut self,
-        journal: AuthorityJournal,
-    ) -> Result<NativeCredentialStoreOpen, CredentialStoreFailure> {
-        journal.validate_persisted_for_backend(CredentialBackendKind::Native)?;
-
-        {
-            let mut interaction = self.interaction_gate.acquire()?;
-            let _mutation_lock = self.journal.acquire_mutation_lock()?;
-            if !matches!(
-                self.read_authority_state_unlocked(&mut interaction)?,
-                AuthorityPairState::Uninitialized
-            ) {
-                return Err(CredentialStoreFailure::RevisionConflict);
-            }
-            if !self.no_authority_ever_existed_unlocked(&mut interaction)? {
-                return Err(CredentialStoreFailure::CorruptRecord);
-            }
-
-            let authority_instance_id = new_authority_instance_id();
-            let marker = encode_authority_marker(&authority_instance_id)?;
-            let journal_bytes = encode_authority_journal(&authority_instance_id, &journal)?;
-            self.entries
-                .write_authority(&mut interaction, &EntryLocator::authority(), &marker)?;
-            interaction.ensure_healthy()?;
-            self.journal
-                .replace(&journal_bytes)
-                .map_err(|_| interaction.latch_commit_unknown())?;
-
-            match self.read_authority_state_unlocked(&mut interaction) {
-                Ok(AuthorityPairState::Ready {
-                    journal: readback, ..
-                }) if *readback == journal => {}
-                _ => return Err(interaction.latch_commit_unknown()),
-            }
-            self.bound_authority = Some(authority_instance_id);
-        }
-
-        Ok(NativeCredentialStoreOpen::Ready {
-            store: self,
-            journal: Box::new(journal),
-        })
-    }
-
-    fn read_authority_state_unlocked(
-        &self,
-        interaction: &mut NativeInteractionLease<'_>,
-    ) -> Result<AuthorityPairState, CredentialStoreFailure> {
-        interaction.ensure_healthy()?;
-        let journal_bytes = self.journal.read()?;
-        let marker_bytes = match self.entries.read(interaction, &EntryLocator::authority()) {
-            Ok(marker) => marker,
-            Err(CredentialStoreFailure::CorruptRecord)
-            | Err(CredentialStoreFailure::UnsupportedSchema) => {
-                return Ok(AuthorityPairState::RecoveryRequired);
-            }
-            Err(failure) => return Err(failure),
-        };
-        match (journal_bytes, marker_bytes) {
-            (None, None) => Ok(AuthorityPairState::Uninitialized),
-            (Some(journal_bytes), Some(marker_bytes)) => {
-                let Some(journal) = decode_authority_journal(&journal_bytes) else {
-                    return Ok(AuthorityPairState::RecoveryRequired);
-                };
-                let Some(marker_id) = decode_authority_marker(marker_bytes.as_slice()) else {
-                    return Ok(AuthorityPairState::RecoveryRequired);
-                };
-                if journal.authority_instance_id == marker_id
-                    && journal
-                        .journal
-                        .validate_persisted_for_backend(CredentialBackendKind::Native)
-                        .is_ok()
-                {
-                    Ok(AuthorityPairState::Ready {
-                        authority_instance_id: marker_id,
-                        journal: Box::new(journal.journal),
-                    })
-                } else {
-                    Ok(AuthorityPairState::RecoveryRequired)
-                }
-            }
-            _ => Ok(AuthorityPairState::RecoveryRequired),
         }
     }
 
     /// Re-reads the journal and marker and requires the pair this store was
     /// bound to. Run under the interaction lease and the mutation lock, so no
     /// cooperating process can change the pair between this check and the
-    /// read that follows. `Ok(None)` is the fresh install: a store opened
-    /// before any authority existed still finds none. A store that was bound
-    /// treats both halves missing like one half missing: either way its
-    /// authority is gone.
+    /// read that follows. Both halves missing is treated like one half
+    /// missing: either way the bound authority is gone.
     fn require_bound_authority_unlocked(
         &self,
         interaction: &mut NativeInteractionLease<'_>,
-    ) -> Result<Option<Box<AuthorityJournal>>, CredentialStoreFailure> {
-        match (
-            self.read_authority_state_unlocked(interaction)?,
-            self.bound_authority.as_deref(),
-        ) {
-            (
-                AuthorityPairState::Ready {
-                    authority_instance_id,
-                    journal,
-                },
-                Some(bound),
-            ) if bound == authority_instance_id => Ok(Some(journal)),
-            (AuthorityPairState::Uninitialized, None) => Ok(None),
-            (
-                AuthorityPairState::Ready { .. }
-                | AuthorityPairState::Uninitialized
-                | AuthorityPairState::RecoveryRequired,
-                _,
-            ) => Err(CredentialStoreFailure::CorruptRecord),
+    ) -> Result<Box<AuthorityJournal>, CredentialStoreFailure> {
+        match read_authority_state_unlocked(&self.entries, self.journal.as_ref(), interaction)? {
+            AuthorityPairState::Ready {
+                authority_instance_id,
+                journal,
+            } if authority_instance_id == self.bound_authority => Ok(journal),
+            AuthorityPairState::Ready { .. }
+            | AuthorityPairState::Uninitialized
+            | AuthorityPairState::RecoveryRequired => Err(CredentialStoreFailure::CorruptRecord),
         }
     }
 
@@ -275,44 +194,170 @@ impl NativeKeyringCredentialStore {
             .read(interaction, locator)
             .map(|record| record.map(EncodedCredentialRecord::from_zeroizing_boundary_bytes))
     }
+}
 
-    /// The independent evidence that authorizes first initialization.
-    ///
-    /// With both halves of the authority pair absent, only native state can
-    /// tell a fresh install from a lost authority. An active record or a
-    /// staging guard for any built-in set proves an authority existed, so the
-    /// store is recovery-required rather than fresh. A staging record is named
-    /// by its operation, which only the lost journal knew, so it cannot be
-    /// looked up; its set's guard, written before any staging record and
-    /// deleted after it, stands in for it. Entries that cannot be decoded
-    /// count as present. Custom sets never reach this store's mutations, and
-    /// the pre-v2 (v1) namespace is not evidence of a v2 authority.
-    fn no_authority_ever_existed_unlocked(
-        &self,
-        interaction: &mut NativeInteractionLease<'_>,
-    ) -> Result<bool, CredentialStoreFailure> {
-        for set_id in BUILT_IN_CREDENTIAL_SET_IDS {
-            let set_id = CredentialSetId::BuiltIn(*set_id);
-            for locator in [
-                EntryLocator::active(&set_id),
-                EntryLocator::staging_guard(&set_id),
-            ] {
-                match self.entries.read(interaction, &locator) {
-                    Ok(None) => {}
-                    Ok(Some(_))
-                    | Err(CredentialStoreFailure::CorruptRecord)
-                    | Err(CredentialStoreFailure::UnsupportedSchema) => return Ok(false),
-                    Err(failure) => return Err(failure),
-                }
+impl UninitializedNativeCredentialStore {
+    /// Publishes the first authority pair, after requiring under the lock
+    /// that the pair is still absent and that no authority ever existed.
+    pub(crate) fn initialize(
+        self,
+        journal: AuthorityJournal,
+    ) -> Result<NativeCredentialStoreOpen, CredentialStoreFailure> {
+        journal.validate_persisted_for_backend(CredentialBackendKind::Native)?;
+
+        let authority_instance_id = {
+            let mut interaction = self.interaction_gate.acquire()?;
+            let _mutation_lock = self.journal.acquire_mutation_lock()?;
+            if !matches!(
+                read_authority_state_unlocked(
+                    &self.entries,
+                    self.journal.as_ref(),
+                    &mut interaction
+                )?,
+                AuthorityPairState::Uninitialized
+            ) {
+                return Err(CredentialStoreFailure::RevisionConflict);
             }
-        }
-        Ok(true)
+            if !no_authority_ever_existed_unlocked(&self.entries, &mut interaction)? {
+                return Err(CredentialStoreFailure::CorruptRecord);
+            }
+
+            let authority_instance_id = new_authority_instance_id();
+            let marker = encode_authority_marker(&authority_instance_id)?;
+            let journal_bytes = encode_authority_journal(&authority_instance_id, &journal)?;
+            self.entries
+                .write_authority(&mut interaction, &EntryLocator::authority(), &marker)?;
+            interaction.ensure_healthy()?;
+            // `replace` succeeds only after reading these exact bytes back
+            // through the held root it published into. Reading the journal
+            // again by path could reach another directory and turn this
+            // verified publication into uncertainty, so only the marker,
+            // which this call wrote to the native store, is read back.
+            self.journal
+                .replace(&journal_bytes)
+                .map_err(|_| interaction.latch_commit_unknown())?;
+            match self
+                .entries
+                .read(&mut interaction, &EntryLocator::authority())
+            {
+                Ok(Some(marker))
+                    if decode_authority_marker(marker.as_slice()).as_deref()
+                        == Some(authority_instance_id.as_str()) => {}
+                Ok(_) | Err(_) => return Err(interaction.latch_commit_unknown()),
+            }
+            authority_instance_id
+        };
+
+        Ok(NativeCredentialStoreOpen::Ready {
+            store: NativeKeyringCredentialStore {
+                entries: self.entries,
+                journal: self.journal,
+                interaction_gate: self.interaction_gate,
+                bound_authority: authority_instance_id,
+            },
+            journal: Box::new(journal),
+        })
     }
 }
 
-/// The bytes of a staging guard. They carry no secret and no operation: the
-/// guard only has to exist.
-const STAGING_GUARD: &[u8] = b"audiograph.credential-v2.staging-guard";
+fn read_authority_state_unlocked(
+    entries: &KeyringEntryAdapter,
+    journal: &dyn AuthorityJournalBoundary,
+    interaction: &mut NativeInteractionLease<'_>,
+) -> Result<AuthorityPairState, CredentialStoreFailure> {
+    interaction.ensure_healthy()?;
+    let journal_bytes = journal.read()?;
+    let marker_bytes = match entries.read(interaction, &EntryLocator::authority()) {
+        Ok(marker) => marker,
+        Err(CredentialStoreFailure::CorruptRecord)
+        | Err(CredentialStoreFailure::UnsupportedSchema) => {
+            return Ok(AuthorityPairState::RecoveryRequired);
+        }
+        Err(failure) => return Err(failure),
+    };
+    match (journal_bytes, marker_bytes) {
+        (None, None) => Ok(AuthorityPairState::Uninitialized),
+        (Some(journal_bytes), Some(marker_bytes)) => {
+            let Some(journal) = decode_authority_journal(&journal_bytes) else {
+                return Ok(AuthorityPairState::RecoveryRequired);
+            };
+            let Some(marker_id) = decode_authority_marker(marker_bytes.as_slice()) else {
+                return Ok(AuthorityPairState::RecoveryRequired);
+            };
+            if journal.authority_instance_id == marker_id
+                && journal
+                    .journal
+                    .validate_persisted_for_backend(CredentialBackendKind::Native)
+                    .is_ok()
+            {
+                Ok(AuthorityPairState::Ready {
+                    authority_instance_id: marker_id,
+                    journal: Box::new(journal.journal),
+                })
+            } else {
+                Ok(AuthorityPairState::RecoveryRequired)
+            }
+        }
+        _ => Ok(AuthorityPairState::RecoveryRequired),
+    }
+}
+
+/// The independent evidence that authorizes first initialization.
+///
+/// Run only once both halves of the authority pair are absent; then only
+/// native state can tell a fresh install from a lost authority. The store
+/// counts as fresh only if the active record and the staging guard of every
+/// built-in set are all absent. Any bytes at any of those locators block
+/// first initialization, including bytes another authority wrote, and an
+/// entry that cannot be decoded counts as present. Every other read failure
+/// is returned as it is, so a fresh machine whose keychain cannot be read is
+/// refused without anything being written.
+///
+/// A staging record is named by its operation, which only the lost journal
+/// knew, so it cannot be looked up; its set's guard, written before the
+/// staging record and removed only after it, stands in for it. The limit:
+/// a staging record written before guards existed, or one that outlived its
+/// guard, is invisible here. Custom sets never reach this store's
+/// mutations, and the pre-v2 (v1) namespace is not evidence of a v2
+/// authority.
+fn no_authority_ever_existed_unlocked(
+    entries: &KeyringEntryAdapter,
+    interaction: &mut NativeInteractionLease<'_>,
+) -> Result<bool, CredentialStoreFailure> {
+    for set_id in BUILT_IN_CREDENTIAL_SET_IDS {
+        let set_id = CredentialSetId::BuiltIn(*set_id);
+        for locator in [
+            EntryLocator::active(&set_id),
+            EntryLocator::staging_guard(&set_id),
+        ] {
+            match entries.read(interaction, &locator) {
+                Ok(None) => {}
+                Ok(Some(_))
+                | Err(CredentialStoreFailure::CorruptRecord)
+                | Err(CredentialStoreFailure::UnsupportedSchema) => return Ok(false),
+                Err(failure) => return Err(failure),
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// A staging guard names the operation whose staging record it guards, so
+/// only that operation's cleanup removes it. It carries no secret.
+const STAGING_GUARD_PREFIX: &str = "audiograph.credential-v2.staging-guard/";
+
+fn staging_guard_bytes(operation_id: &CredentialOperationId) -> Vec<u8> {
+    format!("{STAGING_GUARD_PREFIX}{}", operation_id.as_str()).into_bytes()
+}
+
+/// The operation a guard names, or `None` for bytes no guard was written
+/// with.
+fn guarded_operation(bytes: &[u8]) -> Option<CredentialOperationId> {
+    let named = std::str::from_utf8(bytes)
+        .ok()?
+        .strip_prefix(STAGING_GUARD_PREFIX)?;
+    CredentialOperationId::parse(named).ok()
+}
 
 impl CredentialEntryStore for NativeKeyringCredentialStore {
     fn read_active(
@@ -321,17 +366,10 @@ impl CredentialEntryStore for NativeKeyringCredentialStore {
     ) -> Result<AuthoritativeActiveRead, CredentialStoreFailure> {
         let mut interaction = self.interaction_gate.acquire()?;
         let _mutation_lock = self.journal.acquire_mutation_lock()?;
-        // With no authority there are no credentials, and an entry left
-        // without one is never served.
-        let Some(journal) = self.require_bound_authority_unlocked(&mut interaction)? else {
-            return Ok(AuthoritativeActiveRead {
-                journal: None,
-                record: None,
-            });
-        };
+        let journal = self.require_bound_authority_unlocked(&mut interaction)?;
         let record = self.read_record_unlocked(&mut interaction, &EntryLocator::active(set_id))?;
         Ok(AuthoritativeActiveRead {
-            journal: Some(*journal),
+            journal: *journal,
             record,
         })
     }
@@ -347,7 +385,7 @@ impl CredentialEntryStore for NativeKeyringCredentialStore {
             store: self,
             operation_id: operation_id.clone(),
             set_id: set_id.clone(),
-            authority_instance_id: None,
+            journal_loaded: false,
             interaction,
             expected_active_readback: None,
             expected_staging_readback: None,
@@ -389,45 +427,61 @@ impl NativeCredentialMutationSession<'_> {
     /// validated under this session's lock; without it the session would
     /// act for an authority it never checked.
     fn require_loaded_journal(&self) -> Result<(), CredentialStoreFailure> {
-        if self.authority_instance_id.is_some() {
+        if self.journal_loaded {
             Ok(())
         } else {
             Err(CredentialStoreFailure::Internal)
         }
     }
 
+    /// Publishes `journal` for the bound authority. The boundary's `Ok`
+    /// already means it read these exact bytes back through the held root it
+    /// published into; reading the journal again by path could reach another
+    /// directory and latch uncertainty over a verified publication.
     fn persist_journal(
         &mut self,
         journal: &AuthorityJournal,
     ) -> Result<(), CredentialStoreFailure> {
         self.interaction.ensure_healthy()?;
+        self.require_loaded_journal()?;
         self.require_no_pending_readback()?;
         journal.validate_persisted_for_backend(CredentialBackendKind::Native)?;
 
-        let authority_instance_id = self
-            .authority_instance_id
-            .as_deref()
-            .ok_or(CredentialStoreFailure::Internal)?;
-        let bytes = encode_authority_journal(authority_instance_id, journal)?;
+        let bytes = encode_authority_journal(&self.store.bound_authority, journal)?;
         match self.store.journal.replace(&bytes) {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             Err(CredentialStoreFailure::CommitUnknown) => {
-                return Err(self.interaction.latch_commit_unknown());
+                Err(self.interaction.latch_commit_unknown())
             }
-            Err(failure) => return Err(failure),
+            Err(failure) => Err(failure),
         }
-        match self
-            .store
-            .read_authority_state_unlocked(&mut self.interaction)
-        {
-            Ok(AuthorityPairState::Ready {
-                authority_instance_id: readback_id,
-                journal: readback,
-            }) if readback_id == authority_instance_id && *readback == *journal => Ok(()),
-            Ok(AuthorityPairState::Uninitialized)
-            | Ok(AuthorityPairState::Ready { .. })
-            | Ok(AuthorityPairState::RecoveryRequired)
-            | Err(_) => Err(self.interaction.latch_commit_unknown()),
+    }
+
+    /// Requires that `set_id`'s staging guard is absent, already names
+    /// `operation_id`, or names an operation whose staging record is gone,
+    /// and returns whether it already names `operation_id`. A guard whose
+    /// staging record remains stops another operation from staging, so at
+    /// most one staging record exists per set.
+    fn claim_staging_guard(
+        &mut self,
+        operation_id: &CredentialOperationId,
+        set_id: &CredentialSetId,
+    ) -> Result<bool, CredentialStoreFailure> {
+        let guard = EntryLocator::staging_guard(set_id);
+        let Some(bytes) = self.store.entries.read(&mut self.interaction, &guard)? else {
+            return Ok(false);
+        };
+        let owner =
+            guarded_operation(bytes.as_slice()).ok_or(CredentialStoreFailure::CorruptRecord)?;
+        if owner == *operation_id {
+            return Ok(true);
+        }
+        match self.store.entries.read(
+            &mut self.interaction,
+            &EntryLocator::staging(&owner, set_id),
+        )? {
+            None => Ok(false),
+            Some(_) => Err(CredentialStoreFailure::CorruptRecord),
         }
     }
 }
@@ -438,9 +492,8 @@ impl CredentialMutationSession for NativeCredentialMutationSession<'_> {
         self.require_no_pending_readback()?;
         let journal = self
             .store
-            .require_bound_authority_unlocked(&mut self.interaction)?
-            .ok_or(CredentialStoreFailure::CorruptRecord)?;
-        self.authority_instance_id = self.store.bound_authority.clone();
+            .require_bound_authority_unlocked(&mut self.interaction)?;
+        self.journal_loaded = true;
         Ok(*journal)
     }
 
@@ -511,14 +564,18 @@ impl CredentialMutationSession for NativeCredentialMutationSession<'_> {
         self.require_staging_scope(operation_id, set_id)?;
         self.require_no_pending_readback()?;
         // The guard goes first and is read back before any staging byte
-        // exists, so a staging record never exists without one.
-        let guard = EntryLocator::staging_guard(set_id);
-        self.store
-            .entries
-            .write(&mut self.interaction, &guard, STAGING_GUARD)?;
-        match self.store.entries.read(&mut self.interaction, &guard) {
-            Ok(Some(bytes)) if bytes.as_slice() == STAGING_GUARD => {}
-            Ok(_) | Err(_) => return Err(self.interaction.latch_commit_unknown()),
+        // exists, so a staging record never exists without a guard naming
+        // its operation.
+        if !self.claim_staging_guard(operation_id, set_id)? {
+            let guard = EntryLocator::staging_guard(set_id);
+            let bytes = staging_guard_bytes(operation_id);
+            self.store
+                .entries
+                .write(&mut self.interaction, &guard, &bytes)?;
+            match self.store.entries.read(&mut self.interaction, &guard) {
+                Ok(Some(readback)) if readback.as_slice() == bytes.as_slice() => {}
+                Ok(_) | Err(_) => return Err(self.interaction.latch_commit_unknown()),
+            }
         }
         self.store.entries.write(
             &mut self.interaction,
@@ -571,10 +628,18 @@ impl CredentialMutationSession for NativeCredentialMutationSession<'_> {
             &mut self.interaction,
             &EntryLocator::staging(operation_id, set_id),
         )?;
-        // Only once the staging record is gone does its guard go.
-        self.store
-            .entries
-            .delete_and_verify_absent(&mut self.interaction, &EntryLocator::staging_guard(set_id))
+        // Only once the staging record is gone does its guard go, and only
+        // a guard naming this operation: another operation's guard still
+        // stands for that operation's staging record.
+        let guard = EntryLocator::staging_guard(set_id);
+        match self.store.entries.read(&mut self.interaction, &guard)? {
+            Some(bytes) if guarded_operation(bytes.as_slice()).as_ref() == Some(operation_id) => {
+                self.store
+                    .entries
+                    .delete_and_verify_absent(&mut self.interaction, &guard)
+            }
+            Some(_) | None => Ok(()),
+        }
     }
 
     fn commit_journal(&mut self, journal: &AuthorityJournal) -> Result<(), CredentialStoreFailure> {
@@ -592,7 +657,7 @@ impl Drop for NativeCredentialMutationSession<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeCredentialStoreOpen, NativeKeyringCredentialStore};
+    use super::{NativeCredentialStoreOpen, NativeKeyringCredentialStore, staging_guard_bytes};
     use crate::credentials::adapters::authority_journal::{
         AuthorityJournalBoundary, AuthorityMutationLock, FileAuthorityJournalBoundary,
         encode_authority_journal, encode_authority_marker,
@@ -853,7 +918,6 @@ mod tests {
         reads: AtomicUsize,
         writes: AtomicUsize,
         corrupt_replacements: AtomicBool,
-        fail_read_at: AtomicUsize,
         replace_cut: Mutex<Option<JournalReplaceCut>>,
         lock_contended: AtomicBool,
     }
@@ -863,13 +927,12 @@ mod tests {
 
     impl AuthorityJournalBoundary for MemoryJournalBoundary {
         fn read(&self) -> Result<Option<Vec<u8>>, CredentialStoreFailure> {
-            let read = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
-            if self.fail_read_at.load(Ordering::SeqCst) == read {
-                return Err(CredentialStoreFailure::Unavailable);
-            }
+            self.reads.fetch_add(1, Ordering::SeqCst);
             Ok(self.bytes.lock().expect("memory journal lock").clone())
         }
 
+        /// Honors the boundary contract: a publication whose bytes do not
+        /// read back is `CommitUnknown`, never `Ok`.
         fn replace(&self, bytes: &[u8]) -> Result<(), CredentialStoreFailure> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             let cut = self
@@ -880,15 +943,19 @@ mod tests {
             if matches!(cut, Some(JournalReplaceCut::BeforePublish)) {
                 return Err(CredentialStoreFailure::Unavailable);
             }
-            *self.bytes.lock().expect("memory journal lock") =
-                Some(if self.corrupt_replacements.load(Ordering::SeqCst) {
-                    b"{corrupt-authority-journal".to_vec()
-                } else {
-                    bytes.to_vec()
-                });
-            if matches!(cut, Some(JournalReplaceCut::AfterPublish)) {
+            let corrupt = self.corrupt_replacements.load(Ordering::SeqCst);
+            *self.bytes.lock().expect("memory journal lock") = Some(if corrupt {
+                b"{corrupt-authority-journal".to_vec()
+            } else {
+                bytes.to_vec()
+            });
+            if corrupt || matches!(cut, Some(JournalReplaceCut::AfterPublish)) {
                 return Err(CredentialStoreFailure::CommitUnknown);
             }
+            Ok(())
+        }
+
+        fn remove_stray_staged(&self) -> Result<(), CredentialStoreFailure> {
             Ok(())
         }
 
@@ -1143,15 +1210,6 @@ mod tests {
             .replace_cut
             .lock()
             .expect("journal replace cut lock") = Some(JournalReplaceCut::AfterPublish);
-        run_case(
-            Arc::new(MemoryKeyringBoundary::default()),
-            journal_boundary,
-            CredentialStoreFailure::CommitUnknown,
-            ReopenState::Ready,
-        );
-
-        let journal_boundary = Arc::new(MemoryJournalBoundary::default());
-        journal_boundary.fail_read_at.store(3, Ordering::SeqCst);
         run_case(
             Arc::new(MemoryKeyringBoundary::default()),
             journal_boundary,
@@ -2007,8 +2065,8 @@ mod tests {
         assert!(matches!(
             verified_store.read_active(&verified_set),
             Ok(AuthoritativeActiveRead {
-                journal: Some(_),
-                record: Some(_)
+                record: Some(_),
+                ..
             })
         ));
         // One authority-marker read plus the record read.
@@ -2320,6 +2378,10 @@ mod tests {
             &[
                 ("forbid:get:authority", PolicyTraceTarget::Authority),
                 (
+                    "forbid:get:guard",
+                    PolicyTraceTarget::StagingGuard(BuiltInCredentialSetId::Deepgram),
+                ),
+                (
                     "forbid:set:guard",
                     PolicyTraceTarget::StagingGuard(BuiltInCredentialSetId::Deepgram),
                 ),
@@ -2331,6 +2393,10 @@ mod tests {
                 ("forbid:get:staging", PolicyTraceTarget::Staging),
                 ("forbid:delete:staging", PolicyTraceTarget::Staging),
                 ("forbid:get:staging", PolicyTraceTarget::Staging),
+                (
+                    "forbid:get:guard",
+                    PolicyTraceTarget::StagingGuard(BuiltInCredentialSetId::Deepgram),
+                ),
                 (
                     "forbid:delete:guard",
                     PolicyTraceTarget::StagingGuard(BuiltInCredentialSetId::Deepgram),
@@ -2347,13 +2413,12 @@ mod tests {
                     "forbid:get:active",
                     PolicyTraceTarget::Active(BuiltInCredentialSetId::Deepgram),
                 ),
-                ("forbid:get:authority", PolicyTraceTarget::Authority),
             ],
         );
     }
 
     #[test]
-    fn corrupt_successful_journal_replacement_is_commit_unknown_and_reopens_recovery_required() {
+    fn an_unverifiable_journal_publication_is_commit_unknown_and_reopens_recovery_required() {
         let keyring = Arc::new(MemoryKeyringBoundary::default());
         let journal_boundary = Arc::new(MemoryJournalBoundary::default());
         let opened = NativeKeyringCredentialStore::open_with_boundaries(
@@ -2392,7 +2457,7 @@ mod tests {
                 )
                 .expect("canonical idempotency token"),
             })
-            .expect_err("corrupt journal readback cannot commit");
+            .expect_err("a publication its boundary cannot verify cannot commit");
 
         assert_eq!(
             error.code,
@@ -2754,41 +2819,220 @@ mod tests {
         ));
     }
 
-    /// A store opened before any authority exists reads nothing and never
-    /// touches a record. Once a store it is not bound to initializes an
-    /// authority, it refuses instead.
+    /// Stages a record for `operation` and leaves it, as a cleanup that
+    /// never ran would.
+    fn stage_and_leave(
+        store: &NativeKeyringCredentialStore,
+        operation: &str,
+        set_id: &CredentialSetId,
+    ) -> CredentialOperationId {
+        let operation_id = CredentialOperationId::parse(operation).expect("canonical operation id");
+        let mut session = store
+            .begin_mutation(&operation_id, set_id)
+            .expect("begin mutation");
+        session.load_journal().expect("load journal");
+        session
+            .write_staging(&operation_id, set_id, remnant_record(set_id, &operation_id))
+            .expect("write staging record");
+        session
+            .read_staging(&operation_id, set_id)
+            .expect("read back staging record")
+            .expect("staging record exists");
+        operation_id
+    }
+
+    fn native_entry(keyring: &MemoryKeyringBoundary, account: &str) -> Option<Vec<u8>> {
+        keyring
+            .entries
+            .lock()
+            .expect("memory keyring lock")
+            .iter()
+            .find(|(candidate, _)| candidate == account)
+            .map(|(_, bytes)| bytes.clone())
+    }
+
+    /// Another operation's cleanup verifies its own staging record absent
+    /// but leaves the guard naming the operation whose staging record
+    /// remains, so that record stays discoverable after the authority is
+    /// lost.
     #[test]
-    fn uninitialized_store_reads_none_until_an_unbound_authority_appears() {
+    fn another_operations_cleanup_leaves_the_guard_of_a_remaining_staging_record() {
         let keyring = Arc::new(MemoryKeyringBoundary::default());
         let journal = Arc::new(MemoryJournalBoundary::default());
         let gate = NativeInteractionGate::isolated_for_test();
-        let fresh = match NativeKeyringCredentialStore::open_with_boundaries_and_gate(
+        let store = ready_store_with_gate(keyring.clone(), journal.clone(), gate);
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let staged = stage_and_leave(&store, "65656565-6565-4565-8565-656565656565", &set_id);
+        let other = CredentialOperationId::parse("66666666-6666-4666-8666-666666666666")
+            .expect("canonical operation id");
+        let mut session = store
+            .begin_mutation(&other, &set_id)
+            .expect("begin mutation");
+        session.load_journal().expect("load journal");
+        session
+            .delete_staging(&other, &set_id)
+            .expect("nothing of its own to clean up");
+        drop(session);
+        drop(store);
+
+        assert_eq!(
+            native_entry(&keyring, EntryLocator::staging_guard(&set_id).account()),
+            Some(staging_guard_bytes(&staged))
+        );
+        lose_both_authority_halves(&keyring, &journal);
+        assert!(matches!(
+            NativeKeyringCredentialStore::open_with_boundaries_and_gate(keyring, journal, gate),
+            Ok(NativeCredentialStoreOpen::RecoveryRequired)
+        ));
+    }
+
+    /// While one operation's staging record remains, another cannot stage
+    /// for the same set, so a set never has two staging records. Once that
+    /// record is gone, its leftover guard is taken over.
+    #[test]
+    fn a_remaining_staging_record_holds_its_guard_against_another_operation() {
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let journal = Arc::new(MemoryJournalBoundary::default());
+        let store = ready_store_with_gate(
             keyring.clone(),
-            journal.clone(),
-            gate,
+            journal,
+            NativeInteractionGate::isolated_for_test(),
+        );
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let staged = stage_and_leave(&store, "67676767-6767-4767-8767-676767676767", &set_id);
+        let other = CredentialOperationId::parse("68686868-6868-4868-8868-686868686868")
+            .expect("canonical operation id");
+        let mut session = store
+            .begin_mutation(&other, &set_id)
+            .expect("begin mutation");
+        session.load_journal().expect("load journal");
+
+        assert!(matches!(
+            session.write_staging(&other, &set_id, remnant_record(&set_id, &other)),
+            Err(CredentialStoreFailure::CorruptRecord)
+        ));
+        assert_eq!(
+            native_entry(&keyring, EntryLocator::staging(&other, &set_id).account()),
+            None
+        );
+        drop(session);
+
+        let staged_account = EntryLocator::staging(&staged, &set_id).account().to_owned();
+        keyring
+            .entries
+            .lock()
+            .expect("memory keyring lock")
+            .retain(|(account, _)| *account != staged_account);
+        let mut session = store
+            .begin_mutation(&other, &set_id)
+            .expect("begin mutation");
+        session.load_journal().expect("load journal");
+        session
+            .write_staging(&other, &set_id, remnant_record(&set_id, &other))
+            .expect("a guard whose staging record is gone is taken over");
+        assert_eq!(
+            native_entry(&keyring, EntryLocator::staging_guard(&set_id).account()),
+            Some(staging_guard_bytes(&other))
+        );
+    }
+
+    /// A staged journal file that a failed discard left behind is removed by
+    /// the next open, under the lock; one that cannot be removed fails that
+    /// open closed instead of being ignored.
+    #[test]
+    fn opening_a_store_removes_a_stray_staged_journal_file_or_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "audio-graph-521-open-sweep-{}",
+            uuid::Uuid::new_v4().hyphenated()
+        ));
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let gate = NativeInteractionGate::isolated_for_test();
+        let open = || {
+            NativeKeyringCredentialStore::open_with_boundaries_and_gate(
+                keyring.clone(),
+                Arc::new(FileAuthorityJournalBoundary::with_namespace_lock_root(
+                    root.join("journal"),
+                    root.join("namespace"),
+                )),
+                gate,
+            )
+        };
+        match open().expect("open absent authority") {
+            NativeCredentialStoreOpen::Uninitialized(store) => {
+                store
+                    .initialize(AuthorityJournal::new(CredentialBackendKind::Native))
+                    .expect("initialize native authority");
+            }
+            _ => panic!("expected uninitialized authority"),
+        }
+        let stray = root
+            .join("journal")
+            .join(format!(".state.json.{}.tmp", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&stray, b"stray-journal").expect("plant stray staged file");
+
+        assert!(matches!(
+            open(),
+            Ok(NativeCredentialStoreOpen::Ready { .. })
+        ));
+        assert!(!stray.exists(), "stray staged file survived an open");
+
+        std::fs::create_dir(&stray).expect("plant unremovable stray");
+        assert!(matches!(open(), Err(CredentialStoreFailure::Unavailable)));
+        std::fs::remove_dir_all(&root).expect("remove isolated open-sweep directory");
+    }
+
+    /// A publication the journal boundary verified through its held root
+    /// stays successful when an ancestor of the journal path points
+    /// elsewhere by the time it returns: the session does not read the
+    /// journal again by path.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_verified_publication_through_a_swapped_ancestor_is_not_commit_unknown() {
+        let (base, held, armed, boundary) =
+            super::super::authority_journal::tests::armed_ancestor_swap_boundary(
+                "native-swap-publish",
+            );
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let store = match NativeKeyringCredentialStore::open_with_boundaries_and_gate(
+            keyring,
+            Arc::new(boundary),
+            NativeInteractionGate::isolated_for_test(),
         )
         .expect("open absent authority")
         {
-            NativeCredentialStoreOpen::Uninitialized(store) => store,
+            NativeCredentialStoreOpen::Uninitialized(store) => match store
+                .initialize(AuthorityJournal::new(CredentialBackendKind::Native))
+                .expect("initialize native authority")
+            {
+                NativeCredentialStoreOpen::Ready { store, .. } => store,
+                _ => panic!("expected ready authority"),
+            },
             _ => panic!("expected uninitialized authority"),
         };
         let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
-        let native_reads = keyring.reads.load(Ordering::SeqCst);
-        assert!(matches!(
-            fresh.read_active(&set_id),
-            Ok(AuthoritativeActiveRead {
-                journal: None,
-                record: None
-            })
-        ));
-        // Only the authority marker was read; the record never was.
-        assert_eq!(keyring.reads.load(Ordering::SeqCst), native_reads + 1);
+        let operation_id = CredentialOperationId::parse("69696969-6969-4969-8969-696969696969")
+            .expect("canonical operation id");
+        let mut session = store
+            .begin_mutation(&operation_id, &set_id)
+            .expect("begin mutation");
+        let mut journal = session.load_journal().expect("load journal");
+        journal.global_epoch += 1;
+        armed.store(true, Ordering::SeqCst);
 
-        let _initialized = ready_store_with_gate(keyring.clone(), journal.clone(), gate);
-        assert!(matches!(
-            fresh.read_active(&set_id),
-            Err(CredentialStoreFailure::CorruptRecord)
-        ));
+        assert_eq!(session.persist_intent(&journal), Ok(()));
+        let published = super::decode_authority_journal(
+            &std::fs::read(held.join("state.json")).expect("read held journal"),
+        )
+        .expect("held journal decodes");
+        assert_eq!(published.journal, journal);
+        // Nothing was latched: the session still writes.
+        session
+            .replace_active(&set_id, remnant_record(&set_id, &operation_id))
+            .expect("a verified publication leaves the session healthy");
+
+        drop(session);
+        drop(store);
+        super::super::authority_journal::tests::remove_ancestor_swap_fixture(&base);
     }
 
     fn lose_both_authority_halves(
