@@ -56,6 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Capture starts as one all-or-nothing aggregate (#141). Every selected source
+  must acknowledge before capture reports Running. One failing source stops
+  and joins the others, and leaves no movement-ledger row and no capture or
+  transcription state behind. Transcription and the realtime starts attach only
+  to an acknowledged capture, and a Stop or app shutdown cancels a pending
+  start. A failure names the source and a closed reason, without device or
+  driver text. Sessions can't be loaded into the store while a start is
+  pending.
 - Speaker revisions now correct only the affected turn in the graph, preserving
   other turns and their timeline links. Whole-speaker renames keep the original
   graph node when the new name is unused.
