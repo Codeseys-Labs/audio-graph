@@ -16,6 +16,10 @@
 //! See also: [`crate::asr::deepgram`], [`crate::asr::assemblyai`],
 //! [`crate::asr::aws_transcribe`].
 
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeTransport,
+};
 use uuid::Uuid;
 
 use crate::state::TranscriptSegment;
@@ -197,16 +201,21 @@ fn encode_wav(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
 pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
     config: &C,
     segment: &SpeechSegment,
-) -> Result<Vec<TranscriptSegment>, String> {
-    config.content_egress_policy().check_audio("asr.cloud")?;
-
+) -> Result<Vec<TranscriptSegment>, RuntimeDiagnostic> {
+    let ctx = RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+        .with_transport(RuntimeTransport::Http);
+    config
+        .content_egress_policy()
+        .check_audio("asr.cloud")
+        .map_err(|_| {
+            super::asr_diagnostic(
+                RuntimeErrorCode::PolicyBlocked,
+                RuntimeTransport::Http,
+                None,
+            )
+        })?;
     let call_start = std::time::Instant::now();
-    let audio_secs = segment.audio.len() as f64 / 16_000.0;
-    log::info!(
-        "Cloud ASR: starting transcription request (audio={:.2}s, model={})",
-        audio_secs,
-        config.model()
-    );
+    log::info!("Cloud ASR: starting transcription request");
 
     let wav_bytes = encode_wav(&segment.audio, 16000, 1);
 
@@ -218,7 +227,7 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
     let part = reqwest::blocking::multipart::Part::bytes(wav_bytes)
         .file_name("audio.wav")
         .mime_str("audio/wav")
-        .map_err(|e| format!("Failed to create multipart part: {}", e))?;
+        .map_err(|_| RuntimeDiagnostic::internal(ctx))?;
 
     let form = reqwest::blocking::multipart::Form::new()
         .part("file", part)
@@ -229,48 +238,62 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        .map_err(|_| RuntimeDiagnostic::internal(ctx))?;
 
     let mut request = client.post(&url).multipart(form);
-    if !config.api_key().is_empty() {
+    let credential_sent = !config.api_key().is_empty();
+    if credential_sent {
         request = request.bearer_auth(config.api_key());
     }
 
-    let response = request
-        .send()
-        .map_err(|e| format!("Cloud ASR request failed: {}", e))?;
-
+    let response = request.send().map_err(|error| {
+        if error.is_builder() {
+            RuntimeErrorDiagnostic::invalid_configuration(ctx).into()
+        } else {
+            let code = if error.is_timeout() {
+                RuntimeErrorCode::Timeout
+            } else {
+                RuntimeErrorCode::NetworkUnreachable
+            };
+            super::asr_diagnostic(code, RuntimeTransport::Http, None)
+        }
+    })?;
     let status = response.status();
     if !status.is_success() {
-        let body = response
-            .text()
-            .unwrap_or_else(|_| "unable to read response body".to_string());
-        return Err(cloud_asr_api_error_message(status, &body, config.api_key()));
+        crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+            name: "asr.cloud.http_error",
+            category: crate::analytics::Category::Asr,
+            level: sentry::Level::Error,
+            provider: Some("cloud_asr"),
+            kind: Some("http_error"),
+            http_status: Some(status.as_u16()),
+            recoverable: None,
+        });
+        // HTTP clients strip Authorization on cross-origin redirects.
+        let sent_to_origin = credential_sent
+            && reqwest::Url::parse(&url)
+                .is_ok_and(|original| original.origin() == response.url().origin());
+        return Err(
+            RuntimeErrorDiagnostic::from_http_status(status.as_u16(), sent_to_origin, ctx).into(),
+        );
     }
-
-    let body = response
-        .text()
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
-
-    let whisper_resp: WhisperResponse = serde_json::from_str(&body)
-        .map_err(|e| cloud_asr_parse_error_message(&e, &body, config.api_key()))?;
-
-    let elapsed_ms = call_start.elapsed().as_millis();
-    let rtf = call_start.elapsed().as_secs_f64() / audio_secs.max(0.001);
-    if elapsed_ms > 2_000 {
-        log::warn!(
-            "Cloud ASR: slow API response — elapsed={}ms, audio={:.2}s, RTF={:.2}x (API slower than real-time, segments may be dropped)",
-            elapsed_ms,
-            audio_secs,
-            rtf
-        );
+    let whisper_resp: WhisperResponse = response.json().map_err(|error| {
+        if error.is_timeout() {
+            super::asr_diagnostic(RuntimeErrorCode::Timeout, RuntimeTransport::Http, None)
+        } else {
+            RuntimeErrorDiagnostic::new(
+                RuntimeErrorCode::InvalidResponse,
+                true,
+                RuntimeSafeRecoveryAction::Retry,
+                ctx,
+            )
+            .into()
+        }
+    })?;
+    if call_start.elapsed() > std::time::Duration::from_secs(2) {
+        log::warn!("Cloud ASR: slow API response");
     } else {
-        log::info!(
-            "Cloud ASR: transcription complete — elapsed={}ms, audio={:.2}s, RTF={:.2}x",
-            elapsed_ms,
-            audio_secs,
-            rtf
-        );
+        log::info!("Cloud ASR: transcription complete");
     }
 
     Ok(map_whisper_response(
@@ -279,47 +302,6 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
         segment.start_time.as_secs_f64(),
         segment.end_time.as_secs_f64(),
     ))
-}
-
-fn cloud_asr_api_error_message(status: reqwest::StatusCode, body: &str, _api_key: &str) -> String {
-    // Anonymous, structured diagnostic (no-op unless analytics is enabled). Only
-    // the controlled category/provider/status ride along — never the body.
-    crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
-        name: "asr.cloud.http_error",
-        category: crate::analytics::Category::Asr,
-        level: sentry::Level::Error,
-        provider: Some("cloud_asr"),
-        kind: Some("http_error"),
-        http_status: Some(status.as_u16()),
-        recoverable: None,
-    });
-    format!(
-        "Cloud ASR API error: provider=cloud_asr status={} body_bytes={} body_chars={}",
-        status,
-        body.len(),
-        body.chars().count()
-    )
-}
-
-/// Build the parse-failure error for a malformed cloud-ASR (readiness /
-/// transcription) response.
-///
-/// `serde_json::Error`'s `Display` reports the failure *position* (line/column),
-/// not the input bytes, so the pre-existing `{e}` message did not itself echo
-/// the body. This helper is defense-in-depth on the UI-visible `String` error:
-/// it routes the detail through the shared redaction/safe-excerpt helper
-/// (registering the request `api_key` as a known secret) — bounding length and
-/// scrubbing credential shapes — and reports body byte/char counts instead of
-/// the body, so a future change that interpolated the raw body here cannot leak
-/// the transcript `text` or any credentials the endpoint echoed back.
-fn cloud_asr_parse_error_message(error: &serde_json::Error, body: &str, api_key: &str) -> String {
-    let detail = crate::error::redacted_error_excerpt(&error.to_string(), [api_key], 200);
-    format!(
-        "Failed to parse cloud ASR response: provider=cloud_asr body_bytes={} body_chars={} detail={}",
-        body.len(),
-        body.chars().count(),
-        detail
-    )
 }
 
 /// Map a parsed [`WhisperResponse`] into downstream [`TranscriptSegment`]s.
@@ -505,7 +487,7 @@ mod tests {
     fn test_config() -> CloudAsrConfig {
         CloudAsrConfig {
             endpoint: "https://invalid.localhost.test/v1".into(),
-            api_key: "sk-cloud-asr-private-test-key".into(),
+            api_key: "private cloud test credential".into(),
             model: "whisper-1".into(),
             language: "en".into(),
         }
@@ -628,10 +610,14 @@ mod tests {
 
         let error = transcribe_segment(&config, &segment).unwrap_err();
 
-        assert!(error.contains("Privacy policy blocked"));
-        assert!(error.contains("asr.cloud"));
-        assert!(error.contains(EXPLICIT_POLICY_REQUIRED));
-        assert!(!error.contains("Cloud ASR request failed"));
+        assert_eq!(
+            error,
+            super::super::asr_diagnostic(
+                RuntimeErrorCode::PolicyBlocked,
+                RuntimeTransport::Http,
+                None
+            )
+        );
     }
 
     #[test]
@@ -642,10 +628,14 @@ mod tests {
 
         let error = transcribe_segment(&config, &segment).unwrap_err();
 
-        assert!(error.contains("Privacy policy blocked"));
-        assert!(error.contains("asr.cloud"));
-        assert!(error.contains("local_only"));
-        assert!(!error.contains("Cloud ASR request failed"));
+        assert_eq!(
+            error,
+            super::super::asr_diagnostic(
+                RuntimeErrorCode::PolicyBlocked,
+                RuntimeTransport::Http,
+                None
+            )
+        );
     }
 
     #[test]
@@ -657,106 +647,74 @@ mod tests {
         let error = transcribe_segment(&config, &segment).unwrap_err();
 
         for forbidden in [
-            "sk-cloud-asr-private-test-key",
+            "private cloud test credential",
             "0.5",
             "-0.25",
             "patient said private diagnosis",
             "mic-private-source",
         ] {
             assert!(
-                !error.contains(forbidden),
+                !serde_json::to_string(&error).unwrap().contains(forbidden),
                 "privacy error leaked {forbidden}: {error}"
             );
         }
     }
 
     #[test]
-    fn cloud_asr_error_omits_provider_body_and_secret() {
-        let api_key = "sk-cloud-asr-secret";
-        let provider_body = format!(r#"{{"error":"echoed bearer {api_key}; private transcript"}}"#);
-        let message =
-            cloud_asr_api_error_message(reqwest::StatusCode::UNAUTHORIZED, &provider_body, api_key);
-
-        assert!(
-            message.contains("status=401 Unauthorized"),
-            "error must carry status, got: {message}"
-        );
-        assert!(
-            message.contains(&format!("body_bytes={}", provider_body.len())),
-            "error must carry body byte count, got: {message}"
-        );
-        assert!(
-            message.contains(&format!("body_chars={}", provider_body.chars().count())),
-            "error must carry body character count, got: {message}"
-        );
-        for forbidden in [api_key, "echoed bearer", "private transcript", "<redacted>"] {
-            assert!(
-                !message.contains(forbidden),
-                "error must not echo provider body marker {forbidden}: {message}"
-            );
-        }
-    }
-
-    /// Contract guard for the malformed-response parse path (cloud ASR
-    /// readiness/transcription): the UI-visible `String` error must carry
-    /// provider + body byte/char context but never the body itself or any
-    /// credential shape. `serde_json::Error`'s `Display` only reports line/column
-    /// today, so this also locks in that a future change routing the raw `body`
-    /// (or a body-echoing error) through this helper stays scrubbed. The metadata
-    /// assertions fail if the helper stops emitting provider/byte-count context.
-    #[test]
-    fn cloud_asr_parse_error_redacts_body_and_secret_shapes() {
-        let api_key = "sk-cloud-parse-provider-secret-12345";
-        // A body that is NOT valid JSON (trailing garbage) but embeds every
-        // credential shape plus transcript PII, so the serde error snippet /
-        // any echoed value must be scrubbed.
-        // `userinfo` is assembled at runtime so no contiguous
-        // scheme://user:pass@host literal sits in source for a secret scanner to
-        // flag; the runtime body is identical and still exercises URL-credential
-        // scrubbing.
-        let userinfo = format!("{}:{}", "svc-user", "svc-pass");
-        let body = format!(
-            concat!(
-                r#"{{"text":"private patient transcript","api_key":"{api_key}","#,
-                r#""authorization":"Bearer bearer-cloud-secret-12345","#,
-                r#""aws":"AKIA1234567890ABCDEF","#,
-                r#""url":"https://{userinfo}@example.com/v1?token=cloud-url-secret-12345"}}"#,
-                " <<<not-json-trailer>>>",
+    fn http_responses_produce_closed_diagnostics() {
+        use RuntimeErrorCode as Code;
+        use RuntimeSafeRecoveryAction as Action;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        for (status, key, code, retryable, recovery) in [
+            (
+                401,
+                "private credential",
+                Code::CredentialRejected,
+                false,
+                Action::ReenterCredential,
             ),
-            api_key = api_key,
-            userinfo = userinfo,
-        );
-        let error = serde_json::from_str::<WhisperResponse>(&body)
-            .expect_err("fixture body must fail to parse as WhisperResponse");
-        let message = cloud_asr_parse_error_message(&error, &body, api_key);
-
-        assert!(
-            message.contains("Failed to parse cloud ASR response"),
-            "parse error must name the cloud ASR parse failure, got: {message}"
-        );
-        assert!(
-            message.contains("provider=cloud_asr"),
-            "parse error must carry provider tag, got: {message}"
-        );
-        assert!(
-            message.contains(&format!("body_bytes={}", body.len())),
-            "parse error must carry body byte count, got: {message}"
-        );
-        assert!(
-            message.contains(&format!("body_chars={}", body.chars().count())),
-            "parse error must carry body char count, got: {message}"
-        );
-        for leaked in [
-            api_key,
-            "bearer-cloud-secret-12345",
-            "AKIA1234567890ABCDEF",
-            "svc-user:svc-pass",
-            "cloud-url-secret-12345",
-            "private patient transcript",
+            (
+                401,
+                "",
+                Code::RequestRejected,
+                false,
+                Action::ReviewConfiguration,
+            ),
+            (
+                403,
+                "private credential",
+                Code::PermissionDenied,
+                false,
+                Action::ReviewConfiguration,
+            ),
+            (429, "", Code::RateLimited, true, Action::RetryAfterDelay),
+            (200, "", Code::InvalidResponse, true, Action::Retry),
         ] {
-            assert!(
-                !message.contains(leaked),
-                "cloud ASR parse error leaked {leaked}: {message}"
+            let server = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let mut config = test_config();
+            config.endpoint = format!("http://{}", server.local_addr().unwrap());
+            config.api_key = key.into();
+            let worker = std::thread::spawn(move || {
+                let (mut stream, _) = server.accept().unwrap();
+                let mut buf = [0; 4096];
+                let _ = stream.read(&mut buf).unwrap();
+                let body = "private provider prose";
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let config = config.with_content_egress_policy(ProviderContentEgressPolicy::allow());
+            let diagnostic = transcribe_segment(&config, &speech_segment(vec![0.5])).unwrap_err();
+            worker.join().unwrap();
+            let mut ctx = RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                .with_transport(RuntimeTransport::Http);
+            if status != 200 {
+                ctx = ctx.with_status_class(
+                    audio_graph_ipc_contract::runtime_diagnostic::RuntimeStatusClass::ClientError,
+                );
+            }
+            assert_eq!(
+                diagnostic,
+                RuntimeErrorDiagnostic::new(code, retryable, recovery, ctx).into()
             );
         }
     }

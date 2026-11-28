@@ -134,13 +134,31 @@ function stageStatusInfo(
           count: status.processed_count,
         }),
       };
-    case "Error":
+    case "Error": {
+      const presentation = runtimeDiagnosticPresentation(status.diagnostic);
+      const code =
+        presentation.diagnostic.kind === "runtime"
+          ? presentation.diagnostic.detail.code
+          : undefined;
+      const summaryKey =
+        code === "credential_rejected"
+          ? "pipeline.statusCredentialRejected"
+          : code === "credential_expired"
+            ? "pipeline.statusCredentialExpired"
+            : presentation.translationKey;
+      const message =
+        presentation.recoveryAction === "retry_after_delay" &&
+        presentation.diagnostic.kind === "runtime" &&
+        presentation.diagnostic.detail.context.retry_delay
+          ? t("pipeline.statusReconnecting")
+          : t(summaryKey);
       return {
         modifier: "error",
-        tooltip: t(
-          runtimeDiagnosticPresentation(status.diagnostic).translationKey,
-        ),
+        tooltip: presentation.recoveryTranslationKey
+          ? `${message} ${t(presentation.recoveryTranslationKey)}`
+          : message,
       };
+    }
     case "Degraded":
       // audio-graph-586b: reuses the already-provisioned `warning` dot
       // modifier (yellow — distinct from healthy `running` green and

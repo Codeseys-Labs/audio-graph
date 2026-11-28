@@ -1427,6 +1427,9 @@
     "stageGraph": "Graph",
     "statusIdle": "Idle",
     "statusRunning": "Running — {{count}} processed",
+    "statusCredentialRejected": "The provider rejected the credential.",
+    "statusCredentialExpired": "The provider credential expired.",
+    "statusReconnecting": "Reconnecting to the provider.",
     "statusError": "Error: {{message}}",
     "statusDegraded": "Degraded: {{reason}}",
     "diarizationDegradedReason": {

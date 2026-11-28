@@ -878,13 +878,17 @@ fn transcription_diagnostic(
     .into()
 }
 
-fn unclassified_transcription_diagnostic<T: ?Sized>(
-    _source: &T,
-    transport: RuntimeTransport,
-) -> RuntimeDiagnostic {
+fn internal_transcription_diagnostic(transport: RuntimeTransport) -> RuntimeDiagnostic {
     RuntimeDiagnostic::internal(
         RuntimeDiagnosticContext::new(RuntimeOperation::Transcription).with_transport(transport),
     )
+}
+
+fn websocket_connect_diagnostic(error: crate::error::AppError) -> RuntimeDiagnostic {
+    match error {
+        crate::error::AppError::RuntimeDiagnostic(diagnostic) => diagnostic,
+        _ => internal_transcription_diagnostic(RuntimeTransport::Websocket),
+    }
 }
 
 fn reconnecting_transcription_diagnostic(
@@ -1701,21 +1705,9 @@ const OVERLAP_FRAMES: usize = 16_000 / 2;
 /// typed + translated degradation vocabulary (`SttFidelityDegradation`,
 /// `commands.rs`, rendered via
 /// `t(\`settings.providerReadiness.fidelity.degradation.${value}\`)`). This
-/// enum is that same pattern applied here: `as_wire_code` is the ONLY thing
-/// that reaches `StageStatus::Degraded.reason` (never English prose), and the
-/// frontend renders `pipeline.diarizationDegradedReason.<code>` — a real
-/// translated string in every locale — keyed off it. `diagnostic_text` stays
-/// Rust-side only, for `log::warn!`; it is never sent over the wire.
-///
-/// `#[allow(dead_code)]`: which variants are constructible is
-/// build-feature-dependent (`diarization` vs. `diarization-clustering` vs.
-/// neither are mutually exclusive build configurations — see
-/// `make_diarization_config`), so exactly one of `ClusteringAssetsNotDownloaded`
-/// vs. `{EngineNotCompiled, AssetNotDownloaded, AssetInvalid}` is genuinely
-/// unconstructed in any single build. Per-variant `cfg_attr` would be more
-/// precise but each build direction needs the OPPOSITE gate, so a single
-/// blanket allow on the enum is clearer than either half being silently
-/// right and the other silently wrong.
+/// enum is serialized as a snake_case reason alongside the runtime diagnostic.
+/// The renderer translates that reason; `as_wire_code` provides the same value
+/// for local logs. The wire parity test covers all variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiarizationDegradationReason {
@@ -1755,7 +1747,7 @@ impl DiarizationDegradationReason {
         )
     }
 
-    /// The ONLY form of this value that reaches the frontend
+    /// Matches the serde representation that reaches the frontend
     /// (`StageStatus::Degraded.reason`) — a stable `snake_case` code, never
     /// prose. Must have a matching `pipeline.diarizationDegradedReason.<code>`
     /// key in EVERY locale (`i18n/locale-parity.test.ts` enforces parity
@@ -5770,9 +5762,9 @@ pub(crate) fn run_speech_processor(
 fn handle_moonshine_worker_error(
     ctx: &TranscriptProcessingContext,
     phase: &str,
-    err: MoonshineWorkerError,
+    _err: MoonshineWorkerError,
 ) {
-    let diagnostic = unclassified_transcription_diagnostic(&err, RuntimeTransport::Native);
+    let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Native);
     log::warn!("Moonshine streaming: {phase} failed diagnostic={diagnostic}");
     set_asr_status_and_emit(
         &ctx.app_handle,
@@ -5925,8 +5917,8 @@ pub(crate) fn run_moonshine_speech_processor_with_worker<A: MoonshineStreamingAd
 
     flush_pending_now(&ctx, &extraction_count, &graph_update_count);
 
-    if let Err(err) = worker.stop() {
-        let diagnostic = unclassified_transcription_diagnostic(&err, RuntimeTransport::Native);
+    if worker.stop().is_err() {
+        let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Native);
         log::warn!("Moonshine streaming: stop failed diagnostic={diagnostic}");
         set_asr_status_and_emit(
             &ctx.app_handle,
@@ -6174,9 +6166,8 @@ fn run_asr_worker(
                     );
                 }
             }
-            Err(e) => {
-                let diagnostic =
-                    unclassified_transcription_diagnostic(&e, RuntimeTransport::Native);
+            Err(_) => {
+                let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Native);
                 log::warn!("ASR worker: transcription failed diagnostic={diagnostic}");
             }
         }
@@ -6781,8 +6772,7 @@ fn run_cloud_asr_worker(
                     );
                 }
             }
-            Err(e) => {
-                let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Http);
+            Err(diagnostic) => {
                 log::warn!("Cloud ASR worker: transcription failed diagnostic={diagnostic}");
                 // FA-1: emit so the UI reflects the error instead of the last
                 // "Running" snapshot.
@@ -6850,7 +6840,7 @@ pub(crate) fn run_deepgram_speech_processor(
             log::info!("Deepgram streaming: connected successfully");
         }
         Err(e) => {
-            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            let diagnostic = websocket_connect_diagnostic(e);
             log::error!("Deepgram streaming: failed to connect diagnostic={diagnostic}");
             // FA-1: emit so the UI leaves the "Running" state for this dead
             // provider instead of looking healthy. This returns immediately
@@ -6943,8 +6933,8 @@ pub(crate) fn run_deepgram_speech_processor(
         if let Ok(mut hint) = source_id_hint.write() {
             *hint = Some(chunk.source_id.to_string());
         }
-        if let Err(e) = client.send_audio(&chunk.data) {
-            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+        if client.send_audio(&chunk.data).is_err() {
+            let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Websocket);
             log::warn!("Deepgram streaming: failed to send audio diagnostic={diagnostic}");
             break;
         }
@@ -7920,9 +7910,9 @@ fn run_deepgram_event_receiver(
                     },
                 );
             }
-            DeepgramEvent::Error { message } => {
-                let diagnostic =
-                    unclassified_transcription_diagnostic(&message, RuntimeTransport::Websocket);
+            DeepgramEvent::Error {
+                message: diagnostic,
+            } => {
                 log::warn!("Deepgram event receiver: error diagnostic={diagnostic}");
                 // FA-1: emit so the UI reflects the error instead of the last
                 // "Running" snapshot.
@@ -8054,7 +8044,7 @@ pub(crate) fn run_assemblyai_speech_processor(
             log::info!("AssemblyAI streaming: connected successfully");
         }
         Err(e) => {
-            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            let diagnostic = websocket_connect_diagnostic(e);
             log::error!("AssemblyAI streaming: failed to connect diagnostic={diagnostic}");
             // FA-1: emit so the UI leaves the "Running" state for this dead
             // provider instead of looking healthy. This returns immediately
@@ -8133,8 +8123,8 @@ pub(crate) fn run_assemblyai_speech_processor(
         // client surfaces via `send_audio` returning "Audio channel closed".
 
         // Send audio directly to AssemblyAI (no accumulation needed).
-        if let Err(e) = client.send_audio(&chunk.data) {
-            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+        if client.send_audio(&chunk.data).is_err() {
+            let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Websocket);
             log::warn!("AssemblyAI streaming: failed to send audio diagnostic={diagnostic}");
             break;
         }
@@ -8222,10 +8212,7 @@ fn run_assemblyai_event_receiver(
                 let parsed = match parser.parse_message(frame.as_str(), received_at_ms) {
                     Ok(parsed) => parsed,
                     Err(error) => {
-                        let diagnostic = unclassified_transcription_diagnostic(
-                            &error,
-                            RuntimeTransport::Websocket,
-                        );
+                        let diagnostic = RuntimeDiagnostic::from(error);
                         log::warn!("AssemblyAI v3 parser error diagnostic={diagnostic}");
                         set_asr_status_and_emit(
                             &ctx.app_handle,
@@ -8244,10 +8231,7 @@ fn run_assemblyai_event_receiver(
                 }
 
                 if let Some(error) = parsed.error {
-                    let diagnostic = unclassified_transcription_diagnostic(
-                        &error.message,
-                        RuntimeTransport::Websocket,
-                    );
+                    let diagnostic = error.message;
                     log::warn!("AssemblyAI event receiver: provider error diagnostic={diagnostic}");
                     set_asr_status_and_emit(
                         &ctx.app_handle,
@@ -8327,9 +8311,9 @@ fn run_assemblyai_event_receiver(
                     break;
                 }
             }
-            AssemblyAIEvent::Error { message } => {
-                let diagnostic =
-                    unclassified_transcription_diagnostic(&message, RuntimeTransport::Websocket);
+            AssemblyAIEvent::Error {
+                message: diagnostic,
+            } => {
                 log::warn!("AssemblyAI event receiver: error diagnostic={diagnostic}");
                 // FA-1: emit so the UI reflects the error instead of the last
                 // "Running" snapshot.
@@ -8405,7 +8389,7 @@ pub(crate) fn run_soniox_speech_processor(
             log::info!("Soniox streaming: connected successfully");
         }
         Err(e) => {
-            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            let diagnostic = websocket_connect_diagnostic(e);
             log::error!("Soniox streaming: failed to connect diagnostic={diagnostic}");
             set_asr_status_and_emit(
                 &shared.app_handle,
@@ -8464,8 +8448,8 @@ pub(crate) fn run_soniox_speech_processor(
             break;
         }
 
-        if let Err(e) = client.send_audio(&chunk.data) {
-            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+        if client.send_audio(&chunk.data).is_err() {
+            let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Websocket);
             log::warn!("Soniox streaming: failed to send audio diagnostic={diagnostic}");
             break;
         }
@@ -8601,9 +8585,9 @@ fn run_soniox_event_receiver(
                 log::info!("Soniox event receiver: session finished");
                 break;
             }
-            SonioxEvent::Error { message } => {
-                let diagnostic =
-                    unclassified_transcription_diagnostic(&message, RuntimeTransport::Websocket);
+            SonioxEvent::Error {
+                message: diagnostic,
+            } => {
                 log::warn!("Soniox event receiver: error diagnostic={diagnostic}");
                 set_asr_status_and_emit(
                     &ctx.app_handle,
@@ -8696,7 +8680,7 @@ pub(crate) fn run_openai_realtime_speech_processor(
             log::info!("OpenAI Realtime streaming: connected successfully");
         }
         Err(e) => {
-            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            let diagnostic = websocket_connect_diagnostic(e);
             log::error!("OpenAI Realtime streaming: failed to connect diagnostic={diagnostic}");
             // FA-1: emit so the UI leaves the "Running" state for this dead
             // provider instead of looking healthy. This returns immediately
@@ -8772,9 +8756,9 @@ pub(crate) fn run_openai_realtime_speech_processor(
                 // speech/mod.rs:3240). The cadence commit only ran after
                 // send_audio(), so without this the tail can sit uncommitted.
                 if uncommitted_since_last && last_commit.elapsed() >= COMMIT_INTERVAL {
-                    if let Err(e) = client.commit() {
+                    if client.commit().is_err() {
                         let diagnostic =
-                            unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+                            internal_transcription_diagnostic(RuntimeTransport::Websocket);
                         log::warn!(
                             "OpenAI Realtime streaming: idle commit failed diagnostic={diagnostic}"
                         );
@@ -8805,8 +8789,8 @@ pub(crate) fn run_openai_realtime_speech_processor(
         // transient reconnects internally and `send_audio` buffers during the
         // reconnect window. A truly dead client surfaces via `send_audio`
         // returning "Audio channel closed".
-        if let Err(e) = client.send_audio(&chunk.data) {
-            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+        if client.send_audio(&chunk.data).is_err() {
+            let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Websocket);
             log::warn!("OpenAI Realtime streaming: failed to send audio diagnostic={diagnostic}");
             break;
         }
@@ -8817,9 +8801,8 @@ pub(crate) fn run_openai_realtime_speech_processor(
         // on an empty/uncommitted buffer is a server-side no-op, so this is safe
         // even across silence.
         if last_commit.elapsed() >= COMMIT_INTERVAL {
-            if let Err(e) = client.commit() {
-                let diagnostic =
-                    unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            if client.commit().is_err() {
+                let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Websocket);
                 log::warn!(
                     "OpenAI Realtime streaming: failed to commit audio diagnostic={diagnostic}"
                 );
@@ -8840,8 +8823,8 @@ pub(crate) fn run_openai_realtime_speech_processor(
 
     // Flush any audio buffered since the last cadence commit so the final
     // partial utterance is transcribed rather than dropped on teardown.
-    if uncommitted_since_last && let Err(e) = client.commit() {
-        let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+    if uncommitted_since_last && client.commit().is_err() {
+        let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Websocket);
         log::debug!("OpenAI Realtime streaming: final flush commit failed diagnostic={diagnostic}");
     }
 
@@ -9015,9 +8998,9 @@ fn run_openai_realtime_event_receiver(
                     },
                 );
             }
-            OpenAiRealtimeEvent::Error { message } => {
-                let diagnostic =
-                    unclassified_transcription_diagnostic(&message, RuntimeTransport::Websocket);
+            OpenAiRealtimeEvent::Error {
+                message: diagnostic,
+            } => {
                 log::warn!("OpenAI Realtime event receiver: error diagnostic={diagnostic}");
                 // FA-1: emit so the UI reflects the error instead of the last
                 // "Running" snapshot.
@@ -9283,7 +9266,9 @@ pub(crate) fn run_aws_transcribe_speech_processor(
         set_asr_status_and_emit(
             &app_handle_for_err,
             &pipeline_status_err,
-            StageStatus::Error { diagnostic: e },
+            StageStatus::Error {
+                diagnostic: e.diagnostic,
+            },
         );
     }
 
@@ -9309,8 +9294,8 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
 
     let mut worker = match SherpaStreamingWorker::new(&sherpa_config) {
         Ok(w) => w,
-        Err(e) => {
-            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Native);
+        Err(_) => {
+            let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Native);
             log::error!("Sherpa-onnx streaming: failed to create worker diagnostic={diagnostic}");
             // FA-1 follow-up: record the specific init error; the diarization-only
             // fallback preserves it (it only writes the generic message when asr
@@ -9724,13 +9709,12 @@ mod tests_status {
         diarization_span_revision_for_transcript, dispatch_projection_decision,
         emit_and_dispatch_diarization_span_revision,
         emit_assemblyai_speaker_revision_with_dispatch, final_only_revision_meta,
-        final_span_revision, make_diarization_config, moonshine_final_transcript_segment,
-        moonshine_revision_meta, next_span_revision, provider_item_span_id,
-        provider_sequence_span_id, provider_start_span_id, record_asr_span_revision_event,
-        record_asr_span_revision_event_and_observe_projection, revision_ref,
-        run_agent_proposal_task, run_moonshine_speech_processor_with_worker, run_projection_job,
-        set_asr_status, spawn_deferred_lane_observation, spawn_projection_job,
-        unclassified_transcription_diagnostic,
+        final_span_revision, internal_transcription_diagnostic, make_diarization_config,
+        moonshine_final_transcript_segment, moonshine_revision_meta, next_span_revision,
+        provider_item_span_id, provider_sequence_span_id, provider_start_span_id,
+        record_asr_span_revision_event, record_asr_span_revision_event_and_observe_projection,
+        revision_ref, run_agent_proposal_task, run_moonshine_speech_processor_with_worker,
+        run_projection_job, set_asr_status, spawn_deferred_lane_observation, spawn_projection_job,
     };
     use crate::asr::moonshine::{
         MoonshineAdapterError, MoonshineRuntimeConfig, MoonshineSpanMapper,
@@ -9939,6 +9923,9 @@ mod tests_status {
             DiarizationDegradationReason::AssetNotDownloaded,
             DiarizationDegradationReason::AssetInvalid,
         ];
+        for reason in all {
+            assert_eq!(serde_json::to_value(reason).unwrap(), reason.as_wire_code());
+        }
         let codes: Vec<&str> = all.iter().map(|r| r.as_wire_code()).collect();
         let mut unique = codes.clone();
         unique.sort_unstable();
@@ -12435,36 +12422,123 @@ mod tests_status {
     }
 
     #[test]
-    fn unclassified_speech_diagnostic_discards_raw_message_and_length() {
-        let raw = "provider returned verbatim content body /private/session/path request-id-canary audio_len=7919";
-        let diagnostic = unclassified_transcription_diagnostic(raw, RuntimeTransport::Http);
-
-        assert_eq!(
-            diagnostic,
-            RuntimeDiagnostic::internal(
-                RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
-                    .with_transport(RuntimeTransport::Http)
-            )
-        );
-        let serialized = serde_json::to_string(&diagnostic).expect("diagnostic JSON");
-        let captured_log =
-            format!("Cloud ASR worker: transcription failed diagnostic={diagnostic}");
-        for forbidden in [
-            raw,
-            "message_len",
-            "body_len",
-            "request-id-canary",
-            "audio_len=7919",
-        ] {
-            assert!(!serialized.contains(forbidden));
-            assert!(!captured_log.contains(forbidden));
+    #[cfg_attr(target_os = "macos", ignore = "Tao needs the main thread on macOS")]
+    fn adapter_errors_reach_stage_and_logs() {
+        // Isolate the process-wide logger from other test harnesses.
+        const CHILD: &str = "AUDIOGRAPH_SPEECH_LOG_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "speech::tests_status::adapter_errors_reach_stage_and_logs",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let log = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{log}");
+            for provider in ["Deepgram", "AssemblyAI", "Soniox", "OpenAI Realtime"] {
+                assert!(
+                    log.contains(&format!(
+                        "{provider} event receiver: error diagnostic=runtime/credential_rejected"
+                    )),
+                    "{log}"
+                );
+            }
+            assert!(!log.contains("private provider prose"));
+            return;
         }
+        env_logger::Builder::new()
+            .filter_module("audio_graph::speech", log::LevelFilter::Warn)
+            .init();
+        let dir = unique_tempdir("stage-adapter-errors");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        let expected: RuntimeDiagnostic = audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorDiagnostic::credential_rejected(
+            RuntimeDiagnosticContext::new(RuntimeOperation::Transcription).with_transport(RuntimeTransport::Websocket)
+            .with_status_class(audio_graph_ipc_contract::runtime_diagnostic::RuntimeStatusClass::ClientError)
+        ).into();
+        fn one<T>(event: T) -> crossbeam_channel::Receiver<T> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            tx.send(event).unwrap();
+            rx
+        }
+        let running = || Arc::new(AtomicBool::new(true));
+        let hint = || Arc::new(RwLock::new(None));
+        for provider in ["deepgram", "assemblyai", "soniox", "openai_realtime"] {
+            let shared = moonshine_shared_for_app(&app, super::shared_test_app_handle());
+            let config = moonshine_speech_config(dir.clone());
+            set_asr_status(&app.pipeline_status, StageStatus::Idle);
+            match provider {
+                "deepgram" => super::run_deepgram_event_receiver(
+                    one(crate::asr::deepgram::DeepgramEvent::Error {
+                        message: expected.clone(),
+                    }),
+                    shared,
+                    config,
+                    hint(),
+                    0,
+                    false,
+                ),
+                "assemblyai" => super::run_assemblyai_event_receiver(
+                    one(crate::asr::assemblyai::AssemblyAIEvent::Error {
+                        message: expected.clone(),
+                    }),
+                    running(),
+                    shared,
+                    config,
+                    hint(),
+                ),
+                "soniox" => super::run_soniox_event_receiver(
+                    one(crate::asr::soniox::SonioxEvent::Error {
+                        message: expected.clone(),
+                    }),
+                    running(),
+                    shared,
+                    config,
+                    0,
+                ),
+                _ => super::run_openai_realtime_event_receiver(
+                    one(crate::asr::openai_realtime::OpenAiRealtimeEvent::Error {
+                        message: expected.clone(),
+                    }),
+                    running(),
+                    shared,
+                    config,
+                    hint(),
+                ),
+            }
+            assert!(
+                matches!(&app.pipeline_status.read().unwrap().asr, StageStatus::Error { diagnostic } if *diagnostic == expected),
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_failure_preserves_typed_diagnostic_and_closes_untyped_errors() {
+        let expected: RuntimeDiagnostic = audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorDiagnostic::credential_rejected(
+            RuntimeDiagnosticContext::new(RuntimeOperation::Transcription).with_transport(RuntimeTransport::Websocket)
+        ).into();
+        assert_eq!(
+            super::websocket_connect_diagnostic(crate::error::AppError::RuntimeDiagnostic(
+                expected.clone()
+            )),
+            expected
+        );
+        assert_eq!(
+            super::websocket_connect_diagnostic(crate::error::AppError::Unknown(
+                "private provider prose".into()
+            )),
+            internal_transcription_diagnostic(RuntimeTransport::Websocket)
+        );
     }
 
     #[test]
     fn aws_error_payload_uses_only_the_closed_diagnostic_display() {
         let source = "provider native prose response body /private/session/path request-id-canary audio_len=7919";
-        let diagnostic = unclassified_transcription_diagnostic(source, RuntimeTransport::Sdk);
+        let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Sdk).into();
         let payload = events::AwsErrorPayload::from_transcribe_diagnostic(&diagnostic);
         let serialized = serde_json::to_string(&payload).expect("AWS error payload JSON");
 
@@ -12487,16 +12561,17 @@ mod tests_status {
             assert!(!serialized.contains(forbidden));
         }
 
-        let network = audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorDiagnostic::new(
-            RuntimeErrorCode::NetworkUnreachable,
-            true,
-            RuntimeSafeRecoveryAction::CheckNetwork,
-            RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
-                .with_transport(RuntimeTransport::Sdk),
-        )
-        .into();
+        let network: RuntimeDiagnostic =
+            audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorDiagnostic::new(
+                RuntimeErrorCode::NetworkUnreachable,
+                true,
+                RuntimeSafeRecoveryAction::CheckNetwork,
+                RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                    .with_transport(RuntimeTransport::Sdk),
+            )
+            .into();
         assert!(matches!(
-            events::AwsErrorPayload::from_transcribe_diagnostic(&network).error,
+            events::AwsErrorPayload::from_transcribe_diagnostic(&network.into()).error,
             crate::aws_util::UiAwsError::NetworkUnreachable
         ));
     }

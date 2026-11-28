@@ -183,25 +183,58 @@ fn sdk_diagnostic_context() -> RuntimeDiagnosticContext {
         .with_transport(RuntimeTransport::Sdk)
 }
 
+/// Content-free session failure. Only the legacy AWS toast needs the distinction
+/// between an unknown access key and a signature mismatch.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{diagnostic}")]
+pub struct TranscribeFailure {
+    pub(crate) diagnostic: RuntimeDiagnostic,
+    pub(crate) auth: Option<TranscribeAuthFailure>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TranscribeAuthFailure {
+    InvalidKey,
+    SignatureMismatch,
+    ExpiredToken,
+    AccessDenied,
+}
+
+impl From<RuntimeDiagnostic> for TranscribeFailure {
+    fn from(diagnostic: RuntimeDiagnostic) -> Self {
+        Self {
+            diagnostic,
+            auth: None,
+        }
+    }
+}
+
 fn sdk_runtime_diagnostic(
     code: RuntimeErrorCode,
     retryable: bool,
     recovery_action: RuntimeSafeRecoveryAction,
     status_class: Option<RuntimeStatusClass>,
-) -> RuntimeDiagnostic {
+) -> TranscribeFailure {
     let mut context = sdk_diagnostic_context();
     if let Some(status_class) = status_class {
         context = context.with_status_class(status_class);
     }
-    RuntimeErrorDiagnostic::new(code, retryable, recovery_action, context).into()
+    RuntimeDiagnostic::from(RuntimeErrorDiagnostic::new(
+        code,
+        retryable,
+        recovery_action,
+        context,
+    ))
+    .into()
 }
 
-fn unknown_sdk_diagnostic() -> RuntimeDiagnostic {
-    RuntimeDiagnostic::internal(sdk_diagnostic_context())
+fn unknown_sdk_diagnostic() -> TranscribeFailure {
+    RuntimeDiagnostic::internal(sdk_diagnostic_context()).into()
 }
 
 #[derive(Debug, Clone, Copy)]
 enum AwsServiceFailure {
+    Auth(TranscribeAuthFailure),
     BadRequest,
     Conflict,
     InternalFailure,
@@ -209,8 +242,26 @@ enum AwsServiceFailure {
     ServiceUnavailable,
 }
 
-fn service_failure_diagnostic(failure: AwsServiceFailure) -> RuntimeDiagnostic {
+fn service_failure_diagnostic(failure: AwsServiceFailure) -> TranscribeFailure {
     match failure {
+        AwsServiceFailure::Auth(auth) => {
+            let ctx = sdk_diagnostic_context().with_status_class(RuntimeStatusClass::ClientError);
+            let diagnostic = match auth {
+                TranscribeAuthFailure::InvalidKey | TranscribeAuthFailure::SignatureMismatch => {
+                    RuntimeErrorDiagnostic::credential_rejected(ctx)
+                }
+                TranscribeAuthFailure::ExpiredToken => {
+                    RuntimeErrorDiagnostic::credential_expired(ctx)
+                }
+                TranscribeAuthFailure::AccessDenied => {
+                    RuntimeErrorDiagnostic::permission_denied(ctx)
+                }
+            };
+            TranscribeFailure {
+                diagnostic: diagnostic.into(),
+                auth: Some(auth),
+            }
+        }
         AwsServiceFailure::BadRequest | AwsServiceFailure::Conflict => sdk_runtime_diagnostic(
             RuntimeErrorCode::RequestRejected,
             false,
@@ -242,6 +293,18 @@ fn service_failure_diagnostic(failure: AwsServiceFailure) -> RuntimeDiagnostic {
 /// Transcribe variants. Unknown metadata is never copied into the diagnostic.
 fn allowlisted_service_failure(code: Option<&str>) -> Option<AwsServiceFailure> {
     match code {
+        Some("UnrecognizedClientException") => {
+            Some(AwsServiceFailure::Auth(TranscribeAuthFailure::InvalidKey))
+        }
+        Some("InvalidSignatureException") => Some(AwsServiceFailure::Auth(
+            TranscribeAuthFailure::SignatureMismatch,
+        )),
+        Some("ExpiredTokenException") => {
+            Some(AwsServiceFailure::Auth(TranscribeAuthFailure::ExpiredToken))
+        }
+        Some("AccessDeniedException") => {
+            Some(AwsServiceFailure::Auth(TranscribeAuthFailure::AccessDenied))
+        }
         Some("BadRequestException") => Some(AwsServiceFailure::BadRequest),
         Some("ConflictException") => Some(AwsServiceFailure::Conflict),
         Some("InternalFailureException") => Some(AwsServiceFailure::InternalFailure),
@@ -251,7 +314,7 @@ fn allowlisted_service_failure(code: Option<&str>) -> Option<AwsServiceFailure> 
     }
 }
 
-fn start_stream_service_diagnostic(error: &StartStreamTranscriptionError) -> RuntimeDiagnostic {
+fn start_stream_service_diagnostic(error: &StartStreamTranscriptionError) -> TranscribeFailure {
     let failure = match error {
         StartStreamTranscriptionError::BadRequestException(_) => AwsServiceFailure::BadRequest,
         StartStreamTranscriptionError::ConflictException(_) => AwsServiceFailure::Conflict,
@@ -275,7 +338,7 @@ fn start_stream_service_diagnostic(error: &StartStreamTranscriptionError) -> Run
     service_failure_diagnostic(failure)
 }
 
-fn transcript_stream_service_diagnostic(error: &TranscriptResultStreamError) -> RuntimeDiagnostic {
+fn transcript_stream_service_diagnostic(error: &TranscriptResultStreamError) -> TranscribeFailure {
     let failure = match error {
         TranscriptResultStreamError::BadRequestException(_) => AwsServiceFailure::BadRequest,
         TranscriptResultStreamError::ConflictException(_) => AwsServiceFailure::Conflict,
@@ -299,9 +362,9 @@ fn transcript_stream_service_diagnostic(error: &TranscriptResultStreamError) -> 
 
 fn sdk_error_diagnostic<E, R>(
     error: &transcribe::error::SdkError<E, R>,
-    service_diagnostic: impl Fn(&E) -> RuntimeDiagnostic,
-) -> RuntimeDiagnostic {
-    match error {
+    service_diagnostic: impl Fn(&E) -> TranscribeFailure,
+) -> TranscribeFailure {
+    let failure = match error {
         transcribe::error::SdkError::ConstructionFailure(_) => unknown_sdk_diagnostic(),
         transcribe::error::SdkError::TimeoutError(_) => sdk_runtime_diagnostic(
             RuntimeErrorCode::Timeout,
@@ -323,18 +386,20 @@ fn sdk_error_diagnostic<E, R>(
         ),
         transcribe::error::SdkError::ServiceError(service) => service_diagnostic(service.err()),
         _ => unknown_sdk_diagnostic(),
-    }
+    };
+    log::debug!("AWS Transcribe SDK error diagnostic={failure}");
+    failure
 }
 
 fn start_stream_sdk_diagnostic<R>(
     error: &transcribe::error::SdkError<StartStreamTranscriptionError, R>,
-) -> RuntimeDiagnostic {
+) -> TranscribeFailure {
     sdk_error_diagnostic(error, start_stream_service_diagnostic)
 }
 
 fn transcript_stream_sdk_diagnostic<R>(
     error: &transcribe::error::SdkError<TranscriptResultStreamError, R>,
-) -> RuntimeDiagnostic {
+) -> TranscribeFailure {
     sdk_error_diagnostic(error, transcript_stream_service_diagnostic)
 }
 
@@ -419,9 +484,9 @@ enum DriveOutcome {
     Completed,
     /// A recoverable transport error (dispatch/timeout/response) or an
     /// unexpected server close while still transcribing — reconnect.
-    Recoverable(RuntimeDiagnostic),
+    Recoverable(TranscribeFailure),
     /// A non-recoverable error (service/construction) — surface and stop.
-    Unrecoverable(RuntimeDiagnostic),
+    Unrecoverable(TranscribeFailure),
 }
 
 /// A single step returned by the shared reconnect ladder.
@@ -701,7 +766,7 @@ pub fn run_aws_transcribe_session(
     on_transcript: impl FnMut(AwsTranscribeFinal) + Send + 'static,
     on_partial: impl FnMut(AwsTranscribePartial) + Send + 'static,
     on_status: impl FnMut(AwsTranscribeStatus) + Send + 'static,
-) -> Result<(), RuntimeDiagnostic> {
+) -> Result<(), TranscribeFailure> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -732,7 +797,7 @@ async fn run_streaming_session(
     mut on_transcript: impl FnMut(AwsTranscribeFinal) + Send + 'static,
     mut on_partial: impl FnMut(AwsTranscribePartial) + Send + 'static,
     mut on_status: impl FnMut(AwsTranscribeStatus) + Send + 'static,
-) -> Result<(), RuntimeDiagnostic> {
+) -> Result<(), TranscribeFailure> {
     if config
         .content_egress_policy()
         .check_audio("asr.aws_transcribe")
@@ -998,13 +1063,13 @@ mod tests {
     }
 
     fn assert_runtime_diagnostic(
-        diagnostic: &RuntimeDiagnostic,
+        diagnostic: &TranscribeFailure,
         code: RuntimeErrorCode,
         retryable: bool,
         recovery_action: RuntimeSafeRecoveryAction,
         status_class: Option<RuntimeStatusClass>,
     ) {
-        let RuntimeDiagnostic::Runtime(detail) = diagnostic else {
+        let RuntimeDiagnostic::Runtime(detail) = &diagnostic.diagnostic else {
             panic!("expected runtime diagnostic, got {diagnostic:?}");
         };
         assert_eq!(detail.code, code);
@@ -1015,14 +1080,13 @@ mod tests {
         assert_eq!(detail.context.status_class, status_class);
     }
 
-    fn assert_diagnostic_excludes_canaries(diagnostic: &RuntimeDiagnostic) {
+    fn assert_diagnostic_excludes_canaries(diagnostic: &TranscribeFailure) {
         let stage = crate::events::StageStatus::Error {
-            diagnostic: diagnostic.clone(),
+            diagnostic: diagnostic.diagnostic.clone(),
         };
         let serialized = serde_json::to_string(&stage).expect("stage status JSON");
         let aws_event = crate::events::AwsErrorPayload::from_transcribe_diagnostic(diagnostic);
         let aws_json = serde_json::to_string(&aws_event).expect("AWS error JSON");
-        let captured_log = format!("AWS Transcribe error diagnostic={diagnostic}");
         for forbidden in [
             "provider raw text should not leak",
             "patient said private diagnosis",
@@ -1036,11 +1100,7 @@ mod tests {
             "body_len",
             "7919",
         ] {
-            for (sink, value) in [
-                ("StageStatus", &serialized),
-                ("AWS_ERROR", &aws_json),
-                ("captured log", &captured_log),
-            ] {
+            for (sink, value) in [("StageStatus", &serialized), ("AWS_ERROR", &aws_json)] {
                 assert!(
                     !value.contains(forbidden),
                     "AWS diagnostic leaked {forbidden} through {sink}: {value}"
@@ -1180,7 +1240,7 @@ mod tests {
         )
         .unwrap_err();
 
-        let serialized = serde_json::to_string(&error).expect("policy diagnostic JSON");
+        let serialized = serde_json::to_string(&error.diagnostic).expect("policy diagnostic JSON");
         for forbidden in [
             "0.5",
             "-0.25",
@@ -1328,7 +1388,8 @@ mod tests {
         ];
 
         for (error, code, retryable, recovery_action, status_class) in cases {
-            let diagnostic = start_stream_service_diagnostic(&error);
+            let diagnostic =
+                start_stream_sdk_diagnostic(&transcribe::error::SdkError::service_error(error, ()));
             assert_runtime_diagnostic(&diagnostic, code, retryable, recovery_action, status_class);
             assert_diagnostic_excludes_canaries(&diagnostic);
         }
@@ -1346,6 +1407,9 @@ mod tests {
                         .build(),
                 ),
                 RuntimeErrorCode::RequestRejected,
+                false,
+                RuntimeSafeRecoveryAction::ReviewConfiguration,
+                Some(RuntimeStatusClass::ClientError),
             ),
             (
                 TranscriptResultStreamError::ConflictException(
@@ -1354,6 +1418,9 @@ mod tests {
                         .build(),
                 ),
                 RuntimeErrorCode::RequestRejected,
+                false,
+                RuntimeSafeRecoveryAction::ReviewConfiguration,
+                Some(RuntimeStatusClass::ClientError),
             ),
             (
                 TranscriptResultStreamError::InternalFailureException(
@@ -1362,6 +1429,9 @@ mod tests {
                         .build(),
                 ),
                 RuntimeErrorCode::Internal,
+                true,
+                RuntimeSafeRecoveryAction::Retry,
+                Some(RuntimeStatusClass::ServerError),
             ),
             (
                 TranscriptResultStreamError::LimitExceededException(
@@ -1370,6 +1440,9 @@ mod tests {
                         .build(),
                 ),
                 RuntimeErrorCode::CapacityExhausted,
+                true,
+                RuntimeSafeRecoveryAction::RetryAfterDelay,
+                Some(RuntimeStatusClass::ClientError),
             ),
             (
                 TranscriptResultStreamError::ServiceUnavailableException(
@@ -1378,16 +1451,105 @@ mod tests {
                         .build(),
                 ),
                 RuntimeErrorCode::ProviderUnavailable,
+                true,
+                RuntimeSafeRecoveryAction::RetryAfterDelay,
+                Some(RuntimeStatusClass::ServerError),
             ),
         ];
 
-        for (error, expected_code) in cases {
-            let diagnostic = transcript_stream_service_diagnostic(&error);
-            let RuntimeDiagnostic::Runtime(detail) = &diagnostic else {
-                panic!("expected runtime diagnostic");
-            };
-            assert_eq!(detail.code, expected_code);
+        for (error, code, retryable, recovery, class) in cases {
+            let diagnostic = transcript_stream_sdk_diagnostic(
+                &transcribe::error::SdkError::service_error(error, ()),
+            );
+            assert_runtime_diagnostic(&diagnostic, code, retryable, recovery, class);
             assert_diagnostic_excludes_canaries(&diagnostic);
+        }
+    }
+
+    #[test]
+    fn auth_metadata_reaches_stage_toast_and_logs_without_private_fields() {
+        use RuntimeErrorCode as Code;
+        use RuntimeSafeRecoveryAction as Action;
+        for (metadata, code, action, toast) in [
+            (
+                "UnrecognizedClientException",
+                Code::CredentialRejected,
+                Action::ReenterCredential,
+                "invalid_access_key",
+            ),
+            (
+                "InvalidSignatureException",
+                Code::CredentialRejected,
+                Action::ReenterCredential,
+                "signature_mismatch",
+            ),
+            (
+                "ExpiredTokenException",
+                Code::CredentialExpired,
+                Action::RefreshCredential,
+                "expired_token",
+            ),
+            (
+                "AccessDeniedException",
+                Code::PermissionDenied,
+                Action::ReviewConfiguration,
+                "access_denied",
+            ),
+            (
+                "AccessDeniedExceptionExtra",
+                Code::Internal,
+                Action::None,
+                "unknown",
+            ),
+        ] {
+            let meta = transcribe::error::ErrorMetadata::builder()
+                .code(metadata)
+                .message("private provider prose")
+                .custom("request_id", "private request identifier")
+                .build();
+            let logs = super::super::diagnostic_tests::LogCapture::start();
+            let start = start_stream_sdk_diagnostic(&transcribe::error::SdkError::service_error(
+                StartStreamTranscriptionError::generic(meta.clone()),
+                (),
+            ));
+            let stream =
+                transcript_stream_sdk_diagnostic(&transcribe::error::SdkError::service_error(
+                    TranscriptResultStreamError::generic(meta),
+                    (),
+                ));
+            let records = logs.finish();
+            assert_eq!(records.len(), 2);
+            for failure in [start, stream] {
+                assert_runtime_diagnostic(
+                    &failure,
+                    code,
+                    false,
+                    action,
+                    (code != Code::Internal).then_some(RuntimeStatusClass::ClientError),
+                );
+                let event = serde_json::to_value(
+                    crate::events::AwsErrorPayload::from_transcribe_diagnostic(&failure),
+                )
+                .unwrap();
+                assert_eq!(event["error"]["category"], toast);
+                assert_eq!(event["raw_message"], failure.diagnostic.to_string());
+                if toast == "access_denied" {
+                    assert!(event["error"]["permission"].is_null());
+                }
+                let stage = serde_json::to_string(&crate::events::StageStatus::Error {
+                    diagnostic: failure.diagnostic,
+                })
+                .unwrap();
+                for sink in [records.join(" "), event.to_string(), stage] {
+                    for private in [
+                        metadata,
+                        "private provider prose",
+                        "private request identifier",
+                    ] {
+                        assert!(!sink.contains(private));
+                    }
+                }
+            }
         }
     }
 
@@ -1440,11 +1602,12 @@ mod tests {
                     .build(),
             );
 
-            let diagnostic = start_stream_service_diagnostic(&error);
+            let diagnostic =
+                start_stream_sdk_diagnostic(&transcribe::error::SdkError::service_error(error, ()));
             assert_runtime_diagnostic(&diagnostic, code, retryable, recovery_action, status_class);
             assert_diagnostic_excludes_canaries(&diagnostic);
             assert!(
-                !serde_json::to_string(&diagnostic)
+                !serde_json::to_string(&diagnostic.diagnostic)
                     .expect("diagnostic JSON")
                     .contains(metadata_code)
             );
@@ -1458,7 +1621,8 @@ mod tests {
                 .custom("request_id", "aws-secret-looking-value")
                 .build(),
         );
-        let diagnostic = start_stream_service_diagnostic(&error);
+        let diagnostic =
+            start_stream_sdk_diagnostic(&transcribe::error::SdkError::service_error(error, ()));
 
         assert_runtime_diagnostic(
             &diagnostic,
@@ -1469,7 +1633,7 @@ mod tests {
         );
         assert_diagnostic_excludes_canaries(&diagnostic);
         assert!(
-            !serde_json::to_string(&diagnostic)
+            !serde_json::to_string(&diagnostic.diagnostic)
                 .expect("diagnostic JSON")
                 .contains(near_match)
         );
@@ -1481,7 +1645,8 @@ mod tests {
             "provider raw text should not leak /private/aws/profile/path request-id-canary audio_len=7919",
         ));
 
-        let diagnostic = start_stream_service_diagnostic(&error);
+        let diagnostic =
+            start_stream_sdk_diagnostic(&transcribe::error::SdkError::service_error(error, ()));
 
         assert_runtime_diagnostic(
             &diagnostic,

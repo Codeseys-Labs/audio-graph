@@ -240,12 +240,53 @@ describe("PipelineStatusBar", () => {
     render(<PipelineStatusBar />);
     expect(
       screen.getByRole("img", {
-        name: /Graph: The provider rejected the request\./i,
+        name: /^Graph: The provider rejected the request\.$/i,
       }),
     ).toBeInTheDocument();
     for (const canary of canaries) {
-      expect(document.body.textContent).not.toContain(canary);
+      expect(document.body.innerHTML).not.toContain(canary);
     }
+  });
+
+  it.each([
+    [
+      "credential_rejected",
+      "reenter_credential",
+      "The provider rejected the credential. Re-enter the credential in Settings.",
+    ],
+    [
+      "network_unreachable",
+      "retry_after_delay",
+      "Reconnecting to the provider.",
+    ],
+  ] as const)("presents the recovery for %s", (code, recovery_action, expected) => {
+    resetStore({
+      pipelineStatus: {
+        ...allIdle(),
+        asr: {
+          type: "Error",
+          diagnostic: {
+            kind: "runtime",
+            detail: {
+              code,
+              recovery_action,
+              retryable: recovery_action === "retry_after_delay",
+              context: {
+                operation: "transcription",
+                transport: "websocket",
+                ...(recovery_action === "retry_after_delay"
+                  ? { retry_delay: "short" as const }
+                  : {}),
+              },
+            },
+          },
+        },
+      },
+    });
+    render(<PipelineStatusBar />);
+    expect(
+      screen.getByRole("img", { name: `ASR: ${expected}` }),
+    ).toBeInTheDocument();
   });
 
   it("appends a formatted latency to the tooltip and renders a latency badge", () => {
