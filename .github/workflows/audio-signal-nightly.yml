@@ -67,7 +67,7 @@ jobs:
       - name: Build fixture-player and the live-audio-smoke test binary once
         working-directory: audio-graph/src-tauri
         run: |
-          cargo build --locked -p audio-graph --bin fixture-player --no-default-features --features cloud
+          cargo build --locked -p audio-graph --example fixture-player --no-default-features --features cloud
           cargo test --locked -p audio-graph --lib --no-default-features --features cloud,live-audio-smoke --no-run
 
       - name: Linux — virtual audio (PipeWire null-sink + .monitor) + strict signal smoke
@@ -137,7 +137,7 @@ jobs:
               # (blocked, no EOF) for up to 5 minutes — comfortably longer
               # than one fixture pass — while the explicit SIGTERM below
               # remains the normal stop path.
-              ./target/debug/fixture-player --device pipewire "$fixture_wav" \
+              ./target/debug/examples/fixture-player --device pipewire "$fixture_wav" \
                 > "$player_log" 2>&1 < <(sleep 300) &
               player_pid=$!
 

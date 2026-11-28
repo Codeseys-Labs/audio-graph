@@ -71,6 +71,29 @@ function hasAppleIcon(bytes) {
 
 function configure() {
     const tauri = "src-tauri";
+    const manifestPath = join(tauri, "Cargo.toml");
+    const manifest = readFileSync(manifestPath, "utf8");
+    // Inspect table headers separately so names from examples or package metadata
+    // cannot accidentally satisfy the binary target check.
+    const tables = manifest.split(/(?=^\s*\[\[?[^\r\n]+\]\]?\s*(?:#.*)?$)/m);
+    const bins = tables.filter((table) => /^\s*\[\[\s*(?:bin|"bin"|'bin')\s*\]\]/.test(table));
+    if (bins.length !== 1 || !/^\s*name\s*=\s*["']audio-graph["']\s*(?:#.*)?$/m.test(bins[0])) {
+        throw new Error(`${manifestPath} must declare exactly one [[bin]], named audio-graph.`);
+    }
+    const binDir = join(tauri, "src", "bin");
+    function checkBinDirectory(directory) {
+        for (const entry of readdirSync(directory, { withFileTypes: true })) {
+            const path = join(directory, entry.name);
+            if (entry.isDirectory()) {
+                checkBinDirectory(path);
+            } else if (entry.isSymbolicLink() || entry.name.endsWith(".rs")) {
+                throw new Error(`Unexpected binary source in ${binDir}: ${path}`);
+            }
+        }
+    }
+    if (existsSync(binDir)) {
+        checkBinDirectory(binDir);
+    }
     const configPath = join(tauri, "tauri.conf.json");
     const icons = JSON.parse(readFileSync(configPath, "utf8")).bundle?.icon;
     if (
