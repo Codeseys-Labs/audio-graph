@@ -2540,7 +2540,9 @@ fn basis_events(
     })
 }
 
-/// Apply the same latest-wins, segment-then-span join as the session timeline.
+/// Apply the same latest-wins, source-aware segment-then-span join as the
+/// session timeline: [`crate::timeline::resolve_speaker`] (#498), on the same
+/// [`crate::timeline::speaker_attribution_index`] winners map.
 fn resolve_prompt_speakers(
     events: &mut [TranscriptEvent],
     speakers: Option<&crate::projections::SpeakerTimeline>,
@@ -2551,16 +2553,12 @@ fn resolve_prompt_speakers(
     let mut confirmed = BTreeSet::new();
     for event in events.iter_mut() {
         if let Some(winner) = winners.as_ref().and_then(|winners| {
-            crate::timeline::candidate_keys(event.transcript_segment_id.as_deref(), &event.span_id)
-                .iter()
-                .filter_map(|key| winners.get(key))
-                .find(|span| {
-                    span.source_id
-                        .as_deref()
-                        .is_none_or(|source| source == event.source_id)
-                        && (span.basis_asr_span_ids.is_empty()
-                            || span.basis_asr_span_ids.contains(&event.span_id))
-                })
+            crate::timeline::resolve_speaker(
+                event.source_id.as_str(),
+                event.transcript_segment_id.as_deref(),
+                event.span_id.as_str(),
+                winners,
+            )
         }) {
             event.speaker_id = winner.speaker_id.clone();
             event.speaker_label = winner.speaker_label.clone();

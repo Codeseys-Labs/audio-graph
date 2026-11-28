@@ -4533,15 +4533,16 @@ pub(crate) fn resolve_claim_evidence_basis_events(
         .resolve_covered_events(&ledger.latest_spans)
         .into_iter()
         .map(|mut event| {
-            if let Some(attribution) = attribution.as_ref() {
-                let keys = crate::timeline::candidate_keys(
+            if let Some(winners) = attribution.as_ref()
+                && let Some(winner) = crate::timeline::resolve_speaker(
+                    event.source_id.as_str(),
                     event.transcript_segment_id.as_deref(),
                     event.span_id.as_str(),
-                );
-                if let Some(winner) = keys.iter().find_map(|key| attribution.get(key.as_str())) {
-                    event.speaker_id = winner.speaker_id.clone();
-                    event.speaker_label = winner.speaker_label.clone();
-                }
+                    winners,
+                )
+            {
+                event.speaker_id = winner.speaker_id.clone();
+                event.speaker_label = winner.speaker_label.clone();
             }
             event
         })
@@ -8682,6 +8683,79 @@ mod tests {
             evidence.span().and_then(|span| span.speaker_ref.as_deref()),
             Some("speaker-2"),
             "speaker_ref must read the canonical diarization attribution, not the inline ASR label"
+        );
+    }
+
+    /// #498 apply-time half of the no-cross-source-bleed proof: two sources
+    /// reuse the SAME display segment id (`turn-0@final`) with distinct
+    /// source-qualified ASR span ids, and ONLY the mic source carries a speaker
+    /// correction. `resolve_claim_evidence_basis_events` must stamp the mic
+    /// event with the mic correction while the system event keeps its INLINE
+    /// ASR speaker — the unfiltered `winners.get(display_id)` join this used
+    /// to run bled the mic winner onto the system turn here too (the same
+    /// guard `timeline::resolve_speaker` now applies for the timeline fold
+    /// and the generation prompt).
+    #[test]
+    fn claim_evidence_resolution_does_not_bleed_a_correction_across_shared_segment_ids() {
+        // Two same-shape events: same display segment id, distinct
+        // source-qualified ASR span ids (the AssemblyAI multi-source shape).
+        let mut mic = TranscriptEvent::from(asr_payload("assemblyai:mic:turn-0", 1, "mic words"));
+        mic.source_id = "mic".into();
+        mic.transcript_segment_id = Some("turn-0@final".into());
+        mic.speaker_id = Some("asr-mic".into());
+        mic.speaker_label = Some("Mic Inline".into());
+        mic.start_time = 1.0;
+        mic.end_time = 2.0;
+        let mut system =
+            TranscriptEvent::from(asr_payload("assemblyai:system:turn-0", 1, "system words"));
+        system.source_id = "system".into();
+        system.transcript_segment_id = Some("turn-0@final".into());
+        system.speaker_id = Some("asr-system".into());
+        system.speaker_label = Some("System Inline".into());
+        system.start_time = 5.0;
+        system.end_time = 6.0;
+
+        let mut ledger = TranscriptLedger::new("session-shared-segment");
+        ledger.apply_event(mic.clone()).unwrap();
+        ledger.apply_event(system.clone()).unwrap();
+
+        // ONLY the mic source has a diarization correction, citing the shared
+        // display id AND its own source-qualified ASR span id.
+        let mut mic_span = DiarizationSpanRevision::from(diarization_payload(
+            "dia-mic",
+            "deepgram",
+            1,
+            "spk-mic",
+            DiarizationSpanStability::Stable,
+        ));
+        mic_span.source_id = Some("mic".into());
+        mic_span.speaker_label = Some("Mic Corrected".into());
+        mic_span.basis_transcript_segment_ids = vec!["turn-0@final".into()];
+        mic_span.basis_asr_span_ids = vec!["assemblyai:mic:turn-0".into()];
+        let speakers = SpeakerTimeline::replay("session-shared-segment", [mic_span])
+            .expect("speaker timeline");
+
+        let basis = ProjectionBasis::from_transcript_events(&[mic, system]);
+        let events = resolve_claim_evidence_basis_events(&basis, &ledger, Some(&speakers));
+        let by_span = |span: &str| {
+            events
+                .iter()
+                .find(|event| event.span_id == span)
+                .unwrap_or_else(|| panic!("basis must resolve {span}"))
+        };
+
+        let resolved_mic = by_span("assemblyai:mic:turn-0");
+        assert_eq!(resolved_mic.speaker_id.as_deref(), Some("spk-mic"));
+        assert_eq!(resolved_mic.speaker_label.as_deref(), Some("Mic Corrected"));
+        // Zero cross-source bleed: the system turn keeps its INLINE speaker,
+        // not the mic correction sharing the `turn-0@final` display id.
+        let resolved_system = by_span("assemblyai:system:turn-0");
+        assert_eq!(resolved_system.speaker_id.as_deref(), Some("asr-system"));
+        assert_eq!(
+            resolved_system.speaker_label.as_deref(),
+            Some("System Inline"),
+            "apply-time claim evidence must not stamp another source's correction \
+             onto a turn sharing only the display segment id"
         );
     }
 
