@@ -2295,21 +2295,36 @@ fn capture_snapshot(state: &AppState) -> events::CaptureFact {
     }
 }
 
-/// Attach a renderer: issue it a new capture epoch, fence every start an
-/// earlier renderer left in flight, and return the current capture fact so a
-/// capture that is still running is adopted. Called once per JavaScript
-/// realm, so a reload cancels the starts the previous page left pending.
+/// Attach renderer realm `realm`: issue it a new capture epoch, fence every
+/// start an earlier realm left in flight, and return the current capture
+/// fact so a capture that is still running is adopted. Called once per
+/// JavaScript realm, so a reload cancels the starts the previous page left
+/// pending; a repeated delivery from the same realm changes nothing.
 #[tauri::command]
-pub async fn capture_attach(state: State<'_, AppState>) -> AppResult<CaptureAttachment> {
-    capture_attach_impl(state.inner())
+pub async fn capture_attach(
+    realm: String,
+    state: State<'_, AppState>,
+) -> AppResult<CaptureAttachment> {
+    capture_attach_impl(&realm, state.inner())
 }
 
-fn capture_attach_impl(state: &AppState) -> AppResult<CaptureAttachment> {
+/// Longest realm token a renderer may present.
+const CAPTURE_REALM_MAX_LEN: usize = 64;
+
+fn capture_attach_impl(realm: &str, state: &AppState) -> AppResult<CaptureAttachment> {
+    if realm.is_empty()
+        || realm.len() > CAPTURE_REALM_MAX_LEN
+        || !realm
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(AppError::Unknown("Invalid capture realm".to_string()));
+    }
     let mut manager = state
         .capture_manager
         .lock()
         .map_err(|error| format!("Capture manager lock error: {error}"))?;
-    let epoch = manager.attach();
+    let epoch = manager.attach(realm);
     let mut status = state
         .pipeline_status
         .write()
@@ -2333,9 +2348,13 @@ fn capture_attach_impl(state: &AppState) -> AppResult<CaptureAttachment> {
 /// any of them releases audio, and capture becomes Running only then. On any
 /// failure every prepared source is stopped and joined (or retired, fencing
 /// the next start), no CaptureStarted row stays open, and the capture and
-/// transcription gates stay idle. A refusal carries `(id, Ended)` and names
-/// the failing source by its position in `sources`; success carries
-/// `(id, Running)`. Both carry the current capture fact.
+/// transcription gates stay idle. Success carries `(id, Running)`. Every
+/// error means `id` did not commit and never will; a refusal also carries
+/// `(id, Ended)` and names the failing source by its position in `sources`.
+/// Both carry the current capture fact. Commands are delivered at least
+/// once: a repeated delivery of the live capture's start returns the same
+/// success and changes nothing, and one of the start still preparing
+/// returns that start's outcome.
 #[tauri::command]
 pub async fn start_capture(
     id: events::CaptureId,
@@ -2350,6 +2369,13 @@ pub async fn start_capture(
 enum CaptureStartError {
     Refused(crate::audio::capture::CaptureStartFailure),
     Failed(AppError),
+}
+
+/// A start that succeeded: this delivery committed it, or it repeats the
+/// delivery that did.
+enum CaptureStartOutcome {
+    Committed,
+    Repeated,
 }
 
 impl From<AppError> for CaptureStartError {
@@ -2389,10 +2415,12 @@ async fn start_capture_impl(
     app: &tauri::AppHandle,
 ) -> AppResult<CaptureReply> {
     match commit_capture_start(id, requests, state, app).await {
-        Ok(()) => {
+        Ok(outcome) => {
             // The fact is stamped, so the event may go out after both locks
             // are released and in any order relative to a later Idle.
-            if let Ok(status) = state.pipeline_status.read() {
+            if matches!(outcome, CaptureStartOutcome::Committed)
+                && let Ok(status) = state.pipeline_status.read()
+            {
                 let _ = app.emit(events::PIPELINE_STATUS_EVENT, &*status);
             }
             Ok(CaptureReply {
@@ -2411,15 +2439,18 @@ async fn start_capture_impl(
     }
 }
 
-/// Register, prepare and commit start `id`. Returns once it committed; every
-/// other outcome left nothing running.
+/// Register, prepare and commit start `id`. Returns once it committed, or
+/// once the delivery it repeats did; every other outcome left nothing
+/// running.
 async fn commit_capture_start(
     id: events::CaptureId,
     requests: Vec<CaptureSourceRequest>,
     state: &AppState,
     app: &tauri::AppHandle,
-) -> Result<(), CaptureStartError> {
-    use crate::audio::capture::{CaptureFailureReason, CaptureSourceStart, CaptureStartFailure};
+) -> Result<CaptureStartOutcome, CaptureStartError> {
+    use crate::audio::capture::{
+        CaptureFailureReason, CaptureRegistration, CaptureSourceStart, CaptureStartFailure,
+    };
 
     let count = requests.len();
     log::info!("start_capture called for {count} source(s)");
@@ -2459,7 +2490,7 @@ async fn commit_capture_start(
     // Registered before waiting for the lifecycle lock, so a Stop, attach or
     // app shutdown from here on cancels this start; a start at or below
     // either watermark (a Stop already named it) is refused now.
-    let ticket = state
+    let registration = state
         .capture_manager
         .lock()
         .map_err(|error| format!("Capture manager lock error: {error}"))?
@@ -2467,6 +2498,13 @@ async fn commit_capture_start(
         .map_err(|reason| {
             CaptureStartError::Refused(CaptureStartFailure::refused(reason, count))
         })?;
+    let ticket = match registration {
+        CaptureRegistration::Registered(ticket) => ticket,
+        CaptureRegistration::Live => return Ok(CaptureStartOutcome::Repeated),
+        CaptureRegistration::Preparing(settled) => {
+            return settled_repeated_start(id, settled, count, state).await;
+        }
+    };
     let _registration = CaptureStartRegistration {
         manager: &state.capture_manager,
         id,
@@ -2601,7 +2639,36 @@ async fn commit_capture_start(
     }
     drop(manager);
     log::info!("Started capture of {count} source(s)");
-    Ok(())
+    Ok(CaptureStartOutcome::Committed)
+}
+
+/// What a repeated delivery of a start that is still preparing learns once
+/// that start settled: it is running, or it never will be.
+async fn settled_repeated_start(
+    id: events::CaptureId,
+    mut settled: tokio::sync::watch::Receiver<()>,
+    count: usize,
+    state: &AppState,
+) -> Result<CaptureStartOutcome, CaptureStartError> {
+    // The sender is dropped with the first delivery's registration, after
+    // its commit or its rollback.
+    while settled.changed().await.is_ok() {}
+    let live = state
+        .capture_manager
+        .lock()
+        .map_err(|error| format!("Capture manager lock error: {error}"))?
+        .owned_capture_id()
+        == Some(id);
+    if live {
+        Ok(CaptureStartOutcome::Repeated)
+    } else {
+        Err(CaptureStartError::Refused(
+            crate::audio::capture::CaptureStartFailure::refused(
+                crate::audio::capture::CaptureFailureReason::Cancelled,
+                count,
+            ),
+        ))
+    }
 }
 
 /// Close a previous start's CaptureStarted row whose append failed, if it
@@ -2656,17 +2723,18 @@ pub(crate) fn close_unmatched_capture_start(
     Ok(())
 }
 
-/// Stop every capture up to and including `id`. `None` (app shutdown, or a
-/// tray with no renderer) stops whatever is registered or committed.
+/// Stop every capture up to and including `id`. `None` (the tray Stop) ends
+/// everything up to the newest id the backend knows: the last registered
+/// start and the committed aggregate.
 ///
 /// The cancel watermark is raised before the lifecycle lock is awaited, so a
 /// start at or below `id` that has not registered yet is refused when it
 /// arrives, and a pending one is cancelled. Under the lifecycle lock the
 /// committed aggregate is stopped if its id is at or below `id`; a newer
-/// capture keeps running, so a stale Stop is a successful no-op. The reply
-/// is `(id, Ended)` with the current capture fact; a Stop that did not
-/// complete cleanly fails with that fact. The last source's teardown also
-/// stops transcription and the realtime modes.
+/// capture keeps running, so a stale Stop is a successful no-op, and so is a
+/// repeated delivery. The reply is `(id, Ended)` with the current capture
+/// fact; a Stop that did not complete cleanly fails with that fact. The last
+/// source's teardown also stops transcription and the realtime modes.
 #[tauri::command]
 pub async fn stop_capture(
     id: Option<events::CaptureId>,
@@ -2674,6 +2742,18 @@ pub async fn stop_capture(
     app: tauri::AppHandle,
 ) -> AppResult<CaptureReply> {
     stop_capture_impl(id, state.inner(), &app).await
+}
+
+/// The tray's Stop: a backend action, so it works with no window, a hidden
+/// window and one still loading, and leaves the backend as a window Stop
+/// does. The renderer learns of it from the Ended status.
+pub(crate) fn stop_capture_from_tray(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        if let Err(error) = stop_capture_impl(None, state.inner(), &app).await {
+            log::warn!("The tray Stop: {error}");
+        }
+    });
 }
 
 /// Reconcile an acknowledged capture worker that exited without a Stop request.
@@ -3087,9 +3167,11 @@ fn ensure_capture_still_acknowledged(
 ///
 /// Refused unless `capture_id` is the live acknowledged capture, so a delayed
 /// start continuation cannot attach transcription to a replacement capture.
-/// Spawns a speech processor thread that reads from the processed audio
-/// channel (pipeline output), accumulates chunks into ~2s segments, then runs
-/// ASR + diarization + entity extraction.
+/// Transcription ends with its capture, so while it runs it belongs to the
+/// live capture: a repeated delivery for that capture succeeds and changes
+/// nothing. Spawns a speech processor thread that reads from the processed
+/// audio channel (pipeline output), accumulates chunks into ~2s segments,
+/// then runs ASR + diarization + entity extraction.
 #[tauri::command]
 pub async fn start_transcribe(
     capture_id: events::CaptureId,
@@ -3113,11 +3195,9 @@ pub async fn start_transcribe(
         });
     }
 
-    // Guard: don't double-start
+    // A repeated delivery: transcription already runs for this capture.
     if state.is_transcribing.load(Ordering::SeqCst) {
-        return Err(AppError::SessionInvalid {
-            reason: "Transcription is already running".to_string(),
-        });
+        return Ok(());
     }
 
     // Pre-flight validation: verify the selected providers are ready before
@@ -25067,9 +25147,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Attach as a renderer does; returns a function numbering its starts.
+    /// A renderer realm token no other attach in this process used.
+    fn fresh_realm() -> String {
+        static NEXT_REALM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!("realm-{}", NEXT_REALM.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Attach as a new renderer realm does; returns a function numbering its
+    /// starts.
     fn attach(state: &AppState) -> impl Fn(u64) -> CaptureId {
-        let attached = capture_attach_impl(state).expect("attach");
+        let attached = capture_attach_impl(&fresh_realm(), state).expect("attach");
         assert_eq!(
             attached.snapshot,
             CaptureFact::ended(CaptureId {
@@ -25603,6 +25690,241 @@ mod tests {
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
+    fn a_repeated_start_returns_the_outcome_of_the_delivery_it_repeats_and_changes_nothing() {
+        capture_scenario("start-capture-repeated", |state, app| async move {
+            let controls = script_capture(
+                &state,
+                vec![ScriptedStart::ReadyOnRelease],
+                SCRIPTED_BOUND,
+                SCRIPTED_BOUND,
+            );
+            let workers = controls.workers.clone();
+            let id = attach(&state);
+
+            // Delivered again while the first delivery prepares: it waits for
+            // that delivery and reports its outcome.
+            let (first, repeated) = tokio::join!(
+                start_capture_impl(id(1), capture_requests(&["system"]), &state, &app),
+                async {
+                    let worker = tokio::task::spawn_blocking(move || {
+                        workers.recv_timeout(SCRIPTED_BOUND).unwrap()
+                    })
+                    .await
+                    .unwrap();
+                    let mut repeated = std::pin::pin!(start_capture_impl(
+                        id(1),
+                        capture_requests(&["system"]),
+                        &state,
+                        &app
+                    ));
+                    tokio::select! {
+                        biased;
+                        _ = &mut repeated => panic!("the repeat waits for the first delivery"),
+                        _ = tokio::task::yield_now() => {}
+                    }
+                    worker.release();
+                    repeated.await
+                }
+            );
+            let running = CaptureReply {
+                fact: CaptureFact::running(id(1)),
+                snapshot: CaptureFact::running(id(1)),
+            };
+            assert_eq!(first.expect("the first delivery commits"), running);
+            assert_eq!(repeated.expect("the repeat reports the commit"), running);
+
+            // Delivered again once live: the same success, and nothing new.
+            let again = start_capture_impl(id(1), capture_requests(&["system"]), &state, &app)
+                .await
+                .expect("a repeated delivery of the live start");
+            assert_eq!(again, running);
+            assert_capture_running(&state, id(1));
+            assert_eq!(controls.workers.try_iter().count(), 0, "one worker only");
+            assert_eq!(capture_lifecycle_rows(&state), (1, 0));
+
+            stop(&state, &app, id(1)).await;
+            // Once ended, a late delivery of that start is refused: it can
+            // never run, so Ended is true.
+            let late = refused_start(
+                start_capture_impl(id(1), capture_requests(&["system"]), &state, &app)
+                    .await
+                    .unwrap_err(),
+                id(1),
+            );
+            assert_eq!(late.reason, CaptureFailureReason::Cancelled);
+            assert_eq!(controls.workers.try_iter().count(), 0);
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (1, 1));
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_repeated_stop_and_a_repeated_attach_change_nothing() {
+        capture_scenario("stop-capture-repeated", |state, app| async move {
+            let _controls = script_capture(
+                &state,
+                vec![ScriptedStart::Ready, ScriptedStart::Ready],
+                SCRIPTED_BOUND,
+                SCRIPTED_BOUND,
+            );
+            let realm = fresh_realm();
+            let attached = capture_attach_impl(&realm, &state).expect("attach");
+            let id = |seq| CaptureId {
+                epoch: attached.epoch,
+                seq,
+            };
+            start_capture_impl(id(1), capture_requests(&["system"]), &state, &app)
+                .await
+                .unwrap();
+
+            // The same realm's attach delivered again: same epoch, nothing
+            // fenced, and the capture is still adopted.
+            let again = capture_attach_impl(&realm, &state).expect("attach again");
+            assert_eq!(again.epoch, attached.epoch);
+            assert_eq!(again.snapshot, CaptureFact::running(id(1)));
+            assert_capture_running(&state, id(1));
+
+            let first = stop(&state, &app, id(1)).await;
+            let repeated = stop(&state, &app, id(1)).await;
+            assert_eq!(first, repeated);
+            assert_eq!(repeated.snapshot, CaptureFact::ended(id(1)));
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (1, 1));
+
+            // The realm's next start is not fenced by the repeated attach.
+            start_capture_impl(id(2), capture_requests(&["system"]), &state, &app)
+                .await
+                .expect("the realm starts again");
+            stop(&state, &app, id(2)).await;
+            assert_eq!(capture_lifecycle_rows(&state), (2, 2));
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn the_tray_stop_ends_what_the_backend_holds_with_no_renderer() {
+        capture_scenario("tray-stop", |state, app| async move {
+            let controls = script_capture(
+                &state,
+                vec![ScriptedStart::Ready, ScriptedStart::ReadyOnRelease],
+                SCRIPTED_BOUND,
+                STUCK_WORKER_BOUND,
+            );
+            let workers = controls.workers.clone();
+
+            // No renderer has ever attached: nothing to stop, and no error.
+            let idle = stop_capture_impl(None, &state, &app)
+                .await
+                .expect("an idle tray Stop");
+            assert_eq!(idle.fact.phase, crate::events::CapturePhase::Ended);
+            assert_capture_idle(&state);
+
+            // A committed capture whose renderer is gone.
+            let id = attach(&state);
+            start_capture_impl(id(1), capture_requests(&["system"]), &state, &app)
+                .await
+                .unwrap();
+            let stopped = stop_capture_impl(None, &state, &app)
+                .await
+                .expect("the tray Stop ends the capture");
+            assert!(stopped.fact >= CaptureFact::ended(id(1)));
+            assert_eq!(stopped.snapshot, CaptureFact::ended(id(1)));
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (1, 1));
+
+            // A start still preparing is cancelled.
+            let (started, stopped) = tokio::join!(
+                start_capture_impl(id(2), capture_requests(&["system"]), &state, &app),
+                async {
+                    // The second spawned worker belongs to this start.
+                    let worker = tokio::task::spawn_blocking(move || {
+                        workers.recv_timeout(SCRIPTED_BOUND).unwrap();
+                        workers.recv_timeout(SCRIPTED_BOUND).unwrap()
+                    })
+                    .await
+                    .unwrap();
+                    let stopped = stop_capture_impl(None, &state, &app).await;
+                    worker.release();
+                    stopped
+                }
+            );
+            let failure = refused_start(started.unwrap_err(), id(2));
+            assert_eq!(failure.reason, CaptureFailureReason::Cancelled);
+            assert!(stopped.expect("the tray Stop").fact >= CaptureFact::ended(id(2)));
+            assert_capture_idle(&state);
+            assert_eq!(capture_lifecycle_rows(&state), (1, 1));
+            state
+                .capture_manager
+                .lock()
+                .unwrap()
+                .join_retired_workers(SCRIPTED_BOUND);
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_capture_error_names_the_source_kind_and_never_the_selection_string() {
+        const SELECTION: &str = "app-name:CanaryMeetingApp";
+        capture_scenario("capture-error-kind", |state, app| async move {
+            let controls = script_capture(
+                &state,
+                vec![ScriptedStart::ReadyThenPanic],
+                SCRIPTED_BOUND,
+                SCRIPTED_BOUND,
+            );
+            let (error_tx, error_rx) = crossbeam_channel::unbounded();
+            let listener = app.listen_any(events::CAPTURE_ERROR, move |event| {
+                let _ = error_tx.send(event.payload().to_string());
+            });
+            let id = attach(&state);
+            start_capture_impl(id(1), capture_requests(&[SELECTION]), &state, &app)
+                .await
+                .unwrap();
+            controls.next_worker(SCRIPTED_BOUND).lose_stream();
+            let (source_id, finished) = controls
+                .exit_requests
+                .recv_timeout(SCRIPTED_BOUND)
+                .expect("the panic requests reconciliation");
+            let payload: serde_json::Value = serde_json::from_str(
+                &error_rx
+                    .recv_timeout(SCRIPTED_BOUND)
+                    .expect("a capture-error event"),
+            )
+            .unwrap();
+            app.unlisten(listener);
+            assert_eq!(
+                payload,
+                serde_json::json!({
+                    "capture_id": { "epoch": id(1).epoch, "seq": 1 },
+                    "source_kind": "application",
+                    "error": "capture thread panicked",
+                    "recoverable": false,
+                })
+            );
+            assert!(!payload.to_string().contains("CanaryMeetingApp"));
+
+            reconcile_lost_capture_source(&source_id, &finished, &state, &app)
+                .await
+                .unwrap();
+            assert_capture_idle(&state);
+        });
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
     fn a_start_at_or_below_either_watermark_is_refused_before_anything_is_prepared() {
         capture_scenario("start-capture-watermarks", |state, app| async move {
             let controls = script_capture(
@@ -25635,15 +25957,21 @@ mod tests {
                 .await
                 .expect("above both watermarks");
             assert_eq!(controls.workers.try_iter().count(), 1);
-            // At or below the last registered start, while it runs.
-            for seq in [6, 4] {
-                refused(
-                    start_capture_impl(id(seq), capture_requests(&["system"]), &state, &app)
-                        .await
-                        .unwrap_err(),
-                    seq,
-                );
-            }
+            // At or below the last registered start, while it runs: the live
+            // id itself is a repeated delivery, an older one is refused.
+            assert_eq!(
+                start_capture_impl(id(6), capture_requests(&["system"]), &state, &app)
+                    .await
+                    .expect("a repeated delivery of the live start")
+                    .fact,
+                CaptureFact::running(id(6))
+            );
+            refused(
+                start_capture_impl(id(4), capture_requests(&["system"]), &state, &app)
+                    .await
+                    .unwrap_err(),
+                4,
+            );
             assert!(controls.workers.try_recv().is_err(), "no worker spawned");
             assert_capture_running(&state, id(6));
             stop(&state, &app, id(6)).await;
@@ -25703,7 +26031,7 @@ mod tests {
             start_capture_impl(new(1), capture_requests(&["system"]), &state, &app)
                 .await
                 .expect("the new page's start acknowledges");
-            let reloaded = capture_attach_impl(&state).expect("attach");
+            let reloaded = capture_attach_impl(&fresh_realm(), &state).expect("attach");
             assert_eq!(reloaded.snapshot, CaptureFact::running(new(1)));
             assert_capture_running(&state, new(1));
             // The reloaded page adopts the capture and stops it under its own
@@ -25806,10 +26134,13 @@ mod tests {
         let (pipeline_tx, _pipeline_rx) = crossbeam_channel::bounded(4);
         let (hooks, controls) = scripted_hooks(scripts, SCRIPTED_BOUND, join_timeout);
         manager.set_worker_hooks(hooks);
-        let epoch = manager.attach();
-        let ticket = manager
+        let epoch = manager.attach("realm-a");
+        let crate::audio::capture::CaptureRegistration::Registered(ticket) = manager
             .register_capture_start(CaptureId { epoch, seq: 1 })
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("a new start registers");
+        };
         let requests = sources
             .iter()
             .map(|source_id| crate::audio::capture::CaptureSourceStart {
@@ -27357,6 +27688,77 @@ mod tests {
             }
             stop_transcribe_impl(&state, &app).await.unwrap();
         }
+        drain_test_writers(&state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A transcription start that is refused, or that repeats the one already
+    /// running, begins no coverage check and leaves the projection lanes as
+    /// they were (#141 round 5 with #571).
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_refused_or_repeated_transcription_start_begins_no_coverage_check() {
+        use crate::speech::test_probe::{Control, Phase};
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("capture-verification-repeat");
+        let _home = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        prepare_projection_capture_source(&state);
+        let live = acknowledged_capture(&state, "refused").unwrap().id;
+        let coverage = |state: &AppState| {
+            let view = state.materialized_projection_state.lock().unwrap();
+            (
+                view.notes.transcript_coverage,
+                view.graph.transcript_coverage,
+            )
+        };
+
+        // For a capture that is not the live one: refused before the lanes.
+        let replaced = CaptureId {
+            epoch: live.epoch + 1,
+            seq: 0,
+        };
+        let refused = start_transcribe(replaced, manager.state(), app.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, AppError::SessionInvalid { reason } if reason == TRANSCRIPTION_CAPTURE_NOT_RUNNING),
+            "{refused:?}"
+        );
+        assert_eq!(coverage(&state), (None, None));
+        assert!(!state.is_transcribing.load(Ordering::SeqCst));
+
+        // The real start, verified to the end: both lanes current.
+        *state.speech_processor_thread.lock().unwrap() = Some(std::thread::spawn(|| {}));
+        let control = Control::arm();
+        start_transcribe(live, manager.state(), app.clone())
+            .await
+            .unwrap();
+        control.wait(Phase::BeforeRead);
+        control.resume();
+        control.wait(Phase::BeforeInstall);
+        control.resume();
+        control.wait(Phase::Done);
+        assert_eq!(coverage(&state), (None, None));
+
+        // Delivered again: the same success, and nothing restarted. Beginning
+        // a new coverage check would mark both lanes behind again.
+        start_transcribe(live, manager.state(), app.clone())
+            .await
+            .expect("a repeated delivery of the running start");
+        assert_eq!(coverage(&state), (None, None));
+        assert!(state.is_transcribing.load(Ordering::SeqCst));
+
+        stop_transcribe_impl(&state, &app).await.unwrap();
         drain_test_writers(&state);
         std::fs::remove_dir_all(dir).unwrap();
     }

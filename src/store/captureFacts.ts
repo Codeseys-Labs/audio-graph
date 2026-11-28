@@ -63,12 +63,15 @@ export interface CaptureView {
   captureStarting: boolean;
   /** A Stop is not yet covered by an Ended fact. */
   captureStopping: boolean;
+  /** The backend transcribes exactly the capture shown running. */
+  isTranscribing: boolean;
 }
 
 export function captureView(
   fact: CaptureFact | null,
   startIntent: CaptureId | null,
   stopIntent: CaptureId | null,
+  transcribing: CaptureId | null,
 ): CaptureView {
   const isCapturing =
     fact !== null &&
@@ -82,7 +85,12 @@ export function captureView(
     stopIntent !== null &&
     (fact === null ||
       compareCaptureFacts(fact, { id: stopIntent, phase: "ended" }) < 0);
-  return { isCapturing, captureStarting, captureStopping };
+  const isTranscribing =
+    isCapturing &&
+    transcribing !== null &&
+    fact !== null &&
+    compareCaptureIds(fact.id, transcribing) === 0;
+  return { isCapturing, captureStarting, captureStopping, isTranscribing };
 }
 
 /** The capture slice of the store: the newest fact and the user's intents. */
@@ -90,6 +98,7 @@ export interface CaptureState {
   captureFact: CaptureFact | null;
   captureStartIntent: CaptureId | null;
   captureStopIntent: CaptureId | null;
+  captureTranscribing: CaptureId | null;
   isCapturing: boolean;
   captureStartTime: number | null;
 }
@@ -99,6 +108,12 @@ export interface CaptureChange {
   facts?: readonly CaptureFact[];
   startIntent?: CaptureId;
   stopIntent?: CaptureId | null;
+  /**
+   * A capture the backend said it transcribes (kept if older than the one
+   * already known: transcription only ends with its capture), or `null`
+   * when this renderer stopped transcription.
+   */
+  transcribing?: CaptureId | null;
 }
 
 /**
@@ -118,11 +133,23 @@ export function reduceCaptureState(
     change.stopIntent !== undefined
       ? change.stopIntent
       : state.captureStopIntent;
-  const view = captureView(fact, captureStartIntent, captureStopIntent);
+  const captureTranscribing =
+    change.transcribing === undefined
+      ? state.captureTranscribing
+      : change.transcribing === null
+        ? null
+        : newestCaptureId(state.captureTranscribing, change.transcribing);
+  const view = captureView(
+    fact,
+    captureStartIntent,
+    captureStopIntent,
+    captureTranscribing,
+  );
   return {
     captureFact: fact,
     captureStartIntent,
     captureStopIntent,
+    captureTranscribing,
     ...view,
     captureStartTime: view.isCapturing
       ? state.isCapturing
@@ -131,6 +158,34 @@ export function reduceCaptureState(
       : null,
   };
 }
+
+/** What the capture toggle offers. */
+export interface CaptureToggle {
+  /** Stop, while a capture runs or starts; it stays enabled. */
+  offersStop: boolean;
+  /**
+   * Start is enabled once this realm is attached (a failed attachment's
+   * Start retries it) and a source is selected.
+   */
+  startEnabled: boolean;
+}
+
+export function captureToggle(state: {
+  isCapturing: boolean;
+  captureStarting: boolean;
+  captureAttach: "detached" | "attaching" | "ready" | "failed";
+  selectedSourceIds: readonly string[];
+}): CaptureToggle {
+  const offersStop = state.isCapturing || state.captureStarting;
+  return {
+    offersStop,
+    startEnabled:
+      !offersStop &&
+      (state.captureAttach === "ready" || state.captureAttach === "failed") &&
+      state.selectedSourceIds.length > 0,
+  };
+}
+
 function isCaptureId(value: unknown): value is CaptureId {
   if (typeof value !== "object" || value === null) return false;
   const id = value as Partial<CaptureId>;

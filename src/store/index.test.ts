@@ -209,6 +209,12 @@ describe("AudioGraphStore", () => {
       captureFact: null,
       captureStartIntent: null,
       captureStopIntent: null,
+      captureTranscribing: null,
+      // This realm is attached, as the hook leaves it on mount.
+      captureAttach: "ready",
+      captureEpoch: 1,
+      captureRealm: "test-realm",
+      captureSeq: 0,
       pipelineStatus: statusFor(ended({ epoch: 0, seq: 0 })),
       isTranscribing: false,
       captureStartTime: null,
@@ -275,7 +281,7 @@ describe("AudioGraphStore", () => {
     });
     vi.mocked(invoke).mockResolvedValue(undefined);
 
-    await useAudioGraphStore.getState().startTranscribe();
+    await useAudioGraphStore.getState().startTranscribe(capture);
 
     // Attached to the capture it follows.
     expect(invoke).toHaveBeenCalledWith("start_transcribe", {
@@ -295,7 +301,7 @@ describe("AudioGraphStore", () => {
       }),
     });
 
-    await useAudioGraphStore.getState().startTranscribe();
+    await useAudioGraphStore.getState().startTranscribe({ epoch: 1, seq: 1 });
 
     expect(invoke).not.toHaveBeenCalled();
     expect(useAudioGraphStore.getState().isTranscribing).toBe(false);
@@ -311,7 +317,7 @@ describe("AudioGraphStore", () => {
       settings: null,
     });
 
-    await useAudioGraphStore.getState().startTranscribe();
+    await useAudioGraphStore.getState().startTranscribe({ epoch: 1, seq: 1 });
 
     expect(invoke).not.toHaveBeenCalled();
     expect(useAudioGraphStore.getState().error).toMatch(
@@ -344,7 +350,7 @@ describe("AudioGraphStore", () => {
         settings: null,
       });
 
-      await useAudioGraphStore.getState().startTranscribe();
+      await useAudioGraphStore.getState().startTranscribe({ epoch: 1, seq: 1 });
 
       expect(invoke).not.toHaveBeenCalled();
       expect(useAudioGraphStore.getState().error).toMatch(
@@ -3706,15 +3712,18 @@ describe("AudioGraphStore", () => {
     expect(state.captureStartTime).toBeNull();
   });
 
-  it("treats any rejected start as ended, and an unusable reply as no fact", async () => {
+  it("ends a start on a structured rejection, and keeps it pending on an unusable reply or a transport failure", async () => {
     const start = deferredCommand("start_capture");
     useAudioGraphStore.setState({ selectedSourceIds: ["system-default"] });
 
-    // An unstructured rejection: the start never committed.
+    // A structured error: the backend ran the start and fenced its id.
     const rejected = useAudioGraphStore.getState().startCapture();
     await vi.waitFor(() => lastStartArgs());
     const first = lastStartArgs().id;
-    await start.fail("mocked transport failure");
+    await start.fail({
+      code: "session_invalid",
+      message: { reason: "previous session workers are still stopping" },
+    });
     await rejected;
     let state = useAudioGraphStore.getState();
     expect(state.captureFact).toEqual(ended(first));
@@ -3737,6 +3746,28 @@ describe("AudioGraphStore", () => {
     state = useAudioGraphStore.getState();
     expect(state.captureStarting).toBe(false);
     expect(state.isCapturing).toBe(true);
+    useAudioGraphStore.getState().setPipelineStatus(statusFor(ended(second)));
+
+    // A transport failure says nothing about the start either: it shows as
+    // pending with Stop offered, and that Stop resolves it.
+    const lost = useAudioGraphStore.getState().startCapture();
+    await vi.waitFor(() =>
+      expect(lastStartArgs().id.seq).toBeGreaterThan(second.seq),
+    );
+    const third = lastStartArgs().id;
+    await start.fail(new Error("IPC transport failure"));
+    await lost;
+    state = useAudioGraphStore.getState();
+    expect(state.captureStarting).toBe(true);
+    expect(state.isCapturing).toBe(false);
+    vi.mocked(invoke).mockImplementation(async (cmd, args) =>
+      captureBackendReply(cmd, args),
+    );
+    await useAudioGraphStore.getState().stopCapture();
+    expect(invoke).toHaveBeenCalledWith("stop_capture", { id: third });
+    state = useAudioGraphStore.getState();
+    expect(state.captureStarting).toBe(false);
+    expect(state.captureFact).toEqual(ended(third));
   });
 
   it("locks the sample preview and the selection while a start is pending, and a Stop ends that start", async () => {
@@ -3869,23 +3900,81 @@ describe("AudioGraphStore", () => {
         : captureBackendReply(cmd, args),
     );
 
-    expect(await reloaded.getState().attachCapture()).toBe(5);
+    // No Start is offered, or deferred, before the attachment replies.
+    reloaded.setState({ selectedSourceIds: ["system-default"] });
+    expect(await reloaded.getState().startCapture()).toBeNull();
+    reloaded.getState().attachCapture();
+    expect(reloaded.getState().captureAttach).toBe("attaching");
+    await vi.waitFor(() =>
+      expect(reloaded.getState().captureAttach).toBe("ready"),
+    );
     let state = reloaded.getState();
+    expect(state.captureEpoch).toBe(5);
     expect(state.isCapturing).toBe(true);
     expect(state.captureStarting).toBe(false);
-    // One attachment per realm, however many times it is asked for.
-    await reloaded.getState().attachCapture();
-    expect(
-      vi
-        .mocked(core.invoke)
-        .mock.calls.filter(([cmd]) => cmd === "capture_attach"),
-    ).toHaveLength(1);
+    // One attachment per realm, however many times it is asked for, and it
+    // names the realm so a repeated delivery changes nothing.
+    reloaded.getState().attachCapture();
+    const attaches = vi
+      .mocked(core.invoke)
+      .mock.calls.filter(([cmd]) => cmd === "capture_attach");
+    expect(attaches).toEqual([
+      ["capture_attach", { realm: expect.stringMatching(/^[0-9a-f]{32}$/) }],
+    ]);
+    expect(core.invoke).not.toHaveBeenCalledWith(
+      "start_capture",
+      expect.anything(),
+    );
 
     await reloaded.getState().stopCapture();
     expect(core.invoke).toHaveBeenCalledWith("stop_capture", { id: adopted });
     state = reloaded.getState();
     expect(state.isCapturing).toBe(false);
     expect(state.captureFact).toEqual(ended(adopted));
+  });
+
+  it("shows a failed attachment's closed error, and the next Start retries it without starting", async () => {
+    useAudioGraphStore.setState({
+      captureAttach: "detached",
+      captureEpoch: null,
+      captureRealm: null,
+      selectedSourceIds: ["system-default"],
+    });
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("IPC transport failure"));
+    useAudioGraphStore.getState().attachCapture();
+    await vi.waitFor(() =>
+      expect(useAudioGraphStore.getState().captureAttach).toBe("failed"),
+    );
+    expect(useAudioGraphStore.getState().error).toBe(
+      i18n.t("errors.captureAttach.failed"),
+    );
+    const realm = useAudioGraphStore.getState().captureRealm;
+
+    vi.mocked(invoke).mockImplementation(async (cmd, args) =>
+      captureBackendReply(cmd, args),
+    );
+    expect(await useAudioGraphStore.getState().startCapture()).toBeNull();
+    await vi.waitFor(() =>
+      expect(useAudioGraphStore.getState().captureAttach).toBe("ready"),
+    );
+    // The retry is the same realm's attach, and nothing started.
+    expect(invoke).toHaveBeenLastCalledWith("capture_attach", { realm });
+    expect(invoke).not.toHaveBeenCalledWith("start_capture", expect.anything());
+    expect(useAudioGraphStore.getState().captureStarting).toBe(false);
+  });
+
+  it("does not tell the user to press Stop again when a failed Stop's snapshot says capture ended", async () => {
+    const id = await startedCapture();
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+      if (cmd === "stop_capture") {
+        throw { code: "capture_stop_failed", message: { snapshot: ended(id) } };
+      }
+      return captureBackendReply(cmd, args);
+    });
+    await useAudioGraphStore.getState().stopCapture();
+    const state = useAudioGraphStore.getState();
+    expect(state.isCapturing).toBe(false);
+    expect(state.error).toBe(i18n.t("errors.captureStop.endedIncomplete"));
   });
 
   it("passes the selected backend source descriptor when starting capture", async () => {
@@ -5844,6 +5933,7 @@ describe("stopCapture — SHELL-R2 session routing", () => {
       captureFact: running({ epoch: 9, seq: 1 }),
       captureStartIntent: null,
       captureStopIntent: null,
+      captureTranscribing: { epoch: 9, seq: 1 },
       isCapturing: true,
       captureStarting: false,
       captureStopping: false,
@@ -6045,6 +6135,10 @@ describe("startCaptureAndTranscribe — SHELL-R3 merged Start (ADR-0046)", () =>
       captureFact: null,
       captureStartIntent: null,
       captureStopIntent: null,
+      captureTranscribing: null,
+      captureAttach: "ready",
+      captureEpoch: 1,
+      captureSeq: 0,
       isTranscribing: false,
       error: null,
     });

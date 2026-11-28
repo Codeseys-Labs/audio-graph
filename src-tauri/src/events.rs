@@ -218,12 +218,6 @@ pub const PRIVACY_POLICY_BLOCKED: &str = "privacy-policy-blocked";
 /// Rust — so the existing no-source-selected notification still surfaces.
 pub const GLOBAL_SHORTCUT_TOGGLE_CAPTURE: &str = "global-shortcut-toggle-capture";
 
-/// Event emitted when the tray *Stop capture* menu item is clicked
-/// (audio-graph-a156). Single source of truth for the event name — the tray
-/// menu handler in [`crate::tray`] emits this constant directly. Routed through
-/// the store `stopCapture` path (same as the UI Stop button).
-pub const TRAY_STOP_CAPTURE: &str = "tray-stop-capture";
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LlmUsageUpdatePayload {
     pub session_id: String,
@@ -1005,12 +999,25 @@ pub struct LiveAssistCardRecord {
     pub decision_provenance: Option<Vec<crate::decision::route::DecisionRecord>>,
 }
 
-/// Payload for capture error events.
+/// The kind of a capture source, as a capture-error event names it: never
+/// the selection string, device name or application name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSourceKind {
+    SystemDefault,
+    Device,
+    Application,
+    ProcessTree,
+    Other,
+}
+
+/// Payload for capture error events: the capture and the failing source's
+/// kind, with a closed message.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CaptureErrorPayload {
     /// The capture the failing source belongs to.
     pub capture_id: CaptureId,
-    pub source_id: String,
+    pub source_kind: CaptureSourceKind,
     pub error: String,
     pub recoverable: bool,
 }
@@ -1046,10 +1053,13 @@ pub struct PersistenceQueueBackpressurePayload {
     pub dropped_count: u64,
 }
 
-/// Payload for capture-backpressure state-change events.
+/// Payload for capture-backpressure state-change events. The source is named
+/// by its capture and its position in that capture's start, never by its
+/// selection string (#141).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CaptureBackpressurePayload {
-    pub source_id: String,
+    pub capture_id: CaptureId,
+    pub source_index: usize,
     /// `true` when the ring buffer has started dropping; `false` when recovery
     /// is detected. The frontend should surface this as a transient warning
     /// (e.g. a pill badge) rather than a fatal error.

@@ -2,17 +2,17 @@
 //!
 //! Builds a single [`tauri::tray::TrayIcon`] during setup with:
 //!   - a default icon when idle and a RED-DOT overlay variant while capturing,
-//!   - a menu (Stop capture / Open AudioGraph / Quit) whose *Stop* item is
-//!     enabled only while capturing,
+//!   - a menu (Stop capture / Open AudioGraph / Quit). *Stop* ends capture in
+//!     the backend (#141), so it works with no window, a hidden window and one
+//!     still loading; it is always enabled, and a Stop with nothing running
+//!     changes nothing,
 //!   - a **content-free** tooltip that shows capture duration only — never
 //!     transcript text, meeting titles, or any captured content (privacy
 //!     constraint from the 2026-07-05 UX review, shortlist row 1/3).
 //!
-//! Capture state is owned frontend-side (the store's `isCapturing` spans
-//! multiple sources), so the tray icon swap is driven by the frontend calling
-//! the [`crate::commands::update_tray_capturing`] command whenever capture
-//! transitions, and directly from the global-shortcut path once the store
-//! round-trips. The tray never derives capture content — only the boolean
+//! The icon and tooltip follow the frontend, which calls the
+//! [`crate::commands::update_tray_capturing`] command whenever capture
+//! transitions. The tray never derives capture content — only the boolean
 //! capturing flag + an already-formatted, content-free duration label.
 //!
 //! Runtime tray behavior needs a display, so it is verified manually (see the
@@ -26,23 +26,17 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
-/// Last-applied capturing state. The heavy tray work (icon decode/overlay +
-/// menu rebuild) only needs to run on a capture *transition*; the per-second
-/// duration ticks that keep the tooltip live must not rebuild the menu on every
-/// call. This guard makes the common tick path a single cheap `set_tooltip`.
+/// Last-applied capturing state. The icon decode/overlay only needs to run on
+/// a capture *transition*; the per-second duration ticks that keep the
+/// tooltip live must not redo it on every call. This guard makes the common
+/// tick path a single cheap `set_tooltip`.
 static LAST_CAPTURING: AtomicBool = AtomicBool::new(false);
 
 /// Stable id for the app's single tray icon. Used to look the tray up again
 /// from command handlers via [`AppHandle::tray_by_id`].
 pub const TRAY_ID: &str = "audiograph-main-tray";
 
-/// Menu item id: stop the active capture. Enabled only while capturing.
-///
-/// This string literal is identical to [`crate::events::TRAY_STOP_CAPTURE`],
-/// but that is coincidental, not a shared constant: menu item ids and emitted
-/// event names live in disjoint muda/Tauri namespaces (`event.id` here vs.
-/// `app.emit`'s channel name below), so either value can change independently
-/// without breaking the other.
+/// Menu item id: stop capture in the backend.
 const MENU_STOP: &str = "tray-stop-capture";
 /// Menu item id: show + focus the main window.
 const MENU_OPEN: &str = "tray-open";
@@ -131,15 +125,10 @@ fn format_duration(total_secs: u64) -> String {
     }
 }
 
-/// Build the tray menu. Extracted so the *Stop* item can be looked up by id
-/// later for enable/disable, and so the menu construction is unit-constructible
-/// in a headless test with a mock app handle.
-pub fn build_menu<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-    capturing: bool,
-) -> tauri::Result<Menu<R>> {
-    // Stop is enabled only while capturing.
-    let stop = MenuItem::with_id(app, MENU_STOP, "Stop capture", capturing, None::<&str>)?;
+/// Build the tray menu, unit-constructible in a headless test with a mock
+/// app handle.
+pub fn build_menu<R: tauri::Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+    let stop = MenuItem::with_id(app, MENU_STOP, "Stop capture", true, None::<&str>)?;
     let open = MenuItem::with_id(app, MENU_OPEN, "Open AudioGraph", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     // Quit is a NORMAL menu item handled via `app.exit(0)` in the menu-event
@@ -164,21 +153,14 @@ fn show_main_window<R: tauri::Runtime>(app: &AppHandle<R>) {
 /// The base icon is the app's default window icon; the recording variant is
 /// derived from it via [`red_dot_overlay`] and cached so the icon swap on
 /// capture transitions is a cheap `set_icon` with no re-decode.
-pub fn build_tray<R: tauri::Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    let menu = build_menu(app, false)?;
+pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    let menu = build_menu(app)?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .tooltip(TOOLTIP_IDLE)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            MENU_STOP => {
-                // Route Stop through the frontend store's stopCapture (same path
-                // as the UI Stop button) by emitting an event the frontend
-                // listens to — no parallel capture-stop logic in Rust. The event
-                // name's single source of truth is `events::TRAY_STOP_CAPTURE`.
-                use tauri::Emitter;
-                let _ = app.emit(crate::events::TRAY_STOP_CAPTURE, ());
-            }
+            MENU_STOP => crate::commands::stop_capture_from_tray(app.clone()),
             MENU_OPEN => show_main_window(app),
             // Real exit, even while capturing. A normal item + explicit
             // `app.exit(0)` because muda's predefined Quit is a no-op on Linux.
@@ -207,8 +189,7 @@ pub fn build_tray<R: tauri::Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 }
 
 /// Apply a capture-state change to the tray: swap the icon (red-dot while
-/// capturing, default when idle), refresh the CONTENT-FREE tooltip, and toggle
-/// the *Stop capture* menu item's enabled state.
+/// capturing, default when idle) and refresh the CONTENT-FREE tooltip.
 ///
 /// Idempotent and best-effort: every step logs-and-continues on error so a
 /// tray hiccup can never break the capture command that drives it.
@@ -222,32 +203,20 @@ pub fn apply_capture_state<R: tauri::Runtime>(
         return;
     };
 
-    // Only rebuild the icon + menu on a capture *transition*; ticks that merely
+    // Only swap the icon on a capture *transition*; ticks that merely
     // advance the duration counter fall through to the cheap tooltip update.
     let transitioned = LAST_CAPTURING.swap(capturing, Ordering::SeqCst) != capturing;
 
-    if transitioned {
+    if transitioned && let Some(base) = app.default_window_icon() {
         // Icon swap: derive the red-dot variant from the default window icon.
-        if let Some(base) = app.default_window_icon() {
-            let icon = if capturing {
-                let rgba = red_dot_overlay(base.rgba(), base.width(), base.height());
-                Image::new_owned(rgba, base.width(), base.height())
-            } else {
-                base.clone().to_owned()
-            };
-            if let Err(e) = tray.set_icon(Some(icon)) {
-                log::warn!("tray: failed to set icon (capturing={capturing}): {e}");
-            }
-        }
-
-        // Toggle Stop-capture menu item enabled state.
-        match build_menu(app, capturing) {
-            Ok(menu) => {
-                if let Err(e) = tray.set_menu(Some(menu)) {
-                    log::warn!("tray: failed to refresh menu: {e}");
-                }
-            }
-            Err(e) => log::warn!("tray: failed to rebuild menu: {e}"),
+        let icon = if capturing {
+            let rgba = red_dot_overlay(base.rgba(), base.width(), base.height());
+            Image::new_owned(rgba, base.width(), base.height())
+        } else {
+            base.clone().to_owned()
+        };
+        if let Err(e) = tray.set_icon(Some(icon)) {
+            log::warn!("tray: failed to set icon (capturing={capturing}): {e}");
         }
     }
 

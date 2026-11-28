@@ -409,8 +409,13 @@ const GATE_ABANDONED: u8 = 2;
 struct CaptureThreadContext {
     /// The capture this worker belongs to; capture-error events carry it.
     capture_id: CaptureId,
-    /// Tags chunks; never logged (ids can carry application names).
+    /// Tags chunks; never logged or put in an event (ids can carry
+    /// application names).
     source_id: String,
+    /// What capture-error events name this source by.
+    source_kind: crate::events::CaptureSourceKind,
+    /// Its position in the start: what backpressure events name it by.
+    source_index: usize,
     target: CaptureTarget,
     stop_signal: Arc<AtomicBool>,
     startup_acknowledged: Arc<AtomicBool>,
@@ -591,9 +596,12 @@ fn spawn_capture_worker(
             reconcile_exit(reconcile_app.clone(), reconcile_source.clone(), finished)
         }),
     };
+    let source_kind = capture_source_kind(&request.target);
     let context = CaptureThreadContext {
         capture_id,
         source_id: request.source_id.clone(),
+        source_kind,
+        source_index: index,
         target: request.target,
         stop_signal: Arc::clone(&stop_signal),
         startup_acknowledged: Arc::clone(&startup_acknowledged),
@@ -610,7 +618,7 @@ fn spawn_capture_worker(
     let body = Arc::clone(&hooks.body);
     let parent_loss = stream_loss.clone();
     let panic_app = app_handle.clone();
-    let panic_source = request.source_id.clone();
+    let panic_kind = source_kind;
     let panic_acknowledged = Arc::clone(&startup_acknowledged);
     let thread = std::thread::Builder::new()
         .name("audio-capture".to_string())
@@ -630,7 +638,7 @@ fn spawn_capture_worker(
                         CAPTURE_ERROR,
                         CaptureErrorPayload {
                             capture_id,
-                            source_id: panic_source,
+                            source_kind: panic_kind,
                             error: "capture thread panicked".to_string(),
                             recoverable: false,
                         },
@@ -753,6 +761,20 @@ fn capture_log_label(target: &CaptureTarget) -> &'static str {
         CaptureTarget::ApplicationByName(_) => "application-by-name",
         CaptureTarget::ProcessTree(_) => "process-tree",
         _ => "other",
+    }
+}
+
+/// The closed kind a capture-error event names a source by.
+fn capture_source_kind(target: &CaptureTarget) -> crate::events::CaptureSourceKind {
+    use crate::events::CaptureSourceKind;
+    match target {
+        CaptureTarget::SystemDefault => CaptureSourceKind::SystemDefault,
+        CaptureTarget::Device(_) => CaptureSourceKind::Device,
+        CaptureTarget::Application(_) | CaptureTarget::ApplicationByName(_) => {
+            CaptureSourceKind::Application
+        }
+        CaptureTarget::ProcessTree(_) => CaptureSourceKind::ProcessTree,
+        _ => CaptureSourceKind::Other,
     }
 }
 
@@ -1797,6 +1819,9 @@ pub struct AudioCaptureManager {
     pending_start: Option<PendingCaptureStart>,
     /// The epoch the latest `capture_attach` issued.
     epoch: u64,
+    /// The realm that epoch was issued to, so a repeated attach from the same
+    /// realm returns it again and fences nothing.
+    attached_realm: Option<String>,
     /// Every capture up to and including this id is ended or refused: a start
     /// at or below it never registers. Raised by Stop and by attach.
     cancelled_through: CaptureId,
@@ -1815,6 +1840,20 @@ struct PendingCaptureStart {
     id: CaptureId,
     /// Dropped to cancel, so a cancel is sticky and wakes the waiting start.
     cancel_tx: Option<crossbeam_channel::Sender<()>>,
+    /// Dropped with the registration, which tells a repeated delivery of
+    /// this start that its outcome is known.
+    settled: tokio::sync::watch::Sender<()>,
+}
+
+/// How [`AudioCaptureManager::register_capture_start`] admitted a start.
+pub(crate) enum CaptureRegistration {
+    /// A new start: prepare and commit it.
+    Registered(CaptureStartTicket),
+    /// A repeated delivery of the live capture's start.
+    Live,
+    /// A repeated delivery of the start still preparing: its outcome is known
+    /// once this receiver reports the registration gone.
+    Preparing(tokio::sync::watch::Receiver<()>),
 }
 
 /// A registered start. Its owner must call
@@ -1895,6 +1934,7 @@ impl AudioCaptureManager {
             hooks: CaptureWorkerHooks::default(),
             pending_start: None,
             epoch: 0,
+            attached_realm: None,
             cancelled_through: CaptureId::default(),
             last_registered: CaptureId::default(),
             capture_id: CaptureId::default(),
@@ -1991,10 +2031,15 @@ impl AudioCaptureManager {
 
     // ----- capture lifecycle -----------------------------------------------
 
-    /// A renderer attached: issue it a new epoch and fence every start an
-    /// earlier renderer left in flight, pending or not yet sent. A committed
-    /// capture survives and is adopted from the snapshot. Returns the epoch.
-    pub(crate) fn attach(&mut self) -> u64 {
+    /// Renderer realm `realm` attached: issue it a new epoch and fence every
+    /// start an earlier realm left in flight, pending or not yet sent. A
+    /// committed capture survives and is adopted from the snapshot. A repeated
+    /// delivery from the attached realm returns its epoch and fences nothing.
+    pub(crate) fn attach(&mut self, realm: &str) -> u64 {
+        if self.attached_realm.as_deref() == Some(realm) {
+            return self.epoch;
+        }
+        self.attached_realm = Some(realm.to_string());
         self.epoch += 1;
         self.cancel_through(CaptureId {
             epoch: self.epoch,
@@ -2006,28 +2051,40 @@ impl AudioCaptureManager {
     /// Register start `id` before it waits for the session lifecycle, so a
     /// Stop, attach or shutdown from then on cancels it. A start registers
     /// only if `id` is above both watermarks: newer than every cancelled id
-    /// and every start already registered. Refuses a second concurrent start.
+    /// and every start already registered. Commands are delivered at least
+    /// once, so a repeated delivery of the live capture's start, or of the
+    /// start still preparing, is recognised rather than refused. Refuses a
+    /// second concurrent start, and retires its id so it never runs.
     pub(crate) fn register_capture_start(
         &mut self,
         id: CaptureId,
-    ) -> Result<CaptureStartTicket, CaptureFailureReason> {
+    ) -> Result<CaptureRegistration, CaptureFailureReason> {
+        if self.owned_capture_id() == Some(id) {
+            return Ok(CaptureRegistration::Live);
+        }
+        if let Some(pending) = self.pending_start.as_ref()
+            && pending.id == id
+        {
+            return Ok(CaptureRegistration::Preparing(pending.settled.subscribe()));
+        }
         if self.shutting_down || id <= self.cancelled_through || id <= self.last_registered {
             return Err(CaptureFailureReason::Cancelled);
         }
+        self.last_registered = id;
         if self.pending_start.is_some() {
             return Err(CaptureFailureReason::AlreadyRunning);
         }
-        self.last_registered = id;
         let (cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
         self.pending_start = Some(PendingCaptureStart {
             id,
             cancel_tx: Some(cancel_tx),
+            settled: tokio::sync::watch::Sender::new(()),
         });
-        Ok(CaptureStartTicket {
+        Ok(CaptureRegistration::Registered(CaptureStartTicket {
             id,
             cancel_rx,
             hooks: self.hooks.clone(),
-        })
+        }))
     }
 
     /// Clear `id`'s registration. Idempotent; called on every exit.
@@ -2511,6 +2568,8 @@ impl AudioCaptureManager {
         let CaptureThreadContext {
             capture_id,
             source_id,
+            source_kind,
+            source_index,
             stop_signal,
             pipeline_tx,
             app_handle,
@@ -2647,7 +2706,7 @@ impl AudioCaptureManager {
                                 CAPTURE_ERROR,
                                 CaptureErrorPayload {
                                     capture_id,
-                                    source_id: source_id.clone(),
+                                    source_kind,
                                     error: "audio pipeline stopped accepting capture data"
                                         .to_string(),
                                     recoverable: false,
@@ -2686,7 +2745,8 @@ impl AudioCaptureManager {
                                 &app_handle,
                                 CAPTURE_BACKPRESSURE,
                                 CaptureBackpressurePayload {
-                                    source_id: source_id.clone(),
+                                    capture_id,
+                                    source_index,
                                     is_backpressured: now_backpressured,
                                 },
                             );
@@ -2712,7 +2772,7 @@ impl AudioCaptureManager {
                             CAPTURE_ERROR,
                             CaptureErrorPayload {
                                 capture_id,
-                                source_id: source_id.clone(),
+                                source_kind,
                                 error: reason.event_text().to_string(),
                                 // `e.is_fatal()` already proved the stream is
                                 // dead: a fatal error is never recoverable (#63).
@@ -2755,7 +2815,7 @@ impl AudioCaptureManager {
                             CAPTURE_ERROR,
                             CaptureErrorPayload {
                                 capture_id,
-                                source_id: source_id.clone(),
+                                source_kind,
                                 error: "audio stream ended unexpectedly".to_string(),
                                 recoverable: false,
                             },
@@ -2941,6 +3001,9 @@ pub(crate) mod scripted {
         /// Report Ready, stop waiting for the commit (as when its deadline
         /// passes), then wedge in teardown until released.
         AbandonThenWedge,
+        /// Report Ready, wait for the release, then panic on `lose_stream()`,
+        /// as a capture body that panics after its commit.
+        ReadyThenPanic,
     }
 
     /// What a scripted worker reached, in order.
@@ -3054,6 +3117,15 @@ pub(crate) mod scripted {
                         let _ = events_tx.send(ScriptedEvent::Abandoned);
                         // Teardown wedged in an OS call.
                         let _ = release_rx.recv();
+                    }
+                    false
+                }
+                ScriptedStart::ReadyThenPanic => {
+                    if reported(report_startup(&context, Ok(None)))
+                        && await_capture_release(&context)
+                    {
+                        let _ = lose_rx.recv();
+                        panic!("scripted capture worker panic");
                     }
                     false
                 }
@@ -3393,18 +3465,30 @@ mod handle_lifecycle_tests {
         )
     }
 
+    fn registered(mgr: &mut AudioCaptureManager, start: CaptureId) -> CaptureStartTicket {
+        match mgr.register_capture_start(start) {
+            Ok(CaptureRegistration::Registered(ticket)) => ticket,
+            Ok(_) => panic!("a repeated delivery, not a new start"),
+            Err(reason) => panic!("refused: {reason:?}"),
+        }
+    }
+
+    fn refusal(mgr: &mut AudioCaptureManager, start: CaptureId) -> Option<CaptureFailureReason> {
+        mgr.register_capture_start(start).err()
+    }
+
     #[test]
     fn a_start_registers_only_above_both_watermarks() {
         let mut mgr = AudioCaptureManager::new();
-        assert_eq!(mgr.attach(), 1);
+        assert_eq!(mgr.attach("realm-a"), 1);
         // A Stop that reaches the manager before its start: the start is
         // refused when it arrives, and a newer one is not.
         assert!(!mgr.cancel_through(id(1, 1)));
         assert_eq!(
-            mgr.register_capture_start(id(1, 1)).err(),
+            refusal(&mut mgr, id(1, 1)),
             Some(CaptureFailureReason::Cancelled)
         );
-        let ticket = mgr.register_capture_start(id(1, 3)).unwrap();
+        let ticket = registered(&mut mgr, id(1, 3));
         // A stale Stop for an older start leaves this one alone.
         assert!(!mgr.cancel_through(id(1, 2)));
         assert!(!cancelled(&ticket));
@@ -3413,30 +3497,84 @@ mod handle_lifecycle_tests {
         mgr.release_capture_start(ticket.id);
         // Not newer than the last registered start.
         assert_eq!(
-            mgr.register_capture_start(id(1, 2)).err(),
+            refusal(&mut mgr, id(1, 2)),
             Some(CaptureFailureReason::Cancelled)
         );
-        let next = mgr.register_capture_start(id(1, 4)).unwrap();
+        let next = registered(&mut mgr, id(1, 4));
         mgr.release_capture_start(next.id);
     }
 
     #[test]
     fn attach_fences_every_start_of_an_earlier_renderer() {
         let mut mgr = AudioCaptureManager::new();
-        assert_eq!(mgr.attach(), 1);
-        let pending = mgr.register_capture_start(id(1, 1)).unwrap();
+        assert_eq!(mgr.attach("realm-a"), 1);
+        let pending = registered(&mut mgr, id(1, 1));
         // A reload: the new renderer attaches while the old start is pending.
-        assert_eq!(mgr.attach(), 2);
+        assert_eq!(mgr.attach("realm-b"), 2);
         assert!(cancelled(&pending));
         mgr.release_capture_start(pending.id);
         // The old renderer's later starts, sent before it went away.
         assert_eq!(
-            mgr.register_capture_start(id(1, 7)).err(),
+            refusal(&mut mgr, id(1, 7)),
             Some(CaptureFailureReason::Cancelled)
         );
-        let fresh = mgr.register_capture_start(id(2, 1)).unwrap();
+        let fresh = registered(&mut mgr, id(2, 1));
         assert!(!cancelled(&fresh));
         mgr.release_capture_start(fresh.id);
+    }
+
+    #[test]
+    fn a_repeated_attach_from_the_same_realm_changes_nothing() {
+        let mut mgr = AudioCaptureManager::new();
+        assert_eq!(mgr.attach("realm-a"), 1);
+        let pending = registered(&mut mgr, id(1, 1));
+        assert_eq!(mgr.attach("realm-a"), 1);
+        assert!(!cancelled(&pending), "the realm's own start survives");
+        mgr.release_capture_start(pending.id);
+    }
+
+    #[test]
+    fn a_repeated_start_learns_the_outcome_of_the_delivery_it_repeats() {
+        let mut mgr = AudioCaptureManager::new();
+        mgr.attach("realm-a");
+        let first = registered(&mut mgr, id(1, 1));
+        let Ok(CaptureRegistration::Preparing(settled)) = mgr.register_capture_start(id(1, 1))
+        else {
+            panic!("a repeated delivery of the preparing start waits for it");
+        };
+        assert!(
+            settled.has_changed().is_ok(),
+            "unsettled while the first delivery prepares"
+        );
+        mgr.release_capture_start(first.id);
+        assert!(
+            settled.has_changed().is_err(),
+            "settled once the first delivery's registration is gone"
+        );
+        // Never run, so a later delivery is refused.
+        assert_eq!(
+            refusal(&mut mgr, id(1, 1)),
+            Some(CaptureFailureReason::Cancelled)
+        );
+    }
+
+    #[test]
+    fn a_concurrent_start_is_refused_and_can_never_run() {
+        let mut mgr = AudioCaptureManager::new();
+        mgr.attach("realm-a");
+        let first = registered(&mut mgr, id(1, 1));
+        assert_eq!(
+            refusal(&mut mgr, id(1, 2)),
+            Some(CaptureFailureReason::AlreadyRunning)
+        );
+        mgr.release_capture_start(first.id);
+        // The refused id was retired: its repeated delivery is refused too.
+        assert_eq!(
+            refusal(&mut mgr, id(1, 2)),
+            Some(CaptureFailureReason::Cancelled)
+        );
+        let next = registered(&mut mgr, id(1, 3));
+        mgr.release_capture_start(next.id);
     }
 }
 

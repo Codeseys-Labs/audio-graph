@@ -1648,7 +1648,11 @@
     "providerSettingsLoading": "As configurações dos provedores ainda estão carregando. Tente novamente em instantes.",
     "artifactTooLarge": "Este artefato tem {{sizeMb}} MB, acima do limite de {{ceilingMb}} MB.",
     "captureStop": {
-      "incomplete": "A captura não parou de forma limpa. Pressione Parar novamente; se ela continuar, reinicie o AudioGraph."
+      "incomplete": "A captura não parou de forma limpa. Pressione Parar novamente; se ela continuar, reinicie o AudioGraph.",
+      "endedIncomplete": "A captura parou, mas parte da limpeza não terminou. Se algo parecer errado, reinicie o AudioGraph."
+    },
+    "captureAttach": {
+      "failed": "O AudioGraph não conseguiu se conectar à captura de áudio. Pressione Iniciar para tentar novamente."
     },
     "captureStart": {
       "forSource": "{{source}}: {{reason}}",

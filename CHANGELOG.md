@@ -62,10 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transcription state behind. Each start has a capture id, and Stop, every
   reply and every status event name it, so a late reply or a Stop for an older
   capture can no longer end or revive another one; a reload adopts a capture
-  that is still running. Transcription attaches only to the capture it
-  follows. A failure names the source and a closed reason, without device or
-  driver text. Sessions can't be loaded into the store while a start is
-  pending.
+  that is still running, and a repeated delivery of a command changes nothing.
+  Transcription attaches only to the capture it follows. The tray's Stop ends
+  capture in the backend, so it works while the window is hidden or loading.
+  A failure names the source and a closed reason, without device or driver
+  text, and capture errors name only the kind of source. Start waits until
+  the window is connected to capture, and sessions can't be loaded into the
+  store while a start is pending.
 - Notes and Graph now publish changes after their projection log confirms the
   write. Historical Review shows when an existing projection trails its
   transcript or needs repair after an interrupted write. Export includes

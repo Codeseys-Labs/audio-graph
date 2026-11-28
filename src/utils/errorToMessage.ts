@@ -126,7 +126,12 @@ function formatAppError(err: AppErrorPayload): string {
     case "capture_start_failed":
       return captureStartFailureMessage(err.message?.reason);
     case "capture_stop_failed":
-      return i18n.t("errors.captureStop.incomplete");
+      // Capture has ended when the snapshot says so: nothing to press again.
+      return i18n.t(
+        err.message?.snapshot?.phase === "ended"
+          ? "errors.captureStop.endedIncomplete"
+          : "errors.captureStop.incomplete",
+      );
     case "unknown":
       return err.message;
   }

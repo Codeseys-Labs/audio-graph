@@ -186,6 +186,7 @@ const idle: CaptureState = {
   captureFact: null,
   captureStartIntent: null,
   captureStopIntent: null,
+  captureTranscribing: null,
   isCapturing: false,
   captureStartTime: null,
 };

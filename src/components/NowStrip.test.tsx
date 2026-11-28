@@ -86,6 +86,10 @@ function resetStore(overrides: Partial<StoreState> = {}) {
   for (const fn of Object.values(actions)) fn.mockClear();
   useAudioGraphStore.setState({
     isCapturing: false,
+    captureStarting: false,
+    captureStopping: false,
+    // This realm is attached, as the hook leaves it on mount.
+    captureAttach: "ready",
     isTranscribing: false,
     isGeminiActive: false,
     // SHELL-R4 (plan §R4, ADR-0046): NowStrip now reads these two directly
@@ -194,6 +198,18 @@ describe("NowStrip", () => {
     await waitFor(() =>
       expect(actions.startCaptureAndTranscribe).toHaveBeenCalledTimes(1),
     );
+  });
+
+  it("keeps Start disabled until this realm is attached, and enables it to retry a failed attach", () => {
+    resetStore({
+      selectedSourceIds: ["system-default"],
+      captureAttach: "attaching",
+    });
+    const { rerender } = render(<NowStrip />);
+    expect(screen.getByRole("button", { name: /^start$/i })).toBeDisabled();
+    act(() => useAudioGraphStore.setState({ captureAttach: "failed" }));
+    rerender(<NowStrip />);
+    expect(screen.getByRole("button", { name: /^start$/i })).toBeEnabled();
   });
 
   it("shows a pressed Stop button while capturing and calls stopCapture", async () => {

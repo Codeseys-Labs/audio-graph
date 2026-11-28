@@ -753,16 +753,26 @@ export interface CaptureSessionConfig {
 }
 
 // Event payloads
+/** A capture source's kind, the only way a capture-error event names it. */
+export type CaptureSourceKind =
+  | "system_default"
+  | "device"
+  | "application"
+  | "process_tree"
+  | "other";
+
 export interface CaptureErrorPayload {
   /** The capture the failing source belongs to. */
   capture_id: CaptureId;
-  source_id: string;
+  source_kind: CaptureSourceKind;
   error: string;
   recoverable: boolean;
 }
 
 export interface CaptureBackpressurePayload {
-  source_id: string;
+  /** The capture and the source's position in its start. */
+  capture_id: CaptureId;
+  source_index: number;
   is_backpressured: boolean;
 }
 
@@ -3542,18 +3552,33 @@ export interface AudioGraphStore {
   captureStopping: boolean;
   /**
    * The newest backend capture fact this renderer has seen. `isCapturing`,
-   * `captureStarting` and `captureStopping` derive from it and the two
-   * intents below; nothing else sets them.
+   * `captureStarting`, `captureStopping` and `isTranscribing` derive from
+   * it, the two intents below and `captureTranscribing`; nothing else sets
+   * them.
    */
   captureFact: CaptureFact | null;
   /** The id of this renderer's latest Start. */
   captureStartIntent: CaptureId | null;
   /** The id of this renderer's latest Stop. */
   captureStopIntent: CaptureId | null;
+  /** The capture the backend said it transcribes, if any. */
+  captureTranscribing: CaptureId | null;
   captureStartTime: number | null;
-  /** Attach to capture control once per realm; starts await it. */
-  attachCapture: () => Promise<number>;
-  startCapture: () => Promise<void>;
+  /**
+   * This realm's attachment to capture control. Start is unavailable until
+   * it is `ready`; a `failed` one is retried by the next Start.
+   */
+  captureAttach: "detached" | "attaching" | "ready" | "failed";
+  /** The epoch the attachment issued; this realm's starts carry it. */
+  captureEpoch: number | null;
+  /** This realm's token, sent with every attach, so a repeated one is known. */
+  captureRealm: string | null;
+  /** The sequence number of this realm's latest start. */
+  captureSeq: number;
+  /** Attach this realm to capture control; idempotent once ready. */
+  attachCapture: () => void;
+  /** Start a capture; resolves to its id, or null if none was sent. */
+  startCapture: () => Promise<CaptureId | null>;
   stopCapture: () => Promise<void>;
   /**
    * ONE START (SHELL-R3, ADR-0046): composes `startCapture` then
@@ -3574,12 +3599,13 @@ export interface AudioGraphStore {
   setSourceBackpressure: (sourceId: string, isBackpressured: boolean) => void;
 
   // Transcribe state (manual transcription)
+  /** The backend transcribes the capture the renderer shows running. */
   isTranscribing: boolean;
   /**
-   * Start transcription for capture `captureId` (default: the running
-   * capture). The backend refuses it unless that capture is the live one.
+   * Start transcription for capture `captureId`. Skipped unless that
+   * capture is the one running; the backend refuses it too otherwise.
    */
-  startTranscribe: (captureId?: CaptureId) => Promise<void>;
+  startTranscribe: (captureId: CaptureId) => Promise<void>;
   stopTranscribe: () => Promise<void>;
 
   // Error state

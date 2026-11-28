@@ -50,6 +50,10 @@ function resetStore() {
     captureFact: null,
     captureStartIntent: null,
     captureStopIntent: null,
+    captureTranscribing: null,
+    // Attached already: the hook's attach is then a no-op, and these tests
+    // cover event routing, not the attachment.
+    captureAttach: "ready",
     isCapturing: false,
     captureStarting: false,
     captureStopping: false,
@@ -158,7 +162,7 @@ describe("useTauriEvents", () => {
   it.each([
     false,
     true,
-  ])("restores startup storage status while respecting newer events (%s)", async (newerEvent) => {
+  ])("restores startup storage status, dropped only behind a newer capture fact (%s)", async (newerEvent) => {
     const snapshot = {
       ...useAudioGraphStore.getState().pipelineStatus,
       transcript_crash_safety_unverified: true,
@@ -177,7 +181,15 @@ describe("useTauriEvents", () => {
     });
     const { unmount } = renderHook(() => useTauriEvents());
     await started;
-    const newer = { ...snapshot, transcript_crash_safety_unverified: false };
+    // An event stamped with a newer capture fact than the read's.
+    const newer = {
+      ...snapshot,
+      capture_id: {
+        epoch: snapshot.capture_id.epoch + 1,
+        seq: snapshot.capture_id.seq,
+      },
+      transcript_crash_safety_unverified: false,
+    };
     if (newerEvent) {
       act(() =>
         handlers.get("pipeline-status")?.(makeEvent("pipeline-status", newer)),
@@ -189,6 +201,45 @@ describe("useTauriEvents", () => {
     expect(useAudioGraphStore.getState().pipelineStatus).toEqual(
       newerEvent ? newer : snapshot,
     );
+    unmount();
+  });
+
+  it("applies a status read whose capture fact matches an event that arrived first", async () => {
+    // No arrival-order shortcut: a read is dropped only when it is stale.
+    const live = { epoch: 2, seq: 1 };
+    const runningStage = { type: "Running", processed_count: 0 } as const;
+    const idle = { type: "Idle" } as const;
+    const status = (capture: typeof runningStage | typeof idle) => ({
+      ...useAudioGraphStore.getState().pipelineStatus,
+      capture_id: live,
+      capture,
+    });
+    let finishRead!: (value: unknown) => void;
+    vi.mocked(invoke).mockImplementation(async (cmd) =>
+      cmd === "get_pipeline_status"
+        ? new Promise((resolve) => {
+            finishRead = resolve;
+          })
+        : undefined,
+    );
+    const { unmount } = renderHook(() => useTauriEvents());
+    await waitForAllHandlers();
+    await vi.waitFor(() => expect(typeof finishRead).toBe("function"));
+    // A slow thread's Running snapshot, then the read that saw it end.
+    act(() =>
+      handlers.get("pipeline-status")?.(
+        makeEvent("pipeline-status", status(runningStage)),
+      ),
+    );
+    expect(useAudioGraphStore.getState().isCapturing).toBe(true);
+    await act(async () => {
+      finishRead(status(idle));
+    });
+    expect(useAudioGraphStore.getState().isCapturing).toBe(false);
+    expect(useAudioGraphStore.getState().captureFact).toEqual({
+      id: live,
+      phase: "ended",
+    });
     unmount();
   });
 
@@ -643,7 +694,7 @@ describe("useTauriEvents", () => {
     handlers.get("capture-error")?.(
       makeEvent("capture-error", {
         capture_id: { epoch: 1, seq: 1 },
-        source_id: "mic-1",
+        source_kind: "device",
         error: "device disconnected",
       }),
     );
@@ -652,29 +703,24 @@ describe("useTauriEvents", () => {
     errSpy.mockRestore();
   });
 
-  it("tracks capture-backpressure add and clear transitions", async () => {
+  it("tracks capture-backpressure add and clear transitions per source of a capture", async () => {
     renderHook(() => useTauriEvents());
     await waitForAllHandlers();
-
-    handlers.get("capture-backpressure")?.(
+    const event = (source_index: number, is_backpressured: boolean) =>
       makeEvent("capture-backpressure", {
-        source_id: "mic-1",
-        is_backpressured: true,
-      }),
-    );
-    expect(useAudioGraphStore.getState().backpressuredSources).toContain(
-      "mic-1",
-    );
+        capture_id: { epoch: 1, seq: 1 },
+        source_index,
+        is_backpressured,
+      });
 
-    handlers.get("capture-backpressure")?.(
-      makeEvent("capture-backpressure", {
-        source_id: "mic-1",
-        is_backpressured: false,
-      }),
-    );
-    expect(useAudioGraphStore.getState().backpressuredSources).not.toContain(
-      "mic-1",
-    );
+    handlers.get("capture-backpressure")?.(event(1, true));
+    handlers.get("capture-backpressure")?.(event(0, true));
+    handlers.get("capture-backpressure")?.(event(1, true));
+    expect(useAudioGraphStore.getState().backpressuredSources).toHaveLength(2);
+
+    handlers.get("capture-backpressure")?.(event(1, false));
+    handlers.get("capture-backpressure")?.(event(0, false));
+    expect(useAudioGraphStore.getState().backpressuredSources).toEqual([]);
   });
 
   it("tracks persistence queue backpressure add and clear transitions", async () => {

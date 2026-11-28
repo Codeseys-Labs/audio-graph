@@ -379,6 +379,8 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
       sessions: [SESSION_A],
       sessionsLoading: false,
       selectedSourceIds: ["system-default"],
+      captureAttach: "ready",
+      captureEpoch: 1,
       isCapturing: false,
       isTranscribing: false,
     });
@@ -446,6 +448,8 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
       sessions: [SESSION_A],
       sessionsLoading: false,
       selectedSourceIds: ["system-default"],
+      captureAttach: "ready",
+      captureEpoch: 1,
       isCapturing: false,
       isTranscribing: false,
       loadedSessionId: null,

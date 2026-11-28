@@ -77,6 +77,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
+import { captureToggle } from "../store/captureFacts";
 import {
   describePlannedRoute,
   hasConfiguredDurableNotesRoute,
@@ -172,7 +173,14 @@ function NowStrip() {
       ? null
       : Math.max(0, Math.floor((nowMs - lastNotesSavedAtMs) / 1000));
 
-  const showStop = isCapturing || captureStarting;
+  const captureAttach = useAudioGraphStore((s) => s.captureAttach);
+  const toggle = captureToggle({
+    isCapturing,
+    captureStarting,
+    captureAttach,
+    selectedSourceIds,
+  });
+  const showStop = toggle.offersStop;
   const handleToggleCapture = useCallback(async () => {
     setCapturePending(true);
     try {
@@ -186,7 +194,7 @@ function NowStrip() {
     }
   }, [showStop, startCaptureAndTranscribe, stopCapture]);
 
-  const canStart = selectedSourceIds.length > 0 && !isCapturing;
+  const canStart = toggle.startEnabled;
 
   // Route chip: settings-derived only, "planned:" never "observed" — see
   // this file's doc comment and utils/durableRoute.ts.

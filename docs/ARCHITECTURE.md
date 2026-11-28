@@ -797,11 +797,11 @@ sequenceDiagram
     participant Graph as Knowledge Graph
     participant Audit as Movement Ledger
 
-    UI->>Main: capture_attach() once per page: epoch e, current capture fact
-    Note over UI,Main: Attach cancels any start an earlier page left pending; a running capture is adopted from the fact
+    UI->>Main: capture_attach(realm) once per page: epoch e, current capture fact
+    Note over UI,Main: Attach cancels any start an earlier page left pending; a running capture is adopted from the fact. Start is unavailable until it replies
     UI->>Main: start_capture(id = (e, seq), sources[])
-    Note over UI,Main: Registers only above both watermarks (every cancelled id, every registered id)
-    Note over UI,Main: stop_capture(id) ends every capture up to id: watermark first, then the committed aggregate if not newer
+    Note over UI,Main: Registers only above both watermarks (every cancelled id, every registered id). Commands are at-least-once: a repeat of the live or preparing start reports that start's outcome
+    Note over UI,Main: stop_capture(id) ends every capture up to id: watermark first, then the committed aggregate if not newer. The tray's Stop is stop_capture(None) in the backend
     Main->>Main: close a previous start's uncertain CaptureStarted row, if any
     Main->>Pipe: ResetSession barrier
     Pipe->>Disp: ordered processed reset
@@ -816,7 +816,7 @@ sequenceDiagram
     Note over Main,Audit: A member that died meanwhile fails the start; its CaptureStarted is closed
     Main->>Cap: Commit every source / release receive loops
     Main-->>UI: status (capture_id = id, Running) and reply (id, Running), in any order
-    Note over UI: The renderer keeps the newest fact (id, then Running < Ended), so arrival order never matters
+    Note over UI: The renderer keeps the newest fact (id, then Running < Ended) and drops a status whose fact is older, so arrival order never matters
 
     loop Every ~10ms audio buffer
         Cap->>Pipe: TaggedAudioBuffer (48kHz stereo f32)

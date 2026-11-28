@@ -17,14 +17,14 @@ import { useAudioGraphStore } from "../store";
  *      `stopCapture` path the UI Start/Stop button uses (SHELL-R3, ADR-0046's
  *      "one Start") — no parallel logic — so a no-source-selected start still
  *      surfaces the existing "No audio source selected" error.
- *   2. **Tray Stop menu item** — the backend emits `tray-stop-capture`; we call
- *      the store's `stopCapture` (same path as the UI Stop button).
- *   3. **Tray indicator sync** — capture state lives frontend-side (the store's
- *      `isCapturing` spans multiple sources), so we push it to the tray via the
- *      `update_tray_capturing` command: the backend swaps the icon (red dot),
- *      refreshes the CONTENT-FREE duration tooltip, and enables/disables the
- *      tray Stop item. We send only a boolean + an elapsed-seconds count —
- *      never any captured content (transcript/notes/titles).
+ *   2. **Tray indicator sync** — the tray icon follows the store's
+ *      `isCapturing` (it spans multiple sources), pushed via the
+ *      `update_tray_capturing` command: the backend swaps the icon (red dot)
+ *      and refreshes the CONTENT-FREE duration tooltip. We send only a
+ *      boolean + an elapsed-seconds count — never any captured content
+ *      (transcript/notes/titles). The tray's Stop is a backend action (#141),
+ *      so it needs no listener here: the store learns of it from the Ended
+ *      capture status.
  *
  * Double-fire note: the window-focus `useKeyboardShortcuts` owns plain
  * Cmd/Ctrl+R (no Shift) and explicitly ignores every Shift combo except
@@ -35,61 +35,48 @@ export function useNativeCapture(): void {
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
   const captureStartTime = useAudioGraphStore((s) => s.captureStartTime);
 
-  // ── Global shortcut + tray Stop → store toggle path ──────────────────────
+  // ── Global shortcut → store toggle path ──────────────────────────────────
   useEffect(() => {
-    let unlisten: Array<(() => void) | null> = [];
+    let unlisten: (() => void) | null = null;
     let cancelled = false;
 
     async function setup() {
-      const handles = await Promise.all([
-        listen("global-shortcut-toggle-capture", () => {
-          // Read the latest state at fire time (not the effect's closure) so a
-          // stale `isCapturing` can't flip the wrong direction.
-          const { isCapturing: capturing } = useAudioGraphStore.getState();
-          if (capturing) {
-            void useAudioGraphStore.getState().stopCapture();
-          } else {
-            void useAudioGraphStore.getState().startCaptureAndTranscribe();
-          }
-        }).catch((err) => {
-          // Route through the same diagnostics path as invoke failures
-          // (safeInvoke's frontend.invoke.error) so a broken subscribe surfaces
-          // in the same triage channel. This effect has no deps ([]), so setup()
-          // runs exactly once per mount — one diagnostic here, never per-retry.
-          console.error(
-            "Failed to subscribe to global-shortcut-toggle-capture:",
-            err,
-          );
-          captureFrontendError("frontend.listen.error", {
-            category: "frontend",
-            surface: "listen",
-            component: "global-shortcut-toggle-capture",
-          });
-          return null;
-        }),
-        listen("tray-stop-capture", () => {
+      const handle = await listen("global-shortcut-toggle-capture", () => {
+        // Read the latest state at fire time (not the effect's closure) so a
+        // stale `isCapturing` can't flip the wrong direction.
+        const { isCapturing: capturing } = useAudioGraphStore.getState();
+        if (capturing) {
           void useAudioGraphStore.getState().stopCapture();
-        }).catch((err) => {
-          console.error("Failed to subscribe to tray-stop-capture:", err);
-          captureFrontendError("frontend.listen.error", {
-            category: "frontend",
-            surface: "listen",
-            component: "tray-stop-capture",
-          });
-          return null;
-        }),
-      ]);
+        } else {
+          void useAudioGraphStore.getState().startCaptureAndTranscribe();
+        }
+      }).catch((err) => {
+        // Route through the same diagnostics path as invoke failures
+        // (safeInvoke's frontend.invoke.error) so a broken subscribe surfaces
+        // in the same triage channel. This effect has no deps ([]), so setup()
+        // runs exactly once per mount — one diagnostic here, never per-retry.
+        console.error(
+          "Failed to subscribe to global-shortcut-toggle-capture:",
+          err,
+        );
+        captureFrontendError("frontend.listen.error", {
+          category: "frontend",
+          surface: "listen",
+          component: "global-shortcut-toggle-capture",
+        });
+        return null;
+      });
       if (cancelled) {
-        for (const fn of handles) if (fn) fn();
+        handle?.();
         return;
       }
-      unlisten = handles;
+      unlisten = handle;
     }
 
     setup();
     return () => {
       cancelled = true;
-      for (const fn of unlisten) if (fn) fn();
+      unlisten?.();
     };
     // startCaptureAndTranscribe/stopCapture are stable store actions;
     // getState() reads the live values, so this subscribes exactly once.

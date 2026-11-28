@@ -41,12 +41,12 @@ describe("useNativeCapture", () => {
     vi.clearAllMocks();
   });
 
-  it("subscribes to the global-shortcut and tray-stop events", async () => {
+  it("subscribes to the global shortcut only: the tray Stop is a backend action", async () => {
     renderHook(() => useNativeCapture());
-    await waitFor(() => {
-      expect(handlers.has("global-shortcut-toggle-capture")).toBe(true);
-      expect(handlers.has("tray-stop-capture")).toBe(true);
-    });
+    await waitFor(() =>
+      expect(handlers.has("global-shortcut-toggle-capture")).toBe(true),
+    );
+    expect(handlers.has("tray-stop-capture")).toBe(false);
   });
 
   it("global shortcut STARTS capture when idle (same store path as UI)", async () => {
@@ -83,21 +83,6 @@ describe("useNativeCapture", () => {
 
     expect(stopCapture).toHaveBeenCalledTimes(1);
     expect(startCaptureAndTranscribe).not.toHaveBeenCalled();
-  });
-
-  it("tray Stop routes through the store stopCapture", async () => {
-    useAudioGraphStore.setState({
-      isCapturing: true,
-      captureStartTime: Date.now(),
-    });
-    renderHook(() => useNativeCapture());
-    await waitFor(() => expect(handlers.has("tray-stop-capture")).toBe(true));
-
-    act(() => {
-      handlers.get("tray-stop-capture")?.(evt("tray-stop-capture"));
-    });
-
-    expect(stopCapture).toHaveBeenCalledTimes(1);
   });
 
   // safeInvoke forwards a third `options` arg (undefined) to `invoke`, so we

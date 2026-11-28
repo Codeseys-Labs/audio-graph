@@ -307,7 +307,6 @@ export function useTauriEvents(): void {
     // flag so listeners that resolve after unmount are unlistened instead of
     // leaking (the sync cleanup below would otherwise iterate an empty array).
     let cancelled = false;
-    let sawPipelineStatus = false;
 
     // H5: coalesce high-frequency REPLACE-semantics events (latest wins) so
     // a flood triggers ~10fps store updates instead of one per event. Only
@@ -418,7 +417,6 @@ export function useTauriEvents(): void {
           setMaterializedProjectionGraph(event.payload);
         }),
         safeListen<PipelineStatus>(PIPELINE_STATUS, (event) => {
-          sawPipelineStatus = true;
           setPipelineStatus(event.payload);
         }),
         safeListen<ProcessedAudioConsumerHealthPayload>(
@@ -448,8 +446,14 @@ export function useTauriEvents(): void {
         safeListen<CaptureBackpressurePayload>(
           CAPTURE_BACKPRESSURE,
           (event) => {
-            const { source_id, is_backpressured } = event.payload;
-            setSourceBackpressure(source_id, is_backpressured);
+            // A source is named by its capture and position, never by its
+            // selection string.
+            const { capture_id, source_index, is_backpressured } =
+              event.payload;
+            setSourceBackpressure(
+              `${capture_id.epoch}.${capture_id.seq}/${source_index}`,
+              is_backpressured,
+            );
           },
         ),
         safeListen<PersistenceQueueBackpressurePayload>(
@@ -590,24 +594,15 @@ export function useTauriEvents(): void {
       // returns adopts a capture still running after a reload, and the
       // attachment cancels any start the previous page left pending. The
       // store keeps one attachment per realm, so a remount reuses it.
-      useAudioGraphStore
-        .getState()
-        .attachCapture()
-        .catch(() => {
-          // Start attaches again before it sends anything.
-        });
-      // The startup storage probe may have finished before the renderer mounted.
-      // Subscribe first so a slow initial read cannot overwrite a newer event.
-      if (!sawPipelineStatus) {
-        try {
-          const status = await safeInvoke<PipelineStatus>(
-            "get_pipeline_status",
-          );
-          if (!cancelled && !sawPipelineStatus && status)
-            setPipelineStatus(status);
-        } catch {
-          // The event subscription will publish the next observed status.
-        }
+      useAudioGraphStore.getState().attachCapture();
+      // The startup storage probe may have finished before the renderer
+      // mounted. The read is merged by its capture fact like every event, so
+      // it is dropped only when a newer fact has already arrived.
+      try {
+        const status = await safeInvoke<PipelineStatus>("get_pipeline_status");
+        if (!cancelled && status) setPipelineStatus(status);
+      } catch {
+        // The event subscription will publish the next observed status.
       }
     }
 
