@@ -703,6 +703,24 @@ impl CredentialService {
         Ok(())
     }
 
+    /// Loads the journal under the session's lock and, before the caller
+    /// takes any effect, refuses one older than this service has already
+    /// observed: an older epoch of the same authority is a rollback, and a
+    /// mutation built on it would commit over the history it lost, even when
+    /// the target's revisions still match. A journal at or past the observed
+    /// epoch is adopted. Every mutation path loads its journal through here.
+    fn load_observed_journal<'session>(
+        &self,
+        session: &mut (dyn CredentialMutationSession + 'session),
+        set_id: &CredentialSetId,
+    ) -> Result<AuthorityJournal, CredentialError> {
+        let journal = session
+            .load_journal()
+            .map_err(|failure| self.map_store_failure(failure, set_id))?;
+        self.reconcile_authoritative_journal(&journal, set_id)?;
+        Ok(journal)
+    }
+
     fn active_readback_is_commit_unknown(
         &self,
         failure: CredentialStoreFailure,
@@ -781,9 +799,7 @@ impl CredentialService {
             .store
             .begin_mutation(&prepared.operation_id, &prepared.set_id)
             .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
-        let journal = session
-            .load_journal()
-            .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+        let journal = self.load_observed_journal(session.as_mut(), &prepared.set_id)?;
         Self::require_authoritative_prepared_activation(&journal, prepared)
     }
 
@@ -1014,18 +1030,14 @@ impl CredentialService {
                 .store
                 .begin_mutation(&operation_id, &request.set_id)
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-            let mut journal = session
-                .load_journal()
-                .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
+            let mut journal = self.load_observed_journal(session.as_mut(), &request.set_id)?;
 
             if let Some(previous) = journal.idempotency_entry(&request.idempotency_token) {
                 if previous.set_id == request.set_id
                     && previous.mutation_kind == CredentialMutationKind::Replace
                     && previous.expected_revision == request.expected_revision
                 {
-                    let receipt = previous.receipt.clone();
-                    self.reconcile_authoritative_journal(&journal, &request.set_id)?;
-                    return Ok(receipt);
+                    return Ok(previous.receipt.clone());
                 }
                 Self::ensure_target_has_no_pending_mutation(&journal, &request.set_id)?;
                 return Err(content_free_error(
@@ -1171,18 +1183,14 @@ impl CredentialService {
                 .store
                 .begin_mutation(&operation_id, &request.set_id)
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-            let mut journal = session
-                .load_journal()
-                .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
+            let mut journal = self.load_observed_journal(session.as_mut(), &request.set_id)?;
 
             if let Some(previous) = journal.idempotency_entry(&request.idempotency_token) {
                 if previous.set_id == request.set_id
                     && previous.mutation_kind == CredentialMutationKind::Delete
                     && previous.expected_revision == request.expected_revision
                 {
-                    let receipt = previous.receipt.clone();
-                    self.reconcile_authoritative_journal(&journal, &request.set_id)?;
-                    return Ok(receipt);
+                    return Ok(previous.receipt.clone());
                 }
                 Self::ensure_target_has_no_pending_mutation(&journal, &request.set_id)?;
                 return Err(content_free_error(
@@ -1335,9 +1343,7 @@ impl CredentialService {
                 .store
                 .begin_mutation(&operation_id, &request.set_id)
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-            let mut journal = session
-                .load_journal()
-                .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
+            let mut journal = self.load_observed_journal(session.as_mut(), &request.set_id)?;
             if journal.pending_activation.is_some() || !journal.pending_intents.is_empty() {
                 return Err(
                     CredentialStoreFailure::OperationInProgress.into_public(Some(request.set_id))
@@ -1540,9 +1546,7 @@ impl CredentialService {
                 .store
                 .begin_mutation(&prepared.operation_id, &prepared.set_id)
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
-            let mut journal = session
-                .load_journal()
-                .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+            let mut journal = self.load_observed_journal(session.as_mut(), &prepared.set_id)?;
             Self::require_authoritative_prepared_activation(&journal, prepared)?;
             let Some(pending) = journal.pending_activation.as_mut() else {
                 return Err(content_free_error(
@@ -1591,9 +1595,7 @@ impl CredentialService {
                 .store
                 .begin_mutation(&prepared.operation_id, &prepared.set_id)
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
-            let mut journal = session
-                .load_journal()
-                .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+            let mut journal = self.load_observed_journal(session.as_mut(), &prepared.set_id)?;
             Self::require_authoritative_prepared_activation(&journal, prepared)?;
             if journal.pending_activation.as_ref().is_none_or(|pending| {
                 pending.operation_id != prepared.operation_id
@@ -1702,9 +1704,7 @@ impl CredentialService {
                 .store
                 .begin_mutation(&prepared.operation_id, &prepared.set_id)
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
-            let mut journal = session
-                .load_journal()
-                .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+            let mut journal = self.load_observed_journal(session.as_mut(), &prepared.set_id)?;
             Self::require_authoritative_prepared_activation(&journal, prepared)?;
             if journal.pending_activation.as_ref().is_none_or(|pending| {
                 pending.operation_id != prepared.operation_id
@@ -1814,9 +1814,7 @@ impl CredentialService {
                 .store
                 .begin_mutation(&prepared.operation_id, &prepared.set_id)
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
-            let mut journal = session
-                .load_journal()
-                .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+            let mut journal = self.load_observed_journal(session.as_mut(), &prepared.set_id)?;
             Self::require_authoritative_prepared_activation(&journal, prepared)?;
             let Some(pending) = journal.pending_activation.as_mut() else {
                 return Err(content_free_error(
@@ -1883,9 +1881,7 @@ impl CredentialService {
                 .store
                 .begin_mutation(operation_id, &set_id_hint)
                 .map_err(|failure| self.map_store_failure(failure, &set_id_hint))?;
-            let journal = session
-                .load_journal()
-                .map_err(|failure| self.map_store_failure(failure, &set_id_hint))?;
+            let journal = self.load_observed_journal(session.as_mut(), &set_id_hint)?;
             let completed = journal
                 .idempotency_history
                 .iter()
@@ -1903,7 +1899,6 @@ impl CredentialService {
                     Some(set_id_hint),
                 ));
             }
-            self.reconcile_authoritative_journal(&journal, &set_id_hint)?;
             (journal, completed.map(|(_, receipt)| receipt))
         };
         if let Some(receipt) = completed_receipt {
@@ -1990,9 +1985,7 @@ impl CredentialService {
                 .store
                 .begin_mutation(&prepared.operation_id, &prepared.set_id)
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
-            let mut journal = session
-                .load_journal()
-                .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+            let mut journal = self.load_observed_journal(session.as_mut(), &prepared.set_id)?;
             Self::require_authoritative_prepared_activation(&journal, &prepared)?;
             if journal
                 .pending_activation
@@ -2149,9 +2142,7 @@ impl CredentialService {
                 .store
                 .begin_mutation(&prepared.operation_id, &prepared.set_id)
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
-            let mut journal = session
-                .load_journal()
-                .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+            let mut journal = self.load_observed_journal(session.as_mut(), &prepared.set_id)?;
             Self::require_authoritative_prepared_activation(&journal, prepared)?;
             if journal
                 .pending_activation
@@ -3632,12 +3623,12 @@ mod tests {
             1
         );
         assert_eq!(store.active_write_count(), 1);
-        assert_eq!(
+        // The loser loaded the winner's committed journal before refusing,
+        // so both services have observed the one commit.
+        assert!(
             services
                 .iter()
-                .map(|service| service.snapshot_status().global_epoch)
-                .sum::<u64>(),
-            1
+                .all(|service| service.snapshot_status().global_epoch == 1)
         );
     }
 
@@ -5412,5 +5403,89 @@ mod tests {
             .expect_err("an older journal forbids a lease");
 
         assert_eq!(error.code, CredentialErrorCode::RecoveryRequired);
+    }
+
+    /// The service has observed a later epoch than the journal now holds,
+    /// but the target set did not change in between, so its native record
+    /// and the caller's expected revision still match the older journal.
+    /// Only the epoch reveals the rollback, and every mutation kind refuses
+    /// it before any effect.
+    #[test]
+    fn an_epoch_only_rollback_is_refused_before_any_mutation_effect() {
+        let deepgram = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
+        let openai = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Openai);
+        for mutation in ["replace", "delete", "activate"] {
+            let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+            let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+            let service = CredentialService::with_settings_activation_port(
+                store.clone(),
+                journal,
+                Arc::new(DeterministicTokenSource::default()),
+                Arc::new(FakeSettingsActivationPort::new(60)),
+            );
+            let created =
+                configure_deepgram(&service, "55555555-5555-4555-8555-555555555555", None);
+            let older = store.journal_snapshot();
+            let first = service
+                .replace_set(ReplaceCredentialSet {
+                    set_id: openai.clone(),
+                    auth_method_id: AuthMethodId::ApiKey,
+                    material: StoredSecretBundle::api_key("unrelated-1").expect("API key"),
+                    expected_revision: None,
+                    idempotency_token: idempotency("56565656-5656-4656-8656-565656565656"),
+                })
+                .expect("unrelated replace");
+            service
+                .replace_set(ReplaceCredentialSet {
+                    set_id: openai.clone(),
+                    auth_method_id: AuthMethodId::ApiKey,
+                    material: StoredSecretBundle::api_key("unrelated-2").expect("API key"),
+                    expected_revision: first.new_revision,
+                    idempotency_token: idempotency("57575757-5757-4757-8757-575757575757"),
+                })
+                .expect("unrelated replace");
+            assert!(store.journal_snapshot().global_epoch > older.global_epoch);
+            store.restore_journal(older.clone());
+            let active_writes = store.active_write_count();
+
+            let error = match mutation {
+                "replace" => service
+                    .replace_set(ReplaceCredentialSet {
+                        set_id: deepgram.clone(),
+                        auth_method_id: AuthMethodId::ApiKey,
+                        material: StoredSecretBundle::api_key("over-a-rollback").expect("API key"),
+                        expected_revision: created.new_revision.clone(),
+                        idempotency_token: idempotency("58585858-5858-4858-8858-585858585858"),
+                    })
+                    .expect_err("a replace over a rollback"),
+                "delete" => service
+                    .delete_set(DeleteCredentialSet {
+                        set_id: deepgram.clone(),
+                        expected_revision: created.new_revision.clone(),
+                        idempotency_token: idempotency("59595959-5959-4959-8959-595959595959"),
+                    })
+                    .expect_err("a delete over a rollback"),
+                _ => service
+                    .prepare_settings_activation(PrepareCredentialActivation {
+                        set_id: deepgram.clone(),
+                        auth_method_id: AuthMethodId::ApiKey,
+                        material: StoredSecretBundle::api_key("over-a-rollback").expect("API key"),
+                        expected_revision: created.new_revision.clone(),
+                        expected_settings_revision: 60,
+                        proposed_settings_revision: 61,
+                        idempotency_token: idempotency("5a5a5a5a-5a5a-4a5a-8a5a-5a5a5a5a5a5a"),
+                    })
+                    .expect_err("an activation over a rollback"),
+            };
+
+            assert_eq!(
+                error.code,
+                CredentialErrorCode::RecoveryRequired,
+                "{mutation}"
+            );
+            assert_eq!(store.journal_snapshot(), older, "{mutation}");
+            assert_eq!(store.active_write_count(), active_writes, "{mutation}");
+            assert_eq!(store.staging_count(), 0, "{mutation}");
+        }
     }
 }
