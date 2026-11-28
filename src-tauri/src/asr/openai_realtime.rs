@@ -86,6 +86,8 @@ const OPENAI_REALTIME_ASR_PROVIDER: &str = "asr.openai_realtime_transcription";
 /// with a continuous silence-padded stream, so this only fires when the audio
 /// cadence actually stalls.
 const KEEPALIVE_INTERVAL_SECS: u64 = 8;
+const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+const HEALTHY_SESSION_BEFORE_EXPIRY: Duration = Duration::from_secs(30);
 
 /// Events emitted by the OpenAI Realtime transcription client to downstream
 /// consumers. Mirrors [`crate::asr::deepgram::DeepgramEvent`] in shape so the
@@ -536,6 +538,7 @@ enum DisconnectKind {
     PolicyBlocked(RuntimeDiagnostic),
     TerminalError(RuntimeDiagnostic),
     SessionExpired,
+    SetupTimeout,
     UserRequested,
     WriterEnded,
 }
@@ -704,6 +707,14 @@ fn emit_disconnected_once(
 /// resume), and the per-session transcript accumulator (in `run_io`) starts
 /// fresh because `item_id`s are a new namespace after a reconnect.
 async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
+    session_task_with_timing(ctx, Duration::from_secs, SESSION_SETUP_TIMEOUT).await;
+}
+
+async fn session_task_with_timing(
+    ctx: OpenAiRealtimeSessionCtx,
+    backoff_duration: impl Fn(u64) -> Duration,
+    setup_timeout: Duration,
+) {
     let mut writer = ctx.writer;
     let mut reader = ctx.reader;
     let mut audio_rx = ctx.audio_rx;
@@ -736,6 +747,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
             entries.fetch_add(1, Ordering::SeqCst);
         }
 
+        let mut ready_at = None;
         let disconnect = run_io(RunIoCtx {
             writer: &mut writer,
             reader: &mut reader,
@@ -749,14 +761,20 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
             disconnected_emitted: &disconnected_emitted,
             pending_cmd: &mut pending_cmd,
             keepalive_interval: Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
+            ready_at: &mut ready_at,
+            setup_timeout,
         })
         .await;
 
         // Only the acknowledgement handled by run_io marks the session ready.
-        // An upgrade followed by an early close remains part of this outage.
-        if connected.swap(false, Ordering::SeqCst) {
+        // A premature expiration after readiness is a flap. Keep charging the
+        // same budget so repeated short-lived sessions still reach give-up.
+        connected.store(false, Ordering::SeqCst);
+        if let Some(ready_at) = ready_at
+            && (!matches!(disconnect, DisconnectKind::SessionExpired)
+                || ready_at.elapsed() >= HEALTHY_SESSION_BEFORE_EXPIRY)
+        {
             reconnect_attempts = 0;
-            last_open_error = None;
         }
 
         match disconnect {
@@ -823,7 +841,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
 
                     // Sleep for the backoff window, but bail out early on user
                     // cancellation so shutdown doesn't wait up to 10s.
-                    let sleep = tokio::time::sleep(Duration::from_secs(backoff));
+                    let sleep = tokio::time::sleep(backoff_duration(backoff));
                     tokio::pin!(sleep);
                     loop {
                         tokio::select! {
@@ -855,6 +873,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                         Ok((new_writer, new_reader)) => {
                             writer = new_writer;
                             reader = new_reader;
+                            last_open_error = None;
                             // Do NOT flip `connected` / emit `Reconnected` here: the
                             // socket is open but the session is not yet confirmed.
                             // `run_io` emits `ready_event` on `session.updated`.
@@ -916,6 +935,8 @@ struct RunIoCtx<'a> {
     /// audio-graph-63be). Injectable so tests can drive the timing without a
     /// real 8s wait.
     keepalive_interval: Duration,
+    ready_at: &'a mut Option<tokio::time::Instant>,
+    setup_timeout: Duration,
 }
 
 enum AudioWriteError {
@@ -1007,40 +1028,62 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
         disconnected_emitted,
         pending_cmd,
         keepalive_interval,
+        ready_at,
+        setup_timeout,
     } = ctx;
 
     let mut accumulator: HashMap<String, String> = HashMap::new();
     // Tracks whether this socket's `session.updated` has been seen so the
     // readiness event (`Connected`/`Reconnected`) and the `connected` flag are
     // raised exactly once — and only after the server confirms the config.
-    let mut session_confirmed = false;
+    let setup_deadline = tokio::time::sleep(setup_timeout);
+    tokio::pin!(setup_deadline);
 
     let mut keep_alive = tokio::time::interval(keepalive_interval);
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_outbound = tokio::time::Instant::now();
 
-    // Replay any command whose write failed on the previous socket *before*
-    // pulling new work, preserving ordering. If the replay also fails the
-    // command is put back into `pending_cmd` for the next reconnect.
-    if let Some(cmd) = pending_cmd.take()
-        && let Err(error) = write_audio_cmd(writer, pending_chunks, write_guard, cmd).await
-    {
-        return match error {
-            AudioWriteError::PolicyBlocked(message) => DisconnectKind::PolicyBlocked(message),
-            AudioWriteError::Unsent(unsent, message) => {
-                *pending_cmd = Some(unsent);
-                DisconnectKind::NetworkError(message)
-            }
-        };
-    }
-
     loop {
+        // Leave the audio queue alone during setup. A blocked write on an
+        // unconfirmed socket must not prevent the setup deadline from firing.
+        if ready_at.is_some()
+            && let Some(cmd) = pending_cmd.take()
+        {
+            if let Err(error) = write_audio_cmd(writer, pending_chunks, write_guard, cmd).await {
+                return match error {
+                    AudioWriteError::PolicyBlocked(message) => {
+                        DisconnectKind::PolicyBlocked(message)
+                    }
+                    AudioWriteError::Unsent(unsent, message) => {
+                        *pending_cmd = Some(unsent);
+                        DisconnectKind::NetworkError(message)
+                    }
+                };
+            }
+            last_outbound = tokio::time::Instant::now();
+        }
+
         tokio::select! {
+            _ = &mut setup_deadline, if ready_at.is_none() => {
+                let _ = tokio::time::timeout(Duration::from_secs(1), writer.close()).await;
+                if user_disconnected.load(Ordering::SeqCst) || audio_rx.is_closed() {
+                    return DisconnectKind::UserRequested;
+                }
+                emit_error(event_tx, websocket_diagnostic(Code::Timeout));
+                return DisconnectKind::SetupTimeout;
+            }
+
+            _ = tokio::time::sleep(Duration::from_millis(100)), if ready_at.is_none() => {
+                if user_disconnected.load(Ordering::SeqCst) || audio_rx.is_closed() {
+                    return DisconnectKind::UserRequested;
+                }
+            }
+
             // Idle keepalive: a WS Ping control frame during quiet periods keeps
             // the OpenAI Realtime transcription session from idle-closing when
             // the audio cadence stalls (M2 / audio-graph-63be). Guarded by
             // `last_outbound` so it never fires while audio/commits are flowing.
-            _ = keep_alive.tick() => {
+            _ = keep_alive.tick(), if ready_at.is_some() => {
                 if last_outbound.elapsed() >= keepalive_interval {
                     if let Err(e) = write_guard.send_ping(writer, Vec::new()).await {
                         let message = websocket_write_error(&e);
@@ -1051,7 +1094,7 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                 }
             }
 
-            cmd = audio_rx.recv() => {
+            cmd = audio_rx.recv(), if ready_at.is_some() => {
                 match cmd {
                     Some(cmd @ (AudioCmd::Chunk(_) | AudioCmd::Commit)) => {
                         if let Err(error) =
@@ -1107,8 +1150,8 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                 match result {
                     Ok(Message::Text(text)) => {
                         match handle_server_message(&text, event_tx, &mut accumulator) {
-                            ServerMessage::SessionUpdated if !session_confirmed => {
-                                session_confirmed = true;
+                            ServerMessage::SessionUpdated if ready_at.is_none() => {
+                                *ready_at = Some(tokio::time::Instant::now());
                                 connected.store(true, Ordering::SeqCst);
                                 disconnected_emitted.store(false, Ordering::SeqCst);
                                 let _ = event_tx.send(ready_event.clone());
@@ -1752,6 +1795,8 @@ mod tests {
                     disconnected_emitted: &Arc::new(AtomicBool::new(false)),
                     pending_cmd: &mut None,
                     keepalive_interval,
+                    ready_at: &mut Some(tokio::time::Instant::now()),
+                    setup_timeout: SESSION_SETUP_TIMEOUT,
                 })
                 .await;
                 let diagnostic = match disconnect {
@@ -2710,6 +2755,8 @@ mod tests {
                 disconnected_emitted: &disconnected_emitted,
                 pending_cmd: &mut pending_cmd,
                 keepalive_interval: Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
+                ready_at: &mut Some(tokio::time::Instant::now()),
+                setup_timeout: SESSION_SETUP_TIMEOUT,
             }),
         )
         .await
