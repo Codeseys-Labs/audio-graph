@@ -79,7 +79,7 @@ impl SpeakAloudPipe {
             } => {
                 let provider = DeepgramAuraProvider::from_store(credentials)
                     .map(|provider| provider.with_content_egress_policy(content_egress_policy))
-                    .map_err(|e| format!("Aura provider unavailable: {e:?}"))?;
+                    .map_err(|_| "tts_credential_missing".to_owned())?;
                 let tts_config = TtsConfig {
                     voice: voice.clone(),
                     sample_rate: *sample_rate,
@@ -92,7 +92,7 @@ impl SpeakAloudPipe {
                 let mut session = provider
                     .open(voice, tts_config)
                     .await
-                    .map_err(|e| format!("Aura session open failed: {e:?}"))?;
+                    .map_err(|error| format!("tts_session_open:{error}"))?;
 
                 // Open the audio device at the TTS source rate so we don't
                 // pitch-shift. cpal Stream open is sync-on-thread so this
@@ -102,13 +102,13 @@ impl SpeakAloudPipe {
                         source_sample_rate: *sample_rate,
                         source_channels: 1,
                     })
-                    .map_err(|e| format!("audio device open failed: {e}"))?;
+                    .map_err(|_| "playback_device_unavailable".to_owned())?;
 
                 // Spawn the audio-pump task: drain TtsEventStream, push
                 // AudioChunk samples into the player.
                 let events = session
                     .take_events()
-                    .ok_or_else(|| "TTS session has no event stream".to_string())?;
+                    .ok_or_else(|| "tts_event_stream_unavailable".to_owned())?;
                 let cancel = CancellationToken::new();
                 let cancel_for_task = cancel.clone();
                 let player_for_task = player.clone();
@@ -166,7 +166,7 @@ impl SpeakAloudPipe {
             if !to_flush.trim().is_empty() {
                 self.session
                     .speak(&to_flush)
-                    .map_err(|e| format!("TTS speak failed: {e:?}"))?;
+                    .map_err(|e| format!("tts_speak:{e}"))?;
             }
         }
         Ok(())
@@ -184,11 +184,9 @@ impl SpeakAloudPipe {
         if !pending.trim().is_empty() {
             session
                 .speak(&pending)
-                .map_err(|e| format!("TTS final-speak failed: {e:?}"))?;
+                .map_err(|e| format!("tts_speak:{e}"))?;
         }
-        session
-            .flush()
-            .map_err(|e| format!("TTS flush failed: {e:?}"))?;
+        session.flush().map_err(|e| format!("tts_flush:{e}"))?;
         // Don't cancel the audio pump; it will run until the session emits
         // its final AudioChunk and the stream naturally ends. The pump
         // task lives until session is dropped, which happens when
@@ -263,9 +261,9 @@ async fn pump_audio(
                         // Status events surface in the chat UI eventually;
                         // not relevant to playback.
                     }
-                    Some(TtsEvent::Error { kind, message }) => {
+                    Some(TtsEvent::Error { kind, diagnostic }) => {
                         if is_fatal_tts_error(kind) {
-                            log::warn!("Fatal TTS error during speak-aloud: {kind:?} {message}");
+                            log::warn!("Fatal TTS error during speak-aloud: {kind:?} {diagnostic}");
                             player.cancel();
                             return;
                         }
@@ -275,7 +273,7 @@ async fn pump_audio(
                         // playback — the session may still be healthy and more
                         // audio is coming. Log and keep pumping.
                         log::warn!(
-                            "Non-fatal TTS warning during speak-aloud (continuing): {kind:?} {message}"
+                            "Non-fatal TTS warning during speak-aloud (continuing): {kind:?} {diagnostic}"
                         );
                     }
                 }
@@ -294,6 +292,8 @@ pub use std::sync::Arc as _Arc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tts::deepgram_aura::handle_server_text;
+    use crate::tts::test_support::{assert_no_canaries, capture_tts_logs, take_tts_logs};
     use crate::tts::{TtsError, TtsEvent};
     use std::sync::{Arc, Mutex};
 
@@ -311,6 +311,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeSession {
         calls: Arc<Mutex<Vec<Call>>>,
+        error: Option<TtsError>,
     }
 
     impl FakeSession {
@@ -335,11 +336,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(Call::Speak(text.to_string()));
-            Ok(())
+            self.error.clone().map_or(Ok(()), Err)
         }
         fn flush(&self) -> Result<(), TtsError> {
             self.calls.lock().unwrap().push(Call::Flush);
-            Ok(())
+            self.error.clone().map_or(Ok(()), Err)
         }
         fn clear(&self) -> Result<(), TtsError> {
             self.calls.lock().unwrap().push(Call::Clear);
@@ -360,6 +361,132 @@ mod tests {
             AudioPlayer::new(),
             CancellationToken::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn pipe_open_errors_are_closed_tokens() {
+        let settings = TtsProvider::DeepgramAura {
+            voice: "aura-test-voice-canary".into(),
+            sample_rate: 24_000,
+            speed: 1.0,
+        };
+        let mut credentials = CredentialStore::default();
+        let policy = crate::asr::ProviderContentEgressPolicy::allow();
+
+        let missing =
+            SpeakAloudPipe::maybe_new(true, &settings, &credentials, policy, AudioPlayer::new())
+                .await
+                .err()
+                .expect("missing credential");
+        assert_eq!(missing, "tts_credential_missing");
+
+        let secret = "pipe-handshake-secret-canary";
+        // An invalid header value fails request construction before network I/O.
+        credentials.deepgram_api_key = Some(format!("{secret}\ncanary"));
+        let rejected =
+            SpeakAloudPipe::maybe_new(true, &settings, &credentials, policy, AudioPlayer::new())
+                .await
+                .err()
+                .expect("invalid header");
+        assert_eq!(rejected, "tts_session_open:runtime/request_rejected");
+        assert_no_canaries(&rejected, &[secret, "/v1/speak", "aura-test-voice-canary"]);
+    }
+
+    #[test]
+    fn pipe_speak_and_flush_errors_discard_utterance_and_lengths() {
+        let fake = FakeSession {
+            error: Some(TtsError::from_http_status(422)),
+            ..FakeSession::default()
+        };
+        let secret = "pipe-utterance-secret-canary";
+        let utterance = secret.repeat(113);
+
+        let mut pipe = pipe_with(fake.clone());
+        let append_error = pipe.append_delta(&format!("{utterance}.")).unwrap_err();
+        let mut pipe = pipe_with(fake.clone());
+        pipe.append_delta(&utterance).unwrap();
+        let finish_error = pipe.finish().unwrap_err();
+        let flush_error = pipe_with(fake).finish().unwrap_err();
+
+        assert_eq!(append_error, "tts_speak:runtime/request_rejected");
+        assert_eq!(finish_error, "tts_speak:runtime/request_rejected");
+        assert_eq!(flush_error, "tts_flush:runtime/request_rejected");
+        assert_no_canaries(
+            &format!("{append_error} {finish_error} {flush_error}"),
+            &[
+                secret,
+                &utterance.len().to_string(),
+                &(utterance.len() + 1).to_string(),
+            ],
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pump_logs_only_typed_aura_diagnostics_and_continues_past_warning() {
+        capture_tts_logs();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut flushes = std::collections::VecDeque::new();
+        let clearing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let secret = "pipe-provider-secret-canary";
+        let request_id = "pipe-request-id-canary";
+        let route = "/v1/speak?model=pipe-private-voice";
+        let description = format!("provider message canary {secret} {route}").repeat(29);
+        for frame in ["Warning", "Error"] {
+            handle_server_text(
+                &serde_json::json!({
+                    "type": frame,
+                    "code": "NET-0000",
+                    "request_id": request_id,
+                    "description": description,
+                })
+                .to_string(),
+                &tx,
+                &mut flushes,
+                &clearing,
+            );
+        }
+        let events = futures_util::stream::iter([
+            rx.try_recv().unwrap(),
+            TtsEvent::AudioChunk {
+                samples: vec![-13719; 1871],
+                sample_rate: 24_000,
+            },
+            rx.try_recv().unwrap(),
+        ])
+        .chain(futures_util::stream::pending());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pump_audio(
+                Box::pin(events),
+                AudioPlayer::new(),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("fatal frame stops the pump after the warning");
+
+        let logs = take_tts_logs();
+        assert_eq!(
+            logs,
+            [
+                "Non-fatal TTS warning during speak-aloud (continuing): Unknown runtime/provider_unavailable",
+                "Fatal TTS error during speak-aloud: Server runtime/provider_unavailable",
+            ],
+        );
+        assert_no_canaries(
+            &logs.join("\n"),
+            &[
+                secret,
+                request_id,
+                route,
+                "provider message canary",
+                "NET-0000",
+                &description.len().to_string(),
+                "1871",
+                "3742",
+                "-13719",
+            ],
+        );
     }
 
     // ----- is_clause_boundary truth table ----------------------------------
@@ -510,11 +637,8 @@ mod tests {
         let cancel = CancellationToken::new();
         // A FATAL Error event before a pending tail → the error arm must return
         // even though the stream would otherwise never end.
-        let stream = futures_util::stream::iter(vec![TtsEvent::Error {
-            kind: crate::tts::TtsErrorKind::Server,
-            message: "boom".to_string(),
-        }])
-        .chain(futures_util::stream::pending());
+        let stream = futures_util::stream::iter([TtsError::from_http_status(503).into()])
+            .chain(futures_util::stream::pending());
         let player = AudioPlayer::new();
         // Must return (not hang) via the error arm.
         pump_audio(Box::pin(stream), player, cancel).await;
@@ -546,10 +670,14 @@ mod tests {
         // pumped first.
         let cancel = CancellationToken::new();
         let stream = futures_util::stream::iter(vec![
-            TtsEvent::Error {
-                kind: crate::tts::TtsErrorKind::Unknown,
-                message: "Aura warning: transient hiccup".to_string(),
-            },
+            TtsError::runtime(
+                TtsErrorKind::Unknown,
+                audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorCode::Internal,
+                audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnosticContext::new(
+                    audio_graph_ipc_contract::runtime_diagnostic::RuntimeOperation::SpeechSynthesis,
+                ),
+            )
+            .into(),
             TtsEvent::AudioChunk {
                 samples: vec![7, 8, 9],
                 sample_rate: 24_000,
