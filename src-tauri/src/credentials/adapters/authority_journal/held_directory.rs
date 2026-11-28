@@ -1151,11 +1151,14 @@ mod windows_held {
         ///
         /// The two flushes are the strongest barrier a standard user has: a
         /// file flush persists its data and metadata, and an NTFS directory
-        /// flush persists the directory structure ([MS-FSA] 2.1.5.7). No
-        /// Windows contract states that they make a same-volume rename
-        /// survive power loss (Microsoft Q&A 6057877, November 2026), so that
-        /// survival stays unproven until packaged evidence exists (#210). A
-        /// failed flush leaves the outcome `Unknown`.
+        /// flush persists the directory structure ([MS-FSA] 2.1.5.7). They
+        /// are not a namespace durability claim: no public Windows API
+        /// promises that a same-volume rename survives power loss
+        /// (`docs/research/canonical-directory-durability-2026-08-14.md`;
+        /// Microsoft Q&A 6057877, November 2026). Activation stays gated on
+        /// the evidence profiles instead (#210). A failed flush leaves the
+        /// outcome `Unknown`; the held handle carries `FILE_ADD_FILE`, so a
+        /// flush is never refused for want of access.
         pub(in crate::credentials::adapters) fn publish(mut self) -> Result<(), PublishFailure> {
             let file = self.file.as_ref().ok_or(PublishFailure::NotPublished)?;
             rename_within(file, &self.directory.handle, &self.name)?;

@@ -80,6 +80,12 @@ pub(crate) enum UntrackedRecordOutcome {
     /// this set keeps its own staging record. Repair again once that
     /// activation completes or is recovered.
     Tracked,
+    /// A guard in the pre-fix format was removed, with every staging record
+    /// the journal history names for the set. That guard never named its
+    /// operation and staging records cannot be listed, so a staging record
+    /// of an operation the history does not record cannot be found and may
+    /// remain.
+    LegacyGuardRemoved,
     /// The set's staging guard holds bytes no AudioGraph version writes. It
     /// was left in place, and so was every staging record of the set.
     Unrecognized,

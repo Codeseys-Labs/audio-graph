@@ -413,9 +413,9 @@ impl NativeKeyringCredentialStore {
     ///
     /// Candidates are the operation the guard names and every operation the
     /// journal's history records for the set, which also finds staging a
-    /// guard in the legacy format stood for. Staging records go before the
-    /// guard, so a staging record never outlives its guard. An unrecognized
-    /// guard leaves the set untouched.
+    /// guard in the legacy format stood for when its operation completed.
+    /// Staging records go before the guard, so a staging record never
+    /// outlives its guard. An unrecognized guard leaves the set untouched.
     fn repair_set_unlocked(
         &self,
         interaction: &mut NativeInteractionLease<'_>,
@@ -462,7 +462,9 @@ impl NativeKeyringCredentialStore {
                 .delete_and_verify_absent(interaction, &guard_locator)?;
             removed = true;
         }
-        Ok(if removed {
+        Ok(if matches!(guard, StagingGuard::Legacy) {
+            UntrackedRecordOutcome::LegacyGuardRemoved
+        } else if removed {
             UntrackedRecordOutcome::Removed
         } else if tracked.is_some() {
             UntrackedRecordOutcome::Tracked
@@ -3704,7 +3706,9 @@ mod tests {
     /// A guard in the format written before guards named their operation
     /// cannot be claimed, so staging for its set is refused. Through the
     /// service, the explicit repair removes it, with the staging record the
-    /// journal's history names for the set, and staging works again.
+    /// journal's history names for the set, and staging works again. The
+    /// report says a legacy guard went: a staging record of an operation the
+    /// history does not record could not be found.
     #[test]
     fn a_pre_fix_guard_is_removed_by_the_explicit_repair_with_the_staging_its_history_names() {
         let keyring = Arc::new(MemoryKeyringBoundary::default());
@@ -3769,7 +3773,7 @@ mod tests {
             &sets,
             &[(
                 BuiltInCredentialSetId::Deepgram,
-                UntrackedRecordOutcome::Removed,
+                UntrackedRecordOutcome::LegacyGuardRemoved,
             )],
         );
         assert_eq!(native_entry(&keyring, &pre_guard_staging), None);
