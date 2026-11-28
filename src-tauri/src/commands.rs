@@ -6424,9 +6424,15 @@ fn spawn_card_answer_stream_task(
         drop(slot);
         let frame = match persisted {
             Ok(()) => terminal.frame,
+            // The answer the model produced is still shown, as the failed
+            // attempt's display-only partial text.
             Err(diagnostic) => ChatStreamFrame::Failed {
                 request_id: request_id_for_task.clone(),
-                full_text: String::new(),
+                full_text: match terminal.frame {
+                    ChatStreamFrame::Stream(ChatStreamEvent::Done { full_text, .. })
+                    | ChatStreamFrame::Failed { full_text, .. } => full_text,
+                    ChatStreamFrame::Stream(ChatStreamEvent::Delta { .. }) => String::new(),
+                },
                 diagnostic,
             },
         };
@@ -27706,6 +27712,10 @@ mod tests {
         assert_eq!(frame["event"], "failed", "{frame}");
         assert_eq!(
             frame["data"]["diagnostic"]["detail"]["code"], "internal",
+            "{frame}"
+        );
+        assert_eq!(
+            frame["data"]["full_text"], "an answer that cannot be saved",
             "{frame}"
         );
         assert_eq!(
