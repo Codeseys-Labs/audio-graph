@@ -177,7 +177,7 @@ impl GladiaLiveConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GladiaParsedMessage {
     pub session_id: Option<String>,
     pub revisions: Vec<GladiaParsedRevision>,
@@ -185,6 +185,15 @@ pub struct GladiaParsedMessage {
     pub acknowledgment: Option<GladiaAcknowledgment>,
     pub lifecycle_event: Option<String>,
     pub error: Option<RuntimeDiagnostic>,
+}
+
+impl std::fmt::Debug for GladiaParsedMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GladiaParsedMessage")
+            .field("session_id_present", &self.session_id.is_some())
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -547,7 +556,7 @@ fn utterance_confidence(utterance: &GladiaUtterance) -> f32 {
 fn gladia_error_diagnostic(error: &serde_json::Value) -> RuntimeDiagnostic {
     let code = match error.get("code").and_then(serde_json::Value::as_str) {
         Some("invalid_audio") => Code::RequestRejected,
-        _ => Code::ProviderUnavailable,
+        _ => Code::Internal,
     };
     websocket_diagnostic(code)
 }

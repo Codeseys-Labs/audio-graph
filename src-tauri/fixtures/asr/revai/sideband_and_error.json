@@ -15,8 +15,7 @@
       "received_at_ms": 1700000000102,
       "raw": "{\"type\":\"unknown\"}",
       "expected_parse_error": {
-        "kind": "unsupported_message_type",
-        "value": "unknown"
+        "kind": "unsupported_message_type"
       }
     },
     {

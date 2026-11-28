@@ -71,15 +71,39 @@
     },
     {
       "type": "error",
-      "message": "runtime/provider_unavailable"
+      "message": {
+        "kind": "runtime",
+        "detail": {
+          "code": "internal",
+          "retryable": false,
+          "recovery_action": "none",
+          "context": { "operation": "transcription", "transport": "websocket" }
+        }
+      }
     },
     {
       "type": "error",
-      "message": "runtime/provider_unavailable"
+      "message": {
+        "kind": "runtime",
+        "detail": {
+          "code": "internal",
+          "retryable": false,
+          "recovery_action": "none",
+          "context": { "operation": "transcription", "transport": "websocket" }
+        }
+      }
     },
     {
       "type": "error",
-      "message": "runtime/invalid_response"
+      "message": {
+        "kind": "runtime",
+        "detail": {
+          "code": "invalid_response",
+          "retryable": false,
+          "recovery_action": "none",
+          "context": { "operation": "transcription", "transport": "websocket" }
+        }
+      }
     }
   ]
 }

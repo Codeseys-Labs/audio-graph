@@ -71,8 +71,15 @@ struct FixtureMessage {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExpectedParseError {
     kind: ExpectedParseErrorKind,
+}
+
+#[test]
+fn parse_error_expectations_reject_retired_wire_values() {
+    let json = r#"{"kind":"unsupported_message_type","value":"unknown"}"#;
+    assert!(serde_json::from_str::<ExpectedParseError>(json).is_err());
 }
 
 #[derive(Debug, Deserialize)]

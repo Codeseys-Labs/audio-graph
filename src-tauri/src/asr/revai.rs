@@ -6,7 +6,10 @@
 
 pub use super::AsrParseError as RevAiParseError;
 use super::websocket_diagnostic;
-use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode as Code, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeTransport,
+};
 
 use serde::Deserialize;
 
@@ -98,10 +101,18 @@ impl RevAiStreamingConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RevAiParsedMessage {
     pub connected_id: Option<String>,
     pub revisions: Vec<RevAiParsedRevision>,
+}
+
+impl std::fmt::Debug for RevAiParsedMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RevAiParsedMessage")
+            .field("connected_id_present", &self.connected_id.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -270,11 +281,22 @@ impl RevAiStreamingParser {
 }
 
 pub fn classify_close_code(code: u16) -> RuntimeDiagnostic {
+    // Rev AI documents 4029 as an account concurrency limit with no retry.
+    // https://docs.rev.ai/api/streaming#error-codes
+    if code == 4029 {
+        return RuntimeErrorDiagnostic::new(
+            Code::RateLimited,
+            false,
+            RuntimeSafeRecoveryAction::None,
+            RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                .with_transport(RuntimeTransport::Websocket),
+        )
+        .into();
+    }
     websocket_diagnostic(match code {
         4001 | 4002 => Code::RequestRejected,
         4003 => Code::CapacityExhausted,
         4010 | 4013 => Code::ProviderUnavailable,
-        4029 => Code::RateLimited,
         _ => Code::Internal,
     })
 }
@@ -648,16 +670,38 @@ mod tests {
 
     #[test]
     fn close_codes_classify_retryable_and_terminal_failures() {
-        for (wire_code, code) in [
-            (4001, Code::RequestRejected),
-            (4002, Code::RequestRejected),
-            (4003, Code::CapacityExhausted),
-            (4010, Code::ProviderUnavailable),
-            (4013, Code::ProviderUnavailable),
-            (4029, Code::RateLimited),
-            (4999, Code::Internal),
+        use RuntimeSafeRecoveryAction as Recovery;
+        for (wire_code, code, retryable, recovery) in [
+            (
+                4001,
+                Code::RequestRejected,
+                false,
+                Recovery::ReviewConfiguration,
+            ),
+            (
+                4002,
+                Code::RequestRejected,
+                false,
+                Recovery::ReviewConfiguration,
+            ),
+            (
+                4003,
+                Code::CapacityExhausted,
+                false,
+                Recovery::ReviewConfiguration,
+            ),
+            (4010, Code::ProviderUnavailable, true, Recovery::Retry),
+            (4013, Code::ProviderUnavailable, true, Recovery::Retry),
+            (4029, Code::RateLimited, false, Recovery::None),
+            (4999, Code::Internal, false, Recovery::None),
         ] {
-            assert_eq!(classify_close_code(wire_code), websocket_diagnostic(code));
+            let RuntimeDiagnostic::Runtime(actual) = classify_close_code(wire_code) else {
+                panic!("expected runtime diagnostic for {wire_code}");
+            };
+            assert_eq!(
+                (actual.code, actual.retryable, actual.recovery_action),
+                (code, retryable, recovery)
+            );
         }
     }
 

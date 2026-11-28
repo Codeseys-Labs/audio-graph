@@ -165,13 +165,23 @@ pub struct AssemblyAIConfig {
     pub content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AssemblyAiV3ParsedMessage {
     pub session_id: Option<String>,
     pub revisions: Vec<AssemblyAiV3ParsedRevision>,
     pub speaker_revisions: Vec<AssemblyAiV3SpeakerRevision>,
     pub terminated: bool,
     pub error: Option<AssemblyAiV3ProviderError>,
+}
+
+impl std::fmt::Debug for AssemblyAiV3ParsedMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssemblyAiV3ParsedMessage")
+            .field("session_id_present", &self.session_id.is_some())
+            .field("terminated", &self.terminated)
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +227,8 @@ pub struct AssemblyAiV3Parser {
 struct AssemblyAiV3Response {
     #[serde(rename = "type")]
     message_type: String,
+    #[serde(default, skip_serializing)]
+    error_code: Option<Value>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -328,7 +340,9 @@ impl AssemblyAiV3Parser {
                 speaker_revisions: Vec::new(),
                 terminated: false,
                 error: Some(AssemblyAiV3ProviderError {
-                    message: websocket_diagnostic(Code::RequestRejected),
+                    message: assemblyai_error_diagnostic(
+                        response.error_code.as_ref().and_then(Value::as_u64),
+                    ),
                 }),
             }),
             _ => Err(AssemblyAiV3ParseError::UnsupportedMessageType),
@@ -1240,7 +1254,7 @@ pub(super) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<A
             received_at_ms: current_unix_millis(),
         });
     } else if message_type == Some("Error") {
-        let message = websocket_diagnostic(Code::RequestRejected);
+        let message = assemblyai_error_diagnostic(parsed.get("error_code").and_then(Value::as_u64));
         log::error!("AssemblyAI: server error: {message}");
         let _ = tx.send(AssemblyAIEvent::Error { message });
     } else {
@@ -1252,6 +1266,18 @@ fn emit_invalid_response(tx: &crossbeam_channel::Sender<AssemblyAIEvent>) {
     let message = websocket_diagnostic(Code::InvalidResponse);
     log::warn!("AssemblyAI: {message}");
     let _ = tx.send(AssemblyAIEvent::Error { message });
+}
+
+fn assemblyai_error_diagnostic(code: Option<u64>) -> RuntimeDiagnostic {
+    // https://www.assemblyai.com/docs/streaming/common-session-errors-and-closures
+    // 1008 has several causes. Its numeric code alone cannot justify a retry.
+    websocket_diagnostic(match code {
+        Some(1008 | 3007) => Code::RequestRejected,
+        Some(1011) => Code::ProviderUnavailable,
+        Some(3006) => Code::ProtocolError,
+        Some(3008) => Code::Timeout,
+        _ => Code::Internal,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,6 +1304,62 @@ fn current_unix_millis() -> u64 {
 mod tests {
     use super::*;
     use crate::asr::ws_fixture;
+
+    #[tokio::test]
+    #[ignore = "runs in the isolated ASR log-capture subprocess"]
+    async fn loopback_io_diagnostic_log_canary() {
+        use crate::asr::diagnostic_tests::{
+            REQUEST_ID, SECRET, UNKNOWN, assert_loopback_io, collect_io_errors, wire_prose,
+        };
+        let error =
+            serde_json::json!({"type": "Error", "error_code": UNKNOWN, "error": wire_prose(),
+            "request_id": REQUEST_ID, "api_key": SECRET})
+            .to_string();
+        assert_loopback_io(
+            error,
+            async |socket: ws_fixture::ClientSocket, audio: Option<String>, keepalive_interval| {
+                let (mut writer, mut reader) = socket.split();
+                let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
+                let (event_tx, event_rx) = crossbeam_channel::unbounded();
+                let user_disconnected = Arc::new(AtomicBool::new(false));
+                let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(usize::from(
+                    audio.is_some(),
+                )));
+                let write_guard = AsrWsWriteGuard::new(
+                    "asr.assemblyai",
+                    crate::asr::ProviderContentEgressPolicy::allow(),
+                );
+                if let Some(audio) = audio {
+                    audio_tx.send(AudioCmd::Chunk(audio.into_bytes())).unwrap();
+                }
+                let disconnect = run_io_with_keepalive_interval(
+                    &mut writer,
+                    &mut reader,
+                    &mut audio_rx,
+                    &event_tx,
+                    &user_disconnected,
+                    &pending_chunks,
+                    &write_guard,
+                    keepalive_interval,
+                )
+                .await;
+                let diagnostic = match disconnect {
+                    DisconnectKind::ServerClose(diagnostic)
+                    | DisconnectKind::ProtocolError(diagnostic)
+                    | DisconnectKind::NetworkError(diagnostic) => diagnostic,
+                    _ => panic!("expected a peer close or IO failure"),
+                };
+                let events = collect_io_errors(event_rx, |event| {
+                    let AssemblyAIEvent::Error { message } = event else {
+                        panic!("expected only provider error events");
+                    };
+                    message
+                });
+                (diagnostic, events)
+            },
+        )
+        .await;
+    }
 
     #[test]
     fn emit_session_terminated_once_dedupes_and_re_arms() {
@@ -1434,7 +1516,7 @@ mod tests {
                         "AssemblyAI v3 server error diagnostic leaked {leaked}: {message}"
                     );
                 }
-                assert_eq!(message, websocket_diagnostic(Code::RequestRejected));
+                assert_eq!(message, websocket_diagnostic(Code::Internal));
             }
             other => panic!("expected error event, got {other:?}"),
         }
@@ -1992,7 +2074,9 @@ mod tests {
                     if value.get("type").and_then(Value::as_str) == Some("Error") {
                         panic!(
                             "AssemblyAI live smoke provider error: {}",
-                            websocket_diagnostic(Code::RequestRejected)
+                            assemblyai_error_diagnostic(
+                                value.get("error_code").and_then(Value::as_u64)
+                            )
                         );
                     }
 

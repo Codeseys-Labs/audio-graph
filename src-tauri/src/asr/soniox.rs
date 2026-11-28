@@ -167,7 +167,8 @@ impl SonioxResponse {
             Some(400 | 401 | 403) => Code::RequestRejected,
             Some(408 | 504) => Code::Timeout,
             Some(429) => Code::RateLimited,
-            _ => Code::ProviderUnavailable,
+            Some(503) => Code::ProviderUnavailable,
+            _ => Code::Internal,
         };
         Some(websocket_diagnostic(code))
     }
@@ -973,11 +974,16 @@ async fn run_io_with_keepalive_interval(
                         }
                     }
                     Ok(Message::Close(frame)) => {
-                        if user_disconnected.load(Ordering::SeqCst) || finishing {
+                        let locally_closed = user_disconnected.load(Ordering::SeqCst) || finishing;
+                        let diagnostic = if locally_closed {
+                            websocket_diagnostic(Code::Cancelled)
+                        } else {
+                            websocket_close(frame.as_ref())
+                        };
+                        log::info!("Soniox: server closed connection {diagnostic}");
+                        if locally_closed {
                             return DisconnectKind::UserRequested;
                         }
-                        let diagnostic = websocket_close(frame.as_ref());
-                        log::info!("Soniox: server closed connection {diagnostic}");
                         return DisconnectKind::ServerClose(diagnostic);
                     }
                     Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
@@ -1156,48 +1162,56 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "runs in the isolated ASR log-capture subprocess"]
-    async fn remote_close_diagnostic_log_canary() {
+    async fn close_diagnostic_log_canary() {
         use crate::asr::diagnostic_tests::{CLOSE_REASON, LogCapture, assert_safe};
         use tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
 
-        let (url, server) = ws_fixture::spawn_server(|mut socket| async move {
-            socket
-                .send(Message::Close(Some(CloseFrame {
-                    code: CloseCode::Library(4763),
-                    reason: CLOSE_REASON.into(),
-                })))
-                .await
-                .unwrap();
-        })
-        .await;
-        let (mut writer, mut reader) = ws_fixture::connect_client(&url).await.split();
-        let (_audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
-        let (event_tx, _) = crossbeam_channel::unbounded();
-        let capture = LogCapture::start();
-        let disconnect = run_io(
-            &mut writer,
-            &mut reader,
-            &mut audio_rx,
-            &event_tx,
-            &Arc::new(AtomicBool::new(false)),
-            &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            &mut SonioxRealtimeParser::new("source"),
-            &AsrWsWriteGuard::new(
-                "asr.soniox",
-                crate::asr::ProviderContentEgressPolicy::allow(),
-            ),
-        )
-        .await;
-        assert_safe(&format!("{disconnect:?}"));
-        let DisconnectKind::ServerClose(diagnostic) = disconnect else {
-            panic!("expected a server close");
-        };
-        assert_eq!(diagnostic, websocket_diagnostic(Code::ProviderUnavailable));
-        let logs = capture.finish().join("\n");
-        assert!(logs.contains("Soniox: server closed connection runtime/provider_unavailable"));
-        assert!(!logs.contains("4763"));
-        assert_safe(&logs);
-        server.await.unwrap();
+        for locally_closed in [false, true] {
+            let (url, server) = ws_fixture::spawn_server(|mut socket| async move {
+                socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Library(4763),
+                        reason: CLOSE_REASON.into(),
+                    })))
+                    .await
+                    .unwrap();
+            })
+            .await;
+            let (mut writer, mut reader) = ws_fixture::connect_client(&url).await.split();
+            let (_audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
+            let (event_tx, _) = crossbeam_channel::unbounded();
+            let capture = LogCapture::start();
+            let disconnect = run_io(
+                &mut writer,
+                &mut reader,
+                &mut audio_rx,
+                &event_tx,
+                &Arc::new(AtomicBool::new(locally_closed)),
+                &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                &mut SonioxRealtimeParser::new("source"),
+                &AsrWsWriteGuard::new(
+                    "asr.soniox",
+                    crate::asr::ProviderContentEgressPolicy::allow(),
+                ),
+            )
+            .await;
+            assert_safe(&format!("{disconnect:?}"));
+            let expected = if locally_closed {
+                assert!(matches!(disconnect, DisconnectKind::UserRequested));
+                "Soniox: server closed connection runtime/cancelled"
+            } else {
+                let DisconnectKind::ServerClose(diagnostic) = disconnect else {
+                    panic!("expected a server close");
+                };
+                assert_eq!(diagnostic, websocket_diagnostic(Code::Internal));
+                "Soniox: server closed connection runtime/internal"
+            };
+            let logs = capture.finish().join("\n");
+            assert!(logs.contains(expected));
+            assert!(!logs.contains("4763"));
+            assert_safe(&logs);
+            server.await.unwrap();
+        }
     }
     use crate::projections::{TranscriptEvent, TranscriptLedger};
 

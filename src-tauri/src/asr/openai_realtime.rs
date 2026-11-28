@@ -104,7 +104,7 @@ pub enum OpenAiRealtimeEvent {
     /// A non-fatal error occurred (top-level `error` frame, a transcription
     /// `failed` event, or a local parse failure). The socket stays open.
     #[serde(rename = "error")]
-    Error { message: String },
+    Error { message: RuntimeDiagnostic },
     /// The connection has been established and the transcription session has
     /// been configured (`session.updated` received).
     #[serde(rename = "connected")]
@@ -753,7 +753,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
             }
             DisconnectKind::PolicyBlocked(message) => {
                 log::warn!("OpenAI Realtime session: content egress blocked: {message}");
-                emit_error(&event_tx, &message);
+                emit_error(&event_tx, message);
                 emit_disconnected_once(&event_tx, &disconnected_emitted);
                 break;
             }
@@ -779,7 +779,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                             log::error!(
                                 "OpenAI Realtime session: reconnect budget exhausted after {attempted} attempts"
                             );
-                            emit_error(&event_tx, &websocket_diagnostic(Code::ProviderUnavailable));
+                            emit_error(&event_tx, websocket_diagnostic(Code::ProviderUnavailable));
                             break false;
                         }
                     };
@@ -838,7 +838,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                         }
                         Err(diag) => {
                             log::warn!("OpenAI Realtime session: {diag}");
-                            emit_error(&event_tx, &diag);
+                            emit_error(&event_tx, diag);
                             // Stay in the reconnect ladder. Do not loop back
                             // through run_io with the previous closed socket.
                             continue;
@@ -1093,9 +1093,14 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                         }
                     }
                     Ok(Message::Close(frame)) => {
-                        let diagnostic = websocket_close(frame.as_ref());
+                        let locally_closed = user_disconnected.load(Ordering::SeqCst);
+                        let diagnostic = if locally_closed {
+                            websocket_diagnostic(Code::Cancelled)
+                        } else {
+                            websocket_close(frame.as_ref())
+                        };
                         log::info!("OpenAI Realtime: server closed connection {diagnostic}");
-                        if user_disconnected.load(Ordering::SeqCst) {
+                        if locally_closed {
                             return DisconnectKind::UserRequested;
                         }
                         return DisconnectKind::ServerClose(diagnostic);
@@ -1155,7 +1160,7 @@ pub(super) fn handle_server_message(
         Err(_) => {
             let message = websocket_diagnostic(Code::InvalidResponse);
             log::warn!("OpenAI Realtime: {message}");
-            emit_error(tx, &message);
+            emit_error(tx, message);
             return false;
         }
     };
@@ -1212,12 +1217,12 @@ pub(super) fn handle_server_message(
             if !item_id.is_empty() {
                 accumulator.remove(item_id);
             }
-            emit_error(tx, &openai_realtime_error_diagnostic(parsed.get("error")));
+            emit_error(tx, openai_realtime_error_diagnostic(parsed.get("error")));
             false
         }
         "error" => {
             let message = openai_realtime_error_diagnostic(parsed.get("error"));
-            emit_error(tx, &message);
+            emit_error(tx, message);
             false
         }
         "session.updated" | "session.created" => {
@@ -1234,12 +1239,8 @@ pub(super) fn handle_server_message(
     }
 }
 
-// Converse consumes this event through a String field. Render only the
-// closed diagnostic at this compatibility boundary.
-fn emit_error(tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>, diagnostic: &RuntimeDiagnostic) {
-    let _ = tx.send(OpenAiRealtimeEvent::Error {
-        message: diagnostic.to_string(),
-    });
+fn emit_error(tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>, message: RuntimeDiagnostic) {
+    let _ = tx.send(OpenAiRealtimeEvent::Error { message });
 }
 
 fn openai_realtime_error_diagnostic(error: Option<&Value>) -> RuntimeDiagnostic {
@@ -1250,7 +1251,7 @@ fn openai_realtime_error_diagnostic(error: Option<&Value>) -> RuntimeDiagnostic 
         Some("rate_limit_exceeded") => Code::RateLimited,
         Some("invalid_api_key" | "invalid_value") => Code::RequestRejected,
         Some("session_expired") => Code::Timeout,
-        _ => Code::ProviderUnavailable,
+        _ => Code::Internal,
     })
 }
 
@@ -1330,6 +1331,66 @@ mod tests {
             OPENAI_REALTIME_ASR_PROVIDER,
             crate::asr::ProviderContentEgressPolicy::allow(),
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "runs in the isolated ASR log-capture subprocess"]
+    async fn loopback_io_diagnostic_log_canary() {
+        use crate::asr::diagnostic_tests::{
+            REQUEST_ID, SECRET, UNKNOWN, assert_loopback_io, collect_io_errors, wire_prose,
+        };
+        let error =
+            serde_json::json!({"type": "error", "error": {"code": UNKNOWN, "message": wire_prose(),
+            "event_id": REQUEST_ID, "param": SECRET}})
+            .to_string();
+        assert_loopback_io(
+            error,
+            async |socket: ws_fixture::ClientSocket, audio: Option<String>, keepalive_interval| {
+                let (mut writer, mut reader) = socket.split();
+                let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
+                let (event_tx, event_rx) = crossbeam_channel::unbounded();
+                let user_disconnected = Arc::new(AtomicBool::new(false));
+                let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(usize::from(
+                    audio.is_some(),
+                )));
+                let write_guard = AsrWsWriteGuard::new(
+                    OPENAI_REALTIME_ASR_PROVIDER,
+                    crate::asr::ProviderContentEgressPolicy::allow(),
+                );
+                if let Some(audio) = audio {
+                    audio_tx.send(AudioCmd::Chunk(audio)).unwrap();
+                }
+                let disconnect = run_io(RunIoCtx {
+                    writer: &mut writer,
+                    reader: &mut reader,
+                    audio_rx: &mut audio_rx,
+                    event_tx: &event_tx,
+                    connected: &Arc::new(AtomicBool::new(false)),
+                    user_disconnected: &user_disconnected,
+                    pending_chunks: &pending_chunks,
+                    write_guard: &write_guard,
+                    ready_event: &OpenAiRealtimeEvent::Connected,
+                    disconnected_emitted: &Arc::new(AtomicBool::new(false)),
+                    pending_cmd: &mut None,
+                    keepalive_interval,
+                })
+                .await;
+                let diagnostic = match disconnect {
+                    DisconnectKind::ServerClose(diagnostic)
+                    | DisconnectKind::ProtocolError(diagnostic)
+                    | DisconnectKind::NetworkError(diagnostic) => diagnostic,
+                    _ => panic!("expected a peer close or IO failure"),
+                };
+                let events = collect_io_errors(event_rx, |event| {
+                    let OpenAiRealtimeEvent::Error { message } = event else {
+                        panic!("expected only provider error events");
+                    };
+                    message
+                });
+                (diagnostic, events)
+            },
+        )
+        .await;
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1412,10 +1473,7 @@ mod tests {
                         "OpenAI Realtime server error leaked {leaked}: {message}"
                     );
                 }
-                assert_eq!(
-                    message,
-                    websocket_diagnostic(Code::ProviderUnavailable).to_string()
-                );
+                assert_eq!(message, websocket_diagnostic(Code::Internal));
             }
             other => panic!("expected error event, got {other:?}"),
         }
@@ -1799,7 +1857,7 @@ mod tests {
         );
         match rx.try_recv().unwrap() {
             OpenAiRealtimeEvent::Error { message } => {
-                assert_eq!(message, websocket_diagnostic(Code::RateLimited).to_string());
+                assert_eq!(message, websocket_diagnostic(Code::RateLimited));
             }
             other => panic!("Expected Error, got {other:?}"),
         }
@@ -1820,10 +1878,7 @@ mod tests {
         );
         match rx.try_recv().unwrap() {
             OpenAiRealtimeEvent::Error { message } => {
-                assert_eq!(
-                    message,
-                    websocket_diagnostic(Code::ProviderUnavailable).to_string()
-                );
+                assert_eq!(message, websocket_diagnostic(Code::Internal));
             }
             other => panic!("Expected Error, got {other:?}"),
         }
@@ -1836,10 +1891,7 @@ mod tests {
         handle_server_message("not json", &tx, &mut acc);
         match rx.try_recv().unwrap() {
             OpenAiRealtimeEvent::Error { message } => {
-                assert_eq!(
-                    message,
-                    websocket_diagnostic(Code::InvalidResponse).to_string()
-                );
+                assert_eq!(message, websocket_diagnostic(Code::InvalidResponse));
             }
             other => panic!("Expected Error, got {other:?}"),
         }
@@ -1924,7 +1976,7 @@ mod tests {
                 is_final: true,
             },
             OpenAiRealtimeEvent::Error {
-                message: websocket_diagnostic(Code::Internal).to_string(),
+                message: websocket_diagnostic(Code::Internal),
             },
             OpenAiRealtimeEvent::Connected,
             OpenAiRealtimeEvent::Disconnected,
@@ -2367,10 +2419,7 @@ mod tests {
 
         match recv_event(&event_rx, Duration::from_secs(2)).await {
             OpenAiRealtimeEvent::Error { message } => {
-                assert_eq!(
-                    message,
-                    websocket_diagnostic(Code::NetworkUnreachable).to_string()
-                );
+                assert_eq!(message, websocket_diagnostic(Code::NetworkUnreachable));
             }
             other => panic!("expected reconnect failure error, got {other:?}"),
         }

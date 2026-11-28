@@ -193,12 +193,21 @@ impl SpeechmaticsRealtimeConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SpeechmaticsParsedMessage {
     pub recognition_id: Option<String>,
     pub revisions: Vec<SpeechmaticsParsedRevision>,
     pub end_of_utterance: Option<SpeechmaticsEndOfUtterance>,
     pub error: Option<RuntimeDiagnostic>,
+}
+
+impl std::fmt::Debug for SpeechmaticsParsedMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpeechmaticsParsedMessage")
+            .field("recognition_id_present", &self.recognition_id.is_some())
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -253,7 +262,7 @@ impl SpeechmaticsResponse {
         let code = match self.r#type.as_deref() {
             Some("not_authorised" | "not_allowed" | "invalid_model") => Code::RequestRejected,
             Some("quota_exceeded") => Code::CapacityExhausted,
-            _ => Code::ProviderUnavailable,
+            _ => Code::Internal,
         };
         websocket_diagnostic(code)
     }
@@ -452,7 +461,7 @@ impl SpeechmaticsRealtimeParser {
 
 pub fn classify_close_code(code: u16) -> RuntimeDiagnostic {
     websocket_diagnostic(match code {
-        1000 => Code::Cancelled,
+        1000 => Code::ProviderUnavailable,
         1003 => Code::ProtocolError,
         1008 => Code::PolicyBlocked,
         1011 | 4013 => Code::ProviderUnavailable,
@@ -1000,19 +1009,52 @@ mod tests {
 
     #[test]
     fn close_code_classifier_matches_speechmatics_realtime_codes() {
-        for (wire_code, code) in [
-            (1003, Code::ProtocolError),
-            (1008, Code::PolicyBlocked),
-            (1011, Code::ProviderUnavailable),
-            (4001, Code::RequestRejected),
-            (4003, Code::RequestRejected),
-            (4004, Code::RequestRejected),
-            (4005, Code::CapacityExhausted),
-            (4006, Code::RequestRejected),
-            (4013, Code::ProviderUnavailable),
-            (4999, Code::Internal),
+        use audio_graph_ipc_contract::runtime_diagnostic::RuntimeSafeRecoveryAction as Recovery;
+        for (wire_code, code, retryable, recovery) in [
+            (1000, Code::ProviderUnavailable, true, Recovery::Retry),
+            (1003, Code::ProtocolError, false, Recovery::None),
+            (1008, Code::PolicyBlocked, false, Recovery::ReviewPolicy),
+            (1011, Code::ProviderUnavailable, true, Recovery::Retry),
+            (
+                4001,
+                Code::RequestRejected,
+                false,
+                Recovery::ReviewConfiguration,
+            ),
+            (
+                4003,
+                Code::RequestRejected,
+                false,
+                Recovery::ReviewConfiguration,
+            ),
+            (
+                4004,
+                Code::RequestRejected,
+                false,
+                Recovery::ReviewConfiguration,
+            ),
+            (
+                4005,
+                Code::CapacityExhausted,
+                false,
+                Recovery::ReviewConfiguration,
+            ),
+            (
+                4006,
+                Code::RequestRejected,
+                false,
+                Recovery::ReviewConfiguration,
+            ),
+            (4013, Code::ProviderUnavailable, true, Recovery::Retry),
+            (4999, Code::Internal, false, Recovery::None),
         ] {
-            assert_eq!(classify_close_code(wire_code), websocket_diagnostic(code));
+            let RuntimeDiagnostic::Runtime(actual) = classify_close_code(wire_code) else {
+                panic!("expected runtime diagnostic for {wire_code}");
+            };
+            assert_eq!(
+                (actual.code, actual.retryable, actual.recovery_action),
+                (code, retryable, recovery)
+            );
         }
     }
 

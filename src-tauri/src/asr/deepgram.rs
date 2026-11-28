@@ -1769,7 +1769,7 @@ fn deepgram_error_diagnostic(parsed: &Value) -> RuntimeDiagnostic {
         Some("INVALID_AUTH" | "INSUFFICIENT_PERMISSIONS" | "BAD_REQUEST") => Code::RequestRejected,
         Some("CLIENT_MESSAGE_TIMEOUT") => Code::Timeout,
         Some("RATE_LIMIT_EXCEEDED") => Code::RateLimited,
-        _ => Code::ProviderUnavailable,
+        _ => Code::Internal,
     })
 }
 
@@ -2040,6 +2040,62 @@ mod tests {
         config.api_key = "dg-private-api-key".into();
         config.content_egress_policy = crate::asr::ProviderContentEgressPolicy::block("local_only");
         config
+    }
+
+    #[tokio::test]
+    #[ignore = "runs in the isolated ASR log-capture subprocess"]
+    async fn loopback_io_diagnostic_log_canary() {
+        use crate::asr::diagnostic_tests::{
+            REQUEST_ID, SECRET, UNKNOWN, assert_loopback_io, collect_io_errors, wire_prose,
+        };
+        let error =
+            serde_json::json!({"type": "Error", "err_code": UNKNOWN, "description": wire_prose(),
+            "request_id": REQUEST_ID, "api_key": SECRET})
+            .to_string();
+        assert_loopback_io(
+            error,
+            async |socket: ws_fixture::ClientSocket, audio: Option<String>, keepalive_interval| {
+                let (mut writer, mut reader) = socket.split();
+                let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
+                let (event_tx, event_rx) = crossbeam_channel::unbounded();
+                let user_disconnected = Arc::new(AtomicBool::new(false));
+                let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(usize::from(
+                    audio.is_some(),
+                )));
+                let write_guard = AsrWsWriteGuard::new(
+                    "asr.deepgram",
+                    crate::asr::ProviderContentEgressPolicy::allow(),
+                );
+                if let Some(audio) = audio {
+                    audio_tx.send(AudioCmd::Chunk(audio.into_bytes())).unwrap();
+                }
+                let disconnect = run_io_with_keepalive_interval(
+                    &mut writer,
+                    &mut reader,
+                    &mut audio_rx,
+                    &event_tx,
+                    &user_disconnected,
+                    &pending_chunks,
+                    &write_guard,
+                    keepalive_interval,
+                )
+                .await;
+                let diagnostic = match disconnect {
+                    DisconnectKind::ServerClose(diagnostic)
+                    | DisconnectKind::ProtocolError(diagnostic)
+                    | DisconnectKind::NetworkError(diagnostic) => diagnostic,
+                    _ => panic!("expected a peer close or IO failure"),
+                };
+                let events = collect_io_errors(event_rx, |event| {
+                    let DeepgramEvent::Error { message } = event else {
+                        panic!("expected only provider error events");
+                    };
+                    message
+                });
+                (diagnostic, events)
+            },
+        )
+        .await;
     }
 
     #[test]

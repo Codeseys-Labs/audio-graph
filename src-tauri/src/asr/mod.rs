@@ -93,16 +93,16 @@ fn websocket_error(error: &tungstenite::Error) -> RuntimeDiagnostic {
                 408 | 504 => Code::Timeout,
                 429 => Code::RateLimited,
                 500..=599 => Code::ProviderUnavailable,
-                _ => Code::RequestRejected,
+                300..=499 => Code::RequestRejected,
+                _ => Code::Internal,
             };
             return asr_diagnostic(code, RuntimeTransport::Websocket, class);
         }
         Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => Code::Timeout,
-        Error::Io(_) | Error::Tls(_) | Error::ConnectionClosed | Error::AlreadyClosed => {
-            Code::NetworkUnreachable
-        }
-        Error::Protocol(_) | Error::Utf8(_) => Code::ProtocolError,
-        Error::Capacity(_) => Code::CapacityExhausted,
+        Error::Io(_) | Error::ConnectionClosed | Error::AlreadyClosed => Code::NetworkUnreachable,
+        // A failed TLS handshake can indicate a certificate or protocol problem.
+        Error::Protocol(_) | Error::Utf8(_) | Error::Tls(_) => Code::ProtocolError,
+        Error::Capacity(_) | Error::WriteBufferFull(_) => Code::CapacityExhausted,
         Error::Url(_) => Code::RequestRejected,
         _ => Code::Internal,
     };
@@ -110,26 +110,33 @@ fn websocket_error(error: &tungstenite::Error) -> RuntimeDiagnostic {
 }
 
 fn websocket_write_error(error: &transport::AsrTransportWriteError) -> RuntimeDiagnostic {
-    let code = if error.is_policy_blocked() {
-        RuntimeErrorCode::PolicyBlocked
-    } else {
-        RuntimeErrorCode::NetworkUnreachable
-    };
-    websocket_diagnostic(code)
+    match error {
+        transport::AsrTransportWriteError::Policy => {
+            websocket_diagnostic(RuntimeErrorCode::PolicyBlocked)
+        }
+        transport::AsrTransportWriteError::Write { diagnostic, .. } => diagnostic.clone(),
+    }
 }
 
+/// Classify a peer close. Local cancellation is decided by the adapter.
 fn websocket_close(frame: Option<&CloseFrame>) -> RuntimeDiagnostic {
     use RuntimeErrorCode as Code;
 
     let code = match frame.map(|frame| frame.code) {
-        Some(CloseCode::Normal) => Code::Cancelled,
+        Some(
+            CloseCode::Normal
+            | CloseCode::Away
+            | CloseCode::Abnormal
+            | CloseCode::Error
+            | CloseCode::Restart,
+        ) => Code::ProviderUnavailable,
         Some(CloseCode::Protocol | CloseCode::Unsupported | CloseCode::Invalid) => {
             Code::ProtocolError
         }
         Some(CloseCode::Policy) => Code::PolicyBlocked,
         Some(CloseCode::Size) => Code::CapacityExhausted,
         Some(CloseCode::Again) => Code::RateLimited,
-        _ => Code::ProviderUnavailable,
+        _ => Code::Internal,
     };
     websocket_diagnostic(code)
 }
@@ -164,10 +171,10 @@ mod diagnostic_tests {
     use serde_json::json;
     use std::{cell::RefCell, sync::Once};
 
-    const SECRET: &str = "asr-secret-canary";
-    const REQUEST_ID: &str = "asr-request-id-canary";
+    pub(super) const SECRET: &str = "asr-secret-canary";
+    pub(super) const REQUEST_ID: &str = "asr-request-id-canary";
     const PROSE: &str = "asr-provider-prose-canary";
-    const UNKNOWN: &str = "asr-unknown-code-canary";
+    pub(super) const UNKNOWN: &str = "asr-unknown-code-canary";
     pub(super) const CLOSE_REASON: &str = "asr-close-reason-canary";
     const NATIVE_PROSE: &str = "asr-native-transport-canary";
     const BODY_CHARS: usize = 379;
@@ -222,7 +229,7 @@ mod diagnostic_tests {
         }
     }
 
-    fn wire_prose() -> String {
+    pub(super) fn wire_prose() -> String {
         let canaries = format!("{PROSE}{SECRET}");
         // Give both the exact character count and the exact byte count their own canary.
         let padding = "é".repeat(BODY_BYTES - BODY_CHARS);
@@ -269,6 +276,126 @@ mod diagnostic_tests {
         assert_safe(&format!("{error:?} {error}"));
     }
 
+    pub(super) async fn assert_loopback_io(
+        error_frame: String,
+        run: impl AsyncFn(
+            ws_fixture::ClientSocket,
+            Option<String>,
+            Duration,
+        ) -> (RuntimeDiagnostic, Vec<RuntimeDiagnostic>),
+    ) {
+        use RuntimeErrorCode as Code;
+        use futures_util::SinkExt;
+        use tungstenite::{
+            Message,
+            protocol::{
+                WebSocketConfig,
+                frame::{
+                    Frame,
+                    coding::{Data, OpCode},
+                },
+            },
+        };
+
+        // Exercise each exit on a fresh socket so the preceding close or read
+        // error cannot mask a write or keepalive failure.
+        for (server_frames, audio, max_write, keepalive, code, log_line) in [
+            (
+                vec![
+                    Message::Text(error_frame.into()),
+                    Message::Close(Some(CloseFrame {
+                        code: CloseCode::Normal,
+                        reason: CLOSE_REASON.into(),
+                    })),
+                ],
+                None,
+                4096,
+                Duration::from_secs(10),
+                Code::ProviderUnavailable,
+                "server closed connection runtime/provider_unavailable",
+            ),
+            (
+                vec![Message::Frame(Frame::message(
+                    [vec![0xff], wire_prose().into_bytes()].concat(),
+                    OpCode::Data(Data::Text),
+                    true,
+                ))],
+                None,
+                4096,
+                Duration::from_secs(10),
+                Code::ProtocolError,
+                "WebSocket read error: runtime/protocol_error",
+            ),
+            (
+                Vec::new(),
+                Some(wire_prose()),
+                64,
+                Duration::from_secs(10),
+                Code::CapacityExhausted,
+                "failed to send audio: runtime/capacity_exhausted",
+            ),
+            (
+                Vec::new(),
+                None,
+                1,
+                Duration::from_millis(5),
+                Code::CapacityExhausted,
+                "failed to send keepalive: runtime/capacity_exhausted",
+            ),
+        ] {
+            let (release, wait) = tokio::sync::oneshot::channel::<()>();
+            let (url, server) = ws_fixture::spawn_server(move |mut socket| async move {
+                for frame in server_frames {
+                    socket.send(frame).await.unwrap();
+                }
+                let _ = wait.await;
+            })
+            .await;
+            // Set the cap below the size of the selected outbound frame to
+            // force WriteBufferFull without racing a remote socket shutdown.
+            let config = WebSocketConfig::default()
+                .write_buffer_size(0)
+                .max_write_buffer_size(max_write);
+            let (socket, _) =
+                tokio_tungstenite::connect_async_with_config(&url, Some(config), false)
+                    .await
+                    .unwrap();
+            let capture = LogCapture::start();
+            let (disconnect, events) =
+                tokio::time::timeout(Duration::from_secs(2), run(socket, audio, keepalive))
+                    .await
+                    .expect("adapter IO canary did not exit");
+            assert_diagnostic(&disconnect, code);
+            if code == Code::ProviderUnavailable {
+                let [error] = events.as_slice() else {
+                    panic!("expected one provider error before close");
+                };
+                assert_diagnostic(error, Code::Internal);
+            } else {
+                assert!(events.is_empty());
+            }
+            let logs = capture.finish().join("\n");
+            assert!(logs.contains(log_line), "missing {log_line:?} in {logs:?}");
+            assert_safe(&logs);
+            let _ = release.send(());
+            server.await.unwrap();
+        }
+    }
+
+    pub(super) fn collect_io_errors<E: std::fmt::Debug + serde::Serialize>(
+        events: crossbeam_channel::Receiver<E>,
+        unwrap_error: impl Fn(E) -> RuntimeDiagnostic,
+    ) -> Vec<RuntimeDiagnostic> {
+        events
+            .try_iter()
+            .map(|event| {
+                assert_safe(&format!("{event:?}"));
+                assert_safe(&serde_json::to_string(&event).unwrap());
+                unwrap_error(event)
+            })
+            .collect()
+    }
+
     #[test]
     fn asr_logs_discard_private_wire_details() {
         // Logger and level are process-global. Isolate them from the rest of
@@ -279,7 +406,7 @@ mod diagnostic_tests {
             .expect("run the ASR log-capture subprocess");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            output.status.success() && stdout.contains("8 passed; 0 failed"),
+            output.status.success() && stdout.contains("11 passed; 0 failed"),
             "ASR log canaries failed\n{stdout}\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -358,20 +485,14 @@ mod diagnostic_tests {
         ] {
             assert_diagnostic(&websocket_error(&error), code);
         }
-        let error = transport::AsrTransportWriteError::Write {
-            provider: "fixture",
-            payload_kind: transport::AsrTransportPayloadKind::Audio,
-            message: format!("{NATIVE_PROSE} {SECRET} {}", wire_prose()),
-        };
-        assert_diagnostic(&websocket_write_error(&error), Code::NetworkUnreachable);
         let close = CloseFrame {
             code: CloseCode::Library(4763),
             reason: format!("{CLOSE_REASON} {REQUEST_ID} {SECRET}").into(),
         };
         let diagnostic = websocket_close(Some(&close));
-        assert_diagnostic(&diagnostic, Code::ProviderUnavailable);
+        assert_diagnostic(&diagnostic, Code::Internal);
         assert!(!format!("{diagnostic:?}").contains("4763"));
-        assert_diagnostic(&websocket_close(None), Code::ProviderUnavailable);
+        assert_diagnostic(&websocket_close(None), Code::Internal);
     }
 
     #[test]
@@ -398,7 +519,7 @@ mod diagnostic_tests {
         let deepgram::DeepgramEvent::Error { message } = event else {
             panic!("expected Deepgram error event");
         };
-        assert_diagnostic(&message, RuntimeErrorCode::ProviderUnavailable);
+        assert_diagnostic(&message, RuntimeErrorCode::Internal);
         let logs = capture.finish().join("\n");
         assert!(logs.contains("received metadata"));
         assert!(logs.contains("unhandled Flux TurnInfo event"));
@@ -412,16 +533,13 @@ mod diagnostic_tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut parser = assemblyai::AssemblyAiV3Parser::new("source");
         let payload = json!({
-            "type": "Error", "code": UNKNOWN, "error": wire_prose(), "request_id": REQUEST_ID,
+            "type": "Error", "error_code": UNKNOWN, "error": wire_prose(), "request_id": REQUEST_ID,
             "token": SECRET,
         });
         let payload = payload.to_string();
         let parsed = parser.parse_message(&payload, 0).unwrap();
         assert_safe(&format!("{parsed:?}"));
-        assert_diagnostic(
-            &parsed.error.unwrap().message,
-            RuntimeErrorCode::RequestRejected,
-        );
+        assert_diagnostic(&parsed.error.unwrap().message, RuntimeErrorCode::Internal);
         assemblyai::handle_server_message(&payload, &tx);
         let event = rx.try_recv().unwrap();
         assert_safe(&format!("{event:?}"));
@@ -429,7 +547,31 @@ mod diagnostic_tests {
         let assemblyai::AssemblyAIEvent::Error { message } = event else {
             panic!("expected AssemblyAI error event");
         };
-        assert_diagnostic(&message, RuntimeErrorCode::RequestRejected);
+        assert_diagnostic(&message, RuntimeErrorCode::Internal);
+        for (wire_code, code) in [
+            (1008, RuntimeErrorCode::RequestRejected),
+            (1011, RuntimeErrorCode::ProviderUnavailable),
+            (3005, RuntimeErrorCode::Internal),
+            (3006, RuntimeErrorCode::ProtocolError),
+            (3007, RuntimeErrorCode::RequestRejected),
+            (3008, RuntimeErrorCode::Timeout),
+        ] {
+            let payload = json!({"type": "Error", "error_code": wire_code, "error": wire_prose()});
+            let payload = payload.to_string();
+            let parsed = parser.parse_message(&payload, 0).unwrap();
+            assert_diagnostic(&parsed.error.unwrap().message, code);
+            assemblyai::handle_server_message(&payload, &tx);
+            let assemblyai::AssemblyAIEvent::Error { message } = rx.try_recv().unwrap() else {
+                panic!("expected AssemblyAI error event");
+            };
+            assert_diagnostic(&message, code);
+        }
+        let begin = parser
+            .parse_message(&json!({"type": "Begin", "id": REQUEST_ID}).to_string(), 0)
+            .unwrap();
+        assert_eq!(begin.session_id.as_deref(), Some(REQUEST_ID));
+        assert!(format!("{begin:?}").contains("session_id_present: true"));
+        assert_safe(&format!("{begin:?}"));
         let unknown = json!({"type": UNKNOWN, "request_id": REQUEST_ID}).to_string();
         assemblyai::handle_server_message(&unknown, &tx);
         assert!(rx.try_recv().is_err());
@@ -474,7 +616,20 @@ mod diagnostic_tests {
         let openai_realtime::OpenAiRealtimeEvent::Error { message } = event else {
             panic!("expected OpenAI error event");
         };
-        assert_eq!(message, "runtime/provider_unavailable");
+        assert_diagnostic(&message, RuntimeErrorCode::Internal);
+        for (wire_code, code) in [
+            ("invalid_api_key", RuntimeErrorCode::RequestRejected),
+            ("session_expired", RuntimeErrorCode::Timeout),
+        ] {
+            let payload =
+                json!({"type": "error", "error": {"code": wire_code, "message": wire_prose()}});
+            openai_realtime::handle_server_message(&payload.to_string(), &tx, &mut accumulator);
+            let openai_realtime::OpenAiRealtimeEvent::Error { message } = rx.try_recv().unwrap()
+            else {
+                panic!("expected OpenAI error event");
+            };
+            assert_diagnostic(&message, code);
+        }
         let unknown = json!({"type": UNKNOWN, "request_id": REQUEST_ID});
         openai_realtime::handle_server_message(&unknown.to_string(), &tx, &mut accumulator);
         assert!(rx.try_recv().is_err());
@@ -496,17 +651,26 @@ mod diagnostic_tests {
         let payload = payload.to_string();
         let parsed = parser.parse_message(&payload, 0).unwrap();
         assert_safe(&format!("{parsed:?}"));
-        assert_diagnostic(
-            &parsed.error.unwrap(),
-            RuntimeErrorCode::ProviderUnavailable,
-        );
+        assert_diagnostic(&parsed.error.unwrap(), RuntimeErrorCode::Internal);
         soniox::handle_server_message(&payload, &tx, &mut parser);
         let event = rx.try_recv().unwrap();
         assert_safe(&format!("{event:?}"));
         let soniox::SonioxEvent::Error { message } = event else {
             panic!("expected Soniox error event");
         };
-        assert_diagnostic(&message, RuntimeErrorCode::ProviderUnavailable);
+        assert_diagnostic(&message, RuntimeErrorCode::Internal);
+        for (wire_code, code) in [
+            (408, RuntimeErrorCode::Timeout),
+            (429, RuntimeErrorCode::RateLimited),
+            (504, RuntimeErrorCode::Timeout),
+        ] {
+            let payload = json!({"error_code": wire_code, "error_message": wire_prose()});
+            soniox::handle_server_message(&payload.to_string(), &tx, &mut parser);
+            let soniox::SonioxEvent::Error { message } = rx.try_recv().unwrap() else {
+                panic!("expected Soniox error event");
+            };
+            assert_diagnostic(&message, code);
+        }
         assert_safe(&capture.finish().join("\n"));
     }
 
@@ -522,10 +686,12 @@ mod diagnostic_tests {
         });
         let parsed = parser.parse_message(&payload.to_string(), 0).unwrap();
         assert_safe(&format!("{parsed:?}"));
-        assert_diagnostic(
-            &parsed.error.unwrap(),
-            RuntimeErrorCode::ProviderUnavailable,
-        );
+        assert_diagnostic(&parsed.error.unwrap(), RuntimeErrorCode::Internal);
+        let begin = json!({"type": "start_session", "session_id": REQUEST_ID});
+        let begin = parser.parse_message(&begin.to_string(), 0).unwrap();
+        assert_eq!(begin.session_id.as_deref(), Some(REQUEST_ID));
+        assert!(format!("{begin:?}").contains("session_id_present: true"));
+        assert_safe(&format!("{begin:?}"));
         let unknown = json!({"type": UNKNOWN, "request_id": REQUEST_ID});
         assert_parse_error(
             parser.parse_message(&unknown.to_string(), 0).unwrap_err(),
@@ -545,10 +711,12 @@ mod diagnostic_tests {
         });
         let parsed = parser.parse_message(&payload.to_string(), 0).unwrap();
         assert_safe(&format!("{parsed:?}"));
-        assert_diagnostic(
-            &parsed.error.unwrap(),
-            RuntimeErrorCode::ProviderUnavailable,
-        );
+        assert_diagnostic(&parsed.error.unwrap(), RuntimeErrorCode::Internal);
+        let begin = json!({"message": "RecognitionStarted", "id": REQUEST_ID});
+        let begin = parser.parse_message(&begin.to_string(), 0).unwrap();
+        assert_eq!(begin.recognition_id.as_deref(), Some(REQUEST_ID));
+        assert!(format!("{begin:?}").contains("recognition_id_present: true"));
+        assert_safe(&format!("{begin:?}"));
         let unknown = json!({"message": UNKNOWN, "id": REQUEST_ID});
         assert_parse_error(
             parser.parse_message(&unknown.to_string(), 0).unwrap_err(),
@@ -578,6 +746,11 @@ mod diagnostic_tests {
             parser.parse_message(&malformed.to_string(), 0).unwrap_err(),
             AsrParseError::InvalidJson,
         );
+        let begin = json!({"type": "connected", "id": REQUEST_ID});
+        let begin = parser.parse_message(&begin.to_string(), 0).unwrap();
+        assert_eq!(begin.connected_id.as_deref(), Some(REQUEST_ID));
+        assert!(format!("{begin:?}").contains("connected_id_present: true"));
+        assert_safe(&format!("{begin:?}"));
         assert_diagnostic(
             &revai::classify_close_code(4763),
             RuntimeErrorCode::Internal,
