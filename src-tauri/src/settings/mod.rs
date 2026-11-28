@@ -2034,9 +2034,9 @@ fn migrate_asr_provider_model(settings: &mut AppSettings) {
     // (1) Upgrade a known alias to its canonical id, preserving intent.
     if let Some(upgraded) = crate::asr::deepgram::upgrade_deepgram_model_alias(model) {
         if model != upgraded {
+            // Closed text: the persisted value is what the user typed.
             log::info!(
-                "Migrating persisted Deepgram model alias '{model}' to canonical id \
-                 '{upgraded}' on settings load."
+                "Migrating a persisted Deepgram model alias to canonical id '{upgraded}' on settings load."
             );
             *model = upgraded.to_string();
         }
@@ -2045,12 +2045,10 @@ fn migrate_asr_provider_model(settings: &mut AppSettings) {
 
     // (2)/(3) Valid models pass through; everything else clamps to the default.
     if !crate::asr::deepgram::is_valid_deepgram_streaming_model(model) {
-        let previous = std::mem::replace(
-            model,
-            crate::asr::deepgram::DEEPGRAM_DEFAULT_STREAMING_MODEL.to_string(),
-        );
+        *model = crate::asr::deepgram::DEEPGRAM_DEFAULT_STREAMING_MODEL.to_string();
+        // Closed text: the replaced value is what the user typed.
         log::warn!(
-            "Migrating persisted Deepgram model '{previous}' (not a valid streaming model id) \
+            "Migrating a persisted Deepgram model that is not a valid streaming model id \
              to '{}' on settings load.",
             crate::asr::deepgram::DEEPGRAM_DEFAULT_STREAMING_MODEL
         );
@@ -4157,6 +4155,60 @@ mod tests {
         assert_eq!(parsed.audio_settings.channels, 1);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_settings_load_and_legacy_import_log_no_path_model_or_error_text() {
+        use crate::test_log_capture::{ThreadLogCapture, render};
+
+        let dir = unique_tempdir("lanterncanary-dir");
+        let config_path = dir.join("config").join("config.yaml");
+        let legacy_path = dir.join("data").join("settings.json");
+        let mut legacy =
+            serde_json::to_value(redacted_settings(&AppSettings::default())).expect("legacy json");
+        legacy["asr_provider"] =
+            serde_json::json!({ "type": "deepgram", "model": "lanterncanary-model" });
+        fs::create_dir_all(legacy_path.parent().expect("legacy parent")).expect("legacy dir");
+        fs::write(&legacy_path, legacy.to_string()).expect("write legacy settings.json");
+
+        let capture = ThreadLogCapture::start();
+        // The import writes config.yaml, then its caller fails with text that
+        // names the path, as an OS write error would.
+        let imported =
+            load_settings_from_paths_with_status(&config_path, Some(&legacy_path), |settings| {
+                save_settings_to_path(&config_path, settings)?;
+                Err(format!(
+                    "lanterncanary-write-error at {}",
+                    config_path.display()
+                ))
+            });
+        // The canonical file now exists; it, too, carries a typed model id.
+        fs::write(
+            &config_path,
+            "asr_provider:\n  type: deepgram\n  model: lanterncanary-model\n",
+        )
+        .expect("write config.yaml");
+        let canonical = load_settings_from_paths_with_status(&config_path, None, |_| Ok(()));
+        // Permission hardening that fails, as on a filesystem without ACLs.
+        crate::fs_util::set_owner_only(&dir.join("lanterncanary-missing.yaml"));
+        let logs = render(&capture.finish());
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(imported.status, SettingsLoadStatus::LegacyImported);
+        assert_eq!(canonical.status, SettingsLoadStatus::CanonicalOk);
+        for expected in [
+            "Imported legacy settings.json",
+            "Failed to write imported config.yaml",
+            "Settings saved to config.yaml",
+            "Loaded settings from config.yaml",
+            "not a valid streaming model id",
+            "Owner-only permission hardening failed",
+        ] {
+            assert!(logs.contains(expected), "missing {expected:?} in {logs}");
+        }
+        assert!(!logs.contains("lanterncanary"), "{logs}");
+        let dir_text = dir.display().to_string();
+        assert!(!logs.contains(&dir_text), "{logs}");
     }
 
     #[test]

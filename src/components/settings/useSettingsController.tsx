@@ -411,6 +411,29 @@ function credentialIsPresent(
   return presence[key]?.present === true;
 }
 
+/**
+ * Entries checked under an older credential epoch than the newest one seen
+ * may describe a key that has since been replaced: they are shown as stale,
+ * never as the current key's verdict, whatever request id they arrived on.
+ */
+export function readinessAtLatestEpoch(
+  entries: ProviderReadiness[],
+  seenEpoch: number,
+): { entries: ProviderReadiness[]; latestEpoch: number } {
+  const latestEpoch = entries.reduce(
+    (latest, entry) => Math.max(latest, entry.credential_epoch),
+    seenEpoch,
+  );
+  return {
+    latestEpoch,
+    entries: entries.map((entry) =>
+      entry.credential_epoch < latestEpoch && !entry.stale
+        ? { ...entry, stale: true }
+        : entry,
+    ),
+  };
+}
+
 function providerReadinessFromEntries(
   entries: ProviderReadiness[],
 ): Record<string, ProviderReadiness> {
@@ -1148,6 +1171,8 @@ export function useSettingsController() {
   >(null);
   const providerReadinessRequestRef = useRef<string | null>(null);
   const providerReadinessRequestSeqRef = useRef(0);
+  // The newest credential epoch any readiness response has carried.
+  const providerReadinessEpochRef = useRef(0);
   const [openrouterModelsError, setOpenrouterModelsError] = useState<
     string | null
   >(null);
@@ -2166,8 +2191,13 @@ export function useSettingsController() {
 
   const applyProviderReadiness = useCallback(
     (readiness: ProviderReadiness[], openrouterCatalogBaseUrl: string) => {
+      const current = readinessAtLatestEpoch(
+        readiness,
+        providerReadinessEpochRef.current,
+      );
+      providerReadinessEpochRef.current = current.latestEpoch;
       setProviderReadinessError(null);
-      setProviderReadiness(providerReadinessFromEntries(readiness));
+      setProviderReadiness(providerReadinessFromEntries(current.entries));
       const openrouterReadiness = readiness.find(
         (entry) =>
           entry.provider_id === "llm.openrouter" &&

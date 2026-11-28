@@ -2,10 +2,17 @@ import { invoke } from "@tauri-apps/api/core";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../../store";
-import type { AppSettings, OpenRouterModelEndpoints } from "../../types";
+import type {
+  AppSettings,
+  OpenRouterModelEndpoints,
+  ProviderReadiness,
+} from "../../types";
 import { setField } from "../settingsTypes";
 import { inferOpenRouterRoutingPreset } from "./settingsControllerHelpers";
-import { useSettingsController } from "./useSettingsController";
+import {
+  readinessAtLatestEpoch,
+  useSettingsController,
+} from "./useSettingsController";
 
 // The controller is the orchestration hook behind the Settings modal. Its
 // OpenRouter accelerator handlers (discover + apply-preset) have historically
@@ -1072,5 +1079,45 @@ describe("useSettingsController — provider selection/config round-trip", () =>
       const saved = saveSettings.mock.calls.at(-1)?.[0] as AppSettings;
       expect(saved.asr_provider.type).toBe(tag);
     }
+  });
+});
+
+describe("readinessAtLatestEpoch", () => {
+  const entry = (
+    credentialEpoch: number,
+    stale = false,
+  ): ProviderReadiness => ({
+    provider_id: "llm.openrouter",
+    status: "ready",
+    note: { kind: "verified" },
+    automatic_probe_available: true,
+    checked_at: 1,
+    stale,
+    credential_epoch: credentialEpoch,
+    credentials: [{ key: "openrouter_api_key", present: true }],
+  });
+
+  it("shows a result checked under an older credential epoch as stale", () => {
+    // Key A verified at epoch 1; a response at epoch 2 (key B) was already
+    // shown, so A's verdict must not read as current.
+    const { entries, latestEpoch } = readinessAtLatestEpoch([entry(1)], 2);
+    expect(latestEpoch).toBe(2);
+    expect(entries[0].stale).toBe(true);
+  });
+
+  it("keeps a result from the newest epoch as it came", () => {
+    const fresh = entry(3);
+    const { entries, latestEpoch } = readinessAtLatestEpoch([fresh], 2);
+    expect(latestEpoch).toBe(3);
+    expect(entries[0]).toBe(fresh);
+  });
+
+  it("raises the seen epoch from any entry in the response", () => {
+    const { entries, latestEpoch } = readinessAtLatestEpoch(
+      [entry(4), entry(5)],
+      0,
+    );
+    expect(latestEpoch).toBe(5);
+    expect(entries.map((e) => e.stale)).toEqual([true, false]);
   });
 });

@@ -12757,6 +12757,21 @@ fn store_provider_readiness_for_epoch(
     true
 }
 
+/// A save or delete that landed while the refresh ran may have replaced the
+/// key these results were checked with: they are returned as stale, so no
+/// surface shows them as the current key's verdict.
+fn mark_stale_if_epoch_moved(readiness: &mut [ProviderReadiness], started_epoch: u64) {
+    if PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst) == started_epoch {
+        return;
+    }
+    for entry in readiness
+        .iter_mut()
+        .filter(|entry| entry.checked_at.is_some())
+    {
+        entry.stale = true;
+    }
+}
+
 fn begin_provider_readiness_refresh(
     cache_key: &str,
     now: u64,
@@ -13418,6 +13433,7 @@ pub async fn get_provider_readiness_cmd(
         readiness.push(value);
     }
 
+    mark_stale_if_epoch_moved(&mut readiness, credential_epoch);
     Ok(readiness)
 }
 
@@ -14260,7 +14276,12 @@ async fn probe_aws_credentials(
         .send()
         .await
         .map(|_identity| ())
-        .map_err(|error| sts_failure_diagnostic(&error).into())
+        .map_err(|error| {
+            let status = error
+                .raw_response()
+                .map(|response| response.status().as_u16());
+            sts_failure_diagnostic(&error, status).into()
+        })
 }
 
 fn aws_check_context() -> RuntimeDiagnosticContext {
@@ -14271,17 +14292,29 @@ fn aws_check_context() -> RuntimeDiagnosticContext {
 /// Classify an STS failure from the SDK's error kind and the service's
 /// error code. Neither the SDK's text nor the service message (which names
 /// the caller's ARN and account) is read; a code outside the allowlist is
-/// `internal`.
+/// `internal`. `status` is the HTTP status of the response, when there was one.
 fn sts_failure_diagnostic<R>(
     error: &aws_sdk_sts::error::SdkError<
         aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError,
         R,
     >,
+    status: Option<u16>,
 ) -> RuntimeDiagnostic {
     use aws_sdk_sts::error::{ProvideErrorMetadata, SdkError};
     let runtime = |code, retryable, action| {
         RuntimeErrorDiagnostic::new(code, retryable, action, aws_check_context()).into()
     };
+    // A redirect the HTTP layer did not follow: STS never answers with one,
+    // so it says nothing about the credential. Like the other checks, it is
+    // a rejected request.
+    if let Some(status @ 300..=399) = status
+        && matches!(
+            error,
+            SdkError::ServiceError(_) | SdkError::ResponseError(_)
+        )
+    {
+        return RuntimeErrorDiagnostic::from_http_status(status, false, aws_check_context()).into();
+    }
     match error {
         SdkError::ServiceError(service) => sts_service_code_diagnostic(service.err().code()),
         SdkError::TimeoutError(_) => runtime(
@@ -21697,6 +21730,10 @@ mod tests {
         ));
         assert!(cached_provider_readiness(&current_key(started), unix_millis()).is_none());
         assert!(cached_provider_readiness(&current_key(now_epoch), unix_millis()).is_none());
+        // Nor is it returned as the new key's current verdict.
+        let mut returned = vec![result];
+        mark_stale_if_epoch_moved(&mut returned, started);
+        assert!(returned[0].stale, "a result from before the save is stale");
 
         // With no save in between, the result is cached under its own epoch.
         let (started, store) =
@@ -21707,6 +21744,9 @@ mod tests {
             started,
         ));
         assert!(cached_provider_readiness(&current_key(started), unix_millis()).is_some());
+        let mut returned = vec![checked(&store, started)];
+        mark_stale_if_epoch_moved(&mut returned, started);
+        assert!(!returned[0].stale, "an undisturbed result stays current");
     }
 
     #[tokio::test]
@@ -21883,7 +21923,7 @@ mod tests {
             ),
         ];
         for (error, code) in cases {
-            let diagnostic = sts_failure_diagnostic(&error);
+            let diagnostic = sts_failure_diagnostic(&error, None);
             let RuntimeDiagnostic::Runtime(detail) = &diagnostic else {
                 panic!("a runtime diagnostic");
             };
@@ -21893,6 +21933,32 @@ mod tests {
                 assert!(!serialized.contains(canary), "{canary} in {serialized}");
             }
         }
+    }
+
+    #[test]
+    fn a_stopped_sts_redirect_is_a_rejected_request() {
+        use aws_sdk_sts::error::{ErrorMetadata, SdkError};
+        use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
+
+        // A 307 with an off-origin Location and an empty body: no STS code.
+        let error: SdkError<GetCallerIdentityError, ()> = SdkError::service_error(
+            GetCallerIdentityError::generic(ErrorMetadata::builder().build()),
+            (),
+        );
+        let diagnostic = sts_failure_diagnostic(&error, Some(307));
+        let RuntimeDiagnostic::Runtime(detail) = &diagnostic else {
+            panic!("a runtime diagnostic");
+        };
+        assert_eq!(detail.code, RuntimeErrorCode::RequestRejected);
+        assert_eq!(
+            detail.context.status_class,
+            Some(audio_graph_ipc_contract::runtime_diagnostic::RuntimeStatusClass::Redirect)
+        );
+        // Without the status, the same empty error stays internal.
+        let RuntimeDiagnostic::Runtime(detail) = sts_failure_diagnostic(&error, None) else {
+            panic!("a runtime diagnostic");
+        };
+        assert_eq!(detail.code, RuntimeErrorCode::Internal);
     }
 
     #[tokio::test]

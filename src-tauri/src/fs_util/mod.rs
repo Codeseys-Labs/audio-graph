@@ -67,9 +67,16 @@ pub(crate) fn owner_is_trusted(file: &std::fs::File) -> std::io::Result<bool> {
 }
 
 /// Set owner-only permissions on paths whose callers can tolerate best-effort hardening.
+///
+/// The failure is logged as a closed line: the error names the path (often
+/// under the user's profile) and carries the operating system's text.
+/// Callers that must react to it use [`try_set_owner_only`] and classify the
+/// returned error themselves.
 pub fn set_owner_only(path: &Path) {
-    if let Err(e) = try_set_owner_only(path) {
-        log::warn!("{e}");
+    if try_set_owner_only(path).is_err() {
+        log::warn!(
+            "Owner-only permission hardening failed; the file keeps its inherited permissions"
+        );
     }
 }
 
