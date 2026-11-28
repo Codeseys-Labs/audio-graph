@@ -4240,12 +4240,13 @@ pub async fn send_chat_message(
         // This command returns only a whole reply, so partial text from a
         // failed or cancelled call is discarded rather than presented as an
         // answer.
-        let (reply, tokens_used) = collect_chat_reply(LlmStreamFrames::new(rx))
-            .await
-            .map_err(|diagnostic| {
-                log::warn!("send_chat_message failed: {diagnostic}");
-                AppError::from(diagnostic)
-            })?;
+        let (reply, tokens_used) =
+            collect_chat_reply(LlmStreamFrames::new(rx))
+                .await
+                .map_err(|diagnostic| {
+                    log::warn!("send_chat_message failed: {diagnostic}");
+                    AppError::from(diagnostic)
+                })?;
         let assistant_msg = record_chat_turn(state.inner(), history_generation, user_turn, reply);
         persist_llm_usage_for_session(&app, &state.current_session_id(), tokens_used);
         return Ok(ChatResponse {
@@ -4273,12 +4274,8 @@ pub async fn send_chat_message(
         log::warn!("send_chat_message failed: {diagnostic}");
         AppError::from(diagnostic)
     })?;
-    let assistant_msg = record_chat_turn(
-        state.inner(),
-        history_generation,
-        user_turn,
-        outcome.text,
-    );
+    let assistant_msg =
+        record_chat_turn(state.inner(), history_generation, user_turn, outcome.text);
     persist_llm_usage_for_session(&app, &state.current_session_id(), outcome.tokens_used);
     Ok(ChatResponse {
         message: assistant_msg,
@@ -6083,10 +6080,7 @@ fn finalize_card_answer(
             match FileMemoryRepository::user_data().upsert_live_assist_card(&ctx.session_id, &card)
             {
                 Ok(()) => events::emit_or_log(app, events::AGENT_CARD_UPDATE, card),
-                Err(_) => log::warn!(
-                    "Failed to persist the answer for card_id={}",
-                    ctx.card_id
-                ),
+                Err(_) => log::warn!("Failed to persist the answer for card_id={}", ctx.card_id),
             }
         }
         None => {
@@ -26771,7 +26765,10 @@ mod tests {
         let frame = seen.last().expect("a terminal frame");
         assert!(seen.iter().any(|frame| frame["event"] == "delta"));
         let every_frame = serde_json::Value::from(seen.clone()).to_string();
-        assert!(!every_frame.contains(CHAT_TRANSCRIPT_SENTINEL), "{every_frame}");
+        assert!(
+            !every_frame.contains(CHAT_TRANSCRIPT_SENTINEL),
+            "{every_frame}"
+        );
         assert_eq!(frame["event"], "failed", "{frame}");
         assert_eq!(frame["data"]["full_text"], PARTIAL_REPLY, "{frame}");
         assert_eq!(
@@ -27194,8 +27191,7 @@ mod tests {
                     &state,
                     spawn_raw_http_mock(http_500_response()).await,
                 );
-                let (channel, terminal) =
-                    snapshotting_answer_channel(&state, &session_id, card_id);
+                let (channel, terminal) = snapshotting_answer_channel(&state, &session_id, card_id);
                 let dispatch = answer_question_card_impl(
                     card_id.to_string(),
                     false,
@@ -27326,7 +27322,10 @@ mod tests {
         FileMemoryRepository::user_data()
             .upsert_live_assist_card(session_id, &dismissed)
             .expect("dismiss the card");
-        assert_eq!(files_containing(&dir, PROSE_CANARY), Vec::<std::path::PathBuf>::new());
+        assert_eq!(
+            files_containing(&dir, PROSE_CANARY),
+            Vec::<std::path::PathBuf>::new()
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
