@@ -640,10 +640,20 @@ export interface GraphSnapshot {
 }
 
 // Pipeline status types
+export type AsrReconnectReason =
+  | "session_rollover"
+  | "connection_lost"
+  | "provider_retry_later";
+
 export type StageStatus =
   | { type: "Idle" }
   | { type: "Running"; processed_count: number }
   | { type: "Error"; diagnostic: RuntimeDiagnostic }
+  | {
+      type: "Reconnecting";
+      reason: AsrReconnectReason;
+      retry_delay: RuntimeRetryDelayBucket;
+    }
   /**
    * The stage is running, but not with the backend/fidelity the user's
    * configuration asked for (audio-graph-586b) — e.g. diarization silently

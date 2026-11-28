@@ -52,6 +52,22 @@ mod transport;
 #[cfg(test)]
 mod ws_fixture;
 
+pub(crate) use crate::events::AsrReconnectReason;
+
+impl AsrReconnectReason {
+    fn from_diagnostic(diagnostic: &RuntimeDiagnostic) -> Self {
+        if matches!(
+            diagnostic,
+            RuntimeDiagnostic::Runtime(error)
+                if error.recovery_action == RuntimeSafeRecoveryAction::RetryAfterDelay
+        ) {
+            Self::ProviderRetryLater
+        } else {
+            Self::ConnectionLost
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
 enum AsrStopReason {
@@ -732,7 +748,7 @@ mod diagnostic_tests {
         let event = rx.try_recv().unwrap();
         assert_safe(&format!("{event:?}"));
         assert_safe(&serde_json::to_string(&event).unwrap());
-        let deepgram::DeepgramEvent::Error { message } = event else {
+        let deepgram::DeepgramEvent::Advisory { message } = event else {
             panic!("expected Deepgram error event");
         };
         assert_diagnostic(&message, RuntimeErrorCode::Internal);
@@ -760,7 +776,7 @@ mod diagnostic_tests {
         let event = rx.try_recv().unwrap();
         assert_safe(&format!("{event:?}"));
         assert_safe(&serde_json::to_string(&event).unwrap());
-        let assemblyai::AssemblyAIEvent::Error { message } = event else {
+        let assemblyai::AssemblyAIEvent::Advisory { message } = event else {
             panic!("expected AssemblyAI error event");
         };
         assert_diagnostic(&message, RuntimeErrorCode::Internal);
@@ -777,7 +793,7 @@ mod diagnostic_tests {
             let parsed = parser.parse_message(&payload, 0).unwrap();
             assert_diagnostic(&parsed.error.unwrap().message, code);
             assemblyai::handle_server_message(&payload, &tx);
-            let assemblyai::AssemblyAIEvent::Error { message } = rx.try_recv().unwrap() else {
+            let assemblyai::AssemblyAIEvent::Advisory { message } = rx.try_recv().unwrap() else {
                 panic!("expected AssemblyAI error event");
             };
             assert_diagnostic(&message, code);
@@ -829,7 +845,7 @@ mod diagnostic_tests {
         let event = rx.try_recv().unwrap();
         assert_safe(&format!("{event:?}"));
         assert_safe(&serde_json::to_string(&event).unwrap());
-        let openai_realtime::OpenAiRealtimeEvent::Error { message } = event else {
+        let openai_realtime::OpenAiRealtimeEvent::Advisory { message } = event else {
             panic!("expected OpenAI error event");
         };
         assert_diagnostic(&message, RuntimeErrorCode::Internal);
@@ -840,7 +856,7 @@ mod diagnostic_tests {
             let payload =
                 json!({"type": "error", "error": {"code": wire_code, "message": wire_prose()}});
             openai_realtime::handle_server_message(&payload.to_string(), &tx, &mut accumulator);
-            let openai_realtime::OpenAiRealtimeEvent::Error { message } = rx.try_recv().unwrap()
+            let openai_realtime::OpenAiRealtimeEvent::Advisory { message } = rx.try_recv().unwrap()
             else {
                 panic!("expected OpenAI error event");
             };
@@ -871,7 +887,7 @@ mod diagnostic_tests {
         soniox::handle_server_message(&payload, &tx, &mut parser).unwrap();
         let event = rx.try_recv().unwrap();
         assert_safe(&format!("{event:?}"));
-        let soniox::SonioxEvent::Error { message } = event else {
+        let soniox::SonioxEvent::Advisory { message } = event else {
             panic!("expected Soniox error event");
         };
         assert_diagnostic(&message, RuntimeErrorCode::Internal);
@@ -882,7 +898,7 @@ mod diagnostic_tests {
         ] {
             let payload = json!({"error_code": wire_code, "error_message": wire_prose()});
             soniox::handle_server_message(&payload.to_string(), &tx, &mut parser).unwrap();
-            let soniox::SonioxEvent::Error { message } = rx.try_recv().unwrap() else {
+            let soniox::SonioxEvent::Advisory { message } = rx.try_recv().unwrap() else {
                 panic!("expected Soniox error event");
             };
             assert_diagnostic(&message, code);

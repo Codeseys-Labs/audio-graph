@@ -238,6 +238,10 @@ function NowStrip() {
     persistenceQueueBackpressure,
     backpressuredSourceCount: backpressuredSources.length,
   });
+  const healthLabel =
+    health === "degraded" && pipelineStatus.asr.type === "Reconnecting"
+      ? t("pipeline.statusReconnecting")
+      : t(`pipeline.${health}`);
 
   return (
     <header
@@ -329,9 +333,9 @@ function NowStrip() {
               data-tone={HEALTH_TONE[health]}
               onClick={() => setSystemDrawerOpen(true)}
               aria-label={t("pipeline.openSystemStatus")}
-              title={t(`pipeline.${health}`)}
+              title={healthLabel}
             >
-              <Icon name="system" size={12} /> {t(`pipeline.${health}`)}
+              <Icon name="system" size={12} /> {healthLabel}
             </button>
           </>
         ) : (

@@ -74,7 +74,7 @@
       "is_final": false
     },
     {
-      "type": "error",
+      "type": "advisory",
       "message": {
         "kind": "runtime",
         "detail": {
@@ -86,7 +86,7 @@
       }
     },
     {
-      "type": "error",
+      "type": "advisory",
       "message": {
         "kind": "runtime",
         "detail": {
@@ -98,7 +98,7 @@
       }
     },
     {
-      "type": "error",
+      "type": "advisory",
       "message": {
         "kind": "runtime",
         "detail": {
