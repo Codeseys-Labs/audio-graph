@@ -197,8 +197,9 @@ pub struct AppState {
     /// Writes framed span revisions and returns a receipt after synchronization.
     pub transcript_event_writer: Arc<Mutex<Option<TranscriptEventWriter>>>,
 
-    /// Canonical transcript span ledger for projection-basis checks.
+    /// Fence caption side effects against replacement of the active session.
     pub(crate) transcript_publication: Arc<RwLock<()>>,
+    /// Canonical transcript span ledger for projection-basis checks.
     pub transcript_ledger: Arc<Mutex<TranscriptLedger>>,
 
     /// Provider-neutral diarization span ledger for the active session.

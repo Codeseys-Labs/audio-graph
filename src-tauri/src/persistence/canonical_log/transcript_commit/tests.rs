@@ -539,6 +539,33 @@ fn another_process_cannot_abandon_an_idle_live_writers_uncertain_frame() {
 }
 
 #[test]
+fn repeat_recovery_keeps_a_member_even_if_its_last_byte_equals_the_quarantined_suffix() {
+    let fixture = Fixture::new();
+    commit_transcript(&fixture.path, SESSION, &transcript_event("leaf", "first")).unwrap();
+    kill_at_writer_checkpoint(&fixture.path, "group-member", || {});
+    let through_first_member = fs::read(&fixture.path).unwrap();
+    assert!(through_first_member.ends_with(b"\n"));
+    OpenOptions::new()
+        .append(true)
+        .open(&fixture.path)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
+    kill_at_writer_checkpoint(&fixture.path, "recover-truncate", || {});
+    assert_eq!(fs::read(&fixture.path).unwrap(), through_first_member);
+    let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+    storage.resolve_pending().unwrap();
+    let saved = storage.take_recovered();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].event, group_events()[0]);
+    assert_eq!(saved[0].receipt.sequence, 2);
+    let gaps = transcript_gaps(&fixture.path).unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert!(gaps[0].suffix_quarantined);
+    assert_eq!(gaps[0].after.as_ref().unwrap().sequence, 2);
+}
+
+#[test]
 fn a_new_live_revision_resolves_an_uncertain_predecessor_before_committing() {
     for cut in [Cut::Full, Cut::Short, Cut::Flush, Cut::Sync] {
         let fixture = Fixture::new();

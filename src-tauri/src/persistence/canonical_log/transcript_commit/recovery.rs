@@ -104,11 +104,13 @@ impl Commit<'_> {
         let evidence = checked_bytes_bounded(&evidence_path, intent.frame_len)?;
         // The previous protocol could quarantine an entire matching singleton.
         // Its already published disposition survives an upgrade or second crash.
-        let eligible = match evidence.as_deref().filter(|s| !s.is_empty()) {
-            Some(abandoned) if suffix.ends_with(abandoned) => {
-                &suffix[..suffix.len() - abandoned.len()]
-            }
-            _ => suffix,
+        let eligible = if intent.members.is_empty() && evidence.as_deref() == Some(suffix) {
+            &[][..]
+        } else {
+            // A corrupt next member can end in (or equal) bytes from a kept
+            // member. After truncation never strip such an accidental match
+            // from the authenticated prefix of a group.
+            suffix
         };
         let (length, count) = group::matched_members(eligible, &members)?;
         if count == members.len() {
