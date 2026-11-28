@@ -3663,6 +3663,83 @@ fn llm_internal_diagnostic() -> RuntimeDiagnostic {
     ))
 }
 
+fn llm_cancelled_diagnostic() -> RuntimeDiagnostic {
+    RuntimeErrorDiagnostic::new(
+        RuntimeErrorCode::Cancelled,
+        false,
+        RuntimeSafeRecoveryAction::None,
+        RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
+    )
+    .into()
+}
+
+/// The frames of one LLM stream, as the chat and card-answer consumers read
+/// them. A producer that drops its sender without a terminal frame (its task
+/// panicked or was aborted) yields one `internal` [`TokenDelta::Error`]
+/// carrying the text streamed so far, so each consumer finalizes the call
+/// exactly once, as a failure, and never mistakes a cut-off stream for a
+/// reply. Nothing follows a terminal frame.
+struct LlmStreamFrames {
+    rx: tokio::sync::mpsc::Receiver<crate::llm::streaming::TokenDelta>,
+    streamed: String,
+    ended: bool,
+}
+
+impl LlmStreamFrames {
+    fn new(rx: tokio::sync::mpsc::Receiver<crate::llm::streaming::TokenDelta>) -> Self {
+        Self {
+            rx,
+            streamed: String::new(),
+            ended: false,
+        }
+    }
+
+    async fn next(&mut self) -> Option<crate::llm::streaming::TokenDelta> {
+        use crate::llm::streaming::TokenDelta;
+        if self.ended {
+            return None;
+        }
+        let frame = self.rx.recv().await.unwrap_or_else(|| TokenDelta::Error {
+            diagnostic: llm_internal_diagnostic(),
+            full_text: std::mem::take(&mut self.streamed),
+        });
+        match &frame {
+            TokenDelta::Delta { content, .. } => self.streamed.push_str(content),
+            _ => self.ended = true,
+        }
+        Some(frame)
+    }
+}
+
+/// Drain a stream into one whole reply and its token count. Only an explicit
+/// `Done` is a reply: a failure, a cancellation, or a stream that ends without
+/// a terminal frame is an error, and its partial text is discarded.
+async fn collect_chat_reply(
+    mut frames: LlmStreamFrames,
+) -> Result<(String, u32), RuntimeDiagnostic> {
+    use crate::llm::streaming::TokenDelta;
+    let mut reply = String::new();
+    while let Some(frame) = frames.next().await {
+        match frame {
+            TokenDelta::Delta { content, .. } => reply.push_str(&content),
+            TokenDelta::Done {
+                full_text, usage, ..
+            } => {
+                if !full_text.is_empty() {
+                    reply = full_text;
+                }
+                // `total_tokens` from the provider's terminal `usage` block
+                // covers the whole request (prompt + completion). It stays 0
+                // when the provider omitted usage.
+                return Ok((reply, tokens_used_from_stream_usage(usage)));
+            }
+            TokenDelta::Error { diagnostic, .. } => return Err(diagnostic),
+            TokenDelta::Cancelled { .. } => return Err(llm_cancelled_diagnostic()),
+        }
+    }
+    Err(llm_internal_diagnostic())
+}
+
 /// Returns `true` when the active LLM provider has a streaming code path.
 /// Api/OpenRouter stream provider chunks directly; LocalLlama uses the explicit
 /// backend-handle request path and emits one honest local delta until the local
@@ -3811,7 +3888,7 @@ fn spawn_stream_task(
             source_id: None,
             request_id: Some(request_id.clone()),
         });
-    let (mut rx, cancel) = stream_chat_with_request(request);
+    let (rx, cancel) = stream_chat_with_request(request);
     state.stream_registry.register(request_id.clone(), cancel);
 
     let registry = state.stream_registry.clone();
@@ -3857,7 +3934,8 @@ fn spawn_stream_task(
                 }
             };
 
-        while let Some(frame) = rx.recv().await {
+        let mut frames = LlmStreamFrames::new(rx);
+        while let Some(frame) = frames.next().await {
             match frame {
                 TokenDelta::Delta {
                     content,
@@ -4143,7 +4221,7 @@ pub async fn send_chat_message(
     // delta event spam.
     if provider_supports_streaming(&llm_provider) {
         use crate::llm::streaming::{
-            StreamChatRequest, StreamSourceMetadata, TokenDelta, stream_chat_with_request,
+            StreamChatRequest, StreamSourceMetadata, stream_chat_with_request,
         };
         // Honour the user-configured sampling settings on the blocking shim
         // too, matching the legacy executor path (AUD-STR1 P2).
@@ -4164,49 +4242,18 @@ pub async fn send_chat_message(
         // This blocking shim drains the stream to completion and does not expose
         // cancellation. Dropping a CancellationToken does not fire it; this
         // binding only keeps the stream infrastructure intact.
-        let (mut rx, _no_cancel) = stream_chat_with_request(request);
-        let mut full_text = String::new();
-        // Real token count from the provider's terminal `usage` block (sent when
-        // `stream_options.include_usage` is honoured). `total_tokens` covers the
-        // whole request (prompt + completion), matching the single `tokens_used`
-        // field the frontend dashboard surfaces. Stays 0 only if the provider
-        // omitted usage entirely.
-        let mut tokens_used = 0u32;
-        while let Some(frame) = rx.recv().await {
-            match frame {
-                TokenDelta::Delta { content, .. } => full_text.push_str(&content),
-                TokenDelta::Done {
-                    full_text: t,
-                    usage,
-                    ..
-                } => {
-                    if !t.is_empty() {
-                        full_text = t;
-                    }
-                    tokens_used = tokens_used_from_stream_usage(usage);
-                    break;
-                }
-                TokenDelta::Error { diagnostic, .. } => {
-                    // Chat history keeps neither turn. This command returns
-                    // only a whole reply, so partial text from a failed call
-                    // is discarded rather than presented as an answer.
-                    log::warn!("send_chat_message failed: {diagnostic}");
-                    return Err(diagnostic.into());
-                }
-                TokenDelta::Cancelled { full_text: partial } => {
-                    let assistant_msg =
-                        record_chat_turn(state.inner(), history_generation, user_turn, partial);
-                    // No usage signal: a cancelled stream is dropped before the
-                    // terminal `usage` block arrives, so no real count exists.
-                    return Ok(ChatResponse {
-                        message: assistant_msg,
-                        tokens_used: 0,
-                    });
-                }
-            }
-        }
-        let assistant_msg =
-            record_chat_turn(state.inner(), history_generation, user_turn, full_text);
+        let (rx, _no_cancel) = stream_chat_with_request(request);
+        // Chat history keeps neither turn of a call that did not complete.
+        // This command returns only a whole reply, so partial text from a
+        // failed or cancelled call is discarded rather than presented as an
+        // answer.
+        let (reply, tokens_used) = collect_chat_reply(LlmStreamFrames::new(rx))
+            .await
+            .map_err(|diagnostic| {
+                log::warn!("send_chat_message failed: {diagnostic}");
+                AppError::from(diagnostic)
+            })?;
+        let assistant_msg = record_chat_turn(state.inner(), history_generation, user_turn, reply);
         persist_llm_usage_for_session(&app, &state.current_session_id(), tokens_used);
         return Ok(ChatResponse {
             message: assistant_msg,
@@ -6102,7 +6149,7 @@ fn spawn_card_answer_stream_task(
         source_id: None,
         request_id: Some(request_id.clone()),
     });
-    let (mut rx, cancel) = stream_chat_with_request(request);
+    let (rx, cancel) = stream_chat_with_request(request);
     state.stream_registry.register(request_id.clone(), cancel);
 
     let registry = state.stream_registry.clone();
@@ -6157,7 +6204,8 @@ fn spawn_card_answer_stream_task(
         // send failure) broke.
         let mut channel_alive = true;
 
-        while let Some(frame) = rx.recv().await {
+        let mut frames = LlmStreamFrames::new(rx);
+        while let Some(frame) = frames.next().await {
             match frame {
                 TokenDelta::Delta {
                     content,
@@ -26947,6 +26995,76 @@ mod tests {
             chat_with_mid_stream_step(MidStream::CancelThenRotate, "chat-rotate-during-cancel");
         assert_eq!(frame["data"]["finish_reason"], "cancelled", "{frame}");
         assert_cleared_question_stays_gone(&history, &next);
+    }
+
+    /// A stream whose producer queues `frames` and then drops its sender.
+    fn frames_then_dropped_sender(
+        frames: Vec<crate::llm::streaming::TokenDelta>,
+    ) -> LlmStreamFrames {
+        let (tx, rx) = tokio::sync::mpsc::channel(frames.len().max(1));
+        for frame in frames {
+            tx.try_send(frame).expect("queue a frame");
+        }
+        LlmStreamFrames::new(rx)
+    }
+
+    #[test]
+    fn a_stream_that_ends_without_a_terminal_frame_is_an_internal_failure() {
+        use crate::llm::streaming::TokenDelta;
+        let delta = || TokenDelta::Delta {
+            content: PARTIAL_REPLY.to_string(),
+            finish_reason: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        rt.block_on(async {
+            // Every consumer reads one internal failure carrying the partial
+            // text, then nothing.
+            let mut frames = frames_then_dropped_sender(vec![delta()]);
+            assert!(matches!(frames.next().await, Some(TokenDelta::Delta { .. })));
+            match frames.next().await {
+                Some(TokenDelta::Error {
+                    diagnostic,
+                    full_text,
+                }) => {
+                    assert_eq!(diagnostic, llm_internal_diagnostic());
+                    assert_eq!(full_text, PARTIAL_REPLY);
+                }
+                other => panic!("expected the synthesized failure, got {other:?}"),
+            }
+            assert!(frames.next().await.is_none());
+
+            // The accumulating command reports it, and a cancellation, as an
+            // error; only an explicit `Done` is a reply.
+            assert_eq!(
+                collect_chat_reply(frames_then_dropped_sender(vec![delta()])).await,
+                Err(llm_internal_diagnostic())
+            );
+            assert_eq!(
+                collect_chat_reply(frames_then_dropped_sender(vec![
+                    delta(),
+                    TokenDelta::Cancelled {
+                        full_text: PARTIAL_REPLY.to_string(),
+                    },
+                ]))
+                .await,
+                Err(llm_cancelled_diagnostic())
+            );
+            assert_eq!(
+                collect_chat_reply(frames_then_dropped_sender(vec![
+                    delta(),
+                    TokenDelta::Done {
+                        full_text: PARTIAL_REPLY.to_string(),
+                        usage: None,
+                        finish_reason: "stop".to_string(),
+                    },
+                ]))
+                .await,
+                Ok((PARTIAL_REPLY.to_string(), 0))
+            );
+        });
     }
 
     #[test]
