@@ -18,7 +18,7 @@ import {
 } from "../session/reviewTestUtils";
 import { useAudioGraphStore } from "../store";
 import { NO_PIPELINE_STATUS } from "../store/captureFacts";
-import { captureBackendReply } from "../test/captureBackend";
+import { captureBackendReply, snapshot } from "../test/captureBackend";
 import type { SessionMetadata } from "../types";
 import { downloadAsFile } from "../utils/download";
 import NowStrip from "./NowStrip";
@@ -379,8 +379,11 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
       sessions: [SESSION_A],
       sessionsLoading: false,
       selectedSourceIds: ["system-default"],
+      // Attached, its idle snapshot applied.
       captureAttach: "ready",
       captureEpoch: 1,
+      pipelineStatus: snapshot(),
+      captureUnknown: false,
       isCapturing: false,
       isTranscribing: false,
     });
@@ -448,8 +451,11 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
       sessions: [SESSION_A],
       sessionsLoading: false,
       selectedSourceIds: ["system-default"],
+      // Attached, its idle snapshot applied.
       captureAttach: "ready",
       captureEpoch: 1,
+      pipelineStatus: snapshot(),
+      captureUnknown: false,
       isCapturing: false,
       isTranscribing: false,
       loadedSessionId: null,

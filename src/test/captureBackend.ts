@@ -28,9 +28,23 @@ export function snapshot(
   };
 }
 
+const ORIGIN: CaptureId = { epoch: 0, seq: 0 };
+
+/**
+ * The newest id `retired_through` may name while `id` is in `phase`: below
+ * a capture that is pending or running, which it never covers; `id` itself
+ * once that capture is stopping or ended.
+ */
+function retiredWith(id: CaptureId, phase: CapturePhase): CaptureId {
+  if (phase !== "pending" && phase !== "running") return id;
+  return id.seq > 0 ? { epoch: id.epoch, seq: id.seq - 1 } : ORIGIN;
+}
+
 /**
  * A snapshot at the next revision showing capture `id` in `phase` (its
- * capture stage written to match, `id` retired as registered).
+ * capture stage written to match, and `retired_through` as high as the
+ * contract allows: just below `id` while it is pending or running, `id`
+ * itself otherwise).
  */
 export function statusFor(
   id: CaptureId,
@@ -39,7 +53,7 @@ export function statusFor(
 ): PipelineStatus {
   return snapshot({
     capture_state: { id, phase },
-    retired_through: id,
+    retired_through: retiredWith(id, phase),
     capture:
       phase === "running"
         ? { type: "Running", processed_count: 0 }
@@ -56,8 +70,6 @@ interface BackendState {
   generation: number;
   last: PipelineStatus | null;
 }
-
-const ORIGIN: CaptureId = { epoch: 0, seq: 0 };
 
 let backend: BackendState = {
   attachments: 0,
@@ -80,11 +92,17 @@ export function resetCaptureBackend(): void {
   };
 }
 
+function older(a: CaptureId, b: CaptureId): CaptureId {
+  return compareCaptureIds(a, b) <= 0 ? a : b;
+}
+
 /** Publish the backend's state as a new revision. */
 function publish(): PipelineStatus {
-  backend.last = statusFor(backend.capture.id, backend.capture.phase, {
-    retired_through: backend.retired,
+  const { id, phase } = backend.capture;
+  backend.last = statusFor(id, phase, {
+    retired_through: older(backend.retired, retiredWith(id, phase)),
     transcription: backend.transcription,
+    transcription_generation: backend.generation,
   });
   return backend.last;
 }
@@ -129,13 +147,15 @@ export function captureBackendReply(cmd: string, args?: unknown): unknown {
       return { outcome: "started", snapshot: publish() };
     }
     case "stop_capture": {
-      const id = idArg(args, "id") ?? backend.capture.id;
+      // A stop-everything (no id) ends everything up to the newest id.
+      const id =
+        idArg(args, "id") ?? newer(backend.retired, backend.capture.id);
       backend.retired = newer(backend.retired, id);
       if (
         backend.capture.phase === "idle" ||
         compareCaptureIds(backend.capture.id, id) > 0
       ) {
-        return { outcome: "nothing_running", snapshot: publish() };
+        return { outcome: "not_running", snapshot: publish() };
       }
       backend.capture = { id: backend.capture.id, phase: "idle" };
       backend.transcription = null;
@@ -153,7 +173,14 @@ export function captureBackendReply(cmd: string, args?: unknown): unknown {
           message: { reason: "capture_not_running", snapshot: publish() },
         };
       }
-      backend.generation += 1;
+      const expected: unknown =
+        typeof args === "object" && args !== null
+          ? Reflect.get(args, "expectedGeneration")
+          : undefined;
+      if (expected !== backend.generation + 1) {
+        return { outcome: "repeated", snapshot: backend.last ?? publish() };
+      }
+      backend.generation = expected;
       backend.transcription = { capture: id, generation: backend.generation };
       return { outcome: "started", snapshot: publish() };
     }

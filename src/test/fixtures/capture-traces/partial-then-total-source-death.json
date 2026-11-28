@@ -12,16 +12,17 @@
       },
       "retired_through": {
         "epoch": 1,
-        "seq": 1
+        "seq": 0
       },
       "transcription": null,
+      "transcription_generation": 0,
       "realtime": {
         "gemini": false,
         "converse": false,
         "openai_realtime": false
       },
       "session": {
-        "id": "62a1a1d4-f606-46cd-ad5a-6adf1c1d2236",
+        "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
         "epoch": 0
       },
       "backpressure": [],
@@ -55,61 +56,17 @@
       },
       "retired_through": {
         "epoch": 1,
-        "seq": 1
+        "seq": 0
       },
       "transcription": null,
+      "transcription_generation": 0,
       "realtime": {
         "gemini": false,
         "converse": false,
         "openai_realtime": false
       },
       "session": {
-        "id": "62a1a1d4-f606-46cd-ad5a-6adf1c1d2236",
-        "epoch": 0
-      },
-      "backpressure": [],
-      "capture": {
-        "type": "Running",
-        "processed_count": 0
-      },
-      "pipeline": {
-        "type": "Running",
-        "processed_count": 0
-      },
-      "asr": {
-        "type": "Idle"
-      },
-      "diarization": {
-        "type": "Idle"
-      },
-      "entity_extraction": {
-        "type": "Idle"
-      },
-      "graph": {
-        "type": "Idle"
-      }
-    },
-    {
-      "revision": 4,
-      "capture_state": {
-        "id": {
-          "epoch": 1,
-          "seq": 1
-        },
-        "phase": "running"
-      },
-      "retired_through": {
-        "epoch": 1,
-        "seq": 1
-      },
-      "transcription": null,
-      "realtime": {
-        "gemini": false,
-        "converse": false,
-        "openai_realtime": false
-      },
-      "session": {
-        "id": "62a1a1d4-f606-46cd-ad5a-6adf1c1d2236",
+        "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
         "epoch": 0
       },
       "backpressure": [],
@@ -145,16 +102,63 @@
       },
       "retired_through": {
         "epoch": 1,
-        "seq": 1
+        "seq": 0
       },
       "transcription": null,
+      "transcription_generation": 0,
       "realtime": {
         "gemini": false,
         "converse": false,
         "openai_realtime": false
       },
       "session": {
-        "id": "62a1a1d4-f606-46cd-ad5a-6adf1c1d2236",
+        "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
+        "epoch": 0
+      },
+      "backpressure": [],
+      "capture": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "pipeline": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "asr": {
+        "type": "Idle"
+      },
+      "diarization": {
+        "type": "Idle"
+      },
+      "entity_extraction": {
+        "type": "Idle"
+      },
+      "graph": {
+        "type": "Idle"
+      }
+    },
+    {
+      "revision": 4,
+      "capture_state": {
+        "id": {
+          "epoch": 1,
+          "seq": 1
+        },
+        "phase": "running"
+      },
+      "retired_through": {
+        "epoch": 1,
+        "seq": 0
+      },
+      "transcription": null,
+      "transcription_generation": 0,
+      "realtime": {
+        "gemini": false,
+        "converse": false,
+        "openai_realtime": false
+      },
+      "session": {
+        "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
         "epoch": 0
       },
       "backpressure": [],
@@ -193,13 +197,14 @@
         "seq": 1
       },
       "transcription": null,
+      "transcription_generation": 0,
       "realtime": {
         "gemini": false,
         "converse": false,
         "openai_realtime": false
       },
       "session": {
-        "id": "62a1a1d4-f606-46cd-ad5a-6adf1c1d2236",
+        "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
         "epoch": 0
       },
       "backpressure": [],
@@ -237,13 +242,14 @@
         "seq": 1
       },
       "transcription": null,
+      "transcription_generation": 0,
       "realtime": {
         "gemini": false,
         "converse": false,
         "openai_realtime": false
       },
       "session": {
-        "id": "62a1a1d4-f606-46cd-ad5a-6adf1c1d2236",
+        "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
         "epoch": 0
       },
       "backpressure": [],
@@ -281,13 +287,14 @@
       "seq": 1
     },
     "transcription": null,
+    "transcription_generation": 0,
     "realtime": {
       "gemini": false,
       "converse": false,
       "openai_realtime": false
     },
     "session": {
-      "id": "62a1a1d4-f606-46cd-ad5a-6adf1c1d2236",
+      "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
       "epoch": 0
     },
     "backpressure": [],

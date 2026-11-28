@@ -199,17 +199,18 @@ describe("SessionsBrowser: the just-stopped session's resident data", () => {
       sessionsLoading: false,
       isCapturing: true,
       captureStatus: "running",
+      // B, live: the snapshot names its session, which the Stop routes to.
       pipelineStatus: {
         ...NO_PIPELINE_STATUS,
         revision: 0,
         capture_state: { id: { epoch: 1, seq: 1 }, phase: "running" },
+        session: { id: "session-b", epoch: 0 },
       },
       isTranscribing: true,
       selectedSourceIds: ["system-default"],
       captureStartTime: Date.now(),
       loadedSessionId: null,
       transcriptSegments: [segment("b-1", B_TEXT)],
-      getSessionId: vi.fn(async () => "session-b"),
     });
     render(
       <>

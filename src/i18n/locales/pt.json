@@ -1668,7 +1668,8 @@
     },
     "transcriptionRefused": {
       "capture_not_running": "Não é possível iniciar a transcrição: a captura não está em andamento.",
-      "capture_lost": "Não é possível iniciar a transcrição: a captura parou enquanto a transcrição iniciava."
+      "capture_lost": "Não é possível iniciar a transcrição: a captura parou enquanto a transcrição iniciava.",
+      "start_failed": "Não foi possível iniciar a transcrição, e nada ficou em execução. Tente novamente."
     },
     "captureStart": {
       "forSource": "{{source}}: {{reason}}",

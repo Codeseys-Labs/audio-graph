@@ -1833,6 +1833,9 @@ pub struct AudioCaptureManager {
     /// The realm that epoch was issued to, so a repeated attach from the same
     /// realm returns it again and fences nothing.
     attached_realm: Option<String>,
+    /// Every realm an attach of another realm superseded: a late delivery of
+    /// its attach is refused. One entry per page load.
+    superseded_realms: std::collections::HashSet<String>,
     /// Every capture up to and including this id is ended or refused: a start
     /// at or below it never registers. Raised by Stop and by attach.
     cancelled_through: CaptureId,
@@ -1845,12 +1848,29 @@ pub struct AudioCaptureManager {
     /// The session whose CaptureStarted row may or may not be on the ledger
     /// because its append failed. The next start resolves it first.
     uncertain_capture_start: Option<String>,
-    /// The aggregate whose sources are gone and whose end is not yet
-    /// published: it reads as stopping until the teardown finishes.
+    /// The aggregate being torn down: from the moment a Stop of it is
+    /// accepted, or it lost its last source, until its end is published. It
+    /// reads as stopping, and no transcription or realtime start attaches
+    /// to it.
     ending: Option<CaptureId>,
-    /// What each recent stop-everything operation ended through, so its
-    /// repeated delivery never ends a later capture.
-    stop_operations: std::collections::VecDeque<(String, CaptureId)>,
+    /// The latest stop-everything of the current attachment: its sequence
+    /// number and what it ended through. An older one is stale.
+    stop_operation: Option<(u64, CaptureId)>,
+}
+
+/// A stop-everything as a renderer numbers it: its sequence within the
+/// attachment `epoch`, reused by that Stop's own retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub struct StopOperation {
+    pub epoch: u64,
+    pub seq: u64,
+}
+
+/// Why an attach changed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachRefusal {
+    /// The realm was superseded by a later attach: a late delivery.
+    Superseded,
 }
 
 struct PendingCaptureStart {
@@ -1963,13 +1983,14 @@ impl AudioCaptureManager {
             pending_start: None,
             epoch: 0,
             attached_realm: None,
+            superseded_realms: std::collections::HashSet::new(),
             cancelled_through: CaptureId::default(),
             last_registered: CaptureId::default(),
             capture_id: CaptureId::default(),
             shutting_down: false,
             uncertain_capture_start: None,
             ending: None,
-            stop_operations: std::collections::VecDeque::new(),
+            stop_operation: None,
         }
     }
 
@@ -2064,18 +2085,25 @@ impl AudioCaptureManager {
     /// Renderer realm `realm` attached: issue it a new epoch and fence every
     /// start an earlier realm left in flight, pending or not yet sent. A
     /// committed capture survives and is adopted from the snapshot. A repeated
-    /// delivery from the attached realm returns its epoch and fences nothing.
-    pub(crate) fn attach(&mut self, realm: &str) -> u64 {
+    /// delivery from the attached realm returns its epoch and fences nothing;
+    /// a late delivery from a superseded realm is refused and changes nothing.
+    pub(crate) fn attach(&mut self, realm: &str) -> Result<u64, AttachRefusal> {
         if self.attached_realm.as_deref() == Some(realm) {
-            return self.epoch;
+            return Ok(self.epoch);
         }
-        self.attached_realm = Some(realm.to_string());
+        if self.superseded_realms.contains(realm) {
+            return Err(AttachRefusal::Superseded);
+        }
+        if let Some(previous) = self.attached_realm.replace(realm.to_string()) {
+            self.superseded_realms.insert(previous);
+        }
         self.epoch += 1;
+        self.stop_operation = None;
         self.cancel_through(CaptureId {
             epoch: self.epoch,
             seq: 0,
         });
-        self.epoch
+        Ok(self.epoch)
     }
 
     /// Register start `id` before it waits for the session lifecycle, so a
@@ -2162,42 +2190,66 @@ impl AudioCaptureManager {
     }
 
     /// What stop-everything `operation` ends through: the newest capture id
-    /// known when it first arrived, recorded so a repeated delivery of it
-    /// names the same capture.
-    pub(crate) fn stop_everything_through(&mut self, operation: &str) -> CaptureId {
-        const REMEMBERED_STOP_OPERATIONS: usize = 32;
-        if let Some((_, through)) = self.stop_operations.iter().find(|(op, _)| op == operation) {
-            return *through;
+    /// known when it first arrived. Its repeated delivery names the same
+    /// captures; one of another attachment, or older than the latest of this
+    /// one, is stale (`None`) and must change nothing.
+    pub(crate) fn stop_everything_through(
+        &mut self,
+        operation: StopOperation,
+    ) -> Option<CaptureId> {
+        if operation.epoch != self.epoch {
+            return None;
         }
-        let through = self.newest_capture_id();
-        if self.stop_operations.len() == REMEMBERED_STOP_OPERATIONS {
-            self.stop_operations.pop_front();
+        match self.stop_operation {
+            Some((seq, through)) if seq == operation.seq => Some(through),
+            Some((seq, _)) if operation.seq < seq => None,
+            _ => {
+                let through = self.newest_capture_id();
+                self.stop_operation = Some((operation.seq, through));
+                Some(through)
+            }
         }
-        self.stop_operations
-            .push_back((operation.to_string(), through));
-        through
     }
 
-    /// Every start id at or below this can no longer begin.
+    /// Every start id at or below this can no longer begin, and none is
+    /// pending or running now: the watermarks, capped below the oldest
+    /// capture that is live (preparing and not cancelled, or committed and
+    /// not being torn down).
     pub(crate) fn retired_through(&self) -> CaptureId {
-        self.last_registered.max(self.cancelled_through)
+        let retired = self.last_registered.max(self.cancelled_through);
+        let owned = self
+            .owned_capture_id()
+            .filter(|id| self.ending != Some(*id));
+        let pending = self
+            .pending_start
+            .as_ref()
+            .filter(|pending| pending.cancel_tx.is_some() && !self.shutting_down)
+            .map(|pending| pending.id);
+        match owned.into_iter().chain(pending).min() {
+            Some(live) => retired.min(live.predecessor()),
+            None => retired,
+        }
     }
 
-    /// What the manager holds, as the snapshot states it: the committed
-    /// aggregate while it owns sources, then the one being torn down, then a
-    /// start that is preparing (stopping once cancelled).
+    /// What the manager holds, as the snapshot states it: the aggregate being
+    /// torn down, else the committed one while it owns sources, else a start
+    /// that is preparing (stopping once cancelled).
     pub(crate) fn capture_state(&self) -> crate::events::CaptureState {
         use crate::events::{CapturePhase, CaptureState};
-        if let Some(id) = self.owned_capture_id() {
-            return CaptureState {
-                id,
-                phase: CapturePhase::Running,
-            };
-        }
-        if let Some(id) = self.ending {
+        let owned = self.owned_capture_id();
+        if let Some(id) = self
+            .ending
+            .filter(|id| owned.is_none_or(|owned| owned == *id))
+        {
             return CaptureState {
                 id,
                 phase: CapturePhase::Stopping,
+            };
+        }
+        if let Some(id) = owned {
+            return CaptureState {
+                id,
+                phase: CapturePhase::Running,
             };
         }
         if let Some(pending) = self.pending_start.as_ref() {
@@ -2222,18 +2274,31 @@ impl AudioCaptureManager {
         (!self.sources.is_empty()).then_some(self.capture_id)
     }
 
+    /// A Stop through `through` was accepted: the committed aggregate, if at
+    /// or below it, reads as stopping from now on. Returns whether this Stop
+    /// is the one that made it so.
+    pub(crate) fn accept_stop_through(&mut self, through: CaptureId) -> bool {
+        match self.owned_capture_id().filter(|id| *id <= through) {
+            Some(id) if self.ending != Some(id) => {
+                self.ending = Some(id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Stop every source of the committed aggregate if its id is at or below
     /// `through`. Returns the stopped aggregate's id, which reads as stopping
-    /// until [`Self::finish_ending`].
+    /// (before the first source is joined) until [`Self::finish_ending`].
     pub(crate) fn stop_committed_through(&mut self, through: CaptureId) -> Option<CaptureId> {
         let id = self.owned_capture_id().filter(|id| *id <= through)?;
+        self.ending = Some(id);
         let source_ids: Vec<String> = self.sources.keys().cloned().collect();
         for source_id in source_ids {
-            if let Err(error) = self.stop_capture(&source_id) {
-                log::error!("Failed to stop a capture source: {error}");
+            if self.stop_capture(&source_id).is_err() {
+                log::error!("A capture source was gone before its stop");
             }
         }
-        self.ending = Some(id);
         Some(id)
     }
 
@@ -2488,9 +2553,13 @@ impl AudioCaptureManager {
         stopped
     }
 
-    /// The committed aggregate, when at least one committed source is live.
-    /// A dead handle awaiting reconciliation does not count.
+    /// The committed aggregate, when at least one committed source is live
+    /// and no Stop of it was accepted. A dead handle awaiting reconciliation
+    /// does not count.
     pub(crate) fn acknowledged_capture(&self) -> Option<AcknowledgedCapture> {
+        if self.ending == Some(self.capture_id) {
+            return None;
+        }
         let sources: Vec<String> = self
             .sources
             .iter()
@@ -3116,6 +3185,9 @@ pub(crate) mod scripted {
         /// Report Ready, wait for the release, then panic on `lose_stream()`,
         /// as a capture body that panics after its commit.
         ReadyThenPanic,
+        /// As `Ready`, but once it sees Stop it reports `StopObserved` and
+        /// holds its exit, and so the Stop's join, until released.
+        ReadyThenHoldStop,
     }
 
     /// What a scripted worker reached, in order.
@@ -3127,6 +3199,8 @@ pub(crate) mod scripted {
         Abandoned,
         /// It is dead (finished) but not yet returned.
         Lost,
+        /// It saw Stop and holds its exit until released.
+        StopObserved,
     }
 
     /// Controls for one spawned scripted worker.
@@ -3241,7 +3315,9 @@ pub(crate) mod scripted {
                     }
                     false
                 }
-                ScriptedStart::Ready | ScriptedStart::ReadyOnRelease => {
+                ScriptedStart::Ready
+                | ScriptedStart::ReadyOnRelease
+                | ScriptedStart::ReadyThenHoldStop => {
                     if matches!(script, ScriptedStart::ReadyOnRelease) {
                         let _ = release_rx.recv();
                     }
@@ -3261,6 +3337,10 @@ pub(crate) mod scripted {
                                 std::thread::sleep(Duration::from_millis(5));
                             }
                         }
+                    }
+                    if matches!(script, ScriptedStart::ReadyThenHoldStop) {
+                        let _ = events_tx.send(ScriptedEvent::StopObserved);
+                        let _ = release_rx.recv_timeout(Duration::from_secs(10));
                     }
                     false
                 }
@@ -3302,6 +3382,13 @@ pub(crate) mod scripted {
 
         pub(crate) fn retired_worker_count(&self) -> usize {
             self.retired_threads.len()
+        }
+
+        /// Give the synthetic handles' aggregate a registered start's id, as
+        /// a committed start would.
+        pub(crate) fn set_synthetic_capture_id(&mut self, id: CaptureId) {
+            self.last_registered = self.last_registered.max(id);
+            self.capture_id = id;
         }
     }
 }
@@ -3592,7 +3679,7 @@ mod handle_lifecycle_tests {
     #[test]
     fn a_start_registers_only_above_both_watermarks() {
         let mut mgr = AudioCaptureManager::new();
-        assert_eq!(mgr.attach("realm-a"), 1);
+        assert_eq!(mgr.attach("realm-a"), Ok(1));
         // A Stop that reaches the manager before its start: the start is
         // refused when it arrives, and a newer one is not.
         assert!(!mgr.cancel_through(id(1, 1)));
@@ -3619,10 +3706,10 @@ mod handle_lifecycle_tests {
     #[test]
     fn attach_fences_every_start_of_an_earlier_renderer() {
         let mut mgr = AudioCaptureManager::new();
-        assert_eq!(mgr.attach("realm-a"), 1);
+        assert_eq!(mgr.attach("realm-a"), Ok(1));
         let pending = registered(&mut mgr, id(1, 1));
         // A reload: the new renderer attaches while the old start is pending.
-        assert_eq!(mgr.attach("realm-b"), 2);
+        assert_eq!(mgr.attach("realm-b"), Ok(2));
         assert!(cancelled(&pending));
         mgr.release_capture_start(pending.id);
         // The old renderer's later starts, sent before it went away: refused
@@ -3631,33 +3718,87 @@ mod handle_lifecycle_tests {
             refusal(&mut mgr, id(1, 7)),
             Some(CaptureFailureReason::StaleAttachment)
         );
-        // So is a start of this renderer after a stale attach overtook it.
-        assert_eq!(mgr.attach("realm-a"), 3);
-        assert_eq!(
-            refusal(&mut mgr, id(2, 1)),
-            Some(CaptureFailureReason::StaleAttachment)
-        );
-        // Re-attaching issues a current epoch whose starts register.
-        assert_eq!(mgr.attach("realm-b"), 4);
-        let fresh = registered(&mut mgr, id(4, 1));
+        let fresh = registered(&mut mgr, id(2, 1));
         assert!(!cancelled(&fresh));
         mgr.release_capture_start(fresh.id);
+    }
+
+    /// A reload leaves the old page's in-flight commands to arrive late: its
+    /// attach, delivered again, is refused and fences nothing, and so is its
+    /// stop-everything.
+    #[test]
+    fn a_late_attach_or_stop_everything_from_a_superseded_realm_changes_nothing() {
+        let mut mgr = AudioCaptureManager::new();
+        assert_eq!(mgr.attach("realm-a"), Ok(1));
+        assert_eq!(mgr.attach("realm-b"), Ok(2));
+        let pending = registered(&mut mgr, id(2, 1));
+        assert_eq!(mgr.attach("realm-a"), Err(AttachRefusal::Superseded));
+        assert!(!cancelled(&pending), "the current realm's start survives");
+        assert_eq!(
+            mgr.stop_everything_through(StopOperation { epoch: 1, seq: 1 }),
+            None
+        );
+        assert_eq!(mgr.attach("realm-b"), Ok(2));
+        mgr.release_capture_start(pending.id);
+    }
+
+    /// Stop-everything is ordered within the attachment: its repeat ends what
+    /// its first delivery did, however many others came between, and an
+    /// older one is stale.
+    #[test]
+    fn a_stop_everything_is_ordered_within_its_attachment() {
+        let mut mgr = AudioCaptureManager::new();
+        assert_eq!(mgr.attach("realm-a"), Ok(1));
+        let operation = |seq| StopOperation { epoch: 1, seq };
+        let first = registered(&mut mgr, id(1, 1));
+        assert_eq!(mgr.stop_everything_through(operation(1)), Some(id(1, 1)));
+        mgr.release_capture_start(first.id);
+        for seq in 2..40 {
+            assert_eq!(mgr.stop_everything_through(operation(seq)), Some(id(1, 1)));
+        }
+        let later = registered(&mut mgr, id(1, 2));
+        assert_eq!(mgr.stop_everything_through(operation(1)), None);
+        assert_eq!(mgr.stop_everything_through(operation(39)), Some(id(1, 1)));
+        assert!(!cancelled(&later), "no replay reaches the later start");
+        assert_eq!(mgr.stop_everything_through(operation(40)), Some(id(1, 2)));
+        mgr.release_capture_start(later.id);
     }
 
     #[test]
     fn a_repeated_attach_from_the_same_realm_changes_nothing() {
         let mut mgr = AudioCaptureManager::new();
-        assert_eq!(mgr.attach("realm-a"), 1);
+        assert_eq!(mgr.attach("realm-a"), Ok(1));
         let pending = registered(&mut mgr, id(1, 1));
-        assert_eq!(mgr.attach("realm-a"), 1);
+        assert_eq!(mgr.attach("realm-a"), Ok(1));
         assert!(!cancelled(&pending), "the realm's own start survives");
         mgr.release_capture_start(pending.id);
+    }
+
+    /// `retired_through` never covers a live capture: a start preparing
+    /// behind a running capture, or the running capture itself.
+    #[test]
+    fn retired_through_stays_below_every_live_capture() {
+        let mut mgr = AudioCaptureManager::new();
+        assert_eq!(mgr.attach("realm-a"), Ok(1));
+        let pending = registered(&mut mgr, id(1, 2));
+        assert_eq!(mgr.retired_through(), id(1, 1));
+        assert!(mgr.cancel_through(id(1, 2)));
+        assert_eq!(
+            mgr.retired_through(),
+            id(1, 2),
+            "cancelled: it can never begin"
+        );
+        mgr.release_capture_start(pending.id);
+        let next = registered(&mut mgr, id(1, 5));
+        assert_eq!(mgr.retired_through(), id(1, 4));
+        mgr.release_capture_start(next.id);
+        assert_eq!(mgr.retired_through(), id(1, 5), "released unrun: retired");
     }
 
     #[test]
     fn a_repeated_start_learns_the_outcome_of_the_delivery_it_repeats() {
         let mut mgr = AudioCaptureManager::new();
-        mgr.attach("realm-a");
+        mgr.attach("realm-a").unwrap();
         let first = registered(&mut mgr, id(1, 1));
         let Ok(CaptureRegistration::Preparing(mut settled)) = mgr.register_capture_start(id(1, 1))
         else {
@@ -3688,7 +3829,7 @@ mod handle_lifecycle_tests {
     #[test]
     fn a_concurrent_start_is_refused_and_can_never_run() {
         let mut mgr = AudioCaptureManager::new();
-        mgr.attach("realm-a");
+        mgr.attach("realm-a").unwrap();
         let first = registered(&mut mgr, id(1, 1));
         assert_eq!(
             refusal(&mut mgr, id(1, 2)),

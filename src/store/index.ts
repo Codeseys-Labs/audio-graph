@@ -116,6 +116,7 @@ import type {
   SessionNotesArtifacts,
   SessionRecoveryReport,
   SessionTimelineFold,
+  StopOperation,
   TimelineEntry,
   TranscriptEvent,
   TranscriptSegment,
@@ -138,6 +139,7 @@ import { createAnswerDraftsSlice } from "./answerDrafts";
 import {
   captureStarting,
   captureToggle,
+  captureUnknownOf,
   compareCaptureIds,
   errorSnapshot,
   isCaptureAttachment,
@@ -145,6 +147,9 @@ import {
   isPipelineStatus,
   liveCaptureHoldsStore,
   NO_PIPELINE_STATUS,
+  replySnapshot,
+  START_OUTCOMES,
+  STOP_OUTCOMES,
   snapshotView,
   startSettledBy,
   stopTarget,
@@ -168,15 +173,14 @@ function showsCaptureRunning(status: PipelineStatus, id: CaptureId): boolean {
   );
 }
 
-// Each Stop press is numbered, so a Start can tell whether one came after it
-// and a Stop's spinner is settled by that Stop's own outcome only.
+// Each Stop press is counted, so a Start can tell whether one came after it.
 let stopPresses = 0;
 
 // Whether the last status read failed: a failure streak relays one
 // diagnostic, however many reads it spans.
 let reconcileFailing = false;
 
-/** A random token: this realm's name to capture control, or a Stop's. */
+/** A random token: this realm's name to capture control. */
 function newCaptureToken(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
@@ -187,7 +191,9 @@ function newCaptureToken(): string {
 /**
  * Attach this realm to capture control under `realm`, apply the snapshot
  * the attachment returns, and resolve to its epoch. Rejects when the reply
- * is lost or unusable.
+ * is lost or unusable, or the backend refuses a superseded realm
+ * (`capture_attach_superseded`). Stop-everything operations are numbered
+ * afresh in each new epoch.
  */
 async function attachRealm(realm: string): Promise<number> {
   useAudioGraphStore.setState({
@@ -200,10 +206,16 @@ async function attachRealm(realm: string): Promise<number> {
       throw new Error("capture_attach returned an unusable reply");
     }
     useAudioGraphStore.getState().setPipelineStatus(attachment.snapshot);
-    useAudioGraphStore.setState({
-      captureAttach: "ready",
-      captureEpoch: attachment.epoch,
-    });
+    useAudioGraphStore.setState((state) =>
+      state.captureEpoch === attachment.epoch
+        ? { captureAttach: "ready" }
+        : {
+            captureAttach: "ready",
+            captureEpoch: attachment.epoch,
+            stopSeq: 0,
+            stopOperation: null,
+          },
+    );
     return attachment.epoch;
   } catch (error) {
     useAudioGraphStore.setState({
@@ -2990,14 +3002,17 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       return;
     }
     const previous = state.pipelineStatus;
-    // The session aggregates reset once, on the accepted rotation. The first
-    // snapshot a realm applies is no rotation: nothing of an older session
-    // is shown yet.
+    // The session aggregates reset once per epoch advance, and on the first
+    // snapshot a realm applies: content that arrived before it belongs to no
+    // session this window has seen, so it is fenced as a rotation's is.
     const rotated =
-      previous.revision >= 0 && status.session.epoch > previous.session.epoch;
+      previous.revision < 0 || status.session.epoch > previous.session.epoch;
     if (rotated) historicalLoadGeneration += 1;
     const { id, phase } = status.capture_state;
     const sameCapture = compareCaptureIds(previous.capture_state.id, id) === 0;
+    // One rule for a Start in flight and one whose outcome is unknown: a
+    // snapshot showing that id registered, or retired, settles it, whether
+    // or not its own reply ever arrives.
     const unknownStart =
       state.unknownStart !== null && !startSettledBy(status, state.unknownStart)
         ? state.unknownStart
@@ -3006,6 +3021,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       ...(rotated ? sessionViewReset(state) : {}),
       pipelineStatus: status,
       ...snapshotView(status),
+      startPending:
+        state.startPending !== null &&
+        !startSettledBy(status, state.startPending)
+          ? state.startPending
+          : null,
       unknownStart,
       captureUnknown: unknownStart !== null || state.unknownStop,
       // A display clock only: when this renderer first saw the shown
@@ -3045,7 +3065,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // reply was lost did.
     set((state) => ({
       unknownStop: false,
-      captureUnknown: state.unknownStart !== null,
+      captureUnknown: captureUnknownOf({ ...state, unknownStop: false }),
     }));
   },
   pipelineLatencies: {},
@@ -3099,17 +3119,20 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // ── Capture state ────────────────────────────────────────────────────
   // Every flag here derives from the applied `pipelineStatus` alone (see
   // `setPipelineStatus`); the Start and Stop spinners are settled by their
-  // own command's outcome and never stand in for capture state.
+  // own command's outcome (a Start's also by a snapshot that settles it) and
+  // never stand in for capture state.
   captureStatus: "idle",
   isCapturing: false,
   captureStartTime: null,
   backpressuredSources: [],
-  captureUnknown: false,
+  // No snapshot is applied yet: the backend may hold a capture.
+  captureUnknown: true,
   unknownStart: null,
   unknownStop: false,
   startPending: null,
   stopPending: null,
   stopOperation: null,
+  stopSeq: 0,
   captureAttach: "detached",
   captureEpoch: null,
   captureRealm: null,
@@ -3150,8 +3173,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // until the start settles, so no historical session lands in the
       // store the capture is about to open into.
       startPending: id,
-      // A stop-everything token names what was running before this start:
-      // replaying it could not stop this one.
+      // A stop-everything's retry ends what its first delivery ended, never
+      // this start: the next Stop knowing no id is a new operation.
       stopOperation: null,
       ...exitSamplePreviewState(current.samplePreviewActive),
       // Starting a fresh live capture leaves any historical session view, so
@@ -3212,16 +3235,24 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         ? undefined
         : sourcesBySelectionId.get(selectionId);
     };
-    // A start whose reply was lost or unreadable may run or not: the state is
-    // unknown until a snapshot settles that id.
-    const markUnknown = (startId: CaptureId) =>
+    // Settle start `startId` by its own outcome: a readable reply or refusal
+    // tells it (its snapshot is applied first). A lost or unreadable one, or
+    // an outcome outside the closed set, leaves it unknown until a snapshot
+    // settles that id, as one does for a start still in flight.
+    const settle = (startId: CaptureId, told: boolean) =>
       set((current) => {
+        const inFlight =
+          current.startPending !== null &&
+          compareCaptureIds(current.startPending, startId) === 0;
+        const startPending = inFlight ? null : current.startPending;
+        if (told) return { startPending };
         const unknownStart = startSettledBy(current.pipelineStatus, startId)
           ? current.unknownStart
           : startId;
         return {
+          startPending,
           unknownStart,
-          captureUnknown: unknownStart !== null || current.unknownStop,
+          captureUnknown: captureUnknownOf({ ...current, unknownStart }),
         };
       });
     // Send one start; resolve to its failure, or null once it started. Its
@@ -3236,16 +3267,17 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
           id: startId,
           sources,
         });
-        if (isCaptureCommandReply(reply)) {
-          get().setPipelineStatus(reply.snapshot);
-          return null;
-        }
-        markUnknown(startId);
-        return { message: captureStartFailureMessage(undefined), stale: false };
+        const snapshot = replySnapshot(reply);
+        if (snapshot !== null) get().setPipelineStatus(snapshot);
+        const told = isCaptureCommandReply(reply, START_OUTCOMES);
+        settle(startId, told);
+        return told
+          ? null
+          : { message: captureStartFailureMessage(undefined), stale: false };
       } catch (e) {
         const snapshot = errorSnapshot(e);
-        if (snapshot === null) markUnknown(startId);
-        else get().setPipelineStatus(snapshot);
+        if (snapshot !== null) get().setPipelineStatus(snapshot);
+        settle(startId, snapshot !== null);
         return {
           message: captureStartErrorMessage(e, sourceAt),
           stale:
@@ -3270,14 +3302,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         failure = await attempt(id);
       }
     }
-    set((current) => ({
-      startPending:
-        current.startPending !== null &&
-        compareCaptureIds(current.startPending, id) === 0
-          ? null
-          : current.startPending,
-      error: failure === null ? null : failure.message,
-    }));
+    set({ error: failure === null ? null : failure.message });
     return id;
   },
   // ONE START (SHELL-R3, plan §R3, ADR-0046): the NOW STRIP's Start button
@@ -3326,124 +3351,140 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     if (deferredProviderForDurableStart(settings)) return;
     await get().startTranscribe(id);
   },
-  // SHELL-R2 (plan §R2, ADR-0046): "stop lands you on your own session". Read the
-  // active session id BEFORE stopping — once `stop_capture` tears the
-  // session down there is no other way to learn which session it was — then
-  // route `nav` to it directly (a store action, unlike the old App-local
-  // `workspaceView` `useState`, can do this). `getSessionId()` never throws
-  // for sample preview — it degrades to the truthy `SAMPLE_SESSION_ID`
-  // sentinel instead (see `getSessionId` above), so that case is filtered
-  // out explicitly below rather than via the catch. A genuine invoke error
-  // still degrades to "stay put, stop capture as before" rather than
-  // crashing the stop flow.
+  // SHELL-R2 (plan §R2, ADR-0046): "stop lands you on your own session". The
+  // session this Stop ends is the one the snapshot it was pressed on names —
+  // once `stop_capture` tears the session down there is no other way to
+  // learn which session it was — and `nav` routes to it directly (a store
+  // action, unlike the old App-local `workspaceView` `useState`, can do
+  // this). Nothing is read before the Stop is sent: a Stop waits for no
+  // other command, except the one attach a stop-everything needs when this
+  // realm has no attachment.
   stopCapture: async () => {
     const state = get();
     // Stop is offered while the backend holds, or may hold, a capture.
     if (!captureToggle(state).offersStop) return;
     // The newest capture this renderer knows of ends, and every one before
-    // it; a newer one never does. Knowing none, every capture ends, under a
-    // token the backend records on first delivery: pressing this Stop again
-    // sends the same token, so a replay never ends a capture started later.
+    // it; a newer one never does.
     const target = stopTarget(state);
-    const operation =
-      target === null ? (state.stopOperation ?? newCaptureToken()) : null;
+    // Knowing none while its own Stop is in flight, a press adds nothing:
+    // that Stop's outcome settles the state.
+    if (target === null && state.stopPending !== null) return;
     stopPresses += 1;
-    const press = stopPresses;
-    const seqAtPress = state.captureSeq;
     // The display clock of the capture this Stop ends, for the optimistic
     // "Finalizing…" row: its snapshot clears it.
     const startedAt = state.captureStartTime;
-    set({ stopPending: press, stopOperation: operation });
-    let sessionId: string | null = null;
+    const sessionId =
+      state.pipelineStatus.revision >= 0 && state.pipelineStatus.session.id
+        ? state.pipelineStatus.session.id
+        : null;
+    set((current) => ({ stopPending: (current.stopPending ?? 0) + 1 }));
     try {
-      const id = await state.getSessionId();
-      sessionId = id !== SAMPLE_SESSION_ID ? id : null;
-    } catch {
-      sessionId = null;
-    }
-    // Whether a capture was started here since this Stop: its reply then
-    // touches nothing that capture owns.
-    const superseded = () => get().captureSeq !== seqAtPress;
-    try {
+      // Knowing none, every capture ends: a stop-everything numbered within
+      // this realm's attachment epoch, whose first delivery the backend
+      // records. Pressing this Stop again sends the same operation, so a
+      // retry never ends a capture started later; an operation of another
+      // epoch, or older than the latest, changes nothing.
+      let operation: StopOperation | null = null;
+      if (target === null) {
+        const epoch =
+          state.captureAttach === "ready" && state.captureEpoch !== null
+            ? state.captureEpoch
+            : await attachRealm(state.captureRealm ?? newCaptureToken()).catch(
+                // `attachRealm` shows the failure and reads again.
+                () => null,
+              );
+        if (epoch === null) return;
+        const current = get();
+        operation =
+          current.stopOperation?.epoch === epoch
+            ? current.stopOperation
+            : { epoch, seq: current.stopSeq + 1 };
+        set({ stopOperation: operation, stopSeq: operation.seq });
+      }
       const reply = await invoke<unknown>("stop_capture", {
         id: target,
         operation,
       });
-      const readable = isCaptureCommandReply(reply);
-      if (readable) get().setPipelineStatus(reply.snapshot);
+      const snapshot = replySnapshot(reply);
+      if (snapshot !== null) get().setPipelineStatus(snapshot);
+      // Without a readable reply in the closed set, the state is unknown
+      // until a status read.
+      const told = isCaptureCommandReply(reply, STOP_OUTCOMES);
       set((current) => ({
-        // Without a readable reply the state is unknown until a status read.
-        unknownStop: !readable,
-        captureUnknown: current.unknownStart !== null || !readable,
-        stopOperation: readable ? null : current.stopOperation,
-        ...(superseded()
-          ? {}
-          : {
-              persistenceQueueBackpressure: {},
-              error: null,
-              nav: sessionId
-                ? {
-                    dest: "sessions" as const,
-                    sessionId,
-                    lens: "notes" as const,
-                  }
-                : current.nav,
-              // The 1d92 gap: `sessions.json` may not have this session's
-              // finished entry yet. Snapshot enough of the in-memory capture
-              // state right now to render an optimistic "Finalizing…" row
-              // immediately; SessionsBrowser's merge check drops it the
-              // instant a real `listSessions()` result contains a row with
-              // this id (see `mergeSessionRows`) — no explicit clear action
-              // needed.
-              //
-              // A failed/filtered id read (`sessionId` null above) means
-              // there is no id whose resident data this stop could vouch for
-              // — retaining a PRIOR stop's pending row here would be stale by
-              // definition, so it clears to `null` rather than falling back
-              // to `current.pendingFinalizingSession`.
-              pendingFinalizingSession: sessionId
-                ? {
-                    id: sessionId,
-                    title: null,
-                    created_at: startedAt ?? Date.now(),
-                    ended_at: Date.now(),
-                    duration_seconds: startedAt
-                      ? Math.max(0, Math.round((Date.now() - startedAt) / 1000))
-                      : null,
-                    status: "active",
-                    segment_count: current.transcriptSegments.length,
-                    speaker_count: current.speakers.length,
-                    entity_count: current.graphSnapshot.nodes.length,
-                    transcript_path: "",
-                    graph_path: "",
-                    deleted: false,
-                    deleted_at: null,
-                    optimistic: true,
-                  }
+        unknownStop: !told,
+        captureUnknown: captureUnknownOf({ ...current, unknownStop: !told }),
+        stopOperation: told ? null : current.stopOperation,
+        persistenceQueueBackpressure: {},
+        error: null,
+        nav: sessionId
+          ? {
+              dest: "sessions" as const,
+              sessionId,
+              lens: "notes" as const,
+            }
+          : current.nav,
+        // The 1d92 gap: `sessions.json` may not have this session's
+        // finished entry yet. Snapshot enough of the in-memory capture
+        // state right now to render an optimistic "Finalizing…" row
+        // immediately; SessionsBrowser's merge check drops it the
+        // instant a real `listSessions()` result contains a row with
+        // this id (see `mergeSessionRows`) — no explicit clear action
+        // needed.
+        //
+        // No session known (`sessionId` null above: no snapshot applied)
+        // means there is no id whose resident data this stop could vouch
+        // for — retaining a PRIOR stop's pending row here would be stale by
+        // definition, so it clears to `null` rather than falling back to
+        // `current.pendingFinalizingSession`.
+        pendingFinalizingSession: sessionId
+          ? {
+              id: sessionId,
+              title: null,
+              created_at: startedAt ?? Date.now(),
+              ended_at: Date.now(),
+              duration_seconds: startedAt
+                ? Math.max(0, Math.round((Date.now() - startedAt) / 1000))
                 : null,
-            }),
+              status: "active",
+              segment_count: current.transcriptSegments.length,
+              speaker_count: current.speakers.length,
+              entity_count: current.graphSnapshot.nodes.length,
+              transcript_path: "",
+              graph_path: "",
+              deleted: false,
+              deleted_at: null,
+              optimistic: true,
+            }
+          : null,
       }));
       // Best-effort refresh so the rail picks up the real entry (and the
       // optimistic row above clears itself) as soon as the index catches
       // up; a failure here is not fatal — the rail's own mount effect
       // re-fetches too.
-      if (sessionId && !superseded()) void get().listSessions(200);
+      if (sessionId) void get().listSessions(200);
     } catch (e) {
       // A refusal says what the backend holds now; a lost reply says
-      // nothing, and this Stop's token is kept for pressing it again.
+      // nothing, and this Stop's operation is kept for pressing it again.
       const snapshot = errorSnapshot(e);
       if (snapshot !== null) get().setPipelineStatus(snapshot);
       set((current) => ({
         unknownStop: snapshot === null,
-        captureUnknown: current.unknownStart !== null || snapshot === null,
+        captureUnknown: captureUnknownOf({
+          ...current,
+          unknownStop: snapshot === null,
+        }),
         stopOperation: snapshot === null ? current.stopOperation : null,
-        ...(superseded() ? {} : { error: errorToMessage(e) }),
+        error: errorToMessage(e),
       }));
     } finally {
-      // The spinner of the latest Stop, settled by that Stop alone.
-      set((current) =>
-        current.stopPending === press ? { stopPending: null } : {},
-      );
+      // The spinner stays while any Stop of this window is in flight, each
+      // settled by its own outcome alone.
+      set((current) => ({
+        stopPending:
+          current.stopPending !== null && current.stopPending > 1
+            ? current.stopPending - 1
+            : null,
+      }));
       void get().reconcileCapture();
     }
   },
@@ -3464,11 +3505,19 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // Addressed: only for the capture shown running, and silently skipped
     // once another one has replaced it.
     if (!showsCaptureRunning(pipelineStatus, captureId)) return;
+    // The generation this start begins: the one after the last the applied
+    // snapshot shows issued. A repeated or late delivery of it starts
+    // nothing (`repeated`), whether that generation runs or was stopped.
+    const expectedGeneration = pipelineStatus.transcription_generation + 1;
     let error: string | null = null;
     try {
       // The backend refuses it too unless that capture is the live one.
-      const reply = await invoke<unknown>("start_transcribe", { captureId });
-      if (isCaptureCommandReply(reply)) get().setPipelineStatus(reply.snapshot);
+      const reply = await invoke<unknown>("start_transcribe", {
+        captureId,
+        expectedGeneration,
+      });
+      const snapshot = replySnapshot(reply);
+      if (snapshot !== null) get().setPipelineStatus(snapshot);
     } catch (e) {
       const snapshot = errorSnapshot(e);
       if (snapshot !== null) get().setPipelineStatus(snapshot);
@@ -3492,7 +3541,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         captureId: transcription.capture,
         generation: transcription.generation,
       });
-      if (isCaptureCommandReply(reply)) get().setPipelineStatus(reply.snapshot);
+      const snapshot = replySnapshot(reply);
+      if (snapshot !== null) get().setPipelineStatus(snapshot);
       set({ error: null });
     } catch (e) {
       set({ error: errorToMessage(e) });

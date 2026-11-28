@@ -224,6 +224,11 @@ describe("TokenUsagePanel", () => {
   it("adds persisted LLM usage updates to session and lifetime totals", async () => {
     const bus = installListener();
     installInvokeDefaults();
+    // The applied snapshot names the session the usage belongs to: before
+    // any snapshot, usage counts toward the lifetime totals only.
+    useAudioGraphStore.setState({
+      pipelineStatus: snapshot({ session: { id: "test-session", epoch: 0 } }),
+    });
     render(<TokenUsagePanel />);
     await flushEffects();
 

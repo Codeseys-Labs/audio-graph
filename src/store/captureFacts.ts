@@ -8,6 +8,8 @@ import type {
   RealtimeModes,
   RealtimeStartCommand,
   StageStatus,
+  StartOutcome,
+  StopOutcome,
 } from "../types";
 
 /**
@@ -33,6 +35,7 @@ export const NO_PIPELINE_STATUS: PipelineStatus = {
   capture_state: { id: { epoch: 0, seq: 0 }, phase: "idle" },
   retired_through: { epoch: 0, seq: 0 },
   transcription: null,
+  transcription_generation: 0,
   realtime: { gemini: false, converse: false, openai_realtime: false },
   session: { id: "", epoch: 0 },
   backpressure: [],
@@ -124,9 +127,11 @@ export function stopTarget(
 /** What the capture toggle offers. */
 export interface CaptureToggle {
   /**
-   * Stop, while the backend holds or may hold a capture: it is pending,
-   * running or stopping, its state is unknown, or a start is in flight.
-   * Stop stays enabled throughout.
+   * Stop, unless the window can vouch for an idle backend: the applied
+   * snapshot shows a capture pending, running or stopping, its state is
+   * unknown (no snapshot applied since load, or a command's outcome was
+   * lost), or a Start or Stop of this window is in flight. Stop stays
+   * enabled throughout.
    */
   offersStop: boolean;
   /**
@@ -142,6 +147,7 @@ export function captureToggle(
     | "captureStatus"
     | "captureUnknown"
     | "startPending"
+    | "stopPending"
     | "captureAttach"
     | "selectedSourceIds"
   >,
@@ -149,7 +155,8 @@ export function captureToggle(
   const offersStop =
     state.captureStatus !== "idle" ||
     state.captureUnknown ||
-    state.startPending !== null;
+    state.startPending !== null ||
+    state.stopPending !== null;
   return {
     offersStop,
     startEnabled:
@@ -157,6 +164,24 @@ export function captureToggle(
       (state.captureAttach === "ready" || state.captureAttach === "failed") &&
       state.selectedSourceIds.length > 0,
   };
+}
+
+/**
+ * Whether the renderer cannot vouch for the shown state: no snapshot was
+ * applied since load, or a Start or Stop of its own has an outcome no
+ * snapshot or reply has told.
+ */
+export function captureUnknownOf(
+  state: Pick<
+    AudioGraphStore,
+    "pipelineStatus" | "unknownStart" | "unknownStop"
+  >,
+): boolean {
+  return (
+    state.pipelineStatus.revision < 0 ||
+    state.unknownStart !== null ||
+    state.unknownStop
+  );
 }
 
 /**
@@ -172,31 +197,38 @@ export function captureStarting(
 /**
  * Whether the global store belongs to live capture: the backend holds, or
  * may hold, a capture, or transcribes. A historical load must neither begin
- * nor land meanwhile.
+ * nor land meanwhile. Before the first snapshot nothing is held yet: the
+ * first snapshot applied fences the view as a session rotation does.
  */
 export function liveCaptureHoldsStore(
   state: Pick<
     AudioGraphStore,
-    "captureStatus" | "isTranscribing" | "startPending" | "captureUnknown"
+    | "captureStatus"
+    | "isTranscribing"
+    | "startPending"
+    | "unknownStart"
+    | "unknownStop"
   >,
 ): boolean {
   return (
     state.captureStatus !== "idle" ||
     state.isTranscribing ||
     state.startPending !== null ||
-    state.captureUnknown
+    state.unknownStart !== null ||
+    state.unknownStop
   );
 }
 
 /**
  * Whether an event tagged with `sessionId` belongs to the applied snapshot's
- * session. Before any snapshot is applied every session is admitted.
+ * session. Before any snapshot is applied no session is admitted: the event
+ * is dropped, as one emitted before this realm subscribed is lost.
  */
 export function sessionAdmits(
   status: PipelineStatus,
   sessionId: string,
 ): boolean {
-  return status.revision < 0 || status.session.id === sessionId;
+  return status.revision >= 0 && status.session.id === sessionId;
 }
 
 function isCount(value: unknown): value is number {
@@ -239,6 +271,7 @@ export function isPipelineStatus(value: unknown): value is PipelineStatus {
     !("capture_state" in value) ||
     !("retired_through" in value) ||
     !("transcription" in value) ||
+    !("transcription_generation" in value) ||
     !("realtime" in value) ||
     !("session" in value) ||
     !("backpressure" in value)
@@ -250,6 +283,7 @@ export function isPipelineStatus(value: unknown): value is PipelineStatus {
     capture_state,
     retired_through,
     transcription,
+    transcription_generation,
     realtime,
     session,
     backpressure,
@@ -270,6 +304,7 @@ export function isPipelineStatus(value: unknown): value is PipelineStatus {
         "generation" in transcription &&
         isCaptureId(transcription.capture) &&
         isCount(transcription.generation))) &&
+    isCount(transcription_generation) &&
     typeof realtime === "object" &&
     realtime !== null &&
     REALTIME_MODES.every(
@@ -304,17 +339,47 @@ export function isPipelineStatus(value: unknown): value is PipelineStatus {
   );
 }
 
-export function isCaptureCommandReply(
+/** The outcomes a start (of capture or of transcription) replies with. */
+export const START_OUTCOMES: Record<StartOutcome, true> = {
+  started: true,
+  repeated: true,
+};
+
+/** The outcomes a stop (of capture or of transcription) replies with. */
+export const STOP_OUTCOMES: Record<StopOutcome, true> = {
+  stopped: true,
+  not_running: true,
+};
+
+/**
+ * A reply whose outcome is one of `outcomes`, with a readable snapshot. An
+ * outcome outside the closed set tells nothing: the command's effect is
+ * unknown.
+ */
+export function isCaptureCommandReply<O extends StartOutcome | StopOutcome>(
   value: unknown,
-): value is CaptureCommandReply {
+  outcomes: Record<O, true>,
+): value is CaptureCommandReply<O> {
   return (
     typeof value === "object" &&
     value !== null &&
     "outcome" in value &&
     "snapshot" in value &&
     typeof value.outcome === "string" &&
+    Object.hasOwn(outcomes, value.outcome) &&
     isPipelineStatus(value.snapshot)
   );
+}
+
+/**
+ * The snapshot a reply carries when it carries a readable one, whatever its
+ * outcome: a snapshot is applied by its revision alone.
+ */
+export function replySnapshot(reply: unknown): PipelineStatus | null {
+  if (typeof reply !== "object" || reply === null || !("snapshot" in reply)) {
+    return null;
+  }
+  return isPipelineStatus(reply.snapshot) ? reply.snapshot : null;
 }
 
 export function isCaptureAttachment(

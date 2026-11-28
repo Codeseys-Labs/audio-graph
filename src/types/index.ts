@@ -698,13 +698,22 @@ export interface PipelineStatus extends PipelineStages {
   revision: number;
   /** The capture the backend holds, or last held. */
   capture_state: { id: CaptureId; phase: CapturePhase };
-  /** Every start id at or below this can no longer begin. */
+  /**
+   * Every start id at or below this can no longer begin, and none is pending
+   * or running: no id at or below it is pending or running in this or any
+   * later snapshot.
+   */
   retired_through: CaptureId;
   /**
    * The running transcription: the capture it belongs to and its generation
    * (one per transcription start). Independent of the asr stage's health.
    */
   transcription: TranscriptionSnapshot | null;
+  /**
+   * The last transcription generation the backend issued (0 before any): a
+   * transcription start names the generation after it.
+   */
+  transcription_generation: number;
   realtime: RealtimeModes;
   /** `epoch` increments on every successful session rotation. */
   session: { id: string; epoch: number };
@@ -3043,10 +3052,14 @@ export type AppErrorPayload =
         snapshot: PipelineStatus;
       };
     }
+  | { code: "capture_attach_superseded"; message?: null }
   | { code: "unknown"; message: string };
 
 /** Closed reason `start_transcribe` refused a capture. */
-export type TranscriptionRefusalReason = "capture_not_running" | "capture_lost";
+export type TranscriptionRefusalReason =
+  | "capture_not_running"
+  | "capture_lost"
+  | "start_failed";
 
 /** Closed reason a capture start failed (`audio::capture::CaptureFailureReason`). */
 export const CAPTURE_FAILURE_REASONS = [
@@ -3089,10 +3102,25 @@ export interface CaptureId {
  */
 export type CapturePhase = "pending" | "running" | "stopping" | "idle";
 
+/** What a start (of capture or of transcription) did. */
+export type StartOutcome = "started" | "repeated";
+
+/** What a stop (of capture or of transcription) did. */
+export type StopOutcome = "stopped" | "not_running";
+
 /** A capture command's reply: its outcome and the snapshot after its effect. */
-export interface CaptureCommandReply {
-  outcome: string;
+export interface CaptureCommandReply<O extends StartOutcome | StopOutcome> {
+  outcome: O;
   snapshot: PipelineStatus;
+}
+
+/**
+ * A stop-everything as this renderer numbers it: 1, 2, 3, ... within its
+ * attachment `epoch`, reused by that Stop's own retry.
+ */
+export interface StopOperation {
+  epoch: number;
+  seq: number;
 }
 
 /** `capture_attach`'s reply: this renderer's epoch and the current snapshot. */
@@ -3622,27 +3650,37 @@ export interface AudioGraphStore {
    */
   backpressuredSources: string[];
   /**
-   * The renderer cannot vouch for the shown state: `unknownStart` or
-   * `unknownStop` is set. Stop stays available and the state reconciles.
+   * The renderer cannot vouch for the shown state: no snapshot was applied
+   * since load, or `unknownStart` or `unknownStop` is set. Stop stays
+   * available and the state reconciles.
    */
   captureUnknown: boolean;
   /**
-   * A Start whose reply was lost or unreadable. Cleared once a snapshot
-   * shows that id pending, running or stopping, or shows it can no longer
-   * run (`retired_through` at or above it).
+   * A Start whose outcome its reply did not tell (lost, unreadable, or an
+   * outcome outside the closed set). Cleared once a snapshot shows that id
+   * pending, running or stopping, or shows it can no longer run
+   * (`retired_through` at or above it).
    */
   unknownStart: CaptureId | null;
   /** A Stop whose reply was lost or unreadable; the next status read clears it. */
   unknownStop: boolean;
-  /** Spinner: the id of the Start in flight, settled by its own outcome. */
+  /**
+   * Spinner: the id of the Start in flight. Settled by its own readable
+   * outcome, or by a snapshot that settles that id as `unknownStart` is.
+   */
   startPending: CaptureId | null;
-  /** Spinner: the latest Stop in flight, settled by its own outcome. */
+  /**
+   * Spinner: how many of this window's Stops are in flight (null when
+   * none); each is settled by its own outcome alone.
+   */
   stopPending: number | null;
   /**
-   * The token of a stop-everything whose outcome is unknown, reused when
-   * that Stop is pressed again.
+   * The stop-everything whose outcome is unknown, reused when that Stop is
+   * pressed again within the same attachment epoch.
    */
-  stopOperation: string | null;
+  stopOperation: StopOperation | null;
+  /** The sequence number of this realm's latest stop-everything in its epoch. */
+  stopSeq: number;
   /**
    * This realm's attachment to capture control. Start is unavailable until
    * it is `ready`; a `failed` one is retried by the next Start.
@@ -3660,7 +3698,8 @@ export interface AudioGraphStore {
   startCapture: () => Promise<CaptureId | null>;
   /**
    * Stop the newest capture this renderer knows of, or, knowing none, every
-   * capture (`stop_capture` with no id and an operation token).
+   * capture (`stop_capture` with no id and a numbered operation of this
+   * realm's attachment epoch, attaching first when there is none).
    */
   stopCapture: () => Promise<void>;
   /**

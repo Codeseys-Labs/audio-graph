@@ -3,12 +3,16 @@ import { snapshot, statusFor } from "../test/captureBackend";
 import type { CaptureId } from "../types";
 import {
   captureToggle,
+  captureUnknownOf,
   compareCaptureIds,
   errorSnapshot,
   isCaptureAttachment,
   isCaptureCommandReply,
   isPipelineStatus,
   NO_PIPELINE_STATUS,
+  replySnapshot,
+  START_OUTCOMES,
+  STOP_OUTCOMES,
   sessionAdmits,
   snapshotView,
   startSettledBy,
@@ -130,11 +134,12 @@ describe("captureToggle", () => {
     captureStatus: "idle" as const,
     captureUnknown: false,
     startPending: null,
+    stopPending: null,
     captureAttach: "ready" as const,
     selectedSourceIds: ["system-default"],
   };
 
-  it("offers Stop while the backend holds or may hold a capture", () => {
+  it("offers Stop unless the window can vouch for an idle backend", () => {
     for (const captureStatus of ["pending", "running", "stopping"] as const) {
       expect(captureToggle({ ...idle, captureStatus }).offersStop).toBe(true);
     }
@@ -144,6 +149,8 @@ describe("captureToggle", () => {
     expect(captureToggle({ ...idle, startPending: id(1, 1) }).offersStop).toBe(
       true,
     );
+    // A Stop of this window in flight: its own outcome is not in yet.
+    expect(captureToggle({ ...idle, stopPending: 1 }).offersStop).toBe(true);
     expect(captureToggle(idle)).toEqual({
       offersStop: false,
       startEnabled: true,
@@ -163,9 +170,26 @@ describe("captureToggle", () => {
   });
 });
 
+describe("captureUnknownOf", () => {
+  it("is unknown until a snapshot is applied, and while a command's outcome is", () => {
+    const known = {
+      pipelineStatus: snapshot(),
+      unknownStart: null,
+      unknownStop: false,
+    };
+    expect(
+      captureUnknownOf({ ...known, pipelineStatus: NO_PIPELINE_STATUS }),
+    ).toBe(true);
+    expect(captureUnknownOf({ ...known, unknownStart: id(1, 1) })).toBe(true);
+    expect(captureUnknownOf({ ...known, unknownStop: true })).toBe(true);
+    expect(captureUnknownOf(known)).toBe(false);
+  });
+});
+
 describe("sessionAdmits", () => {
-  it("admits every session before a snapshot, then only the snapshot's", () => {
-    expect(sessionAdmits(NO_PIPELINE_STATUS, "any")).toBe(true);
+  it("admits no session before a snapshot, then only the snapshot's", () => {
+    expect(sessionAdmits(NO_PIPELINE_STATUS, "any")).toBe(false);
+    expect(sessionAdmits(NO_PIPELINE_STATUS, "")).toBe(false);
     const status = snapshot({ session: { id: "s-1", epoch: 1 } });
     expect(sessionAdmits(status, "s-1")).toBe(true);
     expect(sessionAdmits(status, "s-0")).toBe(false);
@@ -188,11 +212,43 @@ describe("reply guards", () => {
     );
     const { asr: _asr, ...noStage } = status;
     expect(isPipelineStatus(noStage)).toBe(false);
+    const { transcription_generation: _generation, ...noGeneration } = status;
+    expect(isPipelineStatus(noGeneration)).toBe(false);
+    expect(isPipelineStatus({ ...status, transcription_generation: -1 })).toBe(
+      false,
+    );
 
-    expect(
-      isCaptureCommandReply({ outcome: "started", snapshot: status }),
-    ).toBe(true);
-    expect(isCaptureCommandReply({ snapshot: status })).toBe(false);
+    // Outcomes are a closed set per command; anything else tells nothing.
+    for (const outcome of ["started", "repeated"]) {
+      expect(
+        isCaptureCommandReply({ outcome, snapshot: status }, START_OUTCOMES),
+      ).toBe(true);
+      expect(
+        isCaptureCommandReply({ outcome, snapshot: status }, STOP_OUTCOMES),
+      ).toBe(false);
+    }
+    for (const outcome of ["stopped", "not_running"]) {
+      expect(
+        isCaptureCommandReply({ outcome, snapshot: status }, STOP_OUTCOMES),
+      ).toBe(true);
+    }
+    for (const outcome of ["nothing_running", "toString", "", "garbled"]) {
+      expect(
+        isCaptureCommandReply({ outcome, snapshot: status }, START_OUTCOMES),
+      ).toBe(false);
+      expect(
+        isCaptureCommandReply({ outcome, snapshot: status }, STOP_OUTCOMES),
+      ).toBe(false);
+    }
+    expect(isCaptureCommandReply({ snapshot: status }, START_OUTCOMES)).toBe(
+      false,
+    );
+    // The snapshot beside any outcome is still read by its revision.
+    expect(replySnapshot({ outcome: "garbled", snapshot: status })).toBe(
+      status,
+    );
+    expect(replySnapshot({ outcome: "started", snapshot: {} })).toBeNull();
+    expect(replySnapshot(undefined)).toBeNull();
     expect(isCaptureAttachment({ epoch: 3, snapshot: status })).toBe(true);
     expect(isCaptureAttachment({ epoch: 0, snapshot: status })).toBe(false);
 

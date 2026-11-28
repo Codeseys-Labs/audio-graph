@@ -311,6 +311,23 @@ pub struct CaptureId {
     pub seq: u64,
 }
 
+impl CaptureId {
+    /// The greatest id below this one.
+    pub(crate) fn predecessor(self) -> Self {
+        match (self.epoch, self.seq) {
+            (_, seq) if seq > 0 => Self {
+                seq: seq - 1,
+                ..self
+            },
+            (epoch, _) if epoch > 0 => Self {
+                epoch: epoch - 1,
+                seq: u64::MAX,
+            },
+            _ => self,
+        }
+    }
+}
+
 /// Where the capture the backend holds is (#141). `Pending`: a start is
 /// registered and preparing; `Running`: committed and owning sources;
 /// `Stopping`: being torn down; `Idle`: nothing registered or owned.
@@ -413,11 +430,13 @@ pub struct TranscriptSaving {
 pub struct PipelineStatus {
     revision: u64,
     capture_state: CaptureState,
-    /// Every start id at or below this can no longer begin.
+    /// Every start id at or below this can no longer begin, and none is
+    /// pending or running.
     retired_through: CaptureId,
     transcription: Option<Transcription>,
-    /// The last transcription generation issued.
-    #[serde(skip)]
+    /// The last transcription generation issued (0 before any): a start
+    /// names the generation it begins, so a late or repeated delivery of it
+    /// starts nothing.
     transcription_generation: u64,
     realtime: RealtimeModes,
     session: SessionState,
@@ -456,6 +475,10 @@ impl PipelineStatus {
 
     pub fn transcription(&self) -> Option<Transcription> {
         self.transcription
+    }
+
+    pub fn transcription_generation(&self) -> u64 {
+        self.transcription_generation
     }
 
     pub fn realtime(&self) -> RealtimeModes {

@@ -76,6 +76,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applies only a newer revision, shows "Recording status unknown" with Stop
   available when a reply is lost, and reconciles by reading the status after
   every command, on focus, and every few seconds while a capture is in flight.
+  Until it has applied a snapshot it treats the state as unknown, offers Stop
+  and keeps reading. Stop shows "stopping" as soon as it is accepted. A late or
+  repeated delivery of any capture command, including a reloaded page's,
+  changes nothing, and a transcription start that cannot run its speech thread
+  is undone and reported with a closed reason.
 - Notes and Graph now publish changes after their projection log confirms the
   write. Historical Review shows when an existing projection trails its
   transcript or needs repair after an interrupted write. Export includes

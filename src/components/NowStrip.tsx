@@ -106,13 +106,13 @@ function NowStrip() {
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
   const captureStatus = useAudioGraphStore((s) => s.captureStatus);
   // Stop is offered while the backend holds, or may hold, a capture: its
-  // state is pending, running, stopping or unknown, or a Start is in flight.
-  // It stays enabled throughout (Stop is idempotent).
+  // state is pending, running, stopping or unknown, or a Start or Stop of
+  // this window is in flight. It stays enabled throughout (Stop is
+  // idempotent).
   const captureUnknown = useAudioGraphStore((s) => s.captureUnknown);
   const startPending = useAudioGraphStore((s) => s.startPending);
-  const stopping = useAudioGraphStore(
-    (s) => s.captureStatus === "stopping" || s.stopPending !== null,
-  );
+  const stopPending = useAudioGraphStore((s) => s.stopPending);
+  const stopping = captureStatus === "stopping" || stopPending !== null;
   const starting = captureStarting({ startPending, captureStatus });
   // SHELL-R4 (plan §R4, ADR-0046): read alongside `isCapturing` so the
   // relocated `.workspace-switcher__state` region below can reproduce the
@@ -184,6 +184,7 @@ function NowStrip() {
     captureStatus,
     captureUnknown,
     startPending,
+    stopPending,
     captureAttach,
     selectedSourceIds,
   });

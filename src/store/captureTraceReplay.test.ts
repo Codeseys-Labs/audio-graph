@@ -123,6 +123,21 @@ describe("capture conformance traces", () => {
         expect(trace.final.revision).toBeGreaterThanOrEqual(
           Math.max(...trace.deliveries.map((status) => status.revision)),
         );
+        // No id at or below a `retired_through` handed out is pending or
+        // running in that snapshot or any later one.
+        let retired = trace.deliveries[0]?.retired_through ?? null;
+        for (const status of [...trace.deliveries, trace.final]) {
+          if (
+            retired === null ||
+            compareCaptureIds(status.retired_through, retired) > 0
+          ) {
+            retired = status.retired_through;
+          }
+          const { id, phase } = status.capture_state;
+          if (phase === "pending" || phase === "running") {
+            expect(compareCaptureIds(id, retired)).toBeGreaterThan(0);
+          }
+        }
       });
 
       for (const [order, deliveries] of replayOrders(trace.deliveries)) {

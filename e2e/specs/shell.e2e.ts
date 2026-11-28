@@ -319,8 +319,12 @@ describe("AudioGraph desktop shell (embedded WebdriverIO/Tauri E2E)", () => {
     const snapshotAt = (revision: number, phase: "running" | "idle") => ({
       revision,
       capture_state: { id: acknowledged, phase },
-      retired_through: acknowledged,
+      // Never at or above a capture that runs; the acknowledged one once it
+      // has ended.
+      retired_through:
+        phase === "running" ? { epoch: 0, seq: 0 } : acknowledged,
       transcription: null,
+      transcription_generation: 0,
       realtime: { gemini: false, converse: false, openai_realtime: false },
       session: { id: "e2e-session", epoch: 0 },
       backpressure: [],

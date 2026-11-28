@@ -13,7 +13,7 @@ import i18n from "../i18n";
 import en from "../i18n/locales/en.json";
 import pt from "../i18n/locales/pt.json";
 import { useAudioGraphStore } from "../store";
-import { NO_PIPELINE_STATUS } from "../store/captureFacts";
+import { captureToggle, NO_PIPELINE_STATUS } from "../store/captureFacts";
 import { snapshot, statusFor } from "../test/captureBackend";
 import type { AwsErrorPayload } from "../types";
 import {
@@ -46,6 +46,7 @@ function resetStore() {
     unknownStart: null,
     unknownStop: false,
     startPending: null,
+    stopPending: null,
     // Attached already: the hook's attach is then a no-op, and these tests
     // cover event routing, not the attachment.
     captureAttach: "ready",
@@ -207,7 +208,7 @@ describe("useTauriEvents", () => {
     expect(reads()).toBe(3);
   });
 
-  it("reads every 3 s only while the shown capture is not idle or its state is unknown, and stops on unmount", async () => {
+  it("reads every 3 s only while the shown capture is not idle, a Start is in flight or its state is unknown, and stops on unmount", async () => {
     const { unmount } = renderHook(() => useTauriEvents());
     await waitForAllHandlers();
     await vi.waitFor(() => expect(reads()).toBe(1));
@@ -235,6 +236,18 @@ describe("useTauriEvents", () => {
       vi.advanceTimersByTime(9_000);
       expect(reads()).toBe(before);
 
+      // A Start in flight, with nothing shown registered yet.
+      act(() =>
+        useAudioGraphStore.setState({ startPending: { epoch: 1, seq: 2 } }),
+      );
+      before = reads();
+      vi.advanceTimersByTime(3_000);
+      expect(reads()).toBe(before + 1);
+      act(() => useAudioGraphStore.setState({ startPending: null }));
+      before = reads();
+      vi.advanceTimersByTime(9_000);
+      expect(reads()).toBe(before);
+
       act(() =>
         useAudioGraphStore.setState({
           captureUnknown: true,
@@ -251,6 +264,138 @@ describe("useTauriEvents", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("with no snapshot since load, a failed attach and failed first reads arm the periodic read, which recovers without a focus change", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      // This realm's load: no snapshot, no attachment.
+      useAudioGraphStore.setState({
+        captureUnknown: true,
+        captureAttach: "detached",
+        captureEpoch: null,
+        captureRealm: null,
+      });
+      let reachable = false;
+      const running = statusFor({ epoch: 1, seq: 1 }, "running");
+      vi.mocked(invoke).mockImplementation(async (cmd) => {
+        if (cmd === "capture_attach" || cmd === "get_pipeline_status") {
+          if (!reachable) throw new Error("IPC transport failure");
+          return cmd === "get_pipeline_status"
+            ? running
+            : { epoch: 1, snapshot: running };
+        }
+        return undefined;
+      });
+      const settleHook = async () => {
+        await act(async () => {
+          for (let i = 0; i < 50; i += 1) await Promise.resolve();
+        });
+      };
+      const { unmount } = renderHook(() => useTauriEvents());
+      await settleHook();
+      // The attach and both first reads (the mount's and the failed
+      // attach's) failed: nothing is applied, and Stop is offered.
+      expect(useAudioGraphStore.getState().captureAttach).toBe("failed");
+      expect(reads()).toBe(2);
+      let state = useAudioGraphStore.getState();
+      expect(state.pipelineStatus.revision).toBe(-1);
+      expect(captureToggle(state).offersStop).toBe(true);
+
+      // IPC recovers; nothing focuses the window.
+      reachable = true;
+      vi.advanceTimersByTime(3_000);
+      await settleHook();
+      expect(reads()).toBe(3);
+      state = useAudioGraphStore.getState();
+      expect(state.isCapturing).toBe(true);
+      expect(state.captureUnknown).toBe(false);
+      expect(captureToggle(state).offersStop).toBe(true);
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops session-tagged events that arrive before the first snapshot, and fences content as the first snapshot applies", async () => {
+    renderHook(() => useTauriEvents());
+    await waitForAllHandlers();
+    const notesOf = (sessionId: string) => ({
+      schema_version: 1,
+      session_id: sessionId,
+      last_sequence: 1,
+      notes: [],
+    });
+    // Session A's notes, graph and card arrive before any snapshot, with
+    // an untagged transcript segment.
+    act(() => {
+      handlers.get("materialized-notes-update")?.(
+        makeEvent("materialized-notes-update", notesOf("session-a")),
+      );
+      handlers.get("materialized-graph-update")?.(
+        makeEvent("materialized-graph-update", {
+          schema_version: 1,
+          session_id: "session-a",
+          last_sequence: 1,
+          nodes: [],
+          edges: [],
+        }),
+      );
+      handlers.get("transcript-update")?.(
+        makeEvent("transcript-update", {
+          id: "seg-a",
+          source_id: "system-default",
+          speaker_id: null,
+          speaker_label: null,
+          text: "a",
+          start_time: 0,
+          end_time: 1,
+          confidence: 1,
+        }),
+      );
+    });
+    let state = useAudioGraphStore.getState();
+    expect(state.materializedNotes).toBeNull();
+    expect(state.materializedProjectionGraph).toBeNull();
+    expect(state.transcriptSegments).toHaveLength(1);
+
+    // B's snapshot is the first applied: the untagged segment is fenced.
+    act(() =>
+      handlers.get("pipeline-status")?.(
+        makeEvent(
+          "pipeline-status",
+          snapshot({ session: { id: "session-b", epoch: 1 } }),
+        ),
+      ),
+    );
+    // A later read of B.
+    act(() =>
+      useAudioGraphStore
+        .getState()
+        .setPipelineStatus(
+          snapshot({ session: { id: "session-b", epoch: 1 } }),
+        ),
+    );
+    state = useAudioGraphStore.getState();
+    expect(state.materializedNotes).toBeNull();
+    expect(state.materializedProjectionGraph).toBeNull();
+    expect(state.transcriptSegments).toEqual([]);
+
+    // B's own notes are admitted; A's are not.
+    act(() => {
+      handlers.get("materialized-notes-update")?.(
+        makeEvent("materialized-notes-update", notesOf("session-a")),
+      );
+    });
+    expect(useAudioGraphStore.getState().materializedNotes).toBeNull();
+    act(() => {
+      handlers.get("materialized-notes-update")?.(
+        makeEvent("materialized-notes-update", notesOf("session-b")),
+      );
+    });
+    expect(useAudioGraphStore.getState().materializedNotes?.session_id).toBe(
+      "session-b",
+    );
   });
 
   it("invokes every registered unlisten on unmount", async () => {
@@ -460,6 +605,12 @@ describe("useTauriEvents", () => {
     useAudioGraphStore.setState({ liveAssistCards: [] });
     renderHook(() => useTauriEvents());
     await waitForAllHandlers();
+    // The live session, as the applied snapshot names it.
+    useAudioGraphStore
+      .getState()
+      .setPipelineStatus(
+        snapshot({ session: { id: "session-live", epoch: 0 } }),
+      );
 
     const card = {
       session_id: "session-live",
@@ -573,6 +724,12 @@ describe("useTauriEvents", () => {
   it("routes live projection patch and materialized artifacts into the store", async () => {
     renderHook(() => useTauriEvents());
     await waitForAllHandlers();
+    // The live session, as the applied snapshot names it.
+    useAudioGraphStore
+      .getState()
+      .setPipelineStatus(
+        snapshot({ session: { id: "session-live", epoch: 0 } }),
+      );
 
     const patch = {
       sequence: 1,

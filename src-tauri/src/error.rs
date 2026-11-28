@@ -142,8 +142,11 @@ pub enum AppError {
     /// capture still runs.
     CaptureStopFailed(Box<CaptureStopFailure>),
     /// A transcription start was refused because its capture is not the
-    /// live one.
+    /// live one, or failed before its speech thread ran.
     TranscriptionRefused(Box<TranscriptionRefusal>),
+    /// A capture attach from a renderer realm a later attach superseded: a
+    /// late delivery from a reloaded page. Nothing changed.
+    CaptureAttachSuperseded,
     /// Catch-all for errors not yet migrated to a typed variant.
     Unknown(String),
 }
@@ -171,6 +174,8 @@ pub enum TranscriptionRefusalReason {
     CaptureNotRunning,
     /// Its capture stopped while transcription was starting.
     CaptureLost,
+    /// Its speech thread could not be started; the start was undone.
+    StartFailed,
 }
 
 /// A refused transcription start, with the status snapshot.
@@ -214,6 +219,7 @@ enum LegacyAppErrorWire<'a> {
     CaptureStartFailed(&'a CaptureStartRefusal),
     CaptureStopFailed(&'a CaptureStopFailure),
     TranscriptionRefused(&'a TranscriptionRefusal),
+    CaptureAttachSuperseded,
     PrivacyPolicyBlocked {
         mode: &'a str,
         action: &'a str,
@@ -285,6 +291,7 @@ impl serde::Serialize for AppError {
             Self::TranscriptionRefused(refusal) => {
                 LegacyAppErrorWire::TranscriptionRefused(refusal)
             }
+            Self::CaptureAttachSuperseded => LegacyAppErrorWire::CaptureAttachSuperseded,
             Self::PrivacyPolicyBlocked {
                 mode,
                 action,
@@ -385,7 +392,13 @@ impl fmt::Display for AppError {
                     f,
                     "Cannot start transcription: capture stopped while transcription was starting"
                 ),
+                TranscriptionRefusalReason::StartFailed => {
+                    write!(f, "Transcription could not start; nothing was left running")
+                }
             },
+            AppError::CaptureAttachSuperseded => {
+                write!(f, "A superseded window's capture attach was refused")
+            }
             AppError::Unknown(msg) => write!(f, "{}", msg),
         }
     }

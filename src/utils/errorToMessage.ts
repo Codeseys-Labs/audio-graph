@@ -135,8 +135,9 @@ function formatAppError(err: AppErrorPayload): string {
     case "transcription_refused":
       // Closed reasons: anything else reads as the capture not running.
       return i18n.t(
-        err.message?.reason === "capture_lost"
-          ? "errors.transcriptionRefused.capture_lost"
+        err.message?.reason === "capture_lost" ||
+          err.message?.reason === "start_failed"
+          ? `errors.transcriptionRefused.${err.message.reason}`
           : "errors.transcriptionRefused.capture_not_running",
       );
     case "unknown":

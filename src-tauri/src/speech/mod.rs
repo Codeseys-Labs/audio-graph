@@ -13479,6 +13479,47 @@ mod tests_status {
         assert!(matches!(asr(), StageStatus::Idle));
     }
 
+    /// Entering, updating and leaving a reconnect are each one publish, in
+    /// revision order, and a reconnect with nothing to restore publishes
+    /// nothing (#141 with #579).
+    #[test]
+    fn each_asr_reconnect_transition_is_one_publish() {
+        let status = crate::status::StatusAuthority::detached();
+        set_asr_status(&status, StageStatus::Running { processed_count: 7 });
+        status.record();
+        let mut reconnect_status = AsrReconnectStatus::default();
+        let reason = events::AsrReconnectReason::ConnectionLost;
+        reconnect_status.reconnecting(&status, reason, 1);
+        reconnect_status.reconnecting(&status, reason, 30);
+        reconnect_status.reconnected(&status, 9);
+        reconnect_status.reconnected(&status, 9);
+        let recorded = status.recorded();
+        let stages: Vec<StageStatus> = recorded
+            .iter()
+            .map(|snapshot| snapshot.stages().asr.clone())
+            .collect();
+        assert!(
+            matches!(
+                stages.as_slice(),
+                [
+                    StageStatus::Reconnecting { .. },
+                    StageStatus::Reconnecting { .. },
+                    StageStatus::Running { processed_count: 9 }
+                ]
+            ),
+            "{stages:?}"
+        );
+        assert!(
+            recorded
+                .windows(2)
+                .all(|pair| pair[0].revision() < pair[1].revision())
+        );
+        assert_eq!(
+            recorded.last().map(|snapshot| snapshot.revision()),
+            Some(status.snapshot().revision())
+        );
+    }
+
     #[test]
     #[cfg_attr(target_os = "macos", ignore = "Tao needs the main thread on macOS")]
     fn deepgram_receiver_updates_stage_across_disconnects_and_recovery() {

@@ -798,10 +798,10 @@ sequenceDiagram
     participant Audit as Movement Ledger
 
     UI->>Main: capture_attach(realm) once per page: epoch e, status snapshot
-    Note over UI,Main: Attach cancels any start an earlier page left pending; a running capture is adopted from the snapshot. Start is unavailable until it replies
+    Note over UI,Main: Attach cancels any start an earlier page left pending; a running capture is adopted from the snapshot. A late attach from a superseded page is refused. Start is unavailable until it replies
     UI->>Main: start_capture(id = (e, seq), sources[])
-    Note over UI,Main: Identity first: a repeat of the live or preparing start reports that start's outcome. Otherwise a start of a superseded epoch is refused stale_attachment, and one at or below either watermark cancelled. Registration publishes (id, pending)
-    Note over UI,Main: stop_capture(id) ends every capture up to id: watermark first, then the committed aggregate if not newer, published stopping before its cleanup. A stop of everything (the tray's, or a window with no id) carries an operation id, so its repeat never ends a later capture
+    Note over UI,Main: Identity first: a repeat of the live or preparing start reports that start's outcome. Otherwise a start of a superseded epoch is refused stale_attachment, and one at or below either watermark cancelled. Registration publishes (id, pending). retired_through never covers a start that is pending or running
+    Note over UI,Main: stop_capture(id) ends every capture up to id: watermark first and the committed aggregate published stopping at once, then, under the lifecycle lock, its sources joined and its cleanup. A window's stop of everything carries (epoch, seq): its repeat ends what its first delivery did, and one of another attachment or older than the latest is stale and changes nothing. The tray's ends what the backend holds
     Main->>Main: close a previous start's uncertain CaptureStarted row, if any
     Main->>Pipe: ResetSession barrier
     Pipe->>Disp: ordered processed reset

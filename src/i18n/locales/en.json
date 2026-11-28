@@ -1668,7 +1668,8 @@
     },
     "transcriptionRefused": {
       "capture_not_running": "Cannot start transcription: capture is not running.",
-      "capture_lost": "Cannot start transcription: capture stopped while transcription was starting."
+      "capture_lost": "Cannot start transcription: capture stopped while transcription was starting.",
+      "start_failed": "Transcription could not start, and nothing was left running. Try again."
     },
     "captureStart": {
       "forSource": "{{source}}: {{reason}}",

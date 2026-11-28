@@ -17,7 +17,8 @@
  *                                 emission has always assumed exists — see
  *                                 `src-tauri/src/events.rs`'s doc on
  *                                 `AGENT_CARD_UPDATE`); dropped when its
- *                                 session is not the applied snapshot's
+ *                                 session is not the applied snapshot's,
+ *                                 or no snapshot is applied yet
  *   - `GRAPH_UPDATE`            → `setGraphSnapshot`
  *   - `GRAPH_DELTA`             → `applyGraphDelta`
  *   - `MATERIALIZED_NOTES_UPDATE`
@@ -29,7 +30,8 @@
  *                                 newer than the applied snapshot; read
  *                                 again on focus, on visibility changes and
  *                                 every few seconds while capture is not
- *                                 idle or its state is unknown
+ *                                 idle, a Start is in flight or the state
+ *                                 is unknown (before the first snapshot too)
  *   - `AUDIO_CONSUMER_HEALTH`   → `setAudioConsumerHealth`
  *   - `SPEAKER_DETECTED`        → `addOrUpdateSpeaker`
  *   - `CAPTURE_ERROR`           → `setError`, unless an older capture's
@@ -190,8 +192,13 @@ const MODEL_DOWNLOAD_PROGRESS = "model-download-progress";
 const PIPELINE_LATENCY = "pipeline-latency";
 const AWS_ERROR = "aws-error";
 
-/** How often a shown capture that is not idle, or unknown, is read again. */
-const CAPTURE_RECONCILE_MS = 3_000;
+/**
+ * How often the backend's state is read again while the window cannot vouch
+ * for an idle backend: the shown capture is not idle, a Start is in flight,
+ * or the state is unknown (including before the first snapshot, so a failed
+ * attach or initial read is retried without a focus change).
+ */
+export const CAPTURE_RECONCILE_MS = 3_000;
 
 // Streaming-chat token deltas + terminal frame no longer arrive as
 // `chat-token-delta` / `chat-token-done` events: audio-graph-1534 moved that
@@ -301,11 +308,14 @@ export function useTauriEvents(): void {
   );
   const addGeminiTranscript = useAudioGraphStore((s) => s.addGeminiTranscript);
 
-  // While the shown capture is pending, running or stopping, or its state
-  // is unknown, it is read again every few seconds: a lost emission is never
-  // shown for long. One interval, cleared once idle and on unmount.
+  // While the shown capture is pending, running or stopping, a Start is in
+  // flight, or the state is unknown (no snapshot applied since load, or a
+  // command's outcome lost), it is read again every few seconds: a lost
+  // emission, a failed attach or a failed first read is never shown for
+  // long, focus or not. One interval, cleared once idle and on unmount.
   const reconcilePeriodically = useAudioGraphStore(
-    (s) => s.captureStatus !== "idle" || s.captureUnknown,
+    (s) =>
+      s.captureStatus !== "idle" || s.captureUnknown || s.startPending !== null,
   );
   useEffect(() => {
     if (!reconcilePeriodically) return;
@@ -413,7 +423,8 @@ export function useTauriEvents(): void {
         // deliverable (d)'s "answered ⇒ feed" classification rule was
         // unreachable in production without this listener.
         safeListen<LiveAssistCardRecord>(AGENT_CARD_UPDATE, (event) => {
-          // A card of another session than the shown one is stale.
+          // A card of another session than the shown one is stale; before
+          // any snapshot no session is shown, and the card is dropped.
           const { pipelineStatus } = useAudioGraphStore.getState();
           if (!sessionAdmits(pipelineStatus, event.payload.session_id)) return;
           upsertLiveAssistCard(event.payload);
