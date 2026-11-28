@@ -204,17 +204,21 @@ pub(crate) struct RecoveredEvent<E> {
 }
 pub(crate) type Attempts<E> = std::sync::Mutex<HashMap<PathBuf, LiveAttempt<E>>>;
 struct Lease<E: CommitPayload> {
-    path: PathBuf,
+    // Live writers can pick the lease up again. A retired job owns it to
+    // completion and releases the OS lock even if the job unwinds.
+    live_key: Option<PathBuf>,
     file: Option<File>,
     pending: Option<PendingPublication<E>>,
 }
 impl<E: CommitPayload> Drop for Lease<E> {
     fn drop(&mut self) {
-        if let (Some(file), Some(frame)) = (self.file.take(), self.pending.take()) {
+        if let (Some(key), Some(file), Some(frame)) =
+            (self.live_key.take(), self.file.take(), self.pending.take())
+        {
             E::attempts()
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(self.path.clone(), LiveAttempt { file, frame });
+                .insert(key, LiveAttempt { file, frame });
         }
     }
 }
@@ -691,7 +695,7 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
             .remove(&lock_key);
         let lease = if let Some(attempt) = retained {
             Lease {
-                path: lock_key,
+                live_key: Some(lock_key),
                 file: Some(attempt.file),
                 pending: Some(attempt.frame),
             }
@@ -711,7 +715,7 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
                 TryLockError::Error(e) => io_failure(CanonicalAppendPhase::RecoveryRead, e),
             })?;
             Lease {
-                path: lock_key,
+                live_key: Some(lock_key),
                 file: Some(file),
                 pending: None,
             }
@@ -1350,7 +1354,30 @@ fn provision_directory(path: &Path) -> Result<Option<QualifiedStorage>, Transcri
     Ok(None)
 }
 
-use super::super::session_artifact_manifest::{ManifestLoadOutcome, SessionArtifactManifestStore};
+use super::super::session_artifact_manifest::{
+    ManifestLoadError, ManifestLoadOutcome, SessionArtifactManifestStore,
+};
+
+fn floor_read_error(error: ManifestLoadError) -> TranscriptCommitError {
+    match error {
+        ManifestLoadError::Io { kind, raw_os_error } => TranscriptCommitError::Io {
+            phase: CanonicalAppendPhase::RecoveryRead,
+            kind,
+            code: raw_os_error,
+        },
+        ManifestLoadError::ChangedDuringRead => TranscriptCommitError::Io {
+            phase: CanonicalAppendPhase::RecoveryRead,
+            kind: io::ErrorKind::WouldBlock,
+            code: None,
+        },
+        ManifestLoadError::Coordination(error) => TranscriptCommitError::Coordination(error),
+        ManifestLoadError::SessionMismatch
+        | ManifestLoadError::NonRegularManifest
+        | ManifestLoadError::TooLarge { .. }
+        | ManifestLoadError::Malformed
+        | ManifestLoadError::Validation(_) => TranscriptCommitError::SessionFloorUnavailable,
+    }
+}
 
 /// Global shared floor admission precedes the per-session transcript lock.
 /// Its writer peer is the unchanged, qualified manifest CAS.
@@ -1367,7 +1394,8 @@ fn with_writable_v1<T>(
             for id in [&ids.manifest, &ids.temporary, &ids.provenance] {
                 match fs::symlink_metadata(root.join(id.as_str())) {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    _ => return Err(TranscriptCommitError::SessionFloorUnavailable),
+                    Err(e) => return Err(io_failure(CanonicalAppendPhase::RecoveryRead, e)),
+                    Ok(_) => return Err(TranscriptCommitError::SessionFloorUnavailable),
                 }
             }
             transcript_floor_lock(root, true)
@@ -1375,10 +1403,7 @@ fn with_writable_v1<T>(
         result => result,
     }
     .map_err(TranscriptCommitError::Coordination)?;
-    match store
-        .load_selected_manifest()
-        .map_err(|_| TranscriptCommitError::SessionFloorUnavailable)?
-    {
+    match store.load_selected_manifest().map_err(floor_read_error)? {
         ManifestLoadOutcome::Absent => operation(),
         ManifestLoadOutcome::Present(manifest) => {
             checked_session_open(&manifest, SessionSemanticsVersion::V1, || Ok::<_, ()>(()))
@@ -1564,6 +1589,9 @@ impl PreparedProjectionStorage {
                 continue;
             }
             let mut candidate = attempted.clone();
+            // When the stored-model rule strips a namespace, retries that
+            // differ only in that namespace compare equal. The frame still
+            // commits to the original stored bytes.
             candidate.provenance.normalize_stored_model();
             if candidate.apply_latency_ms.is_none() {
                 candidate.apply_latency_ms = stored.apply_latency_ms;
