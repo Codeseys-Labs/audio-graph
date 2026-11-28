@@ -10,6 +10,7 @@ use super::{
 };
 use crate::credentials::domain::CredentialStoreFailure;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 #[cfg(target_os = "windows")]
 use super::super::super::windows_credential_manager_ffi::NativeWinCredStore;
@@ -60,11 +61,10 @@ impl KeyringBoundary for WindowsCredentialManagerBoundary {
         &self,
         prompt: &ForbidPrompt<'_>,
         locator: &EntryLocator,
-    ) -> Result<Vec<u8>, CredentialStoreFailure> {
+    ) -> Result<Zeroizing<Vec<u8>>, CredentialStoreFailure> {
         ensure_forbid_prompt(prompt)?;
         let target = prepare_target(locator.windows_target()).map_err(Self::map_prepare_failure)?;
-        let mut secret = self.raw.read(target).map_err(Self::map_read_failure)?;
-        Ok(std::mem::take(&mut *secret))
+        self.raw.read(target).map_err(Self::map_read_failure)
     }
 
     fn set_secret(
@@ -807,8 +807,8 @@ mod tests {
         let policy = masked_production_code(include_str!("windows_credential_manager.rs"), "tests")
             .expect("one root policy test module");
         let method_mutant = policy.replacen(
-            "let mut secret = self.raw.read(target).map_err(Self::map_read_failure)?;",
-            "let _ = self.raw.as_ref().read(target);\nlet mut secret = self.raw.read(target).map_err(Self::map_read_failure)?;",
+            "self.raw.read(target).map_err(Self::map_read_failure)",
+            "let _ = self.raw.as_ref().read(target);\nself.raw.read(target).map_err(Self::map_read_failure)",
             1,
         );
         assert_ne!(method_mutant, policy);

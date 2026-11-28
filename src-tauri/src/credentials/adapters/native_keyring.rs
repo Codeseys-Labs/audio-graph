@@ -607,7 +607,7 @@ mod tests {
             &self,
             prompt: &ForbidPrompt<'_>,
             locator: &EntryLocator,
-        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+        ) -> Result<zeroize::Zeroizing<Vec<u8>>, CredentialStoreFailure> {
             self.trace_policy(prompt, "get", locator);
             self.reads.fetch_add(1, Ordering::SeqCst);
             if locator.account() == "v2/_authority" {
@@ -636,7 +636,7 @@ mod tests {
             {
                 value.push(0xff);
             }
-            Ok(value)
+            Ok(zeroize::Zeroizing::new(value))
         }
 
         fn set_secret(
@@ -696,7 +696,7 @@ mod tests {
             &self,
             _prompt: &ForbidPrompt<'_>,
             locator: &EntryLocator,
-        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+        ) -> Result<zeroize::Zeroizing<Vec<u8>>, CredentialStoreFailure> {
             if locator.account() == "v2/_authority" {
                 Err(CredentialStoreFailure::CorruptRecord)
             } else {

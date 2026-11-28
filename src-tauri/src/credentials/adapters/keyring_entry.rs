@@ -5,7 +5,7 @@ use crate::crash_handler::{RedactedPanicOp, catch_redacted_panic};
 use crate::credentials::domain::CredentialStoreFailure;
 use audio_graph_ipc_contract::credential_contract::{CredentialOperationId, CredentialSetId};
 use std::sync::Arc;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 const CREDENTIAL_SERVICE: &str = "com.codeseys.audiograph.credentials";
 const WINDOWS_TARGET_PREFIX: &str = "Codeseys.AudioGraph.Credentials/";
@@ -59,7 +59,7 @@ pub(super) trait KeyringBoundary: Send + Sync {
         &self,
         prompt: &ForbidPrompt<'_>,
         locator: &EntryLocator,
-    ) -> Result<Vec<u8>, CredentialStoreFailure>;
+    ) -> Result<Zeroizing<Vec<u8>>, CredentialStoreFailure>;
     fn set_secret(
         &self,
         prompt: &ForbidPrompt<'_>,
@@ -101,7 +101,7 @@ impl KeyringEntryAdapter {
         });
         match result {
             Err(_) => Err(invocation.latch_uncertainty()),
-            Ok(Ok(secret)) => Ok(Some(Zeroizing::new(secret))),
+            Ok(Ok(secret)) => Ok(Some(secret)),
             Ok(Err(CredentialStoreFailure::Missing)) => Ok(None),
             Ok(Err(CredentialStoreFailure::StalledWorker)) => Err(invocation.latch_uncertainty()),
             Ok(Err(CredentialStoreFailure::CommitUnknown)) => {
@@ -188,10 +188,7 @@ impl KeyringEntryAdapter {
                 Err(invocation.latch_uncertainty())
             }
             Ok(Err(CredentialStoreFailure::Missing)) => Ok(()),
-            Ok(Ok(mut secret)) => {
-                secret.zeroize();
-                Err(invocation.latch_commit_unknown())
-            }
+            Ok(Ok(_still_present)) => Err(invocation.latch_commit_unknown()),
             Ok(Err(_)) => Err(invocation.latch_commit_unknown()),
         }
     }
@@ -209,6 +206,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use zeroize::Zeroizing;
 
     #[derive(Default)]
     struct MemoryKeyringBoundary {
@@ -220,12 +218,13 @@ mod tests {
             &self,
             _prompt: &ForbidPrompt<'_>,
             locator: &EntryLocator,
-        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+        ) -> Result<Zeroizing<Vec<u8>>, CredentialStoreFailure> {
             self.entries
                 .lock()
                 .expect("memory keyring lock")
                 .get(&(locator.service().to_owned(), locator.account().to_owned()))
                 .cloned()
+                .map(Zeroizing::new)
                 .ok_or(CredentialStoreFailure::Missing)
         }
 
@@ -267,7 +266,7 @@ mod tests {
             &self,
             _prompt: &ForbidPrompt<'_>,
             _locator: &EntryLocator,
-        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+        ) -> Result<Zeroizing<Vec<u8>>, CredentialStoreFailure> {
             let failure = self
                 .0
                 .lock()
@@ -307,9 +306,9 @@ mod tests {
             &self,
             _prompt: &ForbidPrompt<'_>,
             _locator: &EntryLocator,
-        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+        ) -> Result<Zeroizing<Vec<u8>>, CredentialStoreFailure> {
             self.reads.fetch_add(1, Ordering::SeqCst);
-            Ok(b"still-present-after-delete".to_vec())
+            Ok(Zeroizing::new(b"still-present-after-delete".to_vec()))
         }
 
         fn set_secret(
@@ -346,7 +345,7 @@ mod tests {
             &self,
             _prompt: &ForbidPrompt<'_>,
             _locator: &EntryLocator,
-        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+        ) -> Result<Zeroizing<Vec<u8>>, CredentialStoreFailure> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             Err(CredentialStoreFailure::CorruptRecord)
         }
@@ -384,7 +383,7 @@ mod tests {
             &self,
             _prompt: &ForbidPrompt<'_>,
             _locator: &EntryLocator,
-        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+        ) -> Result<Zeroizing<Vec<u8>>, CredentialStoreFailure> {
             unreachable!("write-only failure boundary")
         }
 
@@ -437,7 +436,7 @@ mod tests {
             &self,
             _prompt: &ForbidPrompt<'_>,
             _locator: &EntryLocator,
-        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+        ) -> Result<Zeroizing<Vec<u8>>, CredentialStoreFailure> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             match self.phase {
                 PanicPhase::Read | PanicPhase::ReadAfterMutation => {
@@ -494,7 +493,7 @@ mod tests {
             &self,
             _prompt: &ForbidPrompt<'_>,
             _locator: &EntryLocator,
-        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+        ) -> Result<Zeroizing<Vec<u8>>, CredentialStoreFailure> {
             (self.panic)()
         }
 

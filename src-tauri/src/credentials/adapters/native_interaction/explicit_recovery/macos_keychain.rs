@@ -314,14 +314,14 @@ impl<Api: MacKeychainApi> KeyringBoundary for MacOsKeychainBoundary<Api> {
         &self,
         prompt: &ForbidPrompt<'_>,
         locator: &EntryLocator,
-    ) -> Result<Vec<u8>, CredentialStoreFailure> {
+    ) -> Result<Zeroizing<Vec<u8>>, CredentialStoreFailure> {
         ensure_forbid_prompt(prompt)?;
         match with_interaction_suppressed(&self.api, prompt, |api| {
             let keychain = api.default_user_keychain().map_err(map_open_status)?;
             api.read_secret(&keychain, locator.service(), locator.account())
                 .map_err(map_read_status)
         }) {
-            Ok(secret) => Ok(secret.as_slice().to_vec()),
+            Ok(secret) => Ok(secret),
             Err(GuardFailure::Control) => Err(CredentialStoreFailure::Internal),
             Err(GuardFailure::Operation(failure)) => Err(failure),
             Err(GuardFailure::Restore { disposition }) => {
@@ -797,7 +797,7 @@ mod tests {
             .get_secret(lease.forbid_prompt(), &EntryLocator::authority())
             .expect("guarded read");
 
-        assert_eq!(secret, b"opaque-record");
+        assert_eq!(secret.as_slice(), b"opaque-record");
         assert_eq!(
             trace.snapshot(),
             vec![
@@ -861,7 +861,7 @@ mod tests {
             assert_eq!(
                 success_boundary
                     .get_secret(success_lease.forbid_prompt(), &EntryLocator::authority(),),
-                Ok(b"exact-record".to_vec())
+                Ok(Zeroizing::new(b"exact-record".to_vec()))
             );
             assert_eq!(
                 success_trace.snapshot(),
