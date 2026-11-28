@@ -57,18 +57,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   app): its roots are held for the store's lifetime and must pass the
   filesystem evidence gate before the lock file or any native call exists,
   which refuses every root until evidence profiles ship (#210). A lock is
-  refused once a held root is no longer at its path. Windows replaces the
-  journal with POSIX rename semantics and flushes the file and directory
-  afterwards. A program holding the journal open without sharing delete no
-  longer stalls the whole process: a refusal before any native record
-  changed is a retryable `operation_in_progress` and leaves the runtime
-  ready, and one at the final journal commit leaves that operation for
-  recovery. The roots' directory entries are synced into their parent on
-  every open, once verified to be the held roots. Hardening refuses a file
-  with a second name. One explicit repair takes ownership of a refused
-  journal root (Windows) only while its path still reaches the refused
-  object, and removes staging records and guards the journal does not
-  track. A reopen never adopts another authority or an older journal.
+  refused once a held root is no longer at its path, and every lock also
+  locks the held journal root itself, so two writers of one journal contend
+  even after the lock directory moves. Windows replaces the journal with
+  POSIX rename semantics and flushes the file and directory afterwards. A
+  program holding the journal open without sharing delete or read no longer
+  stalls the whole process: a refusal before any native record changed is a
+  retryable `operation_in_progress` and leaves the runtime ready, and one at
+  the final journal commit leaves that operation for recovery. On every open
+  the roots' directory entries are synced into the parent reached through
+  the held root; a parent that cannot be opened fails the open. Hardening
+  refuses a file with a second name and changes no existing child. One
+  explicit repair takes ownership of a refused journal root (Windows) only
+  after every object it would change passes those checks through its handle,
+  and removes staging records and guards the journal does not track, except
+  the staging of an activation the service saw pending. A reopen never
+  adopts another authority or an older journal.
 
 ### Fixed
 
