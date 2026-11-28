@@ -4106,6 +4106,8 @@ describe("AudioGraphStore", () => {
       },
       updated_at_ms: 75,
     });
+    // Chat needs hydrated settings; never rely on an earlier test's.
+    useAudioGraphStore.setState({ settings: selectableSettings() });
     vi.mocked(invoke)
       .mockResolvedValueOnce(true)
       .mockResolvedValueOnce(dismissedCard)
@@ -6053,7 +6055,13 @@ describe("startCaptureAndTranscribe — SHELL-R3 merged Start (ADR-0046)", () =>
 describe("AudioGraphStore ⇄ safeInvoke analytics chokepoint (3e71)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    useAudioGraphStore.setState({ models: [], error: null });
+    // sendChatMessage needs hydrated settings; never rely on an earlier
+    // describe's.
+    useAudioGraphStore.setState({
+      models: [],
+      error: null,
+      settings: selectableSettings(),
+    });
   });
 
   it("a failed store action sets error state AND captures one command-name diagnostic (never args)", async () => {
