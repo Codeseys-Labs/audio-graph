@@ -26624,14 +26624,18 @@ mod tests {
         (channel, rx)
     }
 
-    async fn terminal_chat_frame(frames: &mut ChatFrames) -> serde_json::Value {
+    /// Every frame the stream sent, up to and including its terminal frame.
+    async fn chat_frames_through_terminal(frames: &mut ChatFrames) -> Vec<serde_json::Value> {
+        let mut seen = Vec::new();
         loop {
             let frame = tokio::time::timeout(Duration::from_secs(20), frames.recv())
                 .await
                 .expect("terminal frame in time")
                 .expect("channel open");
-            if frame["event"] != "delta" {
-                return frame;
+            let terminal = frame["event"] != "delta";
+            seen.push(frame);
+            if terminal {
+                return seen;
             }
         }
     }
@@ -26662,7 +26666,7 @@ mod tests {
             .build()
             .expect("build a current-thread runtime");
         let capture = crate::test_log_capture::ThreadLogCapture::start();
-        let (error, frame) = rt.block_on(async {
+        let (error, seen) = rt.block_on(async {
             point_state_at_mock_llm_provider(
                 &state,
                 spawn_raw_http_mock(http_500_response()).await,
@@ -26678,9 +26682,11 @@ mod tests {
             start_streaming_chat(message.clone(), channel, app.clone(), manager.state())
                 .await
                 .expect("the stream starts");
-            (error, terminal_chat_frame(&mut frames).await)
+            (error, chat_frames_through_terminal(&mut frames).await)
         });
         let logs = crate::test_log_capture::render(&capture.finish());
+        let frame = seen.last().expect("a terminal frame").clone();
+        let every_frame = serde_json::Value::from(seen).to_string();
 
         let error = serde_json::to_value(&error).expect("serialize the IPC error");
         assert_eq!(error["code"], "runtime_diagnostic", "{error}");
@@ -26697,7 +26703,7 @@ mod tests {
         );
         assert_eq!(chat_history_json(&state), prior);
         let history = chat_history_json(&state).to_string();
-        for surface in [error.to_string(), frame.to_string(), history, logs.clone()] {
+        for surface in [error.to_string(), every_frame, history, logs.clone()] {
             assert!(!surface.contains(CHAT_TRANSCRIPT_SENTINEL), "{surface}");
             assert!(!surface.contains(CHAT_PROVIDER_CANARY), "{surface}");
         }
@@ -26734,7 +26740,7 @@ mod tests {
         let prior = seed_chat_session(&state);
 
         let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
-        let (frame, error) = rt.block_on(async {
+        let (seen, error) = rt.block_on(async {
             point_state_at_mock_llm_provider(
                 &state,
                 spawn_raw_http_mock(truncated_sse_response()).await,
@@ -26748,7 +26754,7 @@ mod tests {
             )
             .await
             .expect("the stream starts");
-            let frame = terminal_chat_frame(&mut frames).await;
+            let seen = chat_frames_through_terminal(&mut frames).await;
             point_state_at_mock_llm_provider(
                 &state,
                 spawn_raw_http_mock(truncated_sse_response()).await,
@@ -26757,11 +26763,15 @@ mod tests {
                 send_chat_message("second question".to_string(), app.clone(), manager.state())
                     .await
                     .expect_err("a failed chat is an error, not a reply");
-            (frame, error)
+            (seen, error)
         });
 
         // The streaming terminal carries the partial text for display, as a
-        // failed turn.
+        // failed turn, and no frame carries the transcript.
+        let frame = seen.last().expect("a terminal frame");
+        assert!(seen.iter().any(|frame| frame["event"] == "delta"));
+        let every_frame = serde_json::Value::from(seen.clone()).to_string();
+        assert!(!every_frame.contains(CHAT_TRANSCRIPT_SENTINEL), "{every_frame}");
         assert_eq!(frame["event"], "failed", "{frame}");
         assert_eq!(frame["data"]["full_text"], PARTIAL_REPLY, "{frame}");
         assert_eq!(
@@ -26880,7 +26890,10 @@ mod tests {
                     ));
                 }
             }
-            terminal_chat_frame(&mut frames).await
+            chat_frames_through_terminal(&mut frames)
+                .await
+                .pop()
+                .expect("a terminal frame")
         });
         let history = chat_history_json(&state);
         let next = prepare_chat_request(&state, "next question".to_string())
