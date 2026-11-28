@@ -12,8 +12,8 @@
  *   - Knowledge graph (`GraphSnapshot`, `GraphNode`, `GraphLink`,
  *     `GraphDelta`, `GraphStats`).
  *   - Pipeline status + events (`PipelineStatus`, `StageStatus`,
- *     `CaptureErrorPayload`, `CaptureBackpressurePayload`,
- *     `CaptureStorageFullPayload`, `AwsErrorPayload`).
+ *     `CaptureErrorPayload`, `CaptureStorageFullPayload`,
+ *     `AwsErrorPayload`).
  *   - Settings (`AppSettings` and the provider sub-types).
  *   - Gemini Live events (`GeminiTranscriptionEvent`,
  *     `GeminiResponseEvent`, `GeminiStatusEvent`,
@@ -674,12 +674,32 @@ interface PipelineStages {
   graph: StageStatus;
 }
 
+/**
+ * The one backend snapshot of everything the window shows about capture,
+ * transcription, the realtime modes and the session (#141). It is the
+ * payload of `pipeline-status`, of `get_pipeline_status`, and the `snapshot`
+ * of every capture-control reply and refusal. The renderer applies a
+ * snapshot only when its `revision` is above the last one it applied, and
+ * derives every capture flag from the applied one alone. The stage fields
+ * are display only.
+ */
 export interface PipelineStatus extends PipelineStages {
+  /** Strictly increasing within one backend process; every change bumps it. */
+  revision: number;
+  /** The capture the backend holds, or last held. */
+  capture_state: { id: CaptureId; phase: CapturePhase };
+  /** Every start id at or below this can no longer begin. */
+  retired_through: CaptureId;
   /**
-   * The capture the `capture` stage describes, written with it: together
-   * they are one capture fact (Running or Degraded is running, else ended).
+   * The running transcription: the capture it belongs to and its generation
+   * (one per transcription start). Independent of the asr stage's health.
    */
-  capture_id: CaptureId;
+  transcription: TranscriptionSnapshot | null;
+  realtime: RealtimeModes;
+  /** `epoch` increments on every successful session rotation. */
+  session: { id: string; epoch: number };
+  /** Backpressured capture sources, by capture and request position. */
+  backpressure: SourceBackpressure[];
   transcript_not_saving?:
     | "writer_absent"
     | "storage_full"
@@ -687,6 +707,31 @@ export interface PipelineStatus extends PipelineStages {
     | "confirmation_delayed";
   transcript_crash_safety_unverified?: boolean;
   transcript_captions_lost?: boolean;
+}
+
+/** A running transcription, addressed by its capture and generation. */
+export interface TranscriptionSnapshot {
+  capture: CaptureId;
+  generation: number;
+}
+
+/** Which realtime modes the backend runs. */
+export interface RealtimeModes {
+  gemini: boolean;
+  converse: boolean;
+  openai_realtime: boolean;
+}
+
+/** The command that starts each realtime mode. */
+export type RealtimeStartCommand =
+  | "start_gemini"
+  | "start_converse"
+  | "start_openai_realtime";
+
+/** One backpressured source: its capture and its position in that start. */
+export interface SourceBackpressure {
+  capture: CaptureId;
+  source_index: number;
 }
 
 /**
@@ -767,13 +812,6 @@ export interface CaptureErrorPayload {
   source_kind: CaptureSourceKind;
   error: string;
   recoverable: boolean;
-}
-
-export interface CaptureBackpressurePayload {
-  /** The capture and the source's position in its start. */
-  capture_id: CaptureId;
-  source_index: number;
-  is_backpressured: boolean;
 }
 
 export interface PersistenceQueueBackpressurePayload {
@@ -2979,18 +3017,26 @@ export type AppErrorPayload =
         reason: CaptureFailureReason;
         source_index: number | null;
         sources: CaptureSourceOutcome[];
-        /** This start's fact: always `ended`. */
-        capture: CaptureFact;
-        /** The backend's current capture fact. */
-        snapshot: CaptureFact;
+        /** The backend's state after refusing the start. */
+        snapshot: PipelineStatus;
       };
     }
   | {
       code: "capture_stop_failed";
-      /** Whether the capture still runs is the snapshot's phase. */
-      message: { snapshot: CaptureFact };
+      /** Cleanup did not finish; whether capture still runs is the snapshot's. */
+      message: { snapshot: PipelineStatus };
+    }
+  | {
+      code: "transcription_refused";
+      message: {
+        reason: TranscriptionRefusalReason;
+        snapshot: PipelineStatus;
+      };
     }
   | { code: "unknown"; message: string };
+
+/** Closed reason `start_transcribe` refused a capture. */
+export type TranscriptionRefusalReason = "capture_not_running" | "capture_lost";
 
 /** Closed reason a capture start failed (`audio::capture::CaptureFailureReason`). */
 export const CAPTURE_FAILURE_REASONS = [
@@ -3026,29 +3072,23 @@ export interface CaptureId {
   seq: number;
 }
 
-/** Where a capture is. `running` precedes `ended`. */
-export type CapturePhase = "running" | "ended";
-
 /**
- * One backend fact about a capture. Facts are ordered by id, then phase, so
- * the newest capture's latest phase is the maximum whatever order they
- * arrive in.
+ * Where the backend's capture is: `pending` from registration until its
+ * sources commit, `running` while it owns them, `stopping` while it (or the
+ * pending start) is torn down, `idle` when nothing is registered or owned.
  */
-export interface CaptureFact {
-  id: CaptureId;
-  phase: CapturePhase;
+export type CapturePhase = "pending" | "running" | "stopping" | "idle";
+
+/** A capture command's reply: its outcome and the snapshot after its effect. */
+export interface CaptureCommandReply {
+  outcome: string;
+  snapshot: PipelineStatus;
 }
 
-/** A capture command's reply: its fact, and the backend's current fact. */
-export interface CaptureReply {
-  fact: CaptureFact;
-  snapshot: CaptureFact;
-}
-
-/** `capture_attach`'s reply: this renderer's epoch and the current fact. */
+/** `capture_attach`'s reply: this renderer's epoch and the current snapshot. */
 export interface CaptureAttachment {
   epoch: number;
-  snapshot: CaptureFact;
+  snapshot: PipelineStatus;
 }
 
 /**
@@ -3519,8 +3559,24 @@ export interface AudioGraphStore {
   getSessionId: () => Promise<string>;
 
   // Pipeline status
+  /**
+   * The applied backend snapshot (#141): the one source of every capture,
+   * transcription, backpressure, realtime and stage flag below. Its
+   * `revision` is the last one applied; `-1` until the first arrives.
+   */
   pipelineStatus: PipelineStatus;
+  /**
+   * The one way a snapshot enters the store, from an event, a status read,
+   * or a command's reply or refusal: applied iff its `revision` is above the
+   * last applied one, otherwise dropped whole.
+   */
   setPipelineStatus: (status: PipelineStatus) => void;
+  /**
+   * Read `get_pipeline_status` into the store. Run after every capture
+   * command's reply, on focus and visibility changes, and every few seconds
+   * while capture is not idle or its state is unknown.
+   */
+  reconcileCapture: () => Promise<void>;
   pipelineLatencies: Partial<
     Record<PipelineLatencyEvent["stage"], PipelineLatencyEvent>
   >;
@@ -3542,30 +3598,41 @@ export interface AudioGraphStore {
   addOrUpdateSpeaker: (speaker: SpeakerInfo) => void;
   clearSpeakers: () => void;
 
-  // Capture state
+  // Capture state, derived from `pipelineStatus` alone
+  /** The applied snapshot's capture phase. */
+  captureStatus: CapturePhase;
+  /** `captureStatus` is `running`. */
   isCapturing: boolean;
-  /**
-   * True from Start until a backend fact for that start arrives. Session
-   * loaders and the Sessions browser refuse to load a historical session
-   * meanwhile, so capture never opens over old data.
-   */
-  captureStarting: boolean;
-  /** True from Stop until an Ended fact at or above that Stop arrives. */
-  captureStopping: boolean;
-  /**
-   * The newest backend capture fact this renderer has seen. `isCapturing`,
-   * `captureStarting`, `captureStopping` and `isTranscribing` derive from
-   * it, the two intents below and `captureTranscribing`; nothing else sets
-   * them.
-   */
-  captureFact: CaptureFact | null;
-  /** The id of this renderer's latest Start. */
-  captureStartIntent: CaptureId | null;
-  /** The id of this renderer's latest Stop. */
-  captureStopIntent: CaptureId | null;
-  /** The capture the backend said it transcribes, if any. */
-  captureTranscribing: CaptureId | null;
+  /** When this renderer first saw the shown capture running (display clock). */
   captureStartTime: number | null;
+  /**
+   * Keys `${epoch}.${seq}/${source_index}` of the shown capture's
+   * backpressured sources. Non-empty means at least one source's ring buffer
+   * is dropping chunks.
+   */
+  backpressuredSources: string[];
+  /**
+   * The renderer cannot vouch for the shown state: `unknownStart` or
+   * `unknownStop` is set. Stop stays available and the state reconciles.
+   */
+  captureUnknown: boolean;
+  /**
+   * A Start whose reply was lost or unreadable. Cleared once a snapshot
+   * shows that id pending, running or stopping, or shows it can no longer
+   * run (`retired_through` at or above it).
+   */
+  unknownStart: CaptureId | null;
+  /** A Stop whose reply was lost or unreadable; the next status read clears it. */
+  unknownStop: boolean;
+  /** Spinner: the id of the Start in flight, settled by its own outcome. */
+  startPending: CaptureId | null;
+  /** Spinner: the latest Stop in flight, settled by its own outcome. */
+  stopPending: number | null;
+  /**
+   * The token of a stop-everything whose outcome is unknown, reused when
+   * that Stop is pressed again.
+   */
+  stopOperation: string | null;
   /**
    * This realm's attachment to capture control. Start is unavailable until
    * it is `ready`; a `failed` one is retried by the next Start.
@@ -3581,6 +3648,10 @@ export interface AudioGraphStore {
   attachCapture: () => void;
   /** Start a capture; resolves to its id, or null if none was sent. */
   startCapture: () => Promise<CaptureId | null>;
+  /**
+   * Stop the newest capture this renderer knows of, or, knowing none, every
+   * capture (`stop_capture` with no id and an operation token).
+   */
   stopCapture: () => Promise<void>;
   /**
    * ONE START (SHELL-R3, ADR-0046): composes `startCapture` then
@@ -3592,22 +3663,15 @@ export interface AudioGraphStore {
    */
   startCaptureAndTranscribe: () => Promise<void>;
 
-  /// IDs of sources currently reporting backpressure. Updated by the
-  /// `capture-backpressure` event listener. Non-empty means at least one
-  /// active source's ring buffer is dropping chunks — surface a warning in
-  /// the UI so the user can slow the pipeline (e.g. disable Gemini) before
-  /// transcript quality degrades.
-  backpressuredSources: string[];
-  setSourceBackpressure: (sourceId: string, isBackpressured: boolean) => void;
-
   // Transcribe state (manual transcription)
-  /** The backend transcribes the capture the renderer shows running. */
+  /** The applied snapshot names a running transcription. */
   isTranscribing: boolean;
   /**
-   * Start transcription for capture `captureId`. Skipped unless that
-   * capture is the one running; the backend refuses it too otherwise.
+   * Start transcription for capture `captureId`. Skipped unless the applied
+   * snapshot shows that capture running; the backend refuses it otherwise.
    */
   startTranscribe: (captureId: CaptureId) => Promise<void>;
+  /** Stop the applied snapshot's transcription, by capture and generation. */
   stopTranscribe: () => Promise<void>;
 
   // Error state
@@ -3726,15 +3790,14 @@ export interface AudioGraphStore {
   clearApiEndpoint: () => void;
 
   // ── Gemini Live dual pipeline ───────────────────────────────────────────
+  /** The applied snapshot runs a realtime mode (Gemini, converse or OpenAI). */
   isGeminiActive: boolean;
   geminiTranscripts: GeminiTranscriptEntry[];
-  // Which backend command the active Gemini/converse session was started with,
-  // so `stopGemini` calls the matching stop command. `null` when idle.
-  activeGeminiCommand:
-    | "start_gemini"
-    | "start_converse"
-    | "start_openai_realtime"
-    | null;
+  /**
+   * The start command of the one realtime mode the applied snapshot runs, so
+   * `stopGemini` calls the matching stop; `null` when none or several run.
+   */
+  activeGeminiCommand: RealtimeStartCommand | null;
   addGeminiTranscript: (entry: GeminiTranscriptEntry) => void;
   clearGeminiTranscripts: () => void;
   startGemini: () => Promise<void>;

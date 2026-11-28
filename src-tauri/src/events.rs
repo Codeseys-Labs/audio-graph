@@ -109,12 +109,6 @@ pub const CAPTURE_STORAGE_FULL: &str = "capture-storage-full";
 /// omits session ids, file paths, transcript text, and provider payloads.
 pub const PERSISTENCE_QUEUE_BACKPRESSURE: &str = "persistence-queue-backpressure";
 
-/// Event emitted when the backpressure state of a capture source changes —
-/// i.e. the rsac ring buffer has started or stopped dropping buffers because
-/// the consumer (this app's pipeline) isn't keeping up. Edge-triggered: fires
-/// only on transitions (false→true or true→false), not continuously.
-pub const CAPTURE_BACKPRESSURE: &str = "capture-backpressure";
-
 /// Event emitted by the processed-audio dispatcher with per-consumer queue
 /// health and drop counters.
 /// Payload: [`crate::audio::consumer::ProcessedAudioConsumerHealthPayload`].
@@ -304,50 +298,84 @@ pub struct CaptureId {
     pub seq: u64,
 }
 
-/// Where one capture is. `Running < Ended`: a capture only moves forward.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
+/// Where the capture the backend holds is (#141). `Pending`: a start is
+/// registered and preparing; `Running`: committed and owning sources;
+/// `Stopping`: being torn down; `Idle`: nothing registered or owned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapturePhase {
+    Pending,
     Running,
-    Ended,
+    Stopping,
+    #[default]
+    Idle,
 }
 
-/// One fact about the capture identified by `id`. Facts are ordered by id,
-/// then phase, so the newest capture's latest phase is the maximum, whatever
-/// order the facts arrive in.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-pub struct CaptureFact {
+/// The capture the backend holds, or last held when idle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CaptureState {
     pub id: CaptureId,
     pub phase: CapturePhase,
 }
 
-impl CaptureFact {
-    pub fn running(id: CaptureId) -> Self {
-        Self {
-            id,
-            phase: CapturePhase::Running,
-        }
-    }
+/// A running transcription: the capture it belongs to, and its generation
+/// (one per transcription start), so a stop names exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Transcription {
+    pub capture: CaptureId,
+    pub generation: u64,
+}
 
-    pub fn ended(id: CaptureId) -> Self {
+/// Which realtime modes run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RealtimeModes {
+    pub gemini: bool,
+    pub converse: bool,
+    pub openai_realtime: bool,
+}
+
+/// The live session: its id, and its epoch, which every successful rotation
+/// increments.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionState {
+    pub id: String,
+    pub epoch: u64,
+}
+
+/// A backpressured capture source, named by its capture and its position in
+/// that capture's start, never by its selection string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackpressuredSource {
+    pub capture: CaptureId,
+    pub source_index: usize,
+}
+
+/// The display stages other than capture's.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Stages {
+    pub pipeline: StageStatus,
+    pub asr: StageStatus,
+    pub diarization: StageStatus,
+    pub entity_extraction: StageStatus,
+    pub graph: StageStatus,
+}
+
+impl Stages {
+    /// Every stage set to `stage`.
+    pub fn all(stage: StageStatus) -> Self {
         Self {
-            id,
-            phase: CapturePhase::Ended,
+            pipeline: stage.clone(),
+            asr: stage.clone(),
+            diarization: stage.clone(),
+            entity_extraction: stage.clone(),
+            graph: stage,
         }
     }
 }
 
-/// Overall pipeline status, combining all stages.
-///
-/// The capture stage is private and written only with its capture id
-/// ([`Self::set_capture`]), under the same lock, so every snapshot any thread
-/// clones and emits carries one consistent capture fact.
+/// Whether the live transcript is being saved.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct PipelineStatus {
+pub struct TranscriptSaving {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_not_saving: Option<TranscriptSavingFailure>,
     /// At least one caption was refused in this session. Rotation resets the flag.
@@ -360,36 +388,167 @@ pub struct PipelineStatus {
     /// File sync succeeded on storage without a qualified crash-durability tier.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transcript_crash_safety_unverified: bool,
-    /// The capture `capture` describes.
-    capture_id: CaptureId,
+}
+
+/// The one snapshot of everything the window displays (#141 decision of
+/// 2026-11-28). The live instance lives behind
+/// [`crate::status::StatusAuthority`], the only way to change it: every
+/// change there bumps `revision`, so the renderer applies a snapshot iff its
+/// revision is higher than the last one it applied, and no emission order
+/// can show a state older than one already shown.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PipelineStatus {
+    revision: u64,
+    capture_state: CaptureState,
+    /// Every start id at or below this can no longer begin.
+    retired_through: CaptureId,
+    transcription: Option<Transcription>,
+    /// The last transcription generation issued.
+    #[serde(skip)]
+    transcription_generation: u64,
+    realtime: RealtimeModes,
+    session: SessionState,
+    backpressure: Vec<BackpressuredSource>,
+    #[serde(flatten)]
+    transcript_saving: TranscriptSaving,
+    /// The capture stage's display; written with `capture_state`.
     capture: StageStatus,
-    pub pipeline: StageStatus,
-    pub asr: StageStatus,
-    pub diarization: StageStatus,
-    pub entity_extraction: StageStatus,
-    pub graph: StageStatus,
+    #[serde(flatten)]
+    stages: Stages,
 }
 
 impl PipelineStatus {
+    /// The status of a fresh process for session `session_id`.
+    pub fn new(session_id: String) -> Self {
+        Self {
+            session: SessionState {
+                id: session_id,
+                epoch: 0,
+            },
+            ..Self::default()
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn capture_state(&self) -> CaptureState {
+        self.capture_state
+    }
+
+    pub fn retired_through(&self) -> CaptureId {
+        self.retired_through
+    }
+
+    pub fn transcription(&self) -> Option<Transcription> {
+        self.transcription
+    }
+
+    pub fn realtime(&self) -> RealtimeModes {
+        self.realtime
+    }
+
+    pub fn session(&self) -> &SessionState {
+        &self.session
+    }
+
+    pub fn backpressure(&self) -> &[BackpressuredSource] {
+        &self.backpressure
+    }
+
+    pub fn transcript_saving(&self) -> &TranscriptSaving {
+        &self.transcript_saving
+    }
+
     pub fn capture(&self) -> &StageStatus {
         &self.capture
     }
 
-    /// The capture fact this snapshot states: Running while its capture stage
-    /// runs, Ended otherwise.
-    pub fn capture_fact(&self) -> CaptureFact {
-        match self.capture {
-            StageStatus::Running { .. } | StageStatus::Degraded { .. } => {
-                CaptureFact::running(self.capture_id)
-            }
-            StageStatus::Idle | StageStatus::Error { .. } => CaptureFact::ended(self.capture_id),
-        }
+    pub fn stages(&self) -> &Stages {
+        &self.stages
     }
 
-    /// Set the capture stage and the capture it describes, together.
-    pub fn set_capture(&mut self, id: CaptureId, stage: StageStatus) {
-        self.capture_id = id;
-        self.capture = stage;
+    pub(crate) fn bump_revision(&mut self) {
+        self.revision += 1;
+    }
+
+    /// Set what the capture manager holds, and the capture stage with it.
+    pub(crate) fn set_capture(&mut self, state: CaptureState, retired_through: CaptureId) {
+        self.capture_state = state;
+        self.retired_through = self.retired_through.max(retired_through);
+        self.capture = match state.phase {
+            CapturePhase::Running => StageStatus::Running { processed_count: 0 },
+            CapturePhase::Pending | CapturePhase::Stopping | CapturePhase::Idle => {
+                StageStatus::Idle
+            }
+        };
+    }
+
+    /// Begin a transcription of `capture`: a new generation.
+    pub(crate) fn begin_transcription(&mut self, capture: CaptureId) -> Transcription {
+        self.transcription_generation += 1;
+        let transcription = Transcription {
+            capture,
+            generation: self.transcription_generation,
+        };
+        self.transcription = Some(transcription);
+        transcription
+    }
+
+    pub(crate) fn end_transcription(&mut self) {
+        self.transcription = None;
+    }
+
+    pub(crate) fn realtime_mut(&mut self) -> &mut RealtimeModes {
+        &mut self.realtime
+    }
+
+    /// Enter session `id`: the next epoch, with that session's own stage and
+    /// transcript-saving state.
+    pub(crate) fn begin_session(&mut self, id: String, crash_safety_unverified: bool) {
+        self.session = SessionState {
+            id,
+            epoch: self.session.epoch + 1,
+        };
+        self.transcript_saving = TranscriptSaving {
+            transcript_crash_safety_unverified: crash_safety_unverified,
+            ..TranscriptSaving::default()
+        };
+        self.stages = Stages::default();
+    }
+
+    /// Mark source `source_index` of `capture` backpressured or recovered.
+    /// Returns whether that changed anything.
+    pub(crate) fn set_backpressure(
+        &mut self,
+        capture: CaptureId,
+        source_index: usize,
+        backpressured: bool,
+    ) -> bool {
+        let source = BackpressuredSource {
+            capture,
+            source_index,
+        };
+        let present = self.backpressure.contains(&source);
+        match (backpressured, present) {
+            (true, false) => self.backpressure.push(source),
+            (false, true) => self.backpressure.retain(|other| *other != source),
+            _ => return false,
+        }
+        true
+    }
+
+    pub(crate) fn clear_backpressure(&mut self) {
+        self.backpressure.clear();
+    }
+
+    pub(crate) fn transcript_saving_mut(&mut self) -> &mut TranscriptSaving {
+        &mut self.transcript_saving
+    }
+
+    pub(crate) fn stages_mut(&mut self) -> &mut Stages {
+        &mut self.stages
     }
 }
 
@@ -1053,19 +1212,6 @@ pub struct PersistenceQueueBackpressurePayload {
     pub dropped_count: u64,
 }
 
-/// Payload for capture-backpressure state-change events. The source is named
-/// by its capture and its position in that capture's start, never by its
-/// selection string (#141).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CaptureBackpressurePayload {
-    pub capture_id: CaptureId,
-    pub source_index: usize,
-    /// `true` when the ring buffer has started dropping; `false` when recovery
-    /// is detected. The frontend should surface this as a transient warning
-    /// (e.g. a pill badge) rather than a fatal error.
-    pub is_backpressured: bool,
-}
-
 /// Payload for `AWS_ERROR` events (ag#13).
 ///
 /// `error` carries the structured classification (a [`crate::aws_util::UiAwsError`]
@@ -1147,28 +1293,65 @@ pub fn is_storage_full(err: &std::io::Error) -> bool {
 mod tests {
     use super::*;
 
+    /// The snapshot's wire shape is the renderer's contract (#141): every
+    /// field the window displays, flat stage fields, and the revision.
     #[test]
-    fn capture_facts_order_by_id_then_phase_and_a_status_states_one() {
+    fn a_status_snapshot_states_everything_the_window_displays() {
         let older = CaptureId { epoch: 2, seq: 9 };
         let newer = CaptureId { epoch: 3, seq: 0 };
         assert!(older < newer, "the epoch compares first");
-        assert!(CaptureFact::running(newer) < CaptureFact::ended(newer));
-        assert!(CaptureFact::ended(older) < CaptureFact::running(newer));
 
-        let mut status = PipelineStatus::default();
-        status.set_capture(newer, StageStatus::Running { processed_count: 0 });
-        assert_eq!(status.capture_fact(), CaptureFact::running(newer));
+        let mut status = PipelineStatus::new("session-1".to_string());
+        status.bump_revision();
+        status.set_capture(
+            CaptureState {
+                id: newer,
+                phase: CapturePhase::Running,
+            },
+            newer,
+        );
+        let transcription = status.begin_transcription(newer);
+        assert!(status.set_backpressure(newer, 1, true));
+        assert!(!status.set_backpressure(newer, 1, true), "already set");
+        status.realtime_mut().gemini = true;
         let wire = serde_json::to_value(&status).unwrap();
         assert_eq!(
-            wire["capture_id"],
-            serde_json::json!({"epoch": 3, "seq": 0})
+            wire,
+            serde_json::json!({
+                "revision": 1,
+                "capture_state": {"id": {"epoch": 3, "seq": 0}, "phase": "running"},
+                "retired_through": {"epoch": 3, "seq": 0},
+                "transcription": {"capture": {"epoch": 3, "seq": 0}, "generation": transcription.generation},
+                "realtime": {"gemini": true, "converse": false, "openai_realtime": false},
+                "session": {"id": "session-1", "epoch": 0},
+                "backpressure": [{"capture": {"epoch": 3, "seq": 0}, "source_index": 1}],
+                "capture": {"type": "Running", "processed_count": 0},
+                "pipeline": {"type": "Idle"},
+                "asr": {"type": "Idle"},
+                "diarization": {"type": "Idle"},
+                "entity_extraction": {"type": "Idle"},
+                "graph": {"type": "Idle"},
+            })
         );
-        assert_eq!(wire["capture"]["type"], "Running");
-        status.set_capture(newer, StageStatus::Idle);
-        assert_eq!(status.capture_fact(), CaptureFact::ended(newer));
+
+        // A retired-through watermark never moves back; a rotation keeps the
+        // capture and begins the next session epoch with clean stages.
+        status.set_capture(
+            CaptureState {
+                id: newer,
+                phase: CapturePhase::Idle,
+            },
+            older,
+        );
+        assert_eq!(status.retired_through(), newer);
+        assert!(matches!(status.capture(), StageStatus::Idle));
+        status.begin_session("session-2".to_string(), false);
         assert_eq!(
-            serde_json::to_value(CaptureFact::ended(newer)).unwrap(),
-            serde_json::json!({"id": {"epoch": 3, "seq": 0}, "phase": "ended"})
+            status.session(),
+            &SessionState {
+                id: "session-2".to_string(),
+                epoch: 1,
+            }
         );
     }
 

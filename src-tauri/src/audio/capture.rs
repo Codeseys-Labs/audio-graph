@@ -26,10 +26,7 @@ use rsac::{AutoRecoveryConfig, RecoveryEvent};
 use tauri::AppHandle;
 
 use crate::audio::pipeline::AudioPipelineInput;
-use crate::events::{
-    CAPTURE_BACKPRESSURE, CAPTURE_ERROR, CaptureBackpressurePayload, CaptureErrorPayload,
-    CaptureId, emit_or_log,
-};
+use crate::events::{CAPTURE_ERROR, CaptureErrorPayload, CaptureId, emit_or_log};
 use crate::state::{
     AudioChannelProvenanceKind, AudioDeviceKind, AudioFormatInfo, AudioPermissionKind,
     AudioPermissionRecoveryAction, AudioPermissionRecoveryActionKind, AudioPermissionRecoveryHint,
@@ -433,6 +430,8 @@ struct CaptureThreadContext {
     commit_timeout: Duration,
     pipeline_tx: Sender<AudioPipelineInput>,
     app_handle: AppHandle,
+    /// Where the source's backpressure is published.
+    status: crate::status::StatusAuthority,
     sample_rate: u32,
     channels: u16,
     stream_loss: StreamLoss,
@@ -575,6 +574,7 @@ fn spawn_capture_worker(
     release: &BatchRelease,
     pipeline_tx: Sender<AudioPipelineInput>,
     app_handle: &AppHandle,
+    status: &crate::status::StatusAuthority,
     sample_rate: u32,
     channels: u16,
 ) -> std::io::Result<StartingCapture> {
@@ -619,6 +619,7 @@ fn spawn_capture_worker(
         commit_timeout,
         pipeline_tx,
         app_handle: app_handle.clone(),
+        status: status.clone(),
         sample_rate,
         channels,
         stream_loss: stream_loss.clone(),
@@ -688,6 +689,7 @@ pub(crate) fn prepare_capture_sources(
     requests: Vec<CaptureSourceStart>,
     pipeline_tx: Sender<AudioPipelineInput>,
     app_handle: AppHandle,
+    status: crate::status::StatusAuthority,
     sample_rate: u32,
     channels: u16,
 ) -> Result<PreparedCaptures, CaptureStartRollback> {
@@ -713,6 +715,7 @@ pub(crate) fn prepare_capture_sources(
                 &release,
                 pipeline_tx.clone(),
                 &app_handle,
+                &status,
                 sample_rate,
                 channels,
             ) {
@@ -1842,6 +1845,12 @@ pub struct AudioCaptureManager {
     /// The session whose CaptureStarted row may or may not be on the ledger
     /// because its append failed. The next start resolves it first.
     uncertain_capture_start: Option<String>,
+    /// The aggregate whose sources are gone and whose end is not yet
+    /// published: it reads as stopping until the teardown finishes.
+    ending: Option<CaptureId>,
+    /// What each recent stop-everything operation ended through, so its
+    /// repeated delivery never ends a later capture.
+    stop_operations: std::collections::VecDeque<(String, CaptureId)>,
 }
 
 struct PendingCaptureStart {
@@ -1959,6 +1968,8 @@ impl AudioCaptureManager {
             capture_id: CaptureId::default(),
             shutting_down: false,
             uncertain_capture_start: None,
+            ending: None,
+            stop_operations: std::collections::VecDeque::new(),
         }
     }
 
@@ -2150,13 +2161,70 @@ impl AudioCaptureManager {
             .max(self.cancelled_through)
     }
 
+    /// What stop-everything `operation` ends through: the newest capture id
+    /// known when it first arrived, recorded so a repeated delivery of it
+    /// names the same capture.
+    pub(crate) fn stop_everything_through(&mut self, operation: &str) -> CaptureId {
+        const REMEMBERED_STOP_OPERATIONS: usize = 32;
+        if let Some((_, through)) = self.stop_operations.iter().find(|(op, _)| op == operation) {
+            return *through;
+        }
+        let through = self.newest_capture_id();
+        if self.stop_operations.len() == REMEMBERED_STOP_OPERATIONS {
+            self.stop_operations.pop_front();
+        }
+        self.stop_operations
+            .push_back((operation.to_string(), through));
+        through
+    }
+
+    /// Every start id at or below this can no longer begin.
+    pub(crate) fn retired_through(&self) -> CaptureId {
+        self.last_registered.max(self.cancelled_through)
+    }
+
+    /// What the manager holds, as the snapshot states it: the committed
+    /// aggregate while it owns sources, then the one being torn down, then a
+    /// start that is preparing (stopping once cancelled).
+    pub(crate) fn capture_state(&self) -> crate::events::CaptureState {
+        use crate::events::{CapturePhase, CaptureState};
+        if let Some(id) = self.owned_capture_id() {
+            return CaptureState {
+                id,
+                phase: CapturePhase::Running,
+            };
+        }
+        if let Some(id) = self.ending {
+            return CaptureState {
+                id,
+                phase: CapturePhase::Stopping,
+            };
+        }
+        if let Some(pending) = self.pending_start.as_ref() {
+            let cancelled = self.shutting_down || pending.cancel_tx.is_none();
+            return CaptureState {
+                id: pending.id,
+                phase: if cancelled {
+                    CapturePhase::Stopping
+                } else {
+                    CapturePhase::Pending
+                },
+            };
+        }
+        CaptureState {
+            id: self.newest_capture_id(),
+            phase: CapturePhase::Idle,
+        }
+    }
+
     /// The committed aggregate's id, while it owns sources.
     pub(crate) fn owned_capture_id(&self) -> Option<CaptureId> {
         (!self.sources.is_empty()).then_some(self.capture_id)
     }
 
     /// Stop every source of the committed aggregate if its id is at or below
-    /// `through`. Returns the stopped aggregate's id.
+    /// `through`. Returns the stopped aggregate's id, which reads as stopping
+    /// until [`Self::finish_ending`].
     pub(crate) fn stop_committed_through(&mut self, through: CaptureId) -> Option<CaptureId> {
         let id = self.owned_capture_id().filter(|id| *id <= through)?;
         let source_ids: Vec<String> = self.sources.keys().cloned().collect();
@@ -2165,7 +2233,21 @@ impl AudioCaptureManager {
                 log::error!("Failed to stop a capture source: {error}");
             }
         }
+        self.ending = Some(id);
         Some(id)
+    }
+
+    /// Aggregate `id` lost its last source: it reads as stopping until
+    /// [`Self::finish_ending`].
+    pub(crate) fn begin_ending(&mut self, id: CaptureId) {
+        self.ending = Some(id);
+    }
+
+    /// The teardown of aggregate `id` finished.
+    pub(crate) fn finish_ending(&mut self, id: CaptureId) {
+        if self.ending == Some(id) {
+            self.ending = None;
+        }
     }
 
     /// Take the session whose CaptureStarted row is uncertain, if any.
@@ -2603,6 +2685,7 @@ impl AudioCaptureManager {
             stop_signal,
             pipeline_tx,
             app_handle,
+            status,
             stream_loss,
             ..
         } = context;
@@ -2771,15 +2854,13 @@ impl AudioCaptureManager {
                             } else {
                                 log::info!("[capture {label}] Backpressure cleared");
                             }
-                            emit_or_log(
-                                &app_handle,
-                                CAPTURE_BACKPRESSURE,
-                                CaptureBackpressurePayload {
+                            status.publish_if(|snapshot| {
+                                snapshot.set_backpressure(
                                     capture_id,
                                     source_index,
-                                    is_backpressured: now_backpressured,
-                                },
-                            );
+                                    now_backpressured,
+                                )
+                            });
                             last_backpressured = now_backpressured;
                         }
                     }
@@ -2857,9 +2938,10 @@ impl AudioCaptureManager {
             }
         }
 
-        // 5. Tear down.
+        // 5. Tear down. A source that is gone is no longer backpressured.
         log::info!("[capture {label}] Stopping capture");
         let _ = capture.stop();
+        status.publish_if(|snapshot| snapshot.set_backpressure(capture_id, source_index, false));
         log::info!("[capture {label}] Worker exiting");
         unexpected_exit
     }

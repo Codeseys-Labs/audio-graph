@@ -77,7 +77,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
-import { captureToggle } from "../store/captureFacts";
+import { captureStarting, captureToggle } from "../store/captureFacts";
 import {
   describePlannedRoute,
   hasConfiguredDurableNotesRoute,
@@ -104,10 +104,16 @@ const HEALTH_TONE: Record<"healthy" | "degraded" | "error", string> = {
 function NowStrip() {
   const { t } = useTranslation();
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
-  // A pending Start can be stopped, and a Stop that has not been confirmed
-  // stays "Stopping…" with Stop still enabled (it is idempotent).
-  const captureStarting = useAudioGraphStore((s) => s.captureStarting);
-  const captureStopping = useAudioGraphStore((s) => s.captureStopping);
+  const captureStatus = useAudioGraphStore((s) => s.captureStatus);
+  // Stop is offered while the backend holds, or may hold, a capture: its
+  // state is pending, running, stopping or unknown, or a Start is in flight.
+  // It stays enabled throughout (Stop is idempotent).
+  const captureUnknown = useAudioGraphStore((s) => s.captureUnknown);
+  const startPending = useAudioGraphStore((s) => s.startPending);
+  const stopping = useAudioGraphStore(
+    (s) => s.captureStatus === "stopping" || s.stopPending !== null,
+  );
+  const starting = captureStarting({ startPending, captureStatus });
   // SHELL-R4 (plan §R4, ADR-0046): read alongside `isCapturing` so the
   // relocated `.workspace-switcher__state` region below can reproduce the
   // exact 4-way ternary the destination bar used to render.
@@ -175,8 +181,9 @@ function NowStrip() {
 
   const captureAttach = useAudioGraphStore((s) => s.captureAttach);
   const toggle = captureToggle({
-    isCapturing,
-    captureStarting,
+    captureStatus,
+    captureUnknown,
+    startPending,
     captureAttach,
     selectedSourceIds,
   });
@@ -255,27 +262,25 @@ function NowStrip() {
           disabled={!showStop && (!canStart || capturePending)}
           aria-label={
             showStop
-              ? captureStopping
+              ? stopping
                 ? t("controlBar.stopping")
                 : t("controlBar.stop")
               : t("controlBar.start")
           }
           aria-pressed={showStop}
-          aria-busy={capturePending || captureStarting || captureStopping}
+          aria-busy={capturePending || starting || stopping}
         >
           {showStop ? (
             <>
               <Icon name="stop" size={16} />{" "}
-              {captureStopping
-                ? t("controlBar.stopping")
-                : t("controlBar.stop")}
+              {stopping ? t("controlBar.stopping") : t("controlBar.stop")}
             </>
           ) : (
             <>
               <Icon name="start" size={16} /> {t("controlBar.start")}
             </>
           )}
-          {(capturePending || captureStarting) && !captureStopping && (
+          {(capturePending || starting) && !stopping && (
             <span className="ml-(--space-2) opacity-70" aria-hidden="true">
               …
             </span>
@@ -288,7 +293,9 @@ function NowStrip() {
             test 4 and its `.workspace-switcher__state` selector needed zero
             edits), only the position in the tree changed. */}
         <div className="workspace-switcher__state" aria-live="polite">
-          {isCapturing ? (
+          {captureUnknown ? (
+            <span>{t("controlBar.statusUnknown")}</span>
+          ) : isCapturing ? (
             <span>{t("workspace.stateLive")}</span>
           ) : samplePreviewActive ? (
             <span>{t("workspace.stateSample")}</span>

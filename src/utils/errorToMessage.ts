@@ -128,9 +128,16 @@ function formatAppError(err: AppErrorPayload): string {
     case "capture_stop_failed":
       // Capture has ended when the snapshot says so: nothing to press again.
       return i18n.t(
-        err.message?.snapshot?.phase === "ended"
+        err.message?.snapshot?.capture_state?.phase === "idle"
           ? "errors.captureStop.endedIncomplete"
           : "errors.captureStop.incomplete",
+      );
+    case "transcription_refused":
+      // Closed reasons: anything else reads as the capture not running.
+      return i18n.t(
+        err.message?.reason === "capture_lost"
+          ? "errors.transcriptionRefused.capture_lost"
+          : "errors.transcriptionRefused.capture_not_running",
       );
     case "unknown":
       return err.message;

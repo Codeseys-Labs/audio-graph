@@ -46,12 +46,18 @@ export function computeCompositeHealth({
     transcript_not_saving,
     transcript_captions_lost,
     transcript_crash_safety_unverified,
-    // The capture id is the capture stage's identity, not a stage.
-    capture_id: _captureId,
-    ...stageStatuses
   } = pipelineStatus;
   if (transcript_not_saving) return "error";
-  const stages = Object.values(stageStatuses);
+  // The display stages only: the snapshot's capture, transcription and
+  // session fields are not stages.
+  const stages = [
+    pipelineStatus.capture,
+    pipelineStatus.pipeline,
+    pipelineStatus.asr,
+    pipelineStatus.diarization,
+    pipelineStatus.entity_extraction,
+    pipelineStatus.graph,
+  ];
   if (stages.some((stage) => stage.type === "Error")) return "error";
 
   const persistenceDropped = Object.values(persistenceQueueBackpressure).reduce(

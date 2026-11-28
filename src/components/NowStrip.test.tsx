@@ -7,6 +7,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
+import { NO_PIPELINE_STATUS } from "../store/captureFacts";
 import type { AppSettings, AudioSourceInfo, ProjectionPatch } from "../types";
 import NowStrip from "./NowStrip";
 
@@ -86,8 +87,10 @@ function resetStore(overrides: Partial<StoreState> = {}) {
   for (const fn of Object.values(actions)) fn.mockClear();
   useAudioGraphStore.setState({
     isCapturing: false,
-    captureStarting: false,
-    captureStopping: false,
+    captureStatus: "idle",
+    captureUnknown: false,
+    startPending: null,
+    stopPending: null,
     // This realm is attached, as the hook leaves it on mount.
     captureAttach: "ready",
     isTranscribing: false,
@@ -108,15 +111,7 @@ function resetStore(overrides: Partial<StoreState> = {}) {
     credentialPresence: [],
     modelStatus: null,
     sessionProjectionEvents: [],
-    pipelineStatus: {
-      capture_id: { epoch: 0, seq: 0 },
-      capture: { type: "Idle" },
-      pipeline: { type: "Idle" },
-      asr: { type: "Idle" },
-      diarization: { type: "Idle" },
-      entity_extraction: { type: "Idle" },
-      graph: { type: "Idle" },
-    },
+    pipelineStatus: NO_PIPELINE_STATUS,
     latestAudioConsumerHealth: null,
     persistenceQueueBackpressure: {},
     agentProposals: [],
@@ -215,12 +210,48 @@ describe("NowStrip", () => {
   it("shows a pressed Stop button while capturing and calls stopCapture", async () => {
     resetStore({
       isCapturing: true,
+      captureStatus: "running",
       selectedSourceIds: ["system-default"],
       captureStartTime: Date.now(),
     });
     render(<NowStrip />);
     const stop = screen.getByRole("button", { name: /stop$/i });
     expect(stop).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(stop);
+    await waitFor(() => expect(actions.stopCapture).toHaveBeenCalledTimes(1));
+  });
+
+  it("offers Stop while a start is in flight or pending, and labels a stopping capture", () => {
+    resetStore({
+      selectedSourceIds: ["system-default"],
+      startPending: { epoch: 1, seq: 1 },
+    });
+    const { rerender } = render(<NowStrip />);
+    const stop = screen.getByRole("button", { name: /^stop$/i });
+    expect(stop).toBeEnabled();
+    expect(stop).toHaveAttribute("aria-busy", "true");
+
+    act(() =>
+      useAudioGraphStore.setState({
+        startPending: null,
+        captureStatus: "stopping",
+      }),
+    );
+    rerender(<NowStrip />);
+    expect(screen.getByRole("button", { name: /stopping/i })).toBeEnabled();
+  });
+
+  it("shows an unknown recording status with Stop still offered", async () => {
+    resetStore({
+      selectedSourceIds: ["system-default"],
+      captureUnknown: true,
+    });
+    const { container } = render(<NowStrip />);
+    expect(
+      container.querySelector(".workspace-switcher__state")?.textContent,
+    ).toBe("Recording status unknown");
+    const stop = screen.getByRole("button", { name: /^stop$/i });
+    expect(stop).toBeEnabled();
     fireEvent.click(stop);
     await waitFor(() => expect(actions.stopCapture).toHaveBeenCalledTimes(1));
   });
@@ -355,12 +386,7 @@ describe("NowStrip", () => {
       selectedSourceIds: ["system-default"],
       captureStartTime: Date.now(),
       pipelineStatus: {
-        capture_id: { epoch: 0, seq: 0 },
-        capture: { type: "Idle" },
-        pipeline: { type: "Idle" },
-        asr: { type: "Idle" },
-        diarization: { type: "Idle" },
-        entity_extraction: { type: "Idle" },
+        ...NO_PIPELINE_STATUS,
         graph: {
           type: "Error",
           diagnostic: {

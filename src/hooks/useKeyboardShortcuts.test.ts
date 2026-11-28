@@ -12,6 +12,9 @@ function resetStore() {
     settingsOpen: false,
     sessionsBrowserOpen: false,
     isCapturing: false,
+    captureStatus: "idle",
+    captureUnknown: false,
+    startPending: null,
     selectedSourceIds: ["mic-1"],
     error: null,
   });
@@ -40,7 +43,11 @@ describe("useKeyboardShortcuts", () => {
 
   it("Ctrl+R toggles capture off when currently capturing", () => {
     const stopCapture = vi.fn();
-    useAudioGraphStore.setState({ stopCapture, isCapturing: true });
+    useAudioGraphStore.setState({
+      stopCapture,
+      isCapturing: true,
+      captureStatus: "running",
+    });
 
     renderHook(() => useKeyboardShortcuts());
 

@@ -140,26 +140,44 @@ pub enum AppError {
     CaptureStartFailed(Box<CaptureStartRefusal>),
     /// A capture Stop did not complete cleanly. The snapshot says whether the
     /// capture still runs.
-    CaptureStopFailed(CaptureStopFailure),
+    CaptureStopFailed(Box<CaptureStopFailure>),
+    /// A transcription start was refused because its capture is not the
+    /// live one.
+    TranscriptionRefused(Box<TranscriptionRefusal>),
     /// Catch-all for errors not yet migrated to a typed variant.
     Unknown(String),
 }
 
-/// A refused capture start as the renderer receives it: the closed failure,
-/// the fact that this start ended, and the backend's current capture fact.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// A refused capture start as the renderer receives it: the closed failure
+/// and the status snapshot after it.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CaptureStartRefusal {
     #[serde(flatten)]
     pub failure: crate::audio::capture::CaptureStartFailure,
-    pub capture: crate::events::CaptureFact,
-    pub snapshot: crate::events::CaptureFact,
+    pub snapshot: crate::events::PipelineStatus,
 }
 
-/// A capture Stop that did not complete cleanly, with the backend's current
-/// capture fact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// A capture Stop that did not complete cleanly, with the status snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CaptureStopFailure {
-    pub snapshot: crate::events::CaptureFact,
+    pub snapshot: crate::events::PipelineStatus,
+}
+
+/// Why a transcription start was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptionRefusalReason {
+    /// The capture it names is not the live one.
+    CaptureNotRunning,
+    /// Its capture stopped while transcription was starting.
+    CaptureLost,
+}
+
+/// A refused transcription start, with the status snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TranscriptionRefusal {
+    pub reason: TranscriptionRefusalReason,
+    pub snapshot: crate::events::PipelineStatus,
 }
 
 /// Borrowed mirror of the pre-ec13 wire contract. Keeping the legacy mapping
@@ -195,6 +213,7 @@ enum LegacyAppErrorWire<'a> {
     },
     CaptureStartFailed(&'a CaptureStartRefusal),
     CaptureStopFailed(&'a CaptureStopFailure),
+    TranscriptionRefused(&'a TranscriptionRefusal),
     PrivacyPolicyBlocked {
         mode: &'a str,
         action: &'a str,
@@ -263,6 +282,9 @@ impl serde::Serialize for AppError {
             },
             Self::CaptureStartFailed(refusal) => LegacyAppErrorWire::CaptureStartFailed(refusal),
             Self::CaptureStopFailed(failure) => LegacyAppErrorWire::CaptureStopFailed(failure),
+            Self::TranscriptionRefused(refusal) => {
+                LegacyAppErrorWire::TranscriptionRefused(refusal)
+            }
             Self::PrivacyPolicyBlocked {
                 mode,
                 action,
@@ -355,6 +377,15 @@ impl fmt::Display for AppError {
                 None => write!(f, "Capture start failed: {}", refusal.failure.reason),
             },
             AppError::CaptureStopFailed(_) => write!(f, "Capture stop did not complete cleanly"),
+            AppError::TranscriptionRefused(refusal) => match refusal.reason {
+                TranscriptionRefusalReason::CaptureNotRunning => {
+                    write!(f, "Cannot start transcription: capture is not running")
+                }
+                TranscriptionRefusalReason::CaptureLost => write!(
+                    f,
+                    "Cannot start transcription: capture stopped while transcription was starting"
+                ),
+            },
             AppError::Unknown(msg) => write!(f, "{}", msg),
         }
     }

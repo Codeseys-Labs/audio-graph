@@ -5,25 +5,26 @@
  * Slice layout:
  *   - Audio sources          — `audioSources`, `selectedSourceIds`,
  *                              `searchFilter`, `processes` + fetchers.
- *   - Capture lifecycle      — `isCapturing`, `captureStartTime`,
- *                              `startCapture` / `stopCapture` (wrap
+ *   - Capture lifecycle      — `pipelineStatus` (the applied backend
+ *                              snapshot) and the flags derived from it
+ *                              alone (`captureStatus`, `isCapturing`,
+ *                              `isTranscribing`, `isGeminiActive`, …),
+ *                              plus `startCapture` / `stopCapture` (wrap
  *                              `start_capture` / `stop_capture`).
- *   - Transcribe pipeline    — `isTranscribing`, `startTranscribe` /
- *                              `stopTranscribe` + the live
- *                              `transcriptSegments` buffer populated by
- *                              `TRANSCRIPT_UPDATE` events.
- *   - Gemini Live            — `isGeminiActive`, `startGemini` /
- *                              `stopGemini`, plus the separate
- *                              `geminiTranscripts` buffer appended by
- *                              `GEMINI_TRANSCRIPTION` events.
+ *   - Transcribe pipeline    — `startTranscribe` / `stopTranscribe` + the
+ *                              live `transcriptSegments` buffer populated
+ *                              by `TRANSCRIPT_UPDATE` events.
+ *   - Gemini Live            — `startGemini` / `stopGemini`, plus the
+ *                              separate `geminiTranscripts` buffer appended
+ *                              by `GEMINI_TRANSCRIPTION` events.
  *   - Knowledge graph        — `graphSnapshot` (refreshed on
  *                              `GRAPH_UPDATE`) + the `exportGraph` and
  *                              `getSessionId` command wrappers.
  *   - Speakers               — `speakers` (upserted on
  *                              `SPEAKER_DETECTED` events).
- *   - Pipeline status        — `pipelineStatus` + per-source
- *                              `backpressuredSources` set +
- *                              persistence queue pressure.
+ *   - Pipeline status        — `pipelineStatus` + the shown capture's
+ *                              `backpressuredSources` + persistence queue
+ *                              pressure.
  *   - Chat                   — `chatMessages`, `isChatLoading`,
  *                              `sendChatMessage`, `clearChatHistory`.
  *   - Answer drafts (T4)     — `answerDrafts`, `composerError`,
@@ -45,10 +46,12 @@
  * directly and `setState` to seed fixtures.
  */
 
-// `rawInvoke` is the ONE sanctioned analytics bypass in this module: reserved
-// for calls whose rejection is documented, expected control flow (a capability
-// probe), where a diagnostic would pollute the channel with non-errors. Sole
-// user: `start_streaming_chat` in `sendChatMessage` (see comment there).
+// `rawInvoke` is the sanctioned analytics bypass in this module: reserved for
+// calls whose rejection is documented, expected control flow (a capability
+// probe) or repeats on a timer, where a diagnostic per call would pollute the
+// channel. Users: `start_streaming_chat` in `sendChatMessage` (see comment
+// there), and `get_pipeline_status` in `reconcileCapture`, which reports one
+// diagnostic per failure streak itself.
 import { Channel, invoke as rawInvoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 // All Rust IPC routes through `safeInvoke` (aliased to `invoke`): a drop-in for
@@ -57,6 +60,7 @@ import { create } from "zustand";
 // action's existing catch → `errorToMessage` behavior is unchanged and every
 // failure is reported EXACTLY once at this single chokepoint (audio-graph-3e71).
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
+import { captureFrontendError } from "../analytics/sentry";
 import { autoAnswerAdmits } from "../components/workspace/agentQueue";
 import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
 import {
@@ -77,7 +81,6 @@ import type {
   AsrSpanRevisionEvent,
   AudioGraphStore,
   AudioSourceInfo,
-  CaptureFact,
   CaptureId,
   ChatMessage,
   ChatResponse,
@@ -102,6 +105,7 @@ import type {
   ModelInfo,
   ModelStatus,
   PipelineLatencyEvent,
+  PipelineStatus,
   ProcessedAudioConsumerHealthPayload,
   ProcessInfo,
   ProjectionPatch,
@@ -112,7 +116,6 @@ import type {
   SessionNotesArtifacts,
   SessionRecoveryReport,
   SessionTimelineFold,
-  StageStatus,
   TimelineEntry,
   TranscriptEvent,
   TranscriptSegment,
@@ -133,15 +136,18 @@ import {
 } from "../utils/runtimeDiagnostic";
 import { createAnswerDraftsSlice } from "./answerDrafts";
 import {
-  type CaptureChange,
-  compareCaptureFacts,
+  captureStarting,
+  captureToggle,
   compareCaptureIds,
-  errorCaptureSnapshot,
+  errorSnapshot,
   isCaptureAttachment,
-  isCaptureReply,
-  newestCaptureId,
-  pipelineCaptureFact,
-  reduceCaptureState,
+  isCaptureCommandReply,
+  isPipelineStatus,
+  liveCaptureHoldsStore,
+  NO_PIPELINE_STATUS,
+  snapshotView,
+  startSettledBy,
+  stopTarget,
 } from "./captureFacts";
 import {
   CHAT_STREAM_DELTA_THROTTLE_MS,
@@ -149,48 +155,62 @@ import {
 } from "./chatStream";
 import { createShellNavSlice } from "./shellNav";
 
-const idleStage: StageStatus = { type: "Idle" };
 // Monotonic foreground-session generation. Any transition to Live or a newer
 // historical request invalidates older async Review responses before they can
 // overwrite the current workspace.
 let historicalLoadGeneration = 0;
 
-/**
- * Every capture state change in this store goes through the reducer. The
- * backend ends transcription and the realtime modes with a capture, however
- * it ended (a Stop from here or the tray, or its last source dying), so they
- * end here with it.
- */
-function capturePatch(
-  state: AudioGraphStore,
-  change: CaptureChange,
-): Partial<AudioGraphStore> {
-  const next = reduceCaptureState(state, change, Date.now());
-  return state.isCapturing && !next.isCapturing
-    ? {
-        ...next,
-        isGeminiActive: false,
-        activeGeminiCommand: null,
-        backpressuredSources: [],
-      }
-    : next;
-}
-
-/** Whether `fact` is capture `id` running. */
-function runningCapture(fact: CaptureFact | null, id: CaptureId): boolean {
+/** Whether `status` shows capture `id` running. */
+function showsCaptureRunning(status: PipelineStatus, id: CaptureId): boolean {
   return (
-    fact !== null &&
-    fact.phase === "running" &&
-    compareCaptureIds(fact.id, id) === 0
+    status.capture_state.phase === "running" &&
+    compareCaptureIds(status.capture_state.id, id) === 0
   );
 }
 
-/** A token naming this JavaScript realm to capture control. */
-function newCaptureRealm(): string {
+// Each Stop press is numbered, so a Start can tell whether one came after it
+// and a Stop's spinner is settled by that Stop's own outcome only.
+let stopPresses = 0;
+
+// Whether the last status read failed: a failure streak relays one
+// diagnostic, however many reads it spans.
+let reconcileFailing = false;
+
+/** A random token: this realm's name to capture control, or a Stop's. */
+function newCaptureToken(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
   );
+}
+
+/**
+ * Attach this realm to capture control under `realm`, apply the snapshot
+ * the attachment returns, and resolve to its epoch. Rejects when the reply
+ * is lost or unusable.
+ */
+async function attachRealm(realm: string): Promise<number> {
+  useAudioGraphStore.setState({ captureAttach: "attaching", captureRealm: realm });
+  try {
+    const attachment = await invoke<unknown>("capture_attach", { realm });
+    if (!isCaptureAttachment(attachment)) {
+      throw new Error("capture_attach returned an unusable reply");
+    }
+    useAudioGraphStore.getState().setPipelineStatus(attachment.snapshot);
+    useAudioGraphStore.setState({
+      captureAttach: "ready",
+      captureEpoch: attachment.epoch,
+    });
+    return attachment.epoch;
+  } catch (error) {
+    useAudioGraphStore.setState({
+      captureAttach: "failed",
+      error: i18n.t("errors.captureAttach.failed"),
+    });
+    throw error;
+  } finally {
+    void useAudioGraphStore.getState().reconcileCapture();
+  }
 }
 
 /**
@@ -213,20 +233,6 @@ function captureStartErrorMessage(
         reason: message,
       })
     : message;
-}
-
-/**
- * Whether the global store belongs to live capture: running, transcribing,
- * or starting (Start pressed, not yet acknowledged). A historical load must
- * neither begin nor land meanwhile.
- */
-function liveCaptureHoldsStore(
-  state: Pick<
-    AudioGraphStore,
-    "isCapturing" | "isTranscribing" | "captureStarting"
-  >,
-): boolean {
-  return state.isCapturing || state.isTranscribing || state.captureStarting;
 }
 
 const PROVIDER_DESCRIPTOR_BY_ID = new Map(
@@ -1403,6 +1409,70 @@ function exitSamplePreviewState(active: boolean) {
   return active ? clearSamplePreviewState() : { samplePreviewActive: false };
 }
 
+/**
+ * Every frontend projection owned by the current session view, cleared: what
+ * `resetSessionView` does, and what an accepted session rotation does once.
+ */
+function sessionViewReset(state: AudioGraphStore): Partial<AudioGraphStore> {
+  return {
+    ...exitSamplePreviewState(state.samplePreviewActive),
+    pendingFinalizingSession: null,
+    transcriptSegments: [],
+    asrPartial: null,
+    asrSpanRevisions: [],
+    diarizationSpanRevisions: [],
+    sessionTimeline: null,
+    sessionTimelineTotalCount: null,
+    sessionTimelineLoading: false,
+    transcriptSeekTarget: null,
+    graphEdgeFocus: null,
+    sessionTranscriptEvents: [],
+    sessionProjectionEvents: [],
+    materializedNotes: null,
+    materializedProjectionGraph: null,
+    notesLensStatus: { type: "idle" as const },
+    graphLensStatus: { type: "idle" as const },
+    turnEvents: [],
+    agentStatus: null,
+    agentProposals: [],
+    liveAssistCards: [],
+    approvingAgentProposalIds: [],
+    graphSnapshot: {
+      nodes: [],
+      links: [],
+      stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+    },
+    speakers: [],
+    chatMessages: [],
+    isChatLoading: false,
+    streamingChatRequestId: null,
+    loadedSessionId: null,
+    // audio-graph-83cc T4 fix-round finding (major): every OTHER
+    // session-scoped transient projection above is reset here — these two
+    // (added by this ticket) were an oversight. Without this, a stale
+    // `composerError` banner survives a session switch until the next
+    // submit, and a stale `"streaming"`/`"failed"` draft can outrank a
+    // re-hydrated card's durable `answer` if the same card id reappears
+    // (same-session reload), permanently hiding that card's Ask AI button
+    // (see `answerDrafts.ts`'s module doc: "a dismissed card never keeps a
+    // stale ghost around" — session reset is the session-boundary
+    // equivalent of a dismiss for this state).
+    answerDrafts: {},
+    composerError: null,
+    // audio-graph-83cc T5: the auto-answer counter chip's data source is
+    // session-scoped for the same reason `answerDrafts`/`composerError`
+    // are (see the fix-round comment immediately above) — a stale count
+    // from a PREVIOUS session must not survive into a new one's chip.
+    autoAnswerDispatchCount: 0,
+    // T5: the idempotency guard is ALSO session-scoped — a proposal id
+    // from a previous session should never suppress a genuinely new
+    // proposal that happens to reuse the same id space (defensive; ids
+    // are expected to be unique regardless, but this keeps the field's
+    // lifecycle honest and matches every other field reset in this block).
+    autoAnswerAttemptedProposalIds: new Set<string>(),
+  };
+}
+
 function sampleSessionPreviewState(language?: string) {
   const copy = samplePreviewCopy(language);
   const sourceId = "sample-source";
@@ -1900,10 +1970,6 @@ function sampleSessionPreviewState(language?: string) {
         segment_count: 2,
       },
     ],
-    isTranscribing: false,
-    isGeminiActive: false,
-    activeGeminiCommand: null,
-    backpressuredSources: [],
     persistenceQueueBackpressure: {},
     rightPanelTab: "transcript" as const,
     agentOverlayOpen: true,
@@ -1926,7 +1992,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   toggleSourceId: (id) =>
     set((state) => {
       // The selection a pending start resolved must not change under it.
-      if (state.captureStarting) return {};
+      if (captureStarting(state)) return {};
       const idx = state.selectedSourceIds.indexOf(id);
       if (idx >= 0) {
         return {
@@ -2651,63 +2717,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     ),
   resetSessionView: () => {
     historicalLoadGeneration += 1;
-    set((state) => ({
-      ...exitSamplePreviewState(state.samplePreviewActive),
-      pendingFinalizingSession: null,
-      transcriptSegments: [],
-      asrPartial: null,
-      asrSpanRevisions: [],
-      diarizationSpanRevisions: [],
-      sessionTimeline: null,
-      sessionTimelineTotalCount: null,
-      sessionTimelineLoading: false,
-      transcriptSeekTarget: null,
-      graphEdgeFocus: null,
-      sessionTranscriptEvents: [],
-      sessionProjectionEvents: [],
-      materializedNotes: null,
-      materializedProjectionGraph: null,
-      notesLensStatus: { type: "idle" as const },
-      graphLensStatus: { type: "idle" as const },
-      turnEvents: [],
-      agentStatus: null,
-      agentProposals: [],
-      liveAssistCards: [],
-      approvingAgentProposalIds: [],
-      graphSnapshot: {
-        nodes: [],
-        links: [],
-        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
-      },
-      speakers: [],
-      chatMessages: [],
-      isChatLoading: false,
-      streamingChatRequestId: null,
-      loadedSessionId: null,
-      // audio-graph-83cc T4 fix-round finding (major): every OTHER
-      // session-scoped transient projection above is reset here — these two
-      // (added by this ticket) were an oversight. Without this, a stale
-      // `composerError` banner survives a session switch until the next
-      // submit, and a stale `"streaming"`/`"failed"` draft can outrank a
-      // re-hydrated card's durable `answer` if the same card id reappears
-      // (same-session reload), permanently hiding that card's Ask AI button
-      // (see `answerDrafts.ts`'s module doc: "a dismissed card never keeps a
-      // stale ghost around" — session reset is the session-boundary
-      // equivalent of a dismiss for this state).
-      answerDrafts: {},
-      composerError: null,
-      // audio-graph-83cc T5: the auto-answer counter chip's data source is
-      // session-scoped for the same reason `answerDrafts`/`composerError`
-      // are (see the fix-round comment immediately above) — a stale count
-      // from a PREVIOUS session must not survive into a new one's chip.
-      autoAnswerDispatchCount: 0,
-      // T5: the idempotency guard is ALSO session-scoped — a proposal id
-      // from a previous session should never suppress a genuinely new
-      // proposal that happens to reuse the same id space (defensive; ids
-      // are expected to be unique regardless, but this keeps the field's
-      // lifecycle honest and matches every other field reset in this block).
-      autoAnswerAttemptedProposalIds: new Set<string>(),
-    }));
+    set(sessionViewReset);
   },
   loadSampleSessionPreview: (language?: string) => {
     // Capture owns the store from Start onwards: the sample must not land in
@@ -2964,39 +2974,77 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   },
 
   // ── Pipeline status ──────────────────────────────────────────────────
-  pipelineStatus: {
-    capture_id: { epoch: 0, seq: 0 },
-    capture: idleStage,
-    pipeline: idleStage,
-    asr: idleStage,
-    diarization: idleStage,
-    entity_extraction: idleStage,
-    graph: idleStage,
-  },
+  pipelineStatus: NO_PIPELINE_STATUS,
   setPipelineStatus: (status) => {
-    set((state) => {
-      // Every status read and event is merged by its capture fact: one below
-      // the newest fact is provably stale and dropped whole; one at or above
-      // it is applied.
-      const incoming = pipelineCaptureFact(status);
-      if (
-        state.captureFact !== null &&
-        compareCaptureFacts(incoming, state.captureFact) < 0
-      ) {
-        return state;
-      }
-      return {
-        ...capturePatch(state, {
-          facts: [incoming],
-          // Transcription ends only with its capture, so a snapshot can say
-          // that it runs, never that it stopped.
-          ...(status.asr.type === "Running" && incoming.phase === "running"
-            ? { transcribing: incoming.id }
-            : {}),
-        }),
-        pipelineStatus: status,
-      };
+    const state = get();
+    // One ingestion path for events, status reads and every reply's or
+    // refusal's snapshot: one no newer than the applied snapshot is dropped
+    // whole, whichever path delivered it.
+    if (
+      !isPipelineStatus(status) ||
+      status.revision <= state.pipelineStatus.revision
+    ) {
+      return;
+    }
+    const previous = state.pipelineStatus;
+    // The session aggregates reset once, on the accepted rotation. The first
+    // snapshot a realm applies is no rotation: nothing of an older session
+    // is shown yet.
+    const rotated =
+      previous.revision >= 0 && status.session.epoch > previous.session.epoch;
+    if (rotated) historicalLoadGeneration += 1;
+    const { id, phase } = status.capture_state;
+    const sameCapture = compareCaptureIds(previous.capture_state.id, id) === 0;
+    const unknownStart =
+      state.unknownStart !== null &&
+      !startSettledBy(status, state.unknownStart)
+        ? state.unknownStart
+        : null;
+    set({
+      ...(rotated ? sessionViewReset(state) : {}),
+      pipelineStatus: status,
+      ...snapshotView(status),
+      unknownStart,
+      captureUnknown: unknownStart !== null || state.unknownStop,
+      // A display clock only: when this renderer first saw the shown
+      // capture running, kept while that capture stops.
+      captureStartTime:
+        phase === "running" || phase === "stopping"
+          ? sameCapture && state.captureStartTime !== null
+            ? state.captureStartTime
+            : phase === "running"
+              ? Date.now()
+              : null
+          : null,
     });
+  },
+  reconcileCapture: async () => {
+    let status: unknown;
+    try {
+      // Read every few seconds while capture is not idle: a failing backend
+      // relays one diagnostic per failure streak, not one per read.
+      status = await rawInvoke<unknown>("get_pipeline_status");
+    } catch {
+      if (!reconcileFailing) {
+        reconcileFailing = true;
+        captureFrontendError("frontend.invoke.error", {
+          category: "frontend",
+          surface: "invoke",
+          component: "get_pipeline_status",
+        });
+      }
+      // The next trigger reads again.
+      return;
+    }
+    reconcileFailing = false;
+    if (!isPipelineStatus(status)) return;
+    get().setPipelineStatus(status);
+    // A fresh read is what the backend holds now, whatever a Stop whose
+    // reply was lost did.
+    set((state) => ({
+      unknownStop: false,
+      captureUnknown: state.unknownStart !== null,
+    }));
   },
   pipelineLatencies: {},
   setPipelineLatency: (sample: PipelineLatencyEvent) =>
@@ -3047,14 +3095,19 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     })),
 
   // ── Capture state ────────────────────────────────────────────────────
+  // Every flag here derives from the applied `pipelineStatus` alone (see
+  // `setPipelineStatus`); the Start and Stop spinners are settled by their
+  // own command's outcome and never stand in for capture state.
+  captureStatus: "idle",
   isCapturing: false,
-  captureStarting: false,
-  captureStopping: false,
-  captureFact: null,
-  captureStartIntent: null,
-  captureStopIntent: null,
-  captureTranscribing: null,
   captureStartTime: null,
+  backpressuredSources: [],
+  captureUnknown: false,
+  unknownStart: null,
+  unknownStop: false,
+  startPending: null,
+  stopPending: null,
+  stopOperation: null,
   captureAttach: "detached",
   captureEpoch: null,
   captureRealm: null,
@@ -3064,57 +3117,17 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     if (captureAttach === "attaching" || captureAttach === "ready") return;
     // One token per realm, so a repeated delivery of this attach changes
     // nothing and a reload's attach fences the previous page's starts.
-    const realm = captureRealm ?? newCaptureRealm();
-    set({ captureAttach: "attaching", captureRealm: realm });
-    invoke<unknown>("capture_attach", { realm })
-      .then((attachment) => {
-        if (!isCaptureAttachment(attachment)) {
-          throw new Error("capture_attach returned an unusable reply");
-        }
-        set((state) => ({
-          ...capturePatch(state, { facts: [attachment.snapshot] }),
-          captureAttach: "ready",
-          captureEpoch: attachment.epoch,
-        }));
-      })
-      .catch(() => {
-        set({
-          captureAttach: "failed",
-          error: i18n.t("errors.captureAttach.failed"),
-        });
-      });
+    attachRealm(captureRealm ?? newCaptureToken()).catch(() => {
+      // `attachRealm` shows the failure; the next Start retries it.
+    });
   },
-  backpressuredSources: [],
-  setSourceBackpressure: (sourceId, isBackpressured) =>
-    set((state) => {
-      const present = state.backpressuredSources.includes(sourceId);
-      if (isBackpressured && !present) {
-        return {
-          backpressuredSources: [...state.backpressuredSources, sourceId],
-        };
-      }
-      if (!isBackpressured && present) {
-        return {
-          backpressuredSources: state.backpressuredSources.filter(
-            (id) => id !== sourceId,
-          ),
-        };
-      }
-      return {};
-    }),
   startCapture: async () => {
-    const {
-      selectedSourceIds,
-      audioSources,
-      captureStarting,
-      isCapturing,
-      captureAttach,
-      captureEpoch,
-      captureSeq,
-    } = get();
-    // One start at a time, and none over a running capture: a second press
-    // (or shortcut) must not reset the view again.
-    if (captureStarting || isCapturing) return null;
+    const state = get();
+    const { selectedSourceIds, audioSources, captureAttach, captureEpoch } =
+      state;
+    // One start at a time, and none while the backend holds, or may hold, a
+    // capture: a second press (or shortcut) must not reset the view again.
+    if (captureToggle(state).offersStop) return null;
     // No Start waits for the attachment: until it is ready nothing starts,
     // and a Start after a failed one retries it.
     if (captureAttach !== "ready" || captureEpoch === null) {
@@ -3127,10 +3140,18 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }
     // A historical load in flight at the press must not land.
     historicalLoadGeneration += 1;
-    const id: CaptureId = { epoch: captureEpoch, seq: captureSeq + 1 };
-    set((state) => ({
+    const stopsAtPress = stopPresses;
+    let id: CaptureId = { epoch: captureEpoch, seq: state.captureSeq + 1 };
+    set((current) => ({
       captureSeq: id.seq,
-      ...exitSamplePreviewState(state.samplePreviewActive),
+      // The spinner, in this same update: session loaders refuse from here
+      // until the start settles, so no historical session lands in the
+      // store the capture is about to open into.
+      startPending: id,
+      // A stop-everything token names what was running before this start:
+      // replaying it could not stop this one.
+      stopOperation: null,
+      ...exitSamplePreviewState(current.samplePreviewActive),
       // Starting a fresh live capture leaves any historical session view, so
       // the data-route report should follow the live session, not the old one.
       loadedSessionId: null,
@@ -3171,11 +3192,6 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       sessionTimelineLoading: false,
       transcriptSeekTarget: null,
       graphEdgeFocus: null,
-      // The start's intent, and with it `captureStarting`, in this same
-      // update: session loaders refuse from here until a fact for this start
-      // arrives, so no historical session lands in the store the capture is
-      // about to open into.
-      ...capturePatch(state, { startIntent: id, stopIntent: null }),
     }));
     const sourcesBySelectionId = new Map<string, AudioSourceInfo>();
     for (const source of audioSources) {
@@ -3188,50 +3204,78 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         const source = sourcesBySelectionId.get(sourceId);
         return source ? { sourceId, source } : { sourceId };
       });
-    // Whether this start is still the newest one: a reply for an earlier one
-    // touches nothing a later capture owns.
-    const current = (state: AudioGraphStore) =>
-      state.captureStartIntent !== null &&
-      compareCaptureIds(state.captureStartIntent, id) === 0;
-    try {
-      // One aggregate start: the backend acknowledges every source or rolls
-      // all of them back, so there is nothing to undo here on failure.
-      const reply = await invoke<unknown>("start_capture", { id, sources });
-      if (!isCaptureReply(reply)) {
-        // Nothing to merge: the status events still carry what happened.
-        set((state) =>
-          current(state)
-            ? { error: captureStartFailureMessage(undefined) }
-            : state,
-        );
-        return id;
+    const sourceAt = (index: number) => {
+      const selectionId = selectedSourceIds[index];
+      return selectionId === undefined
+        ? undefined
+        : sourcesBySelectionId.get(selectionId);
+    };
+    // A start whose reply was lost or unreadable may run or not: the state is
+    // unknown until a snapshot settles that id.
+    const markUnknown = (startId: CaptureId) =>
+      set((current) => {
+        const unknownStart = startSettledBy(current.pipelineStatus, startId)
+          ? current.unknownStart
+          : startId;
+        return {
+          unknownStart,
+          captureUnknown: unknownStart !== null || current.unknownStop,
+        };
+      });
+    // Send one start; resolve to its failure, or null once it started. Its
+    // reply or refusal changes nothing but through its snapshot.
+    const attempt = async (
+      startId: CaptureId,
+    ): Promise<{ message: string; stale: boolean } | null> => {
+      try {
+        // One aggregate start: the backend acknowledges every source or rolls
+        // all of them back, so there is nothing to undo here on failure.
+        const reply = await invoke<unknown>("start_capture", {
+          id: startId,
+          sources,
+        });
+        if (isCaptureCommandReply(reply)) {
+          get().setPipelineStatus(reply.snapshot);
+          return null;
+        }
+        markUnknown(startId);
+        return { message: captureStartFailureMessage(undefined), stale: false };
+      } catch (e) {
+        const snapshot = errorSnapshot(e);
+        if (snapshot === null) markUnknown(startId);
+        else get().setPipelineStatus(snapshot);
+        return {
+          message: captureStartErrorMessage(e, sourceAt),
+          stale:
+            isAppErrorPayload(e) &&
+            e.code === "capture_start_failed" &&
+            e.message?.reason === "stale_attachment",
+        };
+      } finally {
+        void get().reconcileCapture();
       }
-      set((state) => ({
-        ...capturePatch(state, { facts: [reply.fact, reply.snapshot] }),
-        ...(current(state) ? { error: null } : {}),
-      }));
-    } catch (e) {
-      // The backend fences an id on every error it returns, so a structured
-      // error says this start never runs. A transport failure says nothing:
-      // the start shows as pending, with Stop, until a fact arrives.
-      const snapshot = errorCaptureSnapshot(e);
-      const facts: CaptureFact[] = isAppErrorPayload(e)
-        ? [{ id, phase: "ended" }, ...(snapshot ? [snapshot] : [])]
-        : [];
-      set((state) => ({
-        ...capturePatch(state, { facts }),
-        ...(current(state)
-          ? {
-              error: captureStartErrorMessage(e, (index) => {
-                const selectionId = selectedSourceIds[index];
-                return selectionId === undefined
-                  ? undefined
-                  : sourcesBySelectionId.get(selectionId);
-              }),
-            }
-          : {}),
-      }));
+    };
+    let failure = await attempt(id);
+    // Another window attached since this epoch was issued: attach once more,
+    // under a new realm token (an attach under this realm's token changes
+    // nothing), and send this start once more as a new id in the new epoch,
+    // unless a Stop was pressed meanwhile. A second stale refusal is shown.
+    if (failure?.stale && stopPresses === stopsAtPress) {
+      const epoch = await attachRealm(newCaptureToken()).catch(() => null);
+      if (epoch !== null && stopPresses === stopsAtPress) {
+        id = { epoch, seq: get().captureSeq + 1 };
+        set({ captureSeq: id.seq, startPending: id });
+        failure = await attempt(id);
+      }
     }
+    set((current) => ({
+      startPending:
+        current.startPending !== null &&
+        compareCaptureIds(current.startPending, id) === 0
+          ? null
+          : current.startPending,
+      error: failure === null ? null : failure.message,
+    }));
     return id;
   },
   // ONE START (SHELL-R3, plan §R3, ADR-0046): the NOW STRIP's Start button
@@ -3267,8 +3311,15 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   startCaptureAndTranscribe: async () => {
     const id = await get().startCapture();
     if (id === null) return;
-    const { captureFact, isTranscribing, settings } = get();
-    if (!runningCapture(captureFact, id) || isTranscribing) return;
+    // Addressed: only the capture this start produced, while it runs and is
+    // not transcribed yet.
+    const { pipelineStatus, settings } = get();
+    if (
+      !showsCaptureRunning(pipelineStatus, id) ||
+      pipelineStatus.transcription !== null
+    ) {
+      return;
+    }
     if (!settings) return;
     if (deferredProviderForDurableStart(settings)) return;
     await get().startTranscribe(id);
@@ -3284,116 +3335,117 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // still degrades to "stay put, stop capture as before" rather than
   // crashing the stop flow.
   stopCapture: async () => {
-    const {
-      captureFact,
-      captureStartIntent,
-      isCapturing,
-      captureStarting,
-      getSessionId,
-    } = get();
-    if (!isCapturing && !captureStarting) return;
-    // Every capture up to the newest this renderer knows of ends, whether
-    // its start is still pending or it runs; a newer one never does.
-    const stopId = newestCaptureId(captureFact?.id ?? null, captureStartIntent);
-    if (stopId === null) return;
-    set((state) => capturePatch(state, { stopIntent: stopId }));
+    const state = get();
+    // Stop is offered while the backend holds, or may hold, a capture.
+    if (!captureToggle(state).offersStop) return;
+    // The newest capture this renderer knows of ends, and every one before
+    // it; a newer one never does. Knowing none, every capture ends, under a
+    // token the backend records on first delivery: pressing this Stop again
+    // sends the same token, so a replay never ends a capture started later.
+    const target = stopTarget(state);
+    const operation =
+      target === null ? (state.stopOperation ?? newCaptureToken()) : null;
+    stopPresses += 1;
+    const press = stopPresses;
+    const seqAtPress = state.captureSeq;
+    // The display clock of the capture this Stop ends, for the optimistic
+    // "Finalizing…" row: its snapshot clears it.
+    const startedAt = state.captureStartTime;
+    set({ stopPending: press, stopOperation: operation });
     let sessionId: string | null = null;
     try {
-      const id = await getSessionId();
+      const id = await state.getSessionId();
       sessionId = id !== SAMPLE_SESSION_ID ? id : null;
     } catch {
       sessionId = null;
     }
-    // Whether a capture newer than the one this Stop ends has started since:
-    // its reply then touches nothing that capture owns.
-    const superseded = (state: AudioGraphStore) => {
-      const newest = newestCaptureId(
-        state.captureFact?.id ?? null,
-        state.captureStartIntent,
-      );
-      return newest !== null && compareCaptureIds(newest, stopId) > 0;
-    };
+    // Whether a capture was started here since this Stop: its reply then
+    // touches nothing that capture owns.
+    const superseded = () => get().captureSeq !== seqAtPress;
     try {
-      const reply = await invoke<unknown>("stop_capture", { id: stopId });
-      set((state) => {
-        // Without a usable reply, "Stopping…" holds until a status event
-        // states the Ended fact. Ending the capture also ends transcription
-        // and the realtime modes here (see `capturePatch`).
-        const facts = isCaptureReply(reply)
-          ? capturePatch(state, { facts: [reply.fact, reply.snapshot] })
-          : {};
-        if (superseded(state)) return facts;
-        return {
-          ...facts,
-          persistenceQueueBackpressure: {},
-          error: null,
-          nav: sessionId
-            ? { dest: "sessions", sessionId, lens: "notes" }
-            : state.nav,
-          // The 1d92 gap: `sessions.json` may not have this session's
-          // finished entry yet. Snapshot enough of the in-memory capture
-          // state right now (`state` is from before the facts above cleared
-          // `captureStartTime`) to render an optimistic "Finalizing…" row
-          // immediately; SessionsBrowser's merge check drops it the instant a
-          // real `listSessions()` result contains a row with this id (see
-          // `mergeSessionRows`) — no explicit clear action needed.
-          //
-          // A failed/filtered id read (`sessionId` null above) means there
-          // is no id whose resident data this stop could vouch for —
-          // retaining a PRIOR stop's pending row here would be stale by
-          // definition, so it clears to `null` rather than falling back to
-          // `state.pendingFinalizingSession`.
-          pendingFinalizingSession: sessionId
-            ? {
-                id: sessionId,
-                title: null,
-                created_at: state.captureStartTime ?? Date.now(),
-                ended_at: Date.now(),
-                duration_seconds: state.captureStartTime
-                  ? Math.max(
-                      0,
-                      Math.round((Date.now() - state.captureStartTime) / 1000),
-                    )
-                  : null,
-                status: "active",
-                segment_count: state.transcriptSegments.length,
-                speaker_count: state.speakers.length,
-                entity_count: state.graphSnapshot.nodes.length,
-                transcript_path: "",
-                graph_path: "",
-                deleted: false,
-                deleted_at: null,
-                optimistic: true,
-              }
-            : null,
-        };
+      const reply = await invoke<unknown>("stop_capture", {
+        id: target,
+        operation,
       });
+      const readable = isCaptureCommandReply(reply);
+      if (readable) get().setPipelineStatus(reply.snapshot);
+      set((current) => ({
+        // Without a readable reply the state is unknown until a status read.
+        unknownStop: !readable,
+        captureUnknown: current.unknownStart !== null || !readable,
+        stopOperation: readable ? null : current.stopOperation,
+        ...(superseded()
+          ? {}
+          : {
+              persistenceQueueBackpressure: {},
+              error: null,
+              nav: sessionId
+                ? { dest: "sessions" as const, sessionId, lens: "notes" as const }
+                : current.nav,
+              // The 1d92 gap: `sessions.json` may not have this session's
+              // finished entry yet. Snapshot enough of the in-memory capture
+              // state right now to render an optimistic "Finalizing…" row
+              // immediately; SessionsBrowser's merge check drops it the
+              // instant a real `listSessions()` result contains a row with
+              // this id (see `mergeSessionRows`) — no explicit clear action
+              // needed.
+              //
+              // A failed/filtered id read (`sessionId` null above) means
+              // there is no id whose resident data this stop could vouch for
+              // — retaining a PRIOR stop's pending row here would be stale by
+              // definition, so it clears to `null` rather than falling back
+              // to `current.pendingFinalizingSession`.
+              pendingFinalizingSession: sessionId
+                ? {
+                    id: sessionId,
+                    title: null,
+                    created_at: startedAt ?? Date.now(),
+                    ended_at: Date.now(),
+                    duration_seconds: startedAt
+                      ? Math.max(0, Math.round((Date.now() - startedAt) / 1000))
+                      : null,
+                    status: "active",
+                    segment_count: current.transcriptSegments.length,
+                    speaker_count: current.speakers.length,
+                    entity_count: current.graphSnapshot.nodes.length,
+                    transcript_path: "",
+                    graph_path: "",
+                    deleted: false,
+                    deleted_at: null,
+                    optimistic: true,
+                  }
+                : null,
+            }),
+      }));
       // Best-effort refresh so the rail picks up the real entry (and the
       // optimistic row above clears itself) as soon as the index catches
       // up; a failure here is not fatal — the rail's own mount effect
       // re-fetches too.
-      if (sessionId && !superseded(get())) void get().listSessions(200);
+      if (sessionId && !superseded()) void get().listSessions(200);
     } catch (e) {
-      // The Stop may be retried (it is idempotent); what the backend reports
-      // now decides what is shown.
-      const snapshot = errorCaptureSnapshot(e);
-      set((state) => ({
-        ...capturePatch(state, {
-          facts: snapshot ? [snapshot] : [],
-          ...(state.captureStopIntent !== null &&
-          compareCaptureIds(state.captureStopIntent, stopId) === 0
-            ? { stopIntent: null }
-            : {}),
-        }),
-        ...(superseded(state) ? {} : { error: errorToMessage(e) }),
+      // A refusal says what the backend holds now; a lost reply says
+      // nothing, and this Stop's token is kept for pressing it again.
+      const snapshot = errorSnapshot(e);
+      if (snapshot !== null) get().setPipelineStatus(snapshot);
+      set((current) => ({
+        unknownStop: snapshot === null,
+        captureUnknown: current.unknownStart !== null || snapshot === null,
+        stopOperation: snapshot === null ? current.stopOperation : null,
+        ...(superseded() ? {} : { error: errorToMessage(e) }),
       }));
+    } finally {
+      // The spinner of the latest Stop, settled by that Stop alone.
+      set((current) =>
+        current.stopPending === press ? { stopPending: null } : {},
+      );
+      void get().reconcileCapture();
     }
   },
 
   // ── Transcribe state ────────────────────────────────────────────────────────
   isTranscribing: false,
   startTranscribe: async (captureId) => {
-    const { captureFact, settings } = get();
+    const { pipelineStatus, settings } = get();
     if (!settings) {
       set({ error: i18n.t("errors.providerSettingsLoading") });
       return;
@@ -3403,36 +3455,43 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       set({ error: providerDeferredMessage(deferredProvider) });
       return;
     }
-    // Addressed: only for the capture that is running, and silently skipped
+    // Addressed: only for the capture shown running, and silently skipped
     // once another one has replaced it.
-    if (!runningCapture(captureFact, captureId)) return;
+    if (!showsCaptureRunning(pipelineStatus, captureId)) return;
+    let error: string | null = null;
     try {
       // The backend refuses it too unless that capture is the live one.
-      await invoke("start_transcribe", { captureId });
-      set((state) => ({
-        ...capturePatch(state, { transcribing: captureId }),
-        ...(runningCapture(state.captureFact, captureId)
-          ? { error: null }
-          : {}),
-      }));
+      const reply = await invoke<unknown>("start_transcribe", { captureId });
+      if (isCaptureCommandReply(reply)) get().setPipelineStatus(reply.snapshot);
     } catch (e) {
-      // An error about a capture that is no longer running is not shown.
-      set((state) =>
-        runningCapture(state.captureFact, captureId)
-          ? { error: errorToMessage(e) }
-          : state,
-      );
+      const snapshot = errorSnapshot(e);
+      if (snapshot !== null) get().setPipelineStatus(snapshot);
+      error = errorToMessage(e);
     }
+    // An outcome about a capture another one has replaced is not shown.
+    if (
+      compareCaptureIds(get().pipelineStatus.capture_state.id, captureId) === 0
+    ) {
+      set({ error });
+    }
+    void get().reconcileCapture();
   },
   stopTranscribe: async () => {
+    // Addressed: the transcription shown, by its capture and generation, so
+    // a late delivery never stops a later one.
+    const { transcription } = get().pipelineStatus;
+    if (transcription === null) return;
     try {
-      await invoke("stop_transcribe");
-      set((state) => ({
-        ...capturePatch(state, { transcribing: null }),
-        error: null,
-      }));
+      const reply = await invoke<unknown>("stop_transcribe", {
+        captureId: transcription.capture,
+        generation: transcription.generation,
+      });
+      if (isCaptureCommandReply(reply)) get().setPipelineStatus(reply.snapshot);
+      set({ error: null });
     } catch (e) {
       set({ error: errorToMessage(e) });
+    } finally {
+      void get().reconcileCapture();
     }
   },
 
@@ -3459,8 +3518,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // Route to the native speech-to-speech runtime when the user is in
     // Converse mode with the native engine; otherwise stay on the TEXT/notes
     // Gemini Live pipeline. Within native S2S the user picks the realtime-agent
-    // provider (Gemini Live vs. the OpenAI Realtime voice agent). Remember which
-    // command we started so `stopGemini` tears down the matching session.
+    // provider (Gemini Live vs. the OpenAI Realtime voice agent).
     const nativeConverse =
       conversationMode === "converse" && converseEngine === "native";
     let startCommand:
@@ -3490,24 +3548,22 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }
     set((state) => exitSamplePreviewState(state.samplePreviewActive));
     try {
+      // The realtime mode shows once the backend's snapshot says it runs.
       await invoke(startCommand);
-      set({
-        isGeminiActive: true,
-        activeGeminiCommand: startCommand,
-        error: null,
-      });
+      set({ error: null });
     } catch (e) {
       set({ error: errorToMessage(e) });
+    } finally {
+      void get().reconcileCapture();
     }
   },
   stopGemini: async () => {
-    // Stop whichever session we started. When the tracked command is known,
-    // stop exactly that one. When it's UNKNOWN (null) — e.g. state seeded
-    // directly in tests, or lost across a reload/recovery while a converse
-    // session is actually live — defaulting to stop_gemini would hit the
-    // wrong backend and leave the converse session running (FINDING #57 P3).
-    // Both stop commands are idempotent (stopping an inactive session is a
-    // no-op), so fire BOTH defensively to guarantee teardown.
+    // Stop the mode the snapshot shows running. When none or several show —
+    // e.g. state seeded directly in tests, or a converse session the
+    // snapshot has not caught up with — defaulting to stop_gemini would hit
+    // the wrong backend and leave the converse session running (FINDING #57
+    // P3). Every stop command is idempotent (stopping an inactive session is
+    // a no-op), so fire them all defensively to guarantee teardown.
     const active = get().activeGeminiCommand;
     try {
       if (active === "start_converse") {
@@ -3529,13 +3585,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
           throw failure.reason;
         }
       }
-      set({
-        isGeminiActive: false,
-        activeGeminiCommand: null,
-        error: null,
-      });
+      set({ error: null });
     } catch (e) {
       set({ error: errorToMessage(e) });
+    } finally {
+      void get().reconcileCapture();
     }
   },
 

@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { useAudioGraphStore } from "../store";
+import { captureToggle } from "../store/captureFacts";
 
 /**
  * Registers global keyboard shortcuts for the app. Should be called once near
@@ -70,7 +71,9 @@ export function useKeyboardShortcuts(): void {
 
       if (e.key === "r" || e.key === "R") {
         e.preventDefault();
-        if (state.isCapturing) {
+        // The NOW STRIP's toggle: Stop while the backend holds, or may
+        // hold, a capture.
+        if (captureToggle(state).offersStop) {
           void state.stopCapture();
         } else {
           // SHELL-R3 (plan §R3, ADR-0046): mirror the NOW STRIP's Start

@@ -34,7 +34,7 @@ use crate::audio::pipeline::ProcessedAudioChunk;
 use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
 };
-use crate::events::{AsrSpanRevisionPayload, AsrSpanStability, PipelineStatus, StageStatus};
+use crate::events::{AsrSpanRevisionPayload, AsrSpanStability, StageStatus};
 use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
@@ -281,7 +281,7 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
 
     let transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>> =
         Arc::new(RwLock::new(VecDeque::new()));
-    let pipeline_status = Arc::new(RwLock::new(PipelineStatus::default()));
+    let pipeline_status = crate::status::StatusAuthority::detached();
     let graph_snapshot = Arc::new(RwLock::new(GraphSnapshot::default()));
     let knowledge_graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
     let graph_extractor = Arc::new(RuleBasedExtractor::new());
@@ -372,7 +372,8 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
         "diarization should assign speaker_label"
     );
 
-    let status = pipeline_status.read().expect("pipeline status lock");
+    let status = pipeline_status.snapshot();
+    let status = status.stages();
     let expected_diagnostic = RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::new(
         RuntimeErrorCode::ProviderUnavailable,
         false,
@@ -473,7 +474,7 @@ fn deepgram_event_receiver_survives_an_idle_tick_and_exits_only_on_channel_close
 
     let transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>> =
         Arc::new(RwLock::new(VecDeque::new()));
-    let pipeline_status = Arc::new(RwLock::new(PipelineStatus::default()));
+    let pipeline_status = crate::status::StatusAuthority::detached();
     let graph_snapshot = Arc::new(RwLock::new(GraphSnapshot::default()));
     let knowledge_graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
     let graph_extractor = Arc::new(RuleBasedExtractor::new());
@@ -687,7 +688,7 @@ fn deepgram_multi_speaker_final_splits_into_per_run_segments() {
 
     let transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>> =
         Arc::new(RwLock::new(VecDeque::new()));
-    let pipeline_status = Arc::new(RwLock::new(PipelineStatus::default()));
+    let pipeline_status = crate::status::StatusAuthority::detached();
     let graph_snapshot = Arc::new(RwLock::new(GraphSnapshot::default()));
     let knowledge_graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
     let graph_extractor = Arc::new(RuleBasedExtractor::new());
@@ -996,7 +997,7 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
         session_id,
     )));
     let projection_schedulers = Arc::new(Mutex::new(ProjectionSchedulers::new(session_id)));
-    let pipeline_status = Arc::new(RwLock::new(PipelineStatus::default()));
+    let pipeline_status = crate::status::StatusAuthority::detached();
     let graph_snapshot = Arc::new(RwLock::new(GraphSnapshot::default()));
     let knowledge_graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
     let graph_extractor = Arc::new(RuleBasedExtractor::new());
@@ -1560,7 +1561,7 @@ impl DeepgramReceiverHarness {
 
         let transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>> =
             Arc::new(RwLock::new(VecDeque::new()));
-        let pipeline_status = Arc::new(RwLock::new(PipelineStatus::default()));
+        let pipeline_status = crate::status::StatusAuthority::detached();
         let graph_snapshot = Arc::new(RwLock::new(GraphSnapshot::default()));
         let knowledge_graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
         let graph_extractor = Arc::new(RuleBasedExtractor::new());

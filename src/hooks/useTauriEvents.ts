@@ -11,26 +11,28 @@
  *   - `DIARIZATION_SPAN_REVISION`
  *                                → `addDiarizationSpanRevision`
  *   - `TURN_EVENT`              → `addTurnEvent`
- *   - `AGENT_STATUS`            → `setAgentStatus`
- *   - `AGENT_PROPOSAL`          → `addAgentProposal` + toast
  *   - `AGENT_CARD_UPDATE`       → `upsertLiveAssistCard` (fix round,
  *                                 audio-graph-83cc T5: wires the listener
  *                                 the backend's `CardAnswer` terminal-frame
  *                                 emission has always assumed exists — see
  *                                 `src-tauri/src/events.rs`'s doc on
- *                                 `AGENT_CARD_UPDATE`)
+ *                                 `AGENT_CARD_UPDATE`); dropped when its
+ *                                 session is not the applied snapshot's
  *   - `GRAPH_UPDATE`            → `setGraphSnapshot`
  *   - `GRAPH_DELTA`             → `applyGraphDelta`
- *   - `PROJECTION_PATCH`        → `addProjectionPatch`
  *   - `MATERIALIZED_NOTES_UPDATE`
- *                                → `setMaterializedNotes`
+ *                                → `setMaterializedNotes` (session-fenced)
  *   - `MATERIALIZED_GRAPH_UPDATE`
  *                                → `setMaterializedProjectionGraph`
- *   - `PIPELINE_STATUS`         → `setPipelineStatus`
+ *                                  (session-fenced)
+ *   - `PIPELINE_STATUS`         → `setPipelineStatus`, applied only when
+ *                                 newer than the applied snapshot; read
+ *                                 again on focus, on visibility changes and
+ *                                 every few seconds while capture is not
+ *                                 idle or its state is unknown
  *   - `AUDIO_CONSUMER_HEALTH`   → `setAudioConsumerHealth`
  *   - `SPEAKER_DETECTED`        → `addOrUpdateSpeaker`
- *   - `CAPTURE_ERROR`           → `setError`
- *   - `CAPTURE_BACKPRESSURE`    → `setSourceBackpressure`
+ *   - `CAPTURE_ERROR`           → `setError`, unless an older capture's
  *   - `PERSISTENCE_QUEUE_BACKPRESSURE`
  *                                → `setPersistenceQueueBackpressure`
  *   - `CAPTURE_STORAGE_FULL`    → `publishStorageFull` (StorageBanner)
@@ -54,7 +56,6 @@
 
 import { listen } from "@tauri-apps/api/event";
 import { useEffect } from "react";
-import { safeInvoke } from "../analytics/safeInvoke";
 import { publishStorageFull } from "../components/StorageBanner";
 import { CREDENTIAL_CONTRACT } from "../generated/credentialContract";
 import {
@@ -63,14 +64,13 @@ import {
 } from "../generated/runtimeDiagnostic";
 import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
-import { compareCaptureIds } from "../store/captureFacts";
+import { compareCaptureIds, sessionAdmits } from "../store/captureFacts";
 import type {
   AgentProposalEvent,
   AgentStatusEvent,
   AsrPartialEvent,
   AsrSpanRevisionEvent,
   AwsErrorPayload,
-  CaptureBackpressurePayload,
   CaptureErrorPayload,
   CaptureStorageFullPayload,
   DiarizationSpanRevisionEvent,
@@ -179,7 +179,6 @@ const PIPELINE_STATUS = "pipeline-status";
 const AUDIO_CONSUMER_HEALTH = "audio-consumer-health";
 const SPEAKER_DETECTED = "speaker-detected";
 const CAPTURE_ERROR = "capture-error";
-const CAPTURE_BACKPRESSURE = "capture-backpressure";
 const PERSISTENCE_QUEUE_BACKPRESSURE = "persistence-queue-backpressure";
 const CAPTURE_STORAGE_FULL = "capture-storage-full";
 const GEMINI_TRANSCRIPTION = "gemini-transcription";
@@ -190,6 +189,10 @@ const OPENAI_REALTIME_STATUS = "openai-realtime-status";
 const MODEL_DOWNLOAD_PROGRESS = "model-download-progress";
 const PIPELINE_LATENCY = "pipeline-latency";
 const AWS_ERROR = "aws-error";
+
+/** How often a shown capture that is not idle, or unknown, is read again. */
+const CAPTURE_RECONCILE_MS = 3_000;
+
 // Streaming-chat token deltas + terminal frame no longer arrive as
 // `chat-token-delta` / `chat-token-done` events: audio-graph-1534 moved that
 // per-token hot path onto a per-invocation `tauri::ipc::Channel<ChatStreamEvent>`
@@ -293,13 +296,24 @@ export function useTauriEvents(): void {
   const addOrUpdateSpeaker = useAudioGraphStore((s) => s.addOrUpdateSpeaker);
   const setError = useAudioGraphStore((s) => s.setError);
   const notify = useAudioGraphStore((s) => s.notify);
-  const setSourceBackpressure = useAudioGraphStore(
-    (s) => s.setSourceBackpressure,
-  );
   const setPersistenceQueueBackpressure = useAudioGraphStore(
     (s) => s.setPersistenceQueueBackpressure,
   );
   const addGeminiTranscript = useAudioGraphStore((s) => s.addGeminiTranscript);
+
+  // While the shown capture is pending, running or stopping, or its state
+  // is unknown, it is read again every few seconds: a lost emission is never
+  // shown for long. One interval, cleared once idle and on unmount.
+  const reconcilePeriodically = useAudioGraphStore(
+    (s) => s.captureStatus !== "idle" || s.captureUnknown,
+  );
+  useEffect(() => {
+    if (!reconcilePeriodically) return;
+    const interval = setInterval(() => {
+      void useAudioGraphStore.getState().reconcileCapture();
+    }, CAPTURE_RECONCILE_MS);
+    return () => clearInterval(interval);
+  }, [reconcilePeriodically]);
 
   useEffect(() => {
     let unlisten: Array<(() => void) | null> = [];
@@ -399,6 +413,9 @@ export function useTauriEvents(): void {
         // deliverable (d)'s "answered ⇒ feed" classification rule was
         // unreachable in production without this listener.
         safeListen<LiveAssistCardRecord>(AGENT_CARD_UPDATE, (event) => {
+          // A card of another session than the shown one is stale.
+          const { pipelineStatus } = useAudioGraphStore.getState();
+          if (!sessionAdmits(pipelineStatus, event.payload.session_id)) return;
           upsertLiveAssistCard(event.payload);
         }),
         safeListen<GraphSnapshot>(GRAPH_UPDATE, (event) => {
@@ -411,9 +428,13 @@ export function useTauriEvents(): void {
           addProjectionPatch(event.payload);
         }),
         safeListen<MaterializedNotes>(MATERIALIZED_NOTES_UPDATE, (event) => {
+          const { pipelineStatus } = useAudioGraphStore.getState();
+          if (!sessionAdmits(pipelineStatus, event.payload.session_id)) return;
           setMaterializedNotes(event.payload);
         }),
         safeListen<MaterializedGraph>(MATERIALIZED_GRAPH_UPDATE, (event) => {
+          const { pipelineStatus } = useAudioGraphStore.getState();
+          if (!sessionAdmits(pipelineStatus, event.payload.session_id)) return;
           setMaterializedProjectionGraph(event.payload);
         }),
         safeListen<PipelineStatus>(PIPELINE_STATUS, (event) => {
@@ -434,28 +455,14 @@ export function useTauriEvents(): void {
           console.error("Capture error", {
             recoverable: event.payload.recoverable,
           });
-          // An error from a capture older than the newest one known is stale.
-          const fact = useAudioGraphStore.getState().captureFact;
-          if (
-            fact === null ||
-            compareCaptureIds(event.payload.capture_id, fact.id) >= 0
-          ) {
+          // An error from a capture older than the one the applied snapshot
+          // shows is stale.
+          const shown =
+            useAudioGraphStore.getState().pipelineStatus.capture_state.id;
+          if (compareCaptureIds(event.payload.capture_id, shown) >= 0) {
             setError(event.payload.error);
           }
         }),
-        safeListen<CaptureBackpressurePayload>(
-          CAPTURE_BACKPRESSURE,
-          (event) => {
-            // A source is named by its capture and position, never by its
-            // selection string.
-            const { capture_id, source_index, is_backpressured } =
-              event.payload;
-            setSourceBackpressure(
-              `${capture_id.epoch}.${capture_id.seq}/${source_index}`,
-              is_backpressured,
-            );
-          },
-        ),
         safeListen<PersistenceQueueBackpressurePayload>(
           PERSISTENCE_QUEUE_BACKPRESSURE,
           (event) => {
@@ -507,12 +514,11 @@ export function useTauriEvents(): void {
               severity: variant,
               message: i18n.t(key),
             });
-          } else if (statusType === "disconnected") {
-            useAudioGraphStore.setState({ isGeminiActive: false });
           } else if (statusType === "reconnected") {
             // Recovery clears the sticky legacy error banner (FINDING #56
             // P2) — nothing else clears it, so it would otherwise linger
-            // long after the link is healthy again.
+            // long after the link is healthy again. Whether the mode runs
+            // is the snapshot's `realtime`, not this notification's.
             setError(null);
             notify({
               severity: resumed ? "success" : "info",
@@ -551,8 +557,6 @@ export function useTauriEvents(): void {
                 severity: variant,
                 message: i18n.t(key),
               });
-            } else if (statusType === "disconnected") {
-              useAudioGraphStore.setState({ isGeminiActive: false });
             } else if (statusType === "reconnected") {
               setError(null);
               notify({
@@ -589,21 +593,29 @@ export function useTauriEvents(): void {
         }
         return;
       }
-      unlisten = handles;
+      // Lost emissions are bounded: a window that regains focus or changes
+      // visibility reads the backend's state again.
+      const reconcile = () => {
+        void useAudioGraphStore.getState().reconcileCapture();
+      };
+      window.addEventListener("focus", reconcile);
+      document.addEventListener("visibilitychange", reconcile);
+      unlisten = [
+        ...handles,
+        () => {
+          window.removeEventListener("focus", reconcile);
+          document.removeEventListener("visibilitychange", reconcile);
+        },
+      ];
       // Attach to capture control once this realm listens: the snapshot it
       // returns adopts a capture still running after a reload, and the
       // attachment cancels any start the previous page left pending. The
       // store keeps one attachment per realm, so a remount reuses it.
       useAudioGraphStore.getState().attachCapture();
-      // The startup storage probe may have finished before the renderer
-      // mounted. The read is merged by its capture fact like every event, so
-      // it is dropped only when a newer fact has already arrived.
-      try {
-        const status = await safeInvoke<PipelineStatus>("get_pipeline_status");
-        if (!cancelled && status) setPipelineStatus(status);
-      } catch {
-        // The event subscription will publish the next observed status.
-      }
+      // The first status read comes after the subscription, so nothing
+      // published in between is lost; like every snapshot it is applied
+      // only when newer than the one already applied.
+      reconcile();
     }
 
     setup();
@@ -636,7 +648,6 @@ export function useTauriEvents(): void {
     setAudioConsumerHealth,
     addOrUpdateSpeaker,
     setError,
-    setSourceBackpressure,
     setPersistenceQueueBackpressure,
     addGeminiTranscript,
     notify,

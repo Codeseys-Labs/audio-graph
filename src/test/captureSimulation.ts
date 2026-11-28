@@ -1,15 +1,27 @@
-import type { CaptureFact, CaptureId, PipelineStatus } from "../types";
+import { isPipelineStatus } from "../store/captureFacts";
+import type {
+  CaptureId,
+  CapturePhase,
+  PipelineStatus,
+  SourceBackpressure,
+  TranscriptionSnapshot,
+} from "../types";
 
 /**
- * A simulation of the capture control protocol (#141, amendment H): a model
- * backend that implements the protocol, a network that delivers commands
- * once or twice and replies and events in any order, and a scheduler that
- * explores those orders. The renderer side is the production store and
- * hooks, driven through mocked `invoke` and `listen`; this module knows them
- * only through {@link RendererRealm}.
+ * A simulation of the capture snapshot contract (#141): a model backend that
+ * publishes a revisioned snapshot on every change and answers every command
+ * with the snapshot after its effect, a network that delivers commands once
+ * or twice and replies and events in any order (dropping, losing or
+ * garbling some), and a scheduler that explores those orders. The renderer
+ * side is the production store and hooks, driven through mocked `invoke` and
+ * `listen`; this module knows them only through {@link RendererRealm}.
+ *
+ * The oracle: after every step the renderer displays the state of the
+ * highest-revision snapshot delivered to it, and after a status read it
+ * displays the model backend's state.
  */
 
-// ── Ids and facts ────────────────────────────────────────────────────────
+// ── Ids ──────────────────────────────────────────────────────────────────
 
 export function compareIds(a: CaptureId, b: CaptureId): number {
   return a.epoch !== b.epoch ? a.epoch - b.epoch : a.seq - b.seq;
@@ -19,10 +31,11 @@ function maxId(a: CaptureId, b: CaptureId): CaptureId {
   return compareIds(a, b) >= 0 ? a : b;
 }
 
-const sameId = (a: CaptureId | null, b: CaptureId | null) =>
-  a !== null && b !== null && compareIds(a, b) === 0;
+const sameId = (a: CaptureId, b: CaptureId) => compareIds(a, b) === 0;
 
 const idText = (id: CaptureId) => `(${id.epoch},${id.seq})`;
+
+const ORIGIN: CaptureId = { epoch: 0, seq: 0 };
 
 function captureIdArg(
   args: unknown,
@@ -43,18 +56,27 @@ function captureIdArg(
   return null;
 }
 
-function realmArg(args: unknown): string | null {
-  if (typeof args !== "object" || args === null || !("realm" in args)) {
+function stringArg(args: unknown, key: "realm" | "operation"): string | null {
+  if (typeof args !== "object" || args === null || !(key in args)) {
     return null;
   }
-  return typeof args.realm === "string" ? args.realm : null;
+  const value: unknown = Reflect.get(args, key);
+  return typeof value === "string" ? value : null;
+}
+
+function numberArg(args: unknown, key: "generation"): number | null {
+  if (typeof args !== "object" || args === null || !(key in args)) {
+    return null;
+  }
+  const value: unknown = Reflect.get(args, key);
+  return typeof value === "number" ? value : null;
 }
 
 // ── The model backend ────────────────────────────────────────────────────
 
 /** Deliberate deviations, to show the simulation catches them. */
 export interface BackendDefects {
-  /** Round 4: a repeated Start of the live id was refused with Ended. */
+  /** Round 4: a repeated Start of the live id was refused as ended. */
   repeatedStartEndsLive?: boolean;
   /** Round 4: the tray Stop was an event the renderer had to handle. */
   trayStopIsRendererEvent?: boolean;
@@ -63,95 +85,90 @@ export interface BackendDefects {
 type CommandOutcome =
   | { ok: true; value: unknown }
   | { ok: false; error: unknown }
-  /** Answered later, by the start it repeats. */
+  /** Answered later, when the start it registered commits. */
   | { deferred: true };
 
 interface PendingStart {
   id: CaptureId;
+  /** A Stop or a newer attachment fenced it while it prepared. */
+  cancelled: boolean;
   /** Deliveries of this start waiting for its outcome. */
-  waiters: Array<(outcome: CaptureFact) => void>;
+  waiters: Array<(outcome: CommandOutcome) => void>;
 }
 
+const transportFailure = () => new Error("IPC transport failure");
+
 export class ModelBackend {
+  revision = 0;
   epoch = 0;
   attachedRealm: string | null = null;
-  cancelledThrough: CaptureId = { epoch: 0, seq: 0 };
-  lastRegistered: CaptureId = { epoch: 0, seq: 0 };
+  capture: { id: CaptureId; phase: CapturePhase } = {
+    id: ORIGIN,
+    phase: "idle",
+  };
+  retired: CaptureId = ORIGIN;
+  transcription: TranscriptionSnapshot | null = null;
+  session = { id: "session-0", epoch: 0 };
+  backpressure: SourceBackpressure[] = [];
   pending: PendingStart | null = null;
-  live: CaptureId | null = null;
-  /** The id the status snapshot is stamped with. */
-  statusId: CaptureId = { epoch: 0, seq: 0 };
-  transcribing = false;
-  /** Every fact it stated about a live id that was not true. */
+  /** What each stop-everything ended through, on its first delivery. */
+  private operations = new Map<string, CaptureId>();
+  private generations = 0;
+  private foreignWindows = 0;
+  /** Every segment spoken, with the session it belongs to. */
+  readonly segments: Array<{ id: string; session: number }> = [];
+  /** Every snapshot it handed out that was not true. */
   readonly violations: string[] = [];
   nextStopFails: "cleanup" | "transport" | null = null;
   nextAttachFails = false;
-  /** The last status emitted while capturing, for a slow thread to repeat. */
-  private lastRunningStatus: PipelineStatus | null = null;
+  /** The last snapshot published while capturing, for a slow thread to repeat. */
+  private lastRunning: PipelineStatus | null = null;
 
   constructor(
     readonly emit: (name: string, payload: unknown) => void,
     readonly defects: BackendDefects = {},
   ) {}
 
-  /** Record a fact the backend states, checking it is true. */
-  private state(fact: CaptureFact): CaptureFact {
-    if (fact.phase === "ended" && sameId(this.live, fact.id)) {
-      this.violations.push(`Ended${idText(fact.id)} while it was live`);
-    }
-    if (
-      fact.phase === "running" &&
-      !sameId(this.live, fact.id) &&
-      !sameId(this.pending?.id ?? null, fact.id)
-    ) {
-      this.violations.push(`Running${idText(fact.id)} while it was not live`);
-    }
-    return fact;
-  }
-
-  snapshot(): CaptureFact {
-    return this.state({
-      id: this.statusId,
-      phase: this.live === null ? "ended" : "running",
-    });
-  }
-
-  status(): PipelineStatus {
-    const fact = this.snapshot();
+  /** The state now, at the current revision. */
+  snapshot(): PipelineStatus {
     const idle = { type: "Idle" } as const;
     const running = { type: "Running", processed_count: 0 } as const;
+    const capturing = this.capture.phase === "running";
     return {
-      capture_id: fact.id,
-      capture: fact.phase === "running" ? running : idle,
-      pipeline: fact.phase === "running" ? running : idle,
-      asr: this.transcribing ? running : idle,
+      revision: this.revision,
+      capture_state: { ...this.capture },
+      retired_through: this.retired,
+      transcription: this.transcription,
+      realtime: { gemini: false, converse: false, openai_realtime: false },
+      session: { ...this.session },
+      backpressure: [...this.backpressure],
+      capture: capturing ? running : idle,
+      pipeline: capturing ? running : idle,
+      asr: this.transcription !== null ? running : idle,
       diarization: idle,
       entity_extraction: idle,
       graph: idle,
     };
   }
 
-  private emitStatus(): void {
-    const status = this.status();
-    if (status.capture.type === "Running") this.lastRunningStatus = status;
+  /** Every change bumps the revision and is published. */
+  private publish(): void {
+    this.revision += 1;
+    const status = this.snapshot();
+    if (status.capture_state.phase === "running") this.lastRunning = status;
     this.emit("pipeline-status", status);
   }
 
-  /** A slower thread emits a snapshot it read while capture was running. */
+  /** A slower thread emits a snapshot it took while capture was running. */
   emitStaleSnapshot(): void {
-    if (this.lastRunningStatus !== null) {
-      this.emit("pipeline-status", this.lastRunningStatus);
-    }
+    if (this.lastRunning !== null) this.emit("pipeline-status", this.lastRunning);
   }
 
-  private reply(fact: CaptureFact): CommandOutcome {
-    return {
-      ok: true,
-      value: { fact: this.state(fact), snapshot: this.snapshot() },
-    };
+  private reply(outcome: string): CommandOutcome {
+    return { ok: true, value: { outcome, snapshot: this.snapshot() } };
   }
 
-  private refusal(id: CaptureId, reason: string): CommandOutcome {
+  private startRefusal(reason: string): CommandOutcome {
     return {
       ok: false,
       error: {
@@ -160,7 +177,6 @@ export class ModelBackend {
           reason,
           source_index: null,
           sources: [],
-          capture: this.state({ id, phase: "ended" }),
           snapshot: this.snapshot(),
         },
       },
@@ -175,7 +191,12 @@ export class ModelBackend {
   ): CommandOutcome {
     switch (cmd) {
       case "capture_attach":
-        return this.attach(realmArg(args));
+        if (this.nextAttachFails) {
+          // Lost in the transport: the attach never ran.
+          this.nextAttachFails = false;
+          return { ok: false, error: transportFailure() };
+        }
+        return this.attach(stringArg(args, "realm"));
       case "start_capture": {
         const id = captureIdArg(args, "id");
         if (id === null) throw new Error("start_capture without an id");
@@ -186,102 +207,105 @@ export class ModelBackend {
         const failure = this.nextStopFails;
         this.nextStopFails = null;
         if (failure === "transport") {
-          return { ok: false, error: new Error("IPC transport failure") };
+          return { ok: false, error: transportFailure() };
         }
-        return this.stop(captureIdArg(args, "id"), failure === "cleanup");
+        return this.stop(
+          captureIdArg(args, "id"),
+          stringArg(args, "operation"),
+          failure === "cleanup",
+        );
       }
-      case "start_transcribe": {
-        const id = captureIdArg(args, "captureId");
-        if (id === null || !sameId(this.live, id)) {
-          return {
-            ok: false,
-            error: {
-              code: "session_invalid",
-              message: {
-                reason: "Cannot start transcription: capture is not running",
-              },
-            },
-          };
-        }
-        this.transcribing = true;
-        return { ok: true, value: null };
-      }
+      case "start_transcribe":
+        return this.startTranscribe(captureIdArg(args, "captureId"));
       case "stop_transcribe":
-        this.transcribing = false;
-        return { ok: true, value: null };
+        return this.stopTranscribe(
+          captureIdArg(args, "captureId"),
+          numberArg(args, "generation"),
+        );
       case "get_pipeline_status":
-        return { ok: true, value: this.status() };
+        return { ok: true, value: this.snapshot() };
       case "new_session_cmd":
-        if (this.live !== null || this.pending !== null) {
-          return {
-            ok: false,
-            error: {
-              code: "session_invalid",
-              message: { reason: "capture is running" },
-            },
-          };
-        }
-        return { ok: true, value: "next-session" };
+        return this.rotate();
       default:
         throw new Error(`not a capture command: ${cmd}`);
     }
   }
 
   private attach(realm: string | null): CommandOutcome {
-    if (this.nextAttachFails) {
-      this.nextAttachFails = false;
-      return { ok: false, error: new Error("IPC transport failure") };
-    }
-    if (realm === null || realm !== this.attachedRealm) {
-      this.attachedRealm = realm;
-      this.epoch += 1;
-      this.cancelThrough({ epoch: this.epoch, seq: 0 });
-      if (this.live === null) this.statusId = { epoch: this.epoch, seq: 0 };
-    }
+    if (realm === null) throw new Error("capture_attach without a realm");
+    // The same realm's attach is idempotent; another one supersedes it.
+    if (realm !== this.attachedRealm) this.supersede(realm);
     return {
       ok: true,
       value: { epoch: this.epoch, snapshot: this.snapshot() },
     };
   }
 
+  /**
+   * A new attachment: a new epoch, every id of the earlier ones retired,
+   * and the start the previous attachment left preparing cancelled.
+   */
+  private supersede(realm: string): void {
+    this.attachedRealm = realm;
+    this.epoch += 1;
+    this.retired = maxId(this.retired, { epoch: this.epoch, seq: 0 });
+    if (this.pending !== null && !this.pending.cancelled) {
+      this.pending.cancelled = true;
+      this.capture = { id: this.pending.id, phase: "stopping" };
+    }
+    this.publish();
+  }
+
   private start(
     id: CaptureId,
     answer: (outcome: CommandOutcome) => void,
   ): CommandOutcome {
-    if (sameId(this.live, id) && !this.defects.repeatedStartEndsLive) {
-      return this.reply({ id, phase: "running" });
+    // Identity before validation: a repeat of the live or the preparing
+    // start reports that start.
+    if (this.capture.phase === "running" && sameId(this.capture.id, id)) {
+      if (this.defects.repeatedStartEndsLive) {
+        this.revision += 1;
+        this.violations.push(`idle${idText(id)} stated while it was running`);
+        return {
+          ok: false,
+          error: {
+            code: "capture_start_failed",
+            message: {
+              reason: "cancelled",
+              source_index: null,
+              sources: [],
+              snapshot: {
+                ...this.snapshot(),
+                capture_state: { id, phase: "idle" },
+              },
+            },
+          },
+        };
+      }
+      return this.reply("repeated");
     }
     if (this.pending !== null && sameId(this.pending.id, id)) {
-      this.pending.waiters.push((fact) =>
-        answer(
-          fact.phase === "running"
-            ? this.reply(fact)
-            : this.refusal(id, "cancelled"),
-        ),
+      return this.startRefusal("still_preparing");
+    }
+    if (id.epoch !== this.epoch) return this.startRefusal("stale_attachment");
+    if (compareIds(id, this.retired) <= 0) {
+      return this.startRefusal("cancelled");
+    }
+    // Registered, refused or not, it is retired.
+    this.retired = id;
+    if (this.capture.phase !== "idle") {
+      this.publish();
+      return this.startRefusal(
+        this.capture.phase === "stopping"
+          ? "previous_capture_stopping"
+          : "already_running",
       );
-      return { deferred: true };
     }
-    if (
-      compareIds(id, this.cancelledThrough) <= 0 ||
-      compareIds(id, this.lastRegistered) <= 0
-    ) {
-      return this.refusal(id, "cancelled");
-    }
-    this.lastRegistered = id;
-    if (this.pending !== null || this.live !== null) {
-      return this.refusal(id, "already_running");
-    }
-    this.pending = {
-      id,
-      waiters: [
-        (fact) =>
-          answer(
-            fact.phase === "running"
-              ? this.reply(fact)
-              : this.refusal(id, "cancelled"),
-          ),
-      ],
-    };
+    this.capture = { id, phase: "pending" };
+    this.transcription = null;
+    this.backpressure = [];
+    this.pending = { id, cancelled: false, waiters: [answer] };
+    this.publish();
     return { deferred: true };
   }
 
@@ -289,43 +313,61 @@ export class ModelBackend {
   commit(): void {
     const pending = this.pending;
     if (pending === null) return;
-    const cancelled = compareIds(pending.id, this.cancelledThrough) <= 0;
-    if (!cancelled) {
-      this.live = pending.id;
-      this.statusId = pending.id;
-      this.transcribing = false;
-    }
-    const outcome: CaptureFact = {
-      id: pending.id,
-      phase: cancelled ? "ended" : "running",
-    };
     this.pending = null;
-    if (!cancelled) this.emitStatus();
-    for (const waiter of pending.waiters) waiter(outcome);
+    if (pending.cancelled) {
+      // Its cleanup: what was torn down is idle now.
+      if (sameId(this.capture.id, pending.id)) {
+        this.capture = { id: pending.id, phase: "idle" };
+      }
+      this.publish();
+      for (const waiter of pending.waiters) {
+        waiter(this.startRefusal("cancelled"));
+      }
+      return;
+    }
+    this.capture = { id: pending.id, phase: "running" };
+    this.publish();
+    for (const waiter of pending.waiters) waiter(this.reply("started"));
   }
 
-  private cancelThrough(through: CaptureId): void {
-    this.cancelledThrough = maxId(this.cancelledThrough, through);
-  }
-
-  private newestId(): CaptureId {
-    return maxId(
-      maxId(this.lastRegistered, this.live ?? this.lastRegistered),
-      this.cancelledThrough,
-    );
-  }
-
-  private end(): void {
-    this.live = null;
-    this.transcribing = false;
-    this.emitStatus();
-  }
-
-  /** End every capture up to `id` (`null`: the newest the backend knows). */
-  stop(id: CaptureId | null, cleanupFails = false): CommandOutcome {
-    const through = id ?? this.newestId();
-    this.cancelThrough(through);
-    if (this.live !== null && compareIds(this.live, through) <= 0) this.end();
+  /** End every capture up to `id`, or (no id) every one `operation` covers. */
+  stop(
+    id: CaptureId | null,
+    operation: string | null,
+    cleanupFails = false,
+  ): CommandOutcome {
+    let through: CaptureId;
+    if (id !== null) {
+      through = id;
+    } else {
+      if (operation === null) {
+        this.violations.push("stop_capture(null) without an operation");
+        return { ok: false, error: transportFailure() };
+      }
+      // Recorded on first delivery: a replay never ends a later capture.
+      through = this.operations.get(operation) ?? this.retired;
+      this.operations.set(operation, through);
+    }
+    const retiring = compareIds(through, this.retired) > 0;
+    this.retired = maxId(this.retired, through);
+    const { id: shown, phase } = this.capture;
+    if (phase === "idle" || compareIds(shown, through) > 0) {
+      if (retiring) this.publish();
+      return this.reply("nothing_running");
+    }
+    if (phase === "pending") {
+      if (this.pending !== null) this.pending.cancelled = true;
+      this.capture = { id: shown, phase: "stopping" };
+      this.publish();
+      return this.reply("stopped");
+    }
+    // Stopping is published before cleanup.
+    if (phase === "running") {
+      this.capture = { id: shown, phase: "stopping" };
+      this.publish();
+    } else if (retiring) {
+      this.publish();
+    }
     if (cleanupFails) {
       return {
         ok: false,
@@ -335,12 +377,129 @@ export class ModelBackend {
         },
       };
     }
-    return this.reply({ id: through, phase: "ended" });
+    this.end();
+    return this.reply("stopped");
+  }
+
+  private end(): void {
+    this.capture = { id: this.capture.id, phase: "idle" };
+    this.transcription = null;
+    this.backpressure = [];
+    this.publish();
   }
 
   /** The live capture's last source died; reconciliation ends it. */
   sourceDies(): void {
-    if (this.live !== null) this.end();
+    if (this.capture.phase !== "running") return;
+    this.capture = { id: this.capture.id, phase: "stopping" };
+    this.publish();
+    this.end();
+  }
+
+  private startTranscribe(id: CaptureId | null): CommandOutcome {
+    if (
+      id === null ||
+      this.capture.phase !== "running" ||
+      !sameId(this.capture.id, id)
+    ) {
+      return {
+        ok: false,
+        error: {
+          code: "transcription_refused",
+          message: { reason: "capture_not_running", snapshot: this.snapshot() },
+        },
+      };
+    }
+    if (this.transcription !== null && sameId(this.transcription.capture, id)) {
+      return this.reply("repeated");
+    }
+    this.generations += 1;
+    this.transcription = { capture: id, generation: this.generations };
+    this.publish();
+    return this.reply("started");
+  }
+
+  private stopTranscribe(
+    id: CaptureId | null,
+    generation: number | null,
+  ): CommandOutcome {
+    const current = this.transcription;
+    if (
+      current === null ||
+      id === null ||
+      !sameId(current.capture, id) ||
+      current.generation !== generation
+    ) {
+      return this.reply("not_running");
+    }
+    this.transcription = null;
+    this.publish();
+    return this.reply("stopped");
+  }
+
+  private rotate(): CommandOutcome {
+    if (this.capture.phase !== "idle" || this.pending !== null) {
+      return {
+        ok: false,
+        error: {
+          code: "session_invalid",
+          message: { reason: "capture is running" },
+        },
+      };
+    }
+    const epoch = this.session.epoch + 1;
+    this.session = { id: `session-${epoch}`, epoch };
+    this.publish();
+    return { ok: true, value: this.session.id };
+  }
+
+  /** A running capture's first source starts or stops dropping chunks. */
+  toggleBackpressure(): void {
+    if (this.capture.phase !== "running") return;
+    const id = this.capture.id;
+    this.backpressure =
+      this.backpressure.length > 0 ? [] : [{ capture: id, source_index: 0 }];
+    this.publish();
+  }
+
+  /** A transcribed capture produces a segment. */
+  speak(): void {
+    if (this.transcription === null) return;
+    const id = `seg-${this.segments.length + 1}`;
+    this.segments.push({ id, session: this.session.epoch });
+    this.emit("transcript-update", {
+      id,
+      source_id: "system-default",
+      speaker_id: null,
+      speaker_label: null,
+      text: id,
+      start_time: 0,
+      end_time: 1,
+      confidence: 1,
+    });
+  }
+
+  /**
+   * Another window attaches, superseding this one's attachment, and starts
+   * a capture when none is held.
+   */
+  foreignStart(): void {
+    this.foreignWindows += 1;
+    this.supersede(`foreign-${this.foreignWindows}`);
+    if (this.capture.phase !== "idle") return;
+    const id = { epoch: this.epoch, seq: 1 };
+    this.retired = id;
+    this.capture = { id, phase: "pending" };
+    this.transcription = null;
+    this.backpressure = [];
+    this.publish();
+    this.capture = { id, phase: "running" };
+    this.publish();
+  }
+
+  /** The backend holds a capture: registered, owned or being torn down. */
+  get holdsCapture(): boolean {
+    return this.capture.phase !== "idle" || this.pending !== null;
   }
 }
 
@@ -368,6 +527,8 @@ type Message =
       cmd: string;
       invocation: Invocation;
       outcome: { ok: true; value: unknown } | { ok: false; error: unknown };
+      /** A fault already replaced it. */
+      faulted: boolean;
     }
   | {
       kind: "event";
@@ -391,25 +552,36 @@ const CAPTURE_COMMANDS: Record<string, true> = {
   new_session_cmd: true,
 };
 
-/** What the simulation reads from, and does to, one renderer realm. */
+/** What the simulation reads from one renderer realm. */
 export interface RendererView {
+  /** The applied snapshot's revision (-1 before any). */
+  revision: number;
+  captureStatus: CapturePhase;
+  /** The capture the applied snapshot names. */
+  captureId: CaptureId;
   isCapturing: boolean;
-  captureStarting: boolean;
   isTranscribing: boolean;
-  /** The capture the renderer shows, when it shows one. */
-  captureId: CaptureId | null;
-  /** The capture it shows transcribing, when it shows that. */
-  transcribingId: CaptureId | null;
+  backpressuredSources: string[];
+  sessionEpoch: number;
+  /** The state is shown as unknown. */
+  unknown: boolean;
+  /** A Start's spinner is on. */
+  startInFlight: boolean;
   /** The toggle offers Start (enabled) or Stop. */
   startOffered: boolean;
   stopOffered: boolean;
+  /** The live transcript's segment ids. */
+  transcriptIds: string[];
 }
 
 export interface RendererRealm {
   view(): RendererView;
   pressStart(): void;
   pressStop(): void;
+  pressStopTranscription(): void;
   newSession(): void;
+  /** A focus, visibility change or timer: read the backend's state again. */
+  reconcile(): void;
   /** Unmount the realm's hooks; its pending replies never arrive. */
   unload(): void;
 }
@@ -430,13 +602,32 @@ export interface Budgets {
   trayStops: number;
   sourceDeaths: number;
   newSessions: number;
-  stopFailures: number;
+  /** Stops whose cleanup does not finish. */
+  cleanupFailures: number;
+  /** Stops lost in the transport before they ran. */
+  stopTransportFailures: number;
   /** Attaches whose delivery fails in the transport. */
   attachFailures: number;
   /** Status snapshots a slower thread emits late. */
   staleSnapshots: number;
   /** Commands that may be delivered twice. */
   duplicates: number;
+  /** `pipeline-status` emissions the transport drops. */
+  drops: number;
+  /** Replies lost in the transport after their command ran. */
+  lostReplies: number;
+  /** Replies that arrive unreadable. */
+  unreadableReplies: number;
+  /** Focus, visibility or timer status reads. */
+  reconciles: number;
+  /** Segments a transcribed capture produces. */
+  speech: number;
+  /** Backpressure changes on the running capture. */
+  backpressures: number;
+  /** Captures another window attaches and starts. */
+  foreignStarts: number;
+  /** Stop Transcription presses. */
+  stopTranscriptions: number;
 }
 
 export const NO_BUDGET: Budgets = {
@@ -446,10 +637,19 @@ export const NO_BUDGET: Budgets = {
   trayStops: 0,
   sourceDeaths: 0,
   newSessions: 0,
-  stopFailures: 0,
+  cleanupFailures: 0,
+  stopTransportFailures: 0,
   attachFailures: 0,
   staleSnapshots: 0,
   duplicates: 0,
+  drops: 0,
+  lostReplies: 0,
+  unreadableReplies: 0,
+  reconciles: 0,
+  speech: 0,
+  backpressures: 0,
+  foreignStarts: 0,
+  stopTranscriptions: 0,
 };
 
 /** A transition, and how far it departs from delivering oldest first. */
@@ -470,6 +670,48 @@ async function settle(): Promise<void> {
   for (let i = 0; i < 64; i += 1) await Promise.resolve();
 }
 
+/** The snapshot a delivered reply value or refusal carries, if any. */
+function deliveredSnapshot(value: unknown): PipelineStatus | null {
+  if (isPipelineStatus(value)) return value;
+  if (typeof value !== "object" || value === null) return null;
+  for (const key of ["snapshot", "message"] as const) {
+    if (key in value) {
+      const inner = deliveredSnapshot(Reflect.get(value, key));
+      if (inner !== null) return inner;
+    }
+  }
+  return null;
+}
+
+/** What the window must display for a snapshot, derived independently. */
+function displayOf(status: PipelineStatus): string {
+  const { id, phase } = status.capture_state;
+  return JSON.stringify({
+    revision: status.revision,
+    captureStatus: phase,
+    captureId: idText(id),
+    isCapturing: phase === "running",
+    isTranscribing: status.transcription !== null,
+    backpressured: status.backpressure
+      .filter((entry) => sameId(entry.capture, id))
+      .map((entry) => `${id.epoch}.${id.seq}/${entry.source_index}`)
+      .sort(),
+    sessionEpoch: status.session.epoch,
+  });
+}
+
+function displayed(view: RendererView): string {
+  return JSON.stringify({
+    revision: view.revision,
+    captureStatus: view.captureStatus,
+    captureId: idText(view.captureId),
+    isCapturing: view.isCapturing,
+    isTranscribing: view.isTranscribing,
+    backpressured: [...view.backpressuredSources].sort(),
+    sessionEpoch: view.sessionEpoch,
+  });
+}
+
 export class CaptureSimulation {
   readonly backend: ModelBackend;
   private messages: Message[] = [];
@@ -480,10 +722,16 @@ export class CaptureSimulation {
   private subscribed = false;
   private pendingListens: Array<() => void> = [];
   private budgets: Budgets;
+  /** The highest-revision snapshot delivered to the loaded realm. */
+  private highest: PipelineStatus | null = null;
+  /** Segments the loaded realm must show: spoken to it since its last Start. */
+  private owedSegments: Array<{ id: string; session: number }> = [];
   /** The user's last capture action, for the intent invariant. */
   private lastIntent: "start" | "stop" | null = null;
-  /** The last Stop's intent cannot hold: it never ran. */
+  /** The last Stop's intent cannot hold: it did not complete. */
   private lastStopUnreliable = false;
+  /** Oracle failures seen after some step, with that step. */
+  private stepFailures: string[] = [];
   readonly trace: string[] = [];
 
   constructor(
@@ -510,6 +758,10 @@ export class CaptureSimulation {
   private emit(name: string, payload: unknown): void {
     // An event sent before the realm's listeners subscribed is lost.
     if (!this.subscribed) return;
+    if (name === "transcript-update") {
+      const segment = this.backend.segments.at(-1);
+      if (segment) this.owedSegments.push(segment);
+    }
     this.push({
       kind: "event",
       seq: this.nextSeq(),
@@ -553,6 +805,8 @@ export class CaptureSimulation {
     this.handlers = new Map();
     this.subscribed = false;
     this.pendingListens = [];
+    this.highest = null;
+    this.owedSegments = [];
     this.realm = await this.factory(this.netFor(this.realmNumber));
     this.push({
       kind: "subscribe",
@@ -573,6 +827,13 @@ export class CaptureSimulation {
     return this.realm.view();
   }
 
+  private observe(status: PipelineStatus | null): void {
+    if (status === null) return;
+    if (this.highest === null || status.revision > this.highest.revision) {
+      this.highest = status;
+    }
+  }
+
   private deliver(message: Message, again: boolean): void {
     switch (message.kind) {
       case "subscribe":
@@ -583,6 +844,9 @@ export class CaptureSimulation {
         return;
       case "event": {
         if (message.realm !== this.realmNumber) return;
+        if (message.name === "pipeline-status") {
+          this.observe(deliveredSnapshot(message.payload));
+        }
         this.handlers.get(message.name)?.({
           event: message.name,
           id: 0,
@@ -593,15 +857,19 @@ export class CaptureSimulation {
       case "reply":
         // A reloaded realm's replies never arrive.
         if (message.invocation.realm !== this.realmNumber) return;
-        if (message.outcome.ok)
+        if (message.outcome.ok) {
+          this.observe(deliveredSnapshot(message.outcome.value));
           message.invocation.resolve(message.outcome.value);
-        else message.invocation.reject(message.outcome.error);
+        } else {
+          this.observe(deliveredSnapshot(message.outcome.error));
+          message.invocation.reject(message.outcome.error);
+        }
         return;
       case "commit":
         this.backend.commit();
         return;
       case "tray":
-        this.backend.stop(null);
+        this.backend.stop(null, `tray-${message.seq}`);
         return;
       case "command": {
         message.deliveries += 1;
@@ -615,6 +883,7 @@ export class CaptureSimulation {
             cmd: message.cmd,
             invocation: message.invocation,
             outcome,
+            faulted: false,
           });
         };
         const hadPending = this.backend.pending !== null;
@@ -622,12 +891,8 @@ export class CaptureSimulation {
         if (!hadPending && this.backend.pending !== null) {
           this.push({ kind: "commit", seq: this.nextSeq() });
         }
-        if (
-          message.cmd === "stop_capture" &&
-          "ok" in outcome &&
-          !outcome.ok &&
-          outcome.error instanceof Error
-        ) {
+        // A Stop that failed did not complete what it was pressed for.
+        if (message.cmd === "stop_capture" && "ok" in outcome && !outcome.ok) {
           this.lastStopUnreliable = true;
         }
         answer(outcome);
@@ -656,12 +921,14 @@ export class CaptureSimulation {
   /** Every transition enabled now. */
   choices(): Choice[] {
     const choices: Choice[] = [];
+    const b = this.budgets;
     this.messages.forEach((message, age) => {
       const take = () => {
         this.messages = this.messages.filter((m) => m !== message);
       };
+      const label = this.messageLabel(message);
       choices.push({
-        label: this.messageLabel(message),
+        label,
         delay: age,
         apply: () => {
           take();
@@ -671,27 +938,62 @@ export class CaptureSimulation {
       if (
         message.kind === "command" &&
         message.deliveries === 0 &&
-        this.budgets.duplicates > 0
+        b.duplicates > 0
       ) {
         choices.push({
-          label: `${this.messageLabel(message)} twice`,
+          label: `${label} twice`,
           delay: age,
           apply: () => {
             // Delivered now, and again later: only the later reply is read.
-            this.budgets.duplicates -= 1;
+            b.duplicates -= 1;
             this.deliver(message, true);
           },
         });
       }
+      if (
+        message.kind === "event" &&
+        message.name === "pipeline-status" &&
+        b.drops > 0
+      ) {
+        choices.push({
+          label: `drop ${label}`,
+          apply: () => {
+            b.drops -= 1;
+            take();
+          },
+        });
+      }
+      if (message.kind === "reply" && !message.faulted) {
+        if (b.lostReplies > 0) {
+          choices.push({
+            label: `lose ${label}`,
+            apply: () => {
+              b.lostReplies -= 1;
+              message.faulted = true;
+              message.outcome = { ok: false, error: transportFailure() };
+            },
+          });
+        }
+        if (b.unreadableReplies > 0) {
+          choices.push({
+            label: `garble ${label}`,
+            apply: () => {
+              b.unreadableReplies -= 1;
+              message.faulted = true;
+              message.outcome = { ok: true, value: { unreadable: true } };
+            },
+          });
+        }
+      }
     });
     const view = this.realm?.view();
-    const b = this.budgets;
     if (view && b.starts > 0 && view.startOffered) {
       choices.push({
         label: "press Start",
         apply: () => {
           b.starts -= 1;
           this.lastIntent = "start";
+          this.owedSegments = [];
           this.realm?.pressStart();
         },
       });
@@ -707,17 +1009,29 @@ export class CaptureSimulation {
         },
       });
     }
+    if (view && b.stopTranscriptions > 0 && view.isTranscribing) {
+      choices.push({
+        label: "press Stop Transcription",
+        apply: () => {
+          b.stopTranscriptions -= 1;
+          this.realm?.pressStopTranscription();
+        },
+      });
+    }
     if (b.trayStops > 0) {
       choices.push({
         label: "tray Stop",
         apply: () => {
           b.trayStops -= 1;
           this.lastIntent = "stop";
-          // A start already sent and not yet registered is newer than
-          // anything the tray Stop can name.
-          this.lastStopUnreliable = this.messages.some(
-            (m) => m.kind === "command" && m.cmd === "start_capture",
-          );
+          // A start already sent and not yet registered, or one this window
+          // will still send (a start in flight may be retried), is newer
+          // than anything the tray Stop can name.
+          this.lastStopUnreliable =
+            view?.startInFlight === true ||
+            this.messages.some(
+              (m) => m.kind === "command" && m.cmd === "start_capture",
+            );
           if (this.defects.trayStopIsRendererEvent) {
             this.emit("tray-stop-capture", null);
           } else {
@@ -735,7 +1049,7 @@ export class CaptureSimulation {
         },
       });
     }
-    if (b.sourceDeaths > 0 && this.backend.live !== null) {
+    if (b.sourceDeaths > 0 && this.backend.capture.phase === "running") {
       choices.push({
         label: "source dies",
         apply: () => {
@@ -753,18 +1067,63 @@ export class CaptureSimulation {
         },
       });
     }
-    if (b.stopFailures > 0) {
-      for (const kind of ["cleanup", "transport"] as const) {
+    if (view && b.reconciles > 0) {
+      choices.push({
+        label: "reconcile",
+        apply: () => {
+          b.reconciles -= 1;
+          this.realm?.reconcile();
+        },
+      });
+    }
+    if (b.speech > 0 && this.backend.transcription !== null) {
+      choices.push({
+        label: "speech",
+        apply: () => {
+          b.speech -= 1;
+          this.backend.speak();
+        },
+      });
+    }
+    if (b.backpressures > 0 && this.backend.capture.phase === "running") {
+      choices.push({
+        label: "backpressure",
+        apply: () => {
+          b.backpressures -= 1;
+          this.backend.toggleBackpressure();
+        },
+      });
+    }
+    if (b.foreignStarts > 0) {
+      choices.push({
+        label: "another window starts",
+        apply: () => {
+          b.foreignStarts -= 1;
+          this.lastIntent = "start";
+          this.backend.foreignStart();
+        },
+      });
+    }
+    // Arming a fault only matters for the next delivery it affects, so it is
+    // offered only while such a command is in flight: arming it any earlier
+    // explores nothing new.
+    const inFlight = (cmd: string) =>
+      this.messages.some((m) => m.kind === "command" && m.cmd === cmd);
+    for (const [kind, budget] of [
+      ["cleanup", "cleanupFailures"],
+      ["transport", "stopTransportFailures"],
+    ] as const) {
+      if (b[budget] > 0 && inFlight("stop_capture")) {
         choices.push({
           label: `next Stop fails (${kind})`,
           apply: () => {
-            b.stopFailures -= 1;
+            b[budget] -= 1;
             this.backend.nextStopFails = kind;
           },
         });
       }
     }
-    if (b.attachFailures > 0) {
+    if (b.attachFailures > 0 && inFlight("capture_attach")) {
       choices.push({
         label: "next attach fails",
         apply: () => {
@@ -793,12 +1152,23 @@ export class CaptureSimulation {
     this.trace.push(choice.label);
     await choice.apply();
     await settle();
+    // The oracle, after every step: the highest revision delivered is what
+    // the window shows.
+    if (this.realm !== null && this.highest !== null) {
+      const expected = displayOf(this.highest);
+      const shown = displayed(this.view());
+      if (shown !== expected && this.stepFailures.length === 0) {
+        this.stepFailures.push(
+          `1: after "${choice.label}" the window shows ${shown}, the highest revision delivered is ${expected}`,
+        );
+      }
+    }
   }
 
   /** Deliver everything pending, oldest first, until nothing is. */
   async drain(): Promise<void> {
     for (let guard = 0; !this.quiescent; guard += 1) {
-      if (guard > 200) throw new Error("the system never went quiet");
+      if (guard > 300) throw new Error("the system never went quiet");
       const [oldest] = [...this.messages].sort((a, b) => a.seq - b.seq);
       const label = this.messageLabel(oldest);
       const choice = this.choices().find((c) => c.label === label);
@@ -807,52 +1177,73 @@ export class CaptureSimulation {
     }
   }
 
-  /** The invariants of amendment H at quiescence; empty when all hold. */
-  invariantFailures(): string[] {
-    const failures: string[] = [];
+  /** Disarm every fault: what follows runs over a working transport. */
+  private disarm(): void {
+    this.backend.nextStopFails = null;
+    this.backend.nextAttachFails = false;
+    for (const key of [
+      "drops",
+      "lostReplies",
+      "unreadableReplies",
+      "duplicates",
+    ] as const) {
+      this.budgets[key] = 0;
+    }
+  }
+
+  /**
+   * The invariants at quiescence; empty when all hold. A status read is
+   * delivered first: the oracle's second half is that afterwards the window
+   * shows the backend's state.
+   */
+  async invariantFailures(): Promise<string[]> {
+    const failures = [...this.stepFailures];
+    this.disarm();
+    this.realm?.reconcile();
+    await settle();
+    await this.drain();
     const view = this.view();
-    const { live, transcribing, violations } = this.backend;
-    const shown = view.isCapturing ? view.captureId : null;
-    if (
-      view.isCapturing !== (live !== null) ||
-      !sameIdOrBothNull(shown, live)
-    ) {
+    const backend = this.backend.snapshot();
+    if (displayed(view) !== displayOf(backend)) {
       failures.push(
-        `1: renderer shows ${shown ? `capture ${idText(shown)}` : "no capture"}, backend has ${live ? idText(live) : "none"}`,
+        `2: after a status read the window shows ${displayed(view)}, the backend holds ${displayOf(backend)}`,
       );
     }
-    const backendTranscribing = transcribing && live !== null ? live : null;
-    const shownTranscribing = view.isTranscribing ? view.transcribingId : null;
-    if (
-      view.isTranscribing !== (backendTranscribing !== null) ||
-      !sameIdOrBothNull(shownTranscribing, backendTranscribing)
-    ) {
-      failures.push(
-        `2: renderer transcribing ${shownTranscribing ? idText(shownTranscribing) : view.isTranscribing ? "(unaddressed)" : "nothing"}, backend ${backendTranscribing ? idText(backendTranscribing) : "nothing"}`,
-      );
-    }
-    if ((live !== null || this.backend.pending !== null) && !view.stopOffered) {
+    if (view.unknown) failures.push("2: after a status read the state is unknown");
+    if (this.backend.holdsCapture && !view.stopOffered) {
       failures.push("3: the backend holds a capture and no Stop is offered");
     }
-    for (const violation of violations) failures.push(`4: ${violation}`);
+    for (const violation of this.backend.violations) {
+      failures.push(`4: ${violation}`);
+    }
     if (
       this.lastIntent === "stop" &&
       !this.lastStopUnreliable &&
-      (live !== null || this.backend.pending !== null)
+      this.backend.holdsCapture
     ) {
       failures.push("5: the last action was a Stop and a capture is running");
+    }
+    const shownSegments = new Set(view.transcriptIds);
+    const lost = this.owedSegments.filter(
+      (segment) =>
+        segment.session === this.backend.session.epoch &&
+        !shownSegments.has(segment.id),
+    );
+    if (lost.length > 0) {
+      failures.push(
+        `6: the live transcript lost ${lost.map((s) => s.id).join(", ")}`,
+      );
     }
     return failures;
   }
 
   /**
-   * Invariant 3's second half: this Stop, over a working transport (faults
-   * armed and not yet spent are disarmed), leads to an idle backend.
+   * Invariant 3's second half: this Stop, over a working transport, leads
+   * to an idle backend and a window that shows it idle.
    */
   async finalStop(kind: "window" | "tray"): Promise<string[]> {
     const failures: string[] = [];
-    this.backend.nextStopFails = null;
-    this.backend.nextAttachFails = false;
+    this.disarm();
     if (kind === "window") {
       if (this.view().stopOffered) this.realm?.pressStop();
     } else if (this.defects.trayStopIsRendererEvent) {
@@ -863,18 +1254,20 @@ export class CaptureSimulation {
     await settle();
     await this.drain();
     const view = this.view();
-    if (this.backend.live !== null || this.backend.pending !== null) {
+    if (this.backend.holdsCapture) {
       failures.push(`3: a ${kind} Stop left the backend capturing`);
     }
-    if (view.isCapturing || view.captureStarting) {
-      failures.push(`3: after a ${kind} Stop the renderer still shows capture`);
+    if (
+      view.captureStatus !== "idle" ||
+      view.startInFlight ||
+      view.unknown
+    ) {
+      failures.push(
+        `3: after a ${kind} Stop the window shows ${view.captureStatus}${view.unknown ? " (unknown)" : ""}`,
+      );
     }
     return failures;
   }
-}
-
-function sameIdOrBothNull(a: CaptureId | null, b: CaptureId | null): boolean {
-  return (a === null && b === null) || sameId(a, b);
 }
 
 // ── Exploration ──────────────────────────────────────────────────────────
@@ -909,7 +1302,7 @@ export async function runSchedule(
     await sim.loadRealm();
     if (options.startAttached) await sim.drain();
     for (let step = 0; ; step += 1) {
-      if (step > 200) throw new Error("schedule too long");
+      if (step > 300) throw new Error("schedule too long");
       const choices = sim.choices();
       const picked = pick(
         choices.map((c) => ({ label: c.label, delay: c.delay ?? 0 })),
@@ -921,7 +1314,7 @@ export async function runSchedule(
       }
       await sim.step(choices[picked]);
     }
-    const failures = sim.invariantFailures();
+    const failures = await sim.invariantFailures();
     failures.push(...(await sim.finalStop(finalStop)));
     return { trace: [...sim.trace], failures };
   } finally {
@@ -1011,16 +1404,34 @@ export function randomPick(random: () => number, endChance = 0.3): Pick {
   };
 }
 
+/** A script step: deliver everything pending, oldest first, until quiet. */
+export const SETTLE = "(deliver everything pending)";
+
+/** The oldest pending message, delivered once. */
+function oldestDelivery(choices: ChoiceInfo[]): number {
+  const oldest = choices.findIndex(
+    ({ label, delay }) =>
+      delay === 0 && /^(deliver|reply|event|subscribe|commit|tray)/.test(label),
+  );
+  if (oldest < 0) throw new Error("nothing to drain");
+  return oldest;
+}
+
 /**
  * A named schedule: each step takes the first choice whose label starts
- * with the next entry (or matches it, for a pattern); afterwards everything
- * pending is delivered oldest first.
+ * with the next entry (or matches it, for a pattern), or, for
+ * {@link SETTLE}, delivers everything pending; afterwards everything pending
+ * is delivered oldest first.
  */
 export function scriptedPick(script: readonly (string | RegExp)[]): Pick {
   let next = 0;
   return (choices, quiescent) => {
+    while (next < script.length && script[next] === SETTLE && quiescent) {
+      next += 1;
+    }
     if (next < script.length) {
       const step = script[next];
+      if (step === SETTLE) return oldestDelivery(choices);
       const index = choices.findIndex(({ label }) =>
         typeof step === "string" ? label.startsWith(step) : step.test(label),
       );
@@ -1033,11 +1444,6 @@ export function scriptedPick(script: readonly (string | RegExp)[]): Pick {
       return index;
     }
     if (quiescent) return "end";
-    // The oldest message, delivered once.
-    const oldest = choices.findIndex(
-      ({ label, delay }) => delay === 0 && /#\d+$/.test(label),
-    );
-    if (oldest < 0) throw new Error("nothing to drain");
-    return oldest;
+    return oldestDelivery(choices);
   };
 }

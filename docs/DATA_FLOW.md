@@ -266,8 +266,8 @@ Detail:
   stalled pipeline causes the chunk to be dropped (not held) so `stop_capture`
   can always reclaim the thread. rsac's internal ring buffer also drops on
   overflow; the thread polls both `backpressure_report()` and v0.4.1's separate
-  subscriber-drop counter and raises edge-triggered `capture-backpressure`
-  events with layer-specific diagnostics.
+  subscriber-drop counter and, on each transition, publishes the source (by
+  capture and request position) into the status snapshot's `backpressure`.
 - **Before the spine (not yet wired):** an AEC stage (`aec_vad/mod.rs`, seed
   098b) is scaffolded to clean mic/system capture against the assistant
   render-reference *before* this 16 kHz bus. It is a fixture harness only today
@@ -726,7 +726,7 @@ boundary, so a slow consumer can never stall capture:
 
 | Boundary | Policy | Citation |
 |---|---|---|
-| rsac ring buffer → capture thread | drop + edge-triggered `capture-backpressure` event | `capture.rs:1150,1164` |
+| rsac ring buffer → capture thread | drop + edge-triggered `backpressure` entry in the published status snapshot | `capture.rs` capture worker |
 | capture → pipeline | `send_timeout(100ms)`, **drop** on stall (reclaimable thread) | `capture.rs:1121` |
 | dispatcher → each consumer | per-consumer drop policy in `dispatch`, **drop** + count (log ~every 50) | `consumer.rs:532`, `commands.rs:1017` |
 | accumulator → ASR worker | `try_send`, **drop** segment | `speech/mod.rs:3108` |

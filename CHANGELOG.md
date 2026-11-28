@@ -59,16 +59,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Capture starts as one all-or-nothing aggregate (#141). Every selected source
   must acknowledge before capture reports Running. One failing source stops
   and joins the others, and leaves no movement-ledger row and no capture or
-  transcription state behind. Each start has a capture id, and Stop, every
-  reply and every status event name it, so a late reply or a Stop for an older
-  capture can no longer end or revive another one; a reload adopts a capture
-  that is still running, and a repeated delivery of a command changes nothing.
-  Transcription attaches only to the capture it follows. The tray's Stop ends
-  capture in the backend, so it works while the window is hidden or loading.
-  A failure names the source and a closed reason, without device or driver
-  text, and capture errors name only the kind of source. Start waits until
-  the window is connected to capture, and sessions can't be loaded into the
-  store while a start is pending.
+  transcription state behind. Each start has a capture id; a reload adopts a
+  capture that is still running, and a repeated delivery of a command changes
+  nothing. Transcription attaches only to the capture it follows, and stopping
+  it names the transcription it stops. The tray's Stop ends capture in the
+  backend, so it works while the window is hidden or loading. A failure names
+  the source and a closed reason, without device or driver text, and capture
+  errors name only the kind of source. Start waits until the window is
+  connected to capture, and sessions can't be loaded into the store while a
+  start is pending.
+- The window now shows the backend's own state (#141). The backend publishes
+  one revisioned snapshot of everything the window displays (capture pending,
+  running, stopping or idle; transcription; realtime modes; the session;
+  backpressured sources; stage health) on every change, and every
+  capture-control reply carries the snapshot after its effect. The window
+  applies only a newer revision, shows "Recording status unknown" with Stop
+  available when a reply is lost, and reconciles by reading the status after
+  every command, on focus, and every few seconds while a capture is in flight.
 - Notes and Graph now publish changes after their projection log confirms the
   write. Historical Review shows when an existing projection trails its
   transcript or needs repair after an interrupted write. Export includes

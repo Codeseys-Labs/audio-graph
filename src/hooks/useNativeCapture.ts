@@ -3,6 +3,7 @@ import { useEffect, useRef } from "react";
 import { safeInvoke } from "../analytics/safeInvoke";
 import { captureFrontendError } from "../analytics/sentry";
 import { useAudioGraphStore } from "../store";
+import { captureToggle } from "../store/captureFacts";
 
 /**
  * Native capture-UX bridge (epic 5c24): system tray recording indicator
@@ -23,8 +24,8 @@ import { useAudioGraphStore } from "../store";
  *      and refreshes the CONTENT-FREE duration tooltip. We send only a
  *      boolean + an elapsed-seconds count — never any captured content
  *      (transcript/notes/titles). The tray's Stop is a backend action (#141),
- *      so it needs no listener here: the store learns of it from the Ended
- *      capture status.
+ *      so it needs no listener here: the store learns of it from the
+ *      backend's next snapshot.
  *
  * Double-fire note: the window-focus `useKeyboardShortcuts` owns plain
  * Cmd/Ctrl+R (no Shift) and explicitly ignores every Shift combo except
@@ -42,13 +43,14 @@ export function useNativeCapture(): void {
 
     async function setup() {
       const handle = await listen("global-shortcut-toggle-capture", () => {
-        // Read the latest state at fire time (not the effect's closure) so a
-        // stale `isCapturing` can't flip the wrong direction.
-        const { isCapturing: capturing } = useAudioGraphStore.getState();
-        if (capturing) {
-          void useAudioGraphStore.getState().stopCapture();
+        // Read the latest state at fire time (not the effect's closure), and
+        // toggle exactly as the Start/Stop button does: Stop while the
+        // backend holds, or may hold, a capture.
+        const state = useAudioGraphStore.getState();
+        if (captureToggle(state).offersStop) {
+          void state.stopCapture();
         } else {
-          void useAudioGraphStore.getState().startCaptureAndTranscribe();
+          void state.startCaptureAndTranscribe();
         }
       }).catch((err) => {
         // Route through the same diagnostics path as invoke failures

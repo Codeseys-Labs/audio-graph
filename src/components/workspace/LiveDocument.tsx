@@ -22,6 +22,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSessionView } from "../../session/SessionViewProvider";
 import { useAudioGraphStore } from "../../store";
+import { captureStarting } from "../../store/captureFacts";
 import type { MaterializedNotes } from "../../types";
 import Icon from "../Icon";
 import IconButton from "../IconButton";
@@ -540,7 +541,7 @@ function DocChangeAnchor({
 export function LiveDocument({ vm }: { vm: LiveDocumentVM }) {
   const { t, i18n } = useTranslation();
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
-  const captureStarting = useAudioGraphStore((s) => s.captureStarting);
+  const starting = useAudioGraphStore(captureStarting);
   const loadSampleSessionPreview = useAudioGraphStore(
     (s) => s.loadSampleSessionPreview,
   );
@@ -730,7 +731,7 @@ export function LiveDocument({ vm }: { vm: LiveDocumentVM }) {
     // sr-only "building" announcement — NOT a spinner, and not the "nothing
     // started yet" hero below, whose sample preview would land in the store
     // the capture is opening into.
-    if (isCapturing || captureStarting) {
+    if (isCapturing || starting) {
       return (
         <div
           className="flex flex-col gap-(--space-3) py-(--space-4) px-(--space-5)"

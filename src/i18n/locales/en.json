@@ -3,6 +3,7 @@
     "start": "Start",
     "stop": "Stop",
     "stopping": "Stopping…",
+    "statusUnknown": "Recording status unknown",
     "recording": "Recording",
     "settings": "Settings",
     "sessions": "Sessions",
@@ -1653,6 +1654,10 @@
     },
     "captureAttach": {
       "failed": "AudioGraph couldn't connect to audio capture. Press Start to try again."
+    },
+    "transcriptionRefused": {
+      "capture_not_running": "Cannot start transcription: capture is not running.",
+      "capture_lost": "Cannot start transcription: capture stopped while transcription was starting."
     },
     "captureStart": {
       "forSource": "{{source}}: {{reason}}",

@@ -17,13 +17,14 @@
  */
 
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 // `safeInvoke` (aliased to `invoke`) is a drop-in for the Tauri `invoke` that
 // relays a command-name-only failure diagnostic to analytics then rethrows, so
 // this call site's error handling is unchanged (audio-graph-3e71).
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
 import { useAudioGraphStore } from "../store";
+import { liveCaptureHoldsStore, sessionAdmits } from "../store/captureFacts";
 import type {
   GeminiStatusEvent,
   LifetimeUsage,
@@ -258,10 +259,15 @@ async function migrateLocalStorageLifetime(): Promise<void> {
 
 function TokenUsagePanel() {
   const { t } = useTranslation();
-  const isCapturing = useAudioGraphStore((state) => state.isCapturing);
-  const isTranscribing = useAudioGraphStore((state) => state.isTranscribing);
-  const resetSessionView = useAudioGraphStore(
-    (state) => state.resetSessionView,
+  // New Session is locked while capture holds the store (the backend refuses
+  // a rotation then too).
+  const liveCapture = useAudioGraphStore(liveCaptureHoldsStore);
+  const reconcileCapture = useAudioGraphStore((state) => state.reconcileCapture);
+  // The applied snapshot's session epoch; `null` before the first snapshot.
+  const sessionEpoch = useAudioGraphStore((state) =>
+    state.pipelineStatus.revision < 0
+      ? null
+      : state.pipelineStatus.session.epoch,
   );
   // Initial state hydrates from localStorage so the cells never flash empty
   // during the async backend round-trip. Backend values overwrite this once
@@ -272,7 +278,7 @@ function TokenUsagePanel() {
   );
   const [lastUsage, setLastUsage] = useState<UsageMetadata | null>(null);
   const [newSessionPending, setNewSessionPending] = useState(false);
-  const newSessionLocked = isCapturing || isTranscribing || newSessionPending;
+  const newSessionLocked = liveCapture || newSessionPending;
 
   // Backend hydration. Happens once on mount. If the Tauri command fails
   // (e.g. during dev in a browser without Tauri, or if the backend isn't
@@ -344,8 +350,14 @@ function TokenUsagePanel() {
           ) {
             return;
           }
+          // Usage of another session than the applied snapshot's counts
+          // toward the lifetime totals only.
+          const { pipelineStatus } = useAudioGraphStore.getState();
           setSession((prev) => {
-            if (prev.sessionId && prev.sessionId !== payload.session_id) {
+            if (
+              !sessionAdmits(pipelineStatus, payload.session_id) ||
+              (prev.sessionId && prev.sessionId !== payload.session_id)
+            ) {
               return prev;
             }
             const next: Totals = {
@@ -427,9 +439,42 @@ function TokenUsagePanel() {
     })();
   }, [t]);
 
-  // Finalize the current session on-disk, seed a fresh one, and re-hydrate
-  // the Session panel from the new zeroed file. Lifetime stays as-is —
-  // previous sessions still contribute to it.
+  // An accepted session rotation (the applied snapshot's session epoch
+  // advancing) resets this panel's session totals once, from the new
+  // session's usage. The New Session reply itself resets nothing: a late
+  // reply must not clear what the new session already shows.
+  const seenSessionEpoch = useRef(sessionEpoch);
+  useEffect(() => {
+    const previous = seenSessionEpoch.current;
+    seenSessionEpoch.current = sessionEpoch;
+    if (previous === null || sessionEpoch === null || sessionEpoch <= previous) {
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const next = sessionUsageToTotals(
+          await invoke<SessionUsage>("get_current_session_usage"),
+        );
+        if (cancelled) return;
+        setSession(next);
+        saveTotals(SESSION_KEY, next);
+      } catch {
+        if (cancelled) return;
+        setSession(ZERO_TOTALS);
+        removeKey(SESSION_KEY);
+      }
+      setLastUsage(null);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionEpoch]);
+
+  // Finalize the current session on-disk and seed a fresh one. The session
+  // view and the Session panel reset when the backend's snapshot shows the
+  // rotation (above), read here right away rather than on the next event.
+  // Lifetime stays as-is — previous sessions still contribute to it.
   const handleNewSession = useCallback(() => {
     if (newSessionPending) return;
     setNewSessionPending(true);
@@ -442,19 +487,9 @@ function TokenUsagePanel() {
         console.error("Failed to start a new session:", err);
         return;
       }
-      resetSessionView();
-      try {
-        const fresh = await invoke<SessionUsage>("get_current_session_usage");
-        const next = sessionUsageToTotals(fresh);
-        setSession(next);
-        saveTotals(SESSION_KEY, next);
-      } catch {
-        setSession(ZERO_TOTALS);
-        removeKey(SESSION_KEY);
-      }
-      setLastUsage(null);
+      await reconcileCapture();
     })().finally(() => setNewSessionPending(false));
-  }, [newSessionPending, resetSessionView]);
+  }, [newSessionPending, reconcileCapture]);
 
   const hasSession =
     session.turns > 0 || session.llmTurns > 0 || combinedTotal(session) > 0;
