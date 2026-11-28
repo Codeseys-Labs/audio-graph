@@ -1216,7 +1216,10 @@
     "inputPlaceholder": "Ask about the conversation...",
     "inputLabel": "Ask about the conversation",
     "send": "Send message",
-    "reviewSendBlocked": "Chat is unavailable while reviewing a past session because sending would target the live workspace. Start a new session to chat safely."
+    "reviewSendBlocked": "Chat is unavailable while reviewing a past session because sending would target the live workspace. Start a new session to chat safely.",
+    "failed": "The reply failed.",
+    "partialReply": "Partial reply, not kept in the chat history:",
+    "rateLimitedHint": "Free-tier models may be capped. Switch to another model or add credits, then try again."
   },
   "notes": {
     "title": "Notes",
@@ -1298,6 +1301,7 @@
     "duplicateCount": "×{{count}}",
     "answerFailedGeneric": "The answer failed.",
     "answerRetry": "Retry",
+    "answerPartial": "Partial answer:",
     "answerInterrupted": "Interrupted",
     "answerTruncatedMarker": "…",
     "answerTruncatedHint": "Answer truncated at the length limit",

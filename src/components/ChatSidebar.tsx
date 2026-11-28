@@ -19,10 +19,11 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useActiveGraphSnapshot } from "../session/useActiveGraphSnapshot";
 import { useAudioGraphStore } from "../store";
-import type { ChatMessage } from "../types";
+import type { ChatThreadMessage } from "../types";
 import { scrollBehavior } from "../utils/motion";
 import Icon from "./Icon";
 import IconButton from "./IconButton";
+import RuntimeDiagnosticText from "./RuntimeDiagnosticText";
 
 function ChatSidebar() {
   const { t } = useTranslation();
@@ -118,7 +119,7 @@ function ChatSidebar() {
           </div>
         )}
 
-        {chatMessages.map((msg: ChatMessage, idx: number) => (
+        {chatMessages.map((msg: ChatThreadMessage, idx: number) => (
           <div
             // Chat is an append-only log: messages are only pushed (and the
             // trailing assistant placeholder updated in place) — never inserted
@@ -140,7 +141,30 @@ function ChatSidebar() {
                   : `${messageContentBase} bg-bg-tertiary text-text-primary border border-(--edge) rounded-bl-sm`
               }
             >
-              {msg.content}
+              {msg.failure ? (
+                <>
+                  {msg.content ? (
+                    <>
+                      <span className="block text-[0.7rem] text-text-muted">
+                        {t("chat.partialReply")}
+                      </span>
+                      {msg.content}
+                    </>
+                  ) : null}
+                  <span
+                    className="block text-(--text-on-tint-danger)"
+                    role="alert"
+                  >
+                    {t("chat.failed")}{" "}
+                    <RuntimeDiagnosticText
+                      diagnostic={msg.failure}
+                      rateLimitedHintKey="chat.rateLimitedHint"
+                    />
+                  </span>
+                </>
+              ) : (
+                msg.content
+              )}
             </div>
           </div>
         ))}

@@ -1216,7 +1216,10 @@
     "inputPlaceholder": "Pergunte sobre a conversa...",
     "inputLabel": "Pergunte sobre a conversa",
     "send": "Enviar mensagem",
-    "reviewSendBlocked": "O chat não está disponível durante a revisão de uma sessão anterior, pois o envio usaria o espaço de trabalho ao vivo. Inicie uma nova sessão para conversar com segurança."
+    "reviewSendBlocked": "O chat não está disponível durante a revisão de uma sessão anterior, pois o envio usaria o espaço de trabalho ao vivo. Inicie uma nova sessão para conversar com segurança.",
+    "failed": "A resposta falhou.",
+    "partialReply": "Resposta parcial, não mantida no histórico do chat:",
+    "rateLimitedHint": "Modelos gratuitos podem ter limite de uso. Troque de modelo ou adicione créditos e tente novamente."
   },
   "notes": {
     "title": "Notas",
@@ -1298,6 +1301,7 @@
     "duplicateCount": "×{{count}}",
     "answerFailedGeneric": "A resposta falhou.",
     "answerRetry": "Tentar novamente",
+    "answerPartial": "Resposta parcial:",
     "answerInterrupted": "Interrompida",
     "answerTruncatedMarker": "…",
     "answerTruncatedHint": "Resposta truncada no limite de tamanho",

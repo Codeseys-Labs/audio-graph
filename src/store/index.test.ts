@@ -10,7 +10,18 @@ import type {
   LiveAssistCardRecord,
   ProjectionPatch,
 } from "../types";
+import { SAFE_INTERNAL_RUNTIME_DIAGNOSTIC } from "../utils/runtimeDiagnostic";
 import { useAudioGraphStore } from "./index";
+
+const RATE_LIMITED_DIAGNOSTIC = {
+  kind: "runtime",
+  detail: {
+    code: "rate_limited",
+    retryable: true,
+    recovery_action: "retry_after_delay",
+    context: { operation: "language_model_inference" },
+  },
+} as const;
 
 function selectableSettings(overrides: Partial<AppSettings> = {}): AppSettings {
   return {
@@ -184,6 +195,7 @@ describe("AudioGraphStore", () => {
       chatMessages: [],
       isChatLoading: false,
       streamingChatRequestId: null,
+      chatReplyTurnId: null,
       isCapturing: false,
       isTranscribing: false,
       captureStartTime: null,
@@ -3888,30 +3900,24 @@ describe("AudioGraphStore", () => {
     useAudioGraphStore.setState({
       chatMessages: [
         { role: "user", content: "What did Alice say?" },
-        { role: "assistant", content: "" },
+        { role: "assistant", content: "", turnId: "turn-1" },
       ],
       isChatLoading: true,
       streamingChatRequestId: "req-stream-1",
     });
 
-    useAudioGraphStore.getState().appendChatTokenDelta({
-      request_id: "req-stream-1",
-      delta: "Alice ",
-    });
-    useAudioGraphStore.getState().appendChatTokenDelta({
-      request_id: "req-stream-1",
-      delta: "said ",
-    });
-    useAudioGraphStore.getState().appendChatTokenDelta({
-      request_id: "req-stream-1",
-      delta: "hello.",
-    });
+    for (const delta of ["Alice ", "said ", "hello."]) {
+      useAudioGraphStore
+        .getState()
+        .appendChatTokenDelta({ request_id: "req-stream-1", delta }, "turn-1");
+    }
 
     const messages = useAudioGraphStore.getState().chatMessages;
     expect(messages).toHaveLength(2);
     expect(messages[1]).toEqual({
       role: "assistant",
       content: "Alice said hello.",
+      turnId: "turn-1",
     });
   });
 
@@ -3925,6 +3931,7 @@ describe("AudioGraphStore", () => {
     getChannel: () => ChannelLike;
     resolveStart: (id: string) => void;
   } {
+    useAudioGraphStore.setState({ settings: selectableSettings() });
     let channel: ChannelLike | null = null;
     let resolveStart: (id: string) => void = () => {};
     vi.mocked(invoke).mockImplementation(async (cmd, args) => {
@@ -4070,20 +4077,22 @@ describe("AudioGraphStore", () => {
     expect(s.streamingChatRequestId).toBeNull();
   });
 
-  it("ignores token deltas for a stale request_id", () => {
+  it("ignores token deltas for a turn whose bubble is gone", () => {
     useAudioGraphStore.setState({
       chatMessages: [
         { role: "user", content: "ping" },
-        { role: "assistant", content: "" },
+        { role: "assistant", content: "", turnId: "turn-1" },
       ],
       isChatLoading: true,
       streamingChatRequestId: "active-req",
     });
 
-    useAudioGraphStore.getState().appendChatTokenDelta({
-      request_id: "stale-req",
-      delta: "should-not-appear",
-    });
+    useAudioGraphStore
+      .getState()
+      .appendChatTokenDelta(
+        { request_id: "cleared-req", delta: "should-not-appear" },
+        "turn-cleared",
+      );
 
     const messages = useAudioGraphStore.getState().chatMessages;
     expect(messages[1].content).toBe("");
@@ -4093,17 +4102,21 @@ describe("AudioGraphStore", () => {
     useAudioGraphStore.setState({
       chatMessages: [
         { role: "user", content: "What time is it?" },
-        { role: "assistant", content: "It is " },
+        { role: "assistant", content: "It is ", turnId: "turn-final" },
       ],
       isChatLoading: true,
       streamingChatRequestId: "req-final",
+      chatReplyTurnId: "turn-final",
     });
 
-    useAudioGraphStore.getState().finalizeChatStream({
-      request_id: "req-final",
-      full_text: "It is 3 o'clock.",
-      finish_reason: "stop",
-    });
+    useAudioGraphStore.getState().finalizeChatStream(
+      {
+        request_id: "req-final",
+        full_text: "It is 3 o'clock.",
+        finish_reason: "stop",
+      },
+      "turn-final",
+    );
 
     const s = useAudioGraphStore.getState();
     expect(s.isChatLoading).toBe(false);
@@ -4112,6 +4125,435 @@ describe("AudioGraphStore", () => {
       role: "assistant",
       content: "It is 3 o'clock.",
     });
+  });
+
+  it("marks the placeholder as a failed turn with its partial text on a failed frame", async () => {
+    const reqId = "req-failed";
+    const { getChannel, resolveStart } = captureStreamChannel();
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    const channel = getChannel();
+    resolveStart(reqId);
+    await sendPromise;
+
+    channel.onmessage?.({
+      event: "failed",
+      data: {
+        request_id: reqId,
+        full_text: "Partial reply",
+        diagnostic: RATE_LIMITED_DIAGNOSTIC,
+      },
+    });
+
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages.at(-1)).toEqual({
+      role: "assistant",
+      content: "Partial reply",
+      failure: RATE_LIMITED_DIAGNOSTIC,
+    });
+    expect(s.isChatLoading).toBe(false);
+    expect(s.streamingChatRequestId).toBeNull();
+    expect(JSON.stringify(s.chatMessages)).not.toContain("runtime/");
+  });
+
+  /** Start a streaming reply, arm its id, then append a proposal message the
+   * way approveAgentProposal does, so the placeholder is no longer last. */
+  async function streamWithAProposalAppended(reqId: string) {
+    const { getChannel, resolveStart } = captureStreamChannel();
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    const channel = getChannel();
+    resolveStart(reqId);
+    await sendPromise;
+    useAudioGraphStore.setState((s) => ({
+      chatMessages: [...s.chatMessages, PROPOSAL_MESSAGE],
+    }));
+    return channel;
+  }
+  const PROPOSAL_MESSAGE = {
+    role: "assistant" as const,
+    content: "Approved agent proposal: Follow up",
+  };
+
+  it("lands a failure on the originating placeholder, not on a proposal message appended mid-stream", async () => {
+    const channel = await streamWithAProposalAppended("req-proposal-fail");
+    channel.onmessage?.({
+      event: "failed",
+      data: {
+        request_id: "req-proposal-fail",
+        full_text: "",
+        diagnostic: RATE_LIMITED_DIAGNOSTIC,
+      },
+    });
+
+    const messages = useAudioGraphStore.getState().chatMessages;
+    expect(messages.slice(-2)).toEqual([
+      { role: "assistant", content: "", failure: RATE_LIMITED_DIAGNOSTIC },
+      PROPOSAL_MESSAGE,
+    ]);
+  });
+
+  it("lands a reply on the originating placeholder, not on a proposal message appended mid-stream", async () => {
+    const channel = await streamWithAProposalAppended("req-proposal-done");
+    channel.onmessage?.({
+      event: "done",
+      data: {
+        request_id: "req-proposal-done",
+        full_text: "The reply",
+        finish_reason: "stop",
+      },
+    });
+
+    const messages = useAudioGraphStore.getState().chatMessages;
+    expect(messages.slice(-2)).toEqual([
+      { role: "assistant", content: "The reply" },
+      PROPOSAL_MESSAGE,
+    ]);
+  });
+
+  it("marks a cancelled reply even when it already has text", async () => {
+    const { getChannel, resolveStart } = captureStreamChannel();
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    const channel = getChannel();
+    resolveStart("req-cancel");
+    await sendPromise;
+    channel.onmessage?.({
+      event: "done",
+      data: {
+        request_id: "req-cancel",
+        full_text: "Half an answer",
+        finish_reason: "cancelled",
+      },
+    });
+
+    expect(useAudioGraphStore.getState().chatMessages.at(-1)).toEqual({
+      role: "assistant",
+      content: "Half an answer [cancelled]",
+    });
+  });
+
+  it("drops a reply whose placeholder was cleared mid-stream", async () => {
+    const { getChannel, resolveStart } = captureStreamChannel();
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    const channel = getChannel();
+    resolveStart("req-cleared");
+    await sendPromise;
+    useAudioGraphStore.setState({ chatMessages: [] });
+    channel.onmessage?.({
+      event: "done",
+      data: {
+        request_id: "req-cleared",
+        full_text: "A reply to a cleared question",
+        finish_reason: "stop",
+      },
+    });
+
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages).toEqual([]);
+    expect(s.isChatLoading).toBe(false);
+  });
+
+  it("fails closed to the fixed internal diagnostic for a malformed failed frame", () => {
+    useAudioGraphStore.setState({
+      chatMessages: [
+        { role: "user", content: "ping" },
+        { role: "assistant", content: "", turnId: "turn-bad" },
+      ],
+      isChatLoading: true,
+      streamingChatRequestId: "req-bad",
+    });
+
+    useAudioGraphStore.getState().finalizeChatStreamFailure(
+      {
+        request_id: "req-bad",
+        full_text: "",
+        diagnostic: {
+          kind: "runtime",
+          detail: { code: "runtime/leaked-text" },
+        },
+      },
+      "turn-bad",
+    );
+
+    expect(useAudioGraphStore.getState().chatMessages.at(-1)?.failure).toEqual(
+      SAFE_INTERNAL_RUNTIME_DIAGNOSTIC,
+    );
+  });
+
+  it("renders a diagnostic rejection from the blocking fallback as a failed turn, not text", async () => {
+    useAudioGraphStore.setState({
+      chatMessages: [],
+      isChatLoading: false,
+      settings: selectableSettings(),
+    });
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        throw new Error("streaming unsupported by provider");
+      }
+      if (cmd === "send_chat_message") {
+        throw {
+          code: "runtime_diagnostic",
+          diagnostic: RATE_LIMITED_DIAGNOSTIC,
+        };
+      }
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().sendChatMessage("hello");
+
+    expect(useAudioGraphStore.getState().chatMessages.at(-1)).toEqual({
+      role: "assistant",
+      content: "",
+      failure: RATE_LIMITED_DIAGNOSTIC,
+    });
+  });
+
+  it("marks a superseded turn's cancellation on its own bubble and keeps the newer turn loading", () => {
+    useAudioGraphStore.setState({
+      chatMessages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: "Half an", turnId: "turn-a" },
+        { role: "user", content: "second" },
+        { role: "assistant", content: "", turnId: "turn-b" },
+      ],
+      isChatLoading: true,
+      streamingChatRequestId: "req-b",
+      chatReplyTurnId: "turn-b",
+    });
+
+    useAudioGraphStore.getState().finalizeChatStream(
+      {
+        request_id: "req-a",
+        full_text: "Half an answer",
+        finish_reason: "cancelled",
+      },
+      "turn-a",
+    );
+
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages[1]).toEqual({
+      role: "assistant",
+      content: "Half an answer [cancelled]",
+    });
+    expect(s.chatMessages[3]).toEqual({
+      role: "assistant",
+      content: "",
+      turnId: "turn-b",
+    });
+    expect(s.isChatLoading).toBe(true);
+    expect(s.streamingChatRequestId).toBe("req-b");
+  });
+
+  it("lets a late blocking reply fill its own bubble without releasing a newer turn", async () => {
+    useAudioGraphStore.setState({ settings: selectableSettings() });
+    let resolveFirst: (response: unknown) => void = () => {};
+    let starts = 0;
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        starts += 1;
+        if (starts === 1) throw new Error("streaming unsupported by provider");
+        return new Promise<string>(() => {});
+      }
+      if (cmd === "send_chat_message") {
+        return new Promise((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return undefined;
+    });
+
+    const first = useAudioGraphStore.getState().sendChatMessage("first");
+    await vi.waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("send_chat_message", {
+        message: "first",
+      }),
+    );
+    void useAudioGraphStore.getState().sendChatMessage("second");
+    resolveFirst({
+      message: { role: "assistant", content: "first reply" },
+      tokens_used: 1,
+    });
+    await first;
+
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages.map((m) => m.content)).toEqual([
+      "first",
+      "first reply",
+      "second",
+      "",
+    ]);
+    expect(s.isChatLoading).toBe(true);
+    expect(s.chatReplyTurnId).toBe(s.chatMessages[3].turnId);
+  });
+
+  it("does not fall back to the blocking command for a send the user cleared", async () => {
+    useAudioGraphStore.setState({ settings: selectableSettings() });
+    let rejectStart: (error: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        return new Promise<string>((_, reject) => {
+          rejectStart = reject;
+        });
+      }
+      return undefined;
+    });
+
+    const send = useAudioGraphStore.getState().sendChatMessage("private");
+    expect(invoke).toHaveBeenCalledWith(
+      "start_streaming_chat",
+      expect.objectContaining({ message: "private" }),
+    );
+    expect(useAudioGraphStore.getState().isChatLoading).toBe(true);
+    await useAudioGraphStore.getState().clearChatHistory();
+    rejectStart(new Error("streaming unsupported by provider"));
+    await send;
+
+    expect(invoke).not.toHaveBeenCalledWith(
+      "send_chat_message",
+      expect.anything(),
+    );
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages).toEqual([]);
+    expect(s.isChatLoading).toBe(false);
+  });
+
+  it("shows a start the backend refused as cancelled instead of retrying it", async () => {
+    const CANCELLED_DIAGNOSTIC = {
+      kind: "runtime",
+      detail: {
+        code: "cancelled",
+        retryable: false,
+        recovery_action: "none",
+        context: { operation: "language_model_inference" },
+      },
+    } as const;
+    useAudioGraphStore.setState({ settings: selectableSettings() });
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        throw { code: "runtime_diagnostic", diagnostic: CANCELLED_DIAGNOSTIC };
+      }
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().sendChatMessage("hello");
+
+    expect(invoke).not.toHaveBeenCalledWith(
+      "send_chat_message",
+      expect.anything(),
+    );
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages.at(-1)).toEqual({
+      role: "assistant",
+      content: "",
+      failure: CANCELLED_DIAGNOSTIC,
+    });
+    expect(s.isChatLoading).toBe(false);
+  });
+
+  it("releases the loading state of a turn the user clears", async () => {
+    const reqId = "req-cleared-loading";
+    const { getChannel, resolveStart } = captureStreamChannel();
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    const channel = getChannel();
+    resolveStart(reqId);
+    await sendPromise;
+    expect(useAudioGraphStore.getState().isChatLoading).toBe(true);
+
+    await useAudioGraphStore.getState().clearChatHistory();
+
+    let s = useAudioGraphStore.getState();
+    expect(s.isChatLoading).toBe(false);
+    expect(s.streamingChatRequestId).toBeNull();
+    // The discarded turn's late terminal frame changes nothing.
+    channel.onmessage?.({
+      event: "done",
+      data: { request_id: reqId, full_text: "late", finish_reason: "stop" },
+    });
+    s = useAudioGraphStore.getState();
+    expect(s.chatMessages).toEqual([]);
+    expect(s.isChatLoading).toBe(false);
+  });
+
+  it("keeps an approval that lands after a clear out of the cleared chat", async () => {
+    const proposal = {
+      id: "approve-then-clear",
+      source_segment_id: "seg-1",
+      source_id: "system-default",
+      speaker_label: "Speaker 1",
+      kind: "graph_suggestion" as const,
+      title: "Follow up",
+      body: "Review this for an action item: follow up",
+      confidence: 0.9,
+      created_at_ms: 1,
+    };
+    useAudioGraphStore.setState({ agentProposals: [proposal] });
+    let resolveApproval: (card: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "approve_agent_proposal") {
+        return new Promise((resolve) => {
+          resolveApproval = resolve;
+        });
+      }
+      return undefined;
+    });
+
+    const approval = useAudioGraphStore
+      .getState()
+      .approveAgentProposal(proposal.id);
+    await useAudioGraphStore.getState().clearChatHistory();
+    resolveApproval({
+      session_id: "live",
+      proposal,
+      status: "approved",
+      source_span_ids: ["seg-1"],
+      graph_context_ids: [],
+      outcome: {
+        proposal_id: proposal.id,
+        status: "applied",
+        message: "Approved agent proposal: Follow up",
+      },
+      created_at_ms: 1,
+      updated_at_ms: 2,
+    });
+
+    expect(await approval).not.toBeNull();
+    expect(useAudioGraphStore.getState().chatMessages).toEqual([]);
+  });
+
+  it("keeps a card from another session out of a loaded historical session's queue", () => {
+    const cardFor = (sessionId: string, id: string) => ({
+      session_id: sessionId,
+      proposal: {
+        id,
+        source_segment_id: "seg-1",
+        source_id: "system-default",
+        speaker_label: "Speaker 1",
+        kind: "question" as const,
+        title: "Question from Speaker 1",
+        body: "Consider answering or linking this question: What changed?",
+        confidence: 0.9,
+        created_at_ms: 1,
+      },
+      status: "dismissed" as const,
+      source_span_ids: ["seg-1"],
+      graph_context_ids: [],
+      created_at_ms: 1,
+      updated_at_ms: 2,
+    });
+    useAudioGraphStore.setState({
+      loadedSessionId: "session-b",
+      liveAssistCards: [],
+    });
+
+    useAudioGraphStore
+      .getState()
+      .upsertLiveAssistCard(cardFor("session-a", "live-card"));
+    expect(useAudioGraphStore.getState().liveAssistCards).toEqual([]);
+
+    useAudioGraphStore
+      .getState()
+      .upsertLiveAssistCard(cardFor("session-b", "loaded-card"));
+    expect(
+      useAudioGraphStore.getState().liveAssistCards.map((c) => c.proposal.id),
+    ).toEqual(["loaded-card"]);
   });
 
   // -----------------------------------------------------------------------
@@ -4213,7 +4655,7 @@ describe("AudioGraphStore", () => {
       ).toBeUndefined();
     });
 
-    it("sets a failed draft (never throwing) on a done frame carrying an error finish_reason", async () => {
+    it("sets a failed draft (never throwing) with the partial text and the closed diagnostic on a failed frame", async () => {
       const { getChannel, resolveDispatch } = captureAnswerChannel<{
         request_id: string;
       }>("answer_question_card");
@@ -4233,18 +4675,19 @@ describe("AudioGraphStore", () => {
       await promise;
 
       channel.onmessage?.({
-        event: "done",
+        event: "failed",
         data: {
           request_id: "req-err",
-          full_text: "",
-          finish_reason: "error: rate limited",
+          full_text: "Partial",
+          diagnostic: RATE_LIMITED_DIAGNOSTIC,
         },
       });
 
       expect(useAudioGraphStore.getState().answerDrafts["card-err"]).toEqual({
         status: "failed",
-        text: "rate limited",
+        text: "Partial",
         requestId: "req-err",
+        failure: RATE_LIMITED_DIAGNOSTIC,
       });
     });
 
