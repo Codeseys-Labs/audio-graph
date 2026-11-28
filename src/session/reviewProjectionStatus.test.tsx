@@ -150,3 +150,28 @@ it("replaces the notice with its own round when an active or untouched session i
   );
   expect(backend).toHaveBeenCalledTimes(8);
 });
+
+it.each([
+  [
+    "notes",
+    "en",
+    "Part of the source for these notes and graph changes is unavailable.",
+  ],
+  [
+    "graph",
+    "pt",
+    "Parte da fonte destas alterações nas notas e no grafo está indisponível.",
+  ],
+] as const)("shows one missing-source notice on the %s lens in %s", async (lens, language, expected) => {
+  await i18n.changeLanguage(language);
+  show(lens, {
+    basis_unavailable: { first_sequence: 2, last_sequence: 4 },
+    transcript_coverage: "behind_transcript",
+    projection_recovery: "recompute_required",
+  });
+  await screen.findByText("orchard");
+  expect(screen.getAllByRole("status")).toHaveLength(1);
+  expect(screen.getByRole("status")).toHaveTextContent(expected);
+  expect(backend).toHaveBeenCalledTimes(2);
+  expect(screen.queryByRole("button")).toBeNull();
+});
