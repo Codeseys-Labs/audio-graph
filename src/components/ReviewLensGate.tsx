@@ -123,6 +123,8 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
       : kind === "graph" && data && "nodes" in data
         ? data
         : null;
+  const unavailable =
+    projection?.reviewProjectionStatuses?.includes("basis_unavailable");
   const behind =
     projection?.reviewProjectionStatuses?.includes("behind_transcript");
   const gap =
@@ -150,12 +152,13 @@ export function ReviewLensGate({ kind, children }: ReviewLensGateProps) {
           </button>
         </div>
       )}
-      {(behind || gap) && (
+      {(unavailable || behind || gap) && (
         <p
           className="mx-(--space-5) mt-(--space-4) text-sm text-text-secondary"
           role="status"
         >
           {[
+            unavailable && t("sessions.review.projectionBasisUnavailable"),
             behind && t("sessions.review.projectionBehindTranscript"),
             gap && t("sessions.review.projectionGap"),
           ]

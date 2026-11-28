@@ -86,7 +86,10 @@ export interface ArtifactSlot<T> {
 }
 
 /** Statuses admitted at the read boundary of one historical lens round. */
-export type ReviewProjectionStatus = "behind_transcript" | "recompute_required";
+export type ReviewProjectionStatus =
+  | "behind_transcript"
+  | "recompute_required"
+  | "basis_unavailable";
 type ReviewProjectionInfo = {
   reviewProjectionStatuses?: ReviewProjectionStatus[];
 };
@@ -140,9 +143,26 @@ function parseProjectionStatus(raw: Record<string, unknown>) {
   const {
     projection_recovery,
     transcript_coverage,
+    basis_unavailable,
     reviewProjectionStatuses: _incoming,
     ...materialized
   } = raw;
+  if (isRecord(basis_unavailable)) {
+    const { first_sequence: first, last_sequence: last } = basis_unavailable;
+    if (
+      typeof first === "number" &&
+      Number.isSafeInteger(first) &&
+      first > 0 &&
+      typeof last === "number" &&
+      Number.isSafeInteger(last) &&
+      last >= first
+    ) {
+      return {
+        ...materialized,
+        reviewProjectionStatuses: ["basis_unavailable"],
+      };
+    }
+  }
   const statuses: ReviewProjectionStatus[] = [];
   if (transcript_coverage === "behind_transcript")
     statuses.push(transcript_coverage);

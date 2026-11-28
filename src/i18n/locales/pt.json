@@ -836,6 +836,7 @@
       "needsLoad": "Esta visualização precisa que a sessão seja carregada primeiro.",
       "loadSession": "Carregar sessão",
       "staleView": "Esta visualização pode estar desatualizada: a última atualização falhou. Mostrando a última cópia carregada.",
+      "projectionBasisUnavailable": "Parte da fonte destas alterações nas notas e no grafo está indisponível. As visualizações mostram apenas as alterações verificadas antes desse ponto.",
       "projectionBehindTranscript": "Esta visualização ainda não inclui todas as revisões salvas da transcrição.",
       "projectionGap": "Não foi possível recuperar uma alteração da projeção. Esta visualização mostra as últimas alterações verificadas.",
       "emptyNotes": "Esta sessão não tem notas.",

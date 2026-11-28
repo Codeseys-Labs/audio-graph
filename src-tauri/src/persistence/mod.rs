@@ -38,7 +38,9 @@ pub mod canonical_log;
 mod projection_history;
 #[cfg(all(test, not(debug_assertions)))]
 pub(crate) mod projection_profile;
-pub(crate) use projection_history::{MAX_PROJECTION_EVENTS_BYTES, ProjectionHistory};
+pub(crate) use projection_history::{
+    ExportProjectionBasisLoss, MAX_PROJECTION_EVENTS_BYTES, ProjectionHistory,
+};
 
 pub(crate) struct VerifiedCaptureCoverage {
     pub(crate) coverage: projection_history::ProjectionCaptureCoverage,

@@ -836,6 +836,7 @@
       "needsLoad": "This view needs the session loaded first.",
       "loadSession": "Load session",
       "staleView": "This view may be out of date: the latest refresh failed. Showing the last copy that loaded.",
+      "projectionBasisUnavailable": "Part of the source for these notes and graph changes is unavailable. The views show only changes verified before that point.",
       "projectionBehindTranscript": "This view does not yet include all saved transcript revisions.",
       "projectionGap": "A saved projection change could not be recovered. This view shows the last verified changes.",
       "emptyNotes": "This session has no notes.",
