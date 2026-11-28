@@ -17645,6 +17645,75 @@ mod tests {
     }
 
     #[test]
+    fn export_session_bundle_carries_no_stored_model_path() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("export-model-path");
+        let _guard = HomeGuard::set(&dir);
+
+        let session_id = "export-model-path";
+        // What records written before the cut hold for a local server: the
+        // path of its model file.
+        let stored = "/home/numbat-user/models/private.gguf";
+
+        let repository = FileMemoryRepository::user_data();
+        let event = projection_status_test_event(&format!("{session_id}-span-1"));
+        let basis = crate::projections::ProjectionBasis::from_transcript_events(
+            std::slice::from_ref(&event),
+        );
+        repository
+            .append_transcript_event(session_id, &event)
+            .expect("append transcript event");
+        let mut notes_patch = report_note_patch(1, basis.clone(), "Exported note body.");
+        notes_patch.provenance.model = stored.to_string();
+        let mut graph_patch = report_graph_patch(1, basis.clone());
+        graph_patch.provenance.model = stored.to_string();
+        for patch in [&notes_patch, &graph_patch] {
+            repository
+                .append_projection_patch(session_id, patch)
+                .expect("append projection patch");
+        }
+        let mut notes = stale_materialized_notes(session_id, basis.clone());
+        notes.notes[0].provenance.model = stored.to_string();
+        repository
+            .save_materialized_notes(session_id, &notes)
+            .expect("save materialized notes artifact");
+        let mut graph = stale_materialized_graph(session_id, basis);
+        graph.nodes[0].provenance.model = stored.to_string();
+        repository
+            .save_materialized_graph(session_id, &graph)
+            .expect("save materialized graph artifact");
+
+        let events_path = crate::user_data::resolve_projection_events_path(session_id)
+            .expect("projection events path");
+        let stored_events = std::fs::read(&events_path).expect("read the projection events");
+        assert!(
+            String::from_utf8_lossy(&stored_events).contains("numbat-user"),
+            "the fixture must store the path"
+        );
+
+        let bundle = session_export_bundle(session_id).expect("export bundle");
+
+        assert_eq!(bundle.projection_events.len(), 2);
+        for patch in &bundle.projection_events {
+            assert_eq!(patch.provenance.model, "private.gguf");
+        }
+        assert!(bundle.notes.is_some() && bundle.materialized_graph.is_some());
+        let json = serde_json::to_string(&bundle).expect("bundle serializes to JSON");
+        assert!(json.contains("private.gguf"), "{json}");
+        assert!(!json.contains("numbat-user"), "{json}");
+
+        // The stored patches were read, not rewritten.
+        assert_eq!(
+            std::fs::read(&events_path).expect("re-read the projection events"),
+            stored_events
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn export_session_bundle_missing_session_errors() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()

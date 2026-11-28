@@ -959,6 +959,24 @@ pub(crate) fn sanitize_served_model(raw: &str) -> Option<String> {
     sanitize_route_metadata(model_id_without_path(raw))
 }
 
+/// Read a persisted model id through [`model_id_without_path`].
+///
+/// A record written before that cut existed can hold a local server's model
+/// path. Cutting it as it is read means nothing loaded, exported or written
+/// again carries the path, and the stored record is left as it is.
+pub(crate) fn deserialize_model_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = <String as serde::Deserialize>::deserialize(deserializer)?;
+    let kept = model_id_without_path(&stored);
+    Ok(if kept.len() == stored.len() {
+        stored
+    } else {
+        kept.to_string()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

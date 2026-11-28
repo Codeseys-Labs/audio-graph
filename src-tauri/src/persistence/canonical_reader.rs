@@ -625,6 +625,46 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_model_path_is_cut_when_a_patch_is_read_and_the_file_is_left_alone() {
+        for (stored, read_back) in [
+            // What a patch written before the cut holds for a local server.
+            ("/home/numbat-user/models/private.gguf", "private.gguf"),
+            (
+                "C:\\Users\\numbat-user\\models\\private.gguf",
+                "private.gguf",
+            ),
+            // An ordinary id is read back as stored.
+            ("numbat-org/probe-model", "numbat-org/probe-model"),
+        ] {
+            let root = unique_tempdir("stored-model-path");
+            let path = root.join("projection.jsonl");
+            let session_id = "session-stored-model-path";
+            let mut legacy = projection_patch(1);
+            legacy.provenance.model = stored.to_string();
+            let mut bytes = serde_json::to_vec(&legacy).expect("serialize legacy patch");
+            bytes.push(b'\n');
+            fs::create_dir_all(&root).expect("create fixture root");
+            fs::write(&path, &bytes).expect("write legacy accepted patch");
+
+            let read = load_projection_patches(&path, session_id).expect("decode the patch");
+            let patch = &present_snapshot(&read).records[0].payload;
+            assert_eq!(patch.provenance.model, read_back, "{stored}");
+
+            // Every item the patch materializes carries the cut id, and so
+            // does the patch when it is written again.
+            let replayed =
+                MaterializedProjectionState::replay_accepted_patches(session_id, [patch.clone()])
+                    .expect("replay the patch");
+            assert_eq!(replayed.notes.notes[0].provenance.model, read_back);
+            let rewritten = serde_json::to_string(patch).expect("serialize the read patch");
+            assert!(!rewritten.contains("numbat-user"), "{rewritten}");
+
+            assert_eq!(fs::read(&path).expect("re-read legacy bytes"), bytes);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn strict_reader_file_repository_routes_all_actual_stream_paths() {
         let root = unique_tempdir("repository-routes");
         let repo = FileMemoryRepository::with_data_root(&root);

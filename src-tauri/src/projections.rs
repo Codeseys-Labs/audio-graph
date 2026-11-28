@@ -2013,6 +2013,12 @@ pub struct ProjectionProvenance {
     /// The SERVED model when the response reported one; see
     /// [`model_source`](Self::model_source), which says which it is rather than
     /// leaving a reader to assume.
+    ///
+    /// Never a filesystem path. New records are cut where they are stamped. A
+    /// record stored before that can hold a local model's path, so it is cut
+    /// again here as it is read: nothing loaded, exported or written again
+    /// carries the path, and the stored record is not rewritten.
+    #[serde(deserialize_with = "crate::llm::route::deserialize_model_id")]
     pub model: String,
     pub prompt_id: String,
     /// The stamped route id (`route.cerebras_via_openrouter`, …). `None` on records

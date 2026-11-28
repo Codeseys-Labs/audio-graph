@@ -61,7 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   graph node when the new name is unused.
 - Notes and graph items no longer record the file path of a local model. A
   self-hosted server that names its model by path (for example
-  `/home/name/private.gguf`) is now recorded by the file name alone (#540).
+  `/home/name/private.gguf`) is now recorded by the file name alone. Sessions
+  saved before this fix are read and exported the same way; their files are
+  not rewritten (#540).
 - vLLM's documented `yes`/`no` noul probability keys are now normalized to the
   canonical `true`/`false` pair at the parse boundary, so documented responses
   validate; mixed, partial, or overlong key pairs are rejected, and the raw
