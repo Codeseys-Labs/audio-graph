@@ -5,6 +5,14 @@
 //! Provider selection remains gated elsewhere until live smoke/source-policy
 //! evidence is strong enough to promote Soniox from planned to selectable.
 
+use super::{
+    asr_diagnostic, websocket_close, websocket_diagnostic, websocket_error, websocket_write_error,
+};
+use crate::error::AppError;
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeErrorCode as Code, RuntimeTransport,
+};
+
 #[cfg(test)]
 use super::reconnect::backoff_for_attempt;
 use super::reconnect::{ReconnectStep, next_reconnect_step};
@@ -53,7 +61,7 @@ const KEEPALIVE_INTERVAL_SECS: u64 = 8;
 pub struct SonioxParsedMessage {
     pub revisions: Vec<SonioxParsedRevision>,
     pub finished: bool,
-    pub error: Option<SonioxProviderError>,
+    pub error: Option<RuntimeDiagnostic>,
     pub final_audio_proc_ms: Option<u64>,
     pub total_audio_proc_ms: Option<u64>,
 }
@@ -67,19 +75,7 @@ pub struct SonioxParsedRevision {
     pub total_audio_proc_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SonioxProviderError {
-    pub code: Option<String>,
-    pub error_type: Option<String>,
-    pub message: String,
-    pub request_id: Option<String>,
-    pub more_info: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SonioxParseError {
-    InvalidJson(String),
-}
+pub use super::AsrParseError as SonioxParseError;
 
 // Channel event enum: boxing the large `Revision` variant would ripple
 // through every construction and match site for negligible benefit.
@@ -88,7 +84,7 @@ pub enum SonioxParseError {
 pub enum SonioxEvent {
     Revision(SonioxParsedRevision),
     Finished,
-    Error { message: String },
+    Error { message: RuntimeDiagnostic },
     Connected,
     Disconnected,
     Reconnecting { attempt: u32, backoff_secs: u64 },
@@ -143,7 +139,7 @@ struct SonioxActiveTurn {
     non_final_tokens: Vec<SonioxToken>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct SonioxResponse {
     #[serde(default)]
     tokens: Vec<SonioxToken>,
@@ -158,11 +154,23 @@ struct SonioxResponse {
     #[serde(default)]
     error_type: Option<String>,
     #[serde(default)]
-    error_message: Option<String>,
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    more_info: Option<String>,
+    error_message: Option<serde::de::IgnoredAny>,
+}
+
+impl SonioxResponse {
+    fn diagnostic(&self) -> Option<RuntimeDiagnostic> {
+        if self.error_code.is_none() && self.error_type.is_none() && self.error_message.is_none() {
+            return None;
+        }
+
+        let code = match self.error_code.as_ref().and_then(Value::as_u64) {
+            Some(400 | 401 | 403) => Code::RequestRejected,
+            Some(408 | 504) => Code::Timeout,
+            Some(429) => Code::RateLimited,
+            _ => Code::ProviderUnavailable,
+        };
+        Some(websocket_diagnostic(code))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -279,20 +287,21 @@ impl SonioxRealtimeParser {
         text: &str,
         received_at_ms: u64,
     ) -> Result<SonioxParsedMessage, SonioxParseError> {
-        let response: SonioxResponse = serde_json::from_str(text)
-            .map_err(|error| SonioxParseError::InvalidJson(error.to_string()))?;
+        let response: SonioxResponse =
+            serde_json::from_str(text).map_err(|_| SonioxParseError::InvalidJson)?;
         self.response_sequence += 1;
 
-        let error = response
-            .error_message
-            .as_ref()
-            .map(|message| SonioxProviderError {
-                code: response.error_code.as_ref().map(json_value_to_string),
-                error_type: response.error_type.clone(),
-                message: message.clone(),
-                request_id: response.request_id.clone(),
-                more_info: response.more_info.clone(),
+        // Error responses have no transcription output. Convert their private
+        // fields before returning from the parser.
+        if let Some(error) = response.diagnostic() {
+            return Ok(SonioxParsedMessage {
+                revisions: Vec::new(),
+                finished: response.finished,
+                final_audio_proc_ms: None,
+                total_audio_proc_ms: None,
+                error: Some(error),
             });
+        }
 
         let mut revisions = Vec::new();
         let transcript_tokens = response
@@ -343,7 +352,7 @@ impl SonioxRealtimeParser {
         Ok(SonioxParsedMessage {
             revisions,
             finished: response.finished,
-            error,
+            error: None,
             final_audio_proc_ms: response.final_audio_proc_ms,
             total_audio_proc_ms: response.total_audio_proc_ms,
         })
@@ -468,12 +477,12 @@ impl SonioxClient {
         }
     }
 
-    pub fn connect(&mut self) -> Result<(), String> {
+    pub fn connect(&mut self) -> Result<(), AppError> {
         if self.config.api_key.trim().is_empty() {
-            return Err("Soniox API key is not configured".to_string());
+            return Err(websocket_diagnostic(Code::RequestRejected).into());
         }
         if self.config.model.trim().is_empty() {
-            return Err("Soniox model is not configured".to_string());
+            return Err(websocket_diagnostic(Code::RequestRejected).into());
         }
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -481,7 +490,7 @@ impl SonioxClient {
             .enable_all()
             .thread_name("soniox-ws-rt")
             .build()
-            .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
+            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native, None))?;
 
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
@@ -514,7 +523,7 @@ impl SonioxClient {
                 #[cfg(test)]
                 run_io_entries: None,
             }));
-            Ok::<_, String>((atx, session_handle))
+            Ok::<_, RuntimeDiagnostic>((atx, session_handle))
         })?;
 
         self.audio_tx = Some(audio_tx);
@@ -533,7 +542,8 @@ impl SonioxClient {
 
         self.config
             .content_egress_policy
-            .check_audio("asr.soniox")?;
+            .check_audio("asr.soniox")
+            .map_err(|_| websocket_diagnostic(Code::PolicyBlocked).to_string())?;
 
         let tx = self
             .audio_tx
@@ -603,32 +613,27 @@ impl Drop for SonioxClient {
 #[derive(Debug)]
 #[allow(dead_code)]
 enum DisconnectKind {
-    ServerClose(String),
-    NetworkError(String),
-    PolicyBlocked(String),
-    ProtocolError(String),
+    ServerClose(RuntimeDiagnostic),
+    NetworkError(RuntimeDiagnostic),
+    PolicyBlocked(RuntimeDiagnostic),
+    ProtocolError(RuntimeDiagnostic),
     UserRequested,
     WriterEnded,
 }
 
-async fn open_ws(config: &SonioxConfig) -> Result<(AsrWsWriter, AsrWsReader), String> {
+async fn open_ws(config: &SonioxConfig) -> Result<(AsrWsWriter, AsrWsReader), RuntimeDiagnostic> {
     open_ws_url(config, WEBSOCKET_URL).await
 }
 
 async fn open_ws_url(
     config: &SonioxConfig,
     url_str: &str,
-) -> Result<(AsrWsWriter, AsrWsReader), String> {
+) -> Result<(AsrWsWriter, AsrWsReader), RuntimeDiagnostic> {
     // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
     // ordinary connect error instead of hanging the reconnect ladder forever.
     let (ws_stream, _response) = crate::ws_request::connect_async_bounded(url_str)
         .await
-        .map_err(|e| {
-            crate::error::redacted_provider_diagnostic(
-                &format!("WebSocket connect failed: {e}"),
-                [&config.api_key],
-            )
-        })?;
+        .map_err(|error| websocket_error(&error))?;
     let (mut writer, reader) = ws_stream.split();
     let payload = soniox_session_config_payload(config);
     AsrWsWriteGuard::new("asr.soniox", config.content_egress_policy)
@@ -638,18 +643,13 @@ async fn open_ws_url(
             payload.to_string(),
         )
         .await
-        .map_err(|e| {
-            crate::error::redacted_provider_diagnostic(
-                &format!("Soniox config send failed: {e}"),
-                [&config.api_key],
-            )
-        })?;
+        .map_err(|error| websocket_write_error(&error))?;
     Ok((writer, reader))
 }
 
 #[cfg(test)]
 type ReconnectOpenFuture =
-    Pin<Box<dyn Future<Output = Result<(AsrWsWriter, AsrWsReader), String>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<(AsrWsWriter, AsrWsReader), RuntimeDiagnostic>> + Send>>;
 
 #[cfg(test)]
 type ReconnectOpener = Arc<dyn Fn(SonioxConfig) -> ReconnectOpenFuture + Send + Sync>;
@@ -658,7 +658,7 @@ type ReconnectOpener = Arc<dyn Fn(SonioxConfig) -> ReconnectOpenFuture + Send + 
 async fn open_reconnect_ws(
     config: &SonioxConfig,
     opener: Option<&ReconnectOpener>,
-) -> Result<(AsrWsWriter, AsrWsReader), String> {
+) -> Result<(AsrWsWriter, AsrWsReader), RuntimeDiagnostic> {
     if let Some(opener) = opener {
         opener(config.clone()).await
     } else {
@@ -734,7 +734,6 @@ async fn session_task(ctx: SonioxSessionCtx) {
             &pending_chunks,
             &mut parser,
             &write_guard,
-            &config.api_key,
         )
         .await;
 
@@ -773,7 +772,7 @@ async fn session_task(ctx: SonioxSessionCtx) {
                                 "Soniox session: reconnect budget exhausted after {attempted} attempts"
                             );
                             let _ = event_tx.send(SonioxEvent::Error {
-                                message: "Soniox reconnect attempts exhausted".into(),
+                                message: websocket_diagnostic(Code::ProviderUnavailable),
                             });
                             emit_disconnected_once(&event_tx, &disconnected_emitted);
                             break false;
@@ -837,14 +836,7 @@ async fn session_task(ctx: SonioxSessionCtx) {
                             reconnect_attempts = 0;
                             break true;
                         }
-                        Err(e) => {
-                            // Redact: a reconnect error can embed the upgrade
-                            // request (api_key) or URL userinfo, so scrub the key
-                            // before it reaches logs or the UI.
-                            let diag = crate::error::redacted_provider_diagnostic(
-                                &format!("Reconnect attempt {attempt} failed: {e}"),
-                                [&config.api_key],
-                            );
+                        Err(diag) => {
                             log::warn!("Soniox session: {diag}");
                             let _ = event_tx.send(SonioxEvent::Error { message: diag });
                             continue;
@@ -874,7 +866,6 @@ async fn run_io(
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     parser: &mut SonioxRealtimeParser,
     write_guard: &AsrWsWriteGuard,
-    api_key: &str,
 ) -> DisconnectKind {
     run_io_with_keepalive_interval(
         writer,
@@ -885,7 +876,6 @@ async fn run_io(
         pending_chunks,
         parser,
         write_guard,
-        api_key,
         Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
     )
     .await
@@ -901,7 +891,6 @@ async fn run_io_with_keepalive_interval(
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     parser: &mut SonioxRealtimeParser,
     write_guard: &AsrWsWriteGuard,
-    api_key: &str,
     keepalive_interval: Duration,
 ) -> DisconnectKind {
     let mut finishing = false;
@@ -919,10 +908,7 @@ async fn run_io_with_keepalive_interval(
             _ = keep_alive.tick(), if !finishing => {
                 if last_outbound.elapsed() >= keepalive_interval {
                     if let Err(e) = write_guard.send_ping(writer, Vec::new()).await {
-                        let message = crate::error::redacted_provider_diagnostic(
-                            &format!("keepalive failed: {e}"),
-                            [api_key],
-                        );
+                        let message = websocket_write_error(&e);
                         log::error!("Soniox: failed to send keepalive: {message}");
                         return DisconnectKind::NetworkError(message);
                     }
@@ -947,10 +933,7 @@ async fn run_io_with_keepalive_interval(
                             .await
                         {
                             let policy_blocked = e.is_policy_blocked();
-                            let message = crate::error::redacted_provider_diagnostic(
-                                &format!("send failed: {e}"),
-                                [api_key],
-                            );
+                            let message = websocket_write_error(&e);
                             log::error!("Soniox: failed to send audio: {message}");
                             return if policy_blocked {
                                 DisconnectKind::PolicyBlocked(message)
@@ -977,36 +960,25 @@ async fn run_io_with_keepalive_interval(
 
             result = reader.next() => {
                 let Some(result) = result else {
-                    return DisconnectKind::NetworkError("reader stream ended".into());
+                    return DisconnectKind::NetworkError(websocket_diagnostic(Code::NetworkUnreachable));
                 };
 
                 match result {
                     Ok(Message::Text(text)) => {
                         let finished =
-                            handle_server_message_with_key(&text, event_tx, parser, api_key);
+                            handle_server_message(&text, event_tx, parser);
                         if finished && finishing {
                             let _ = writer.close().await;
                             return DisconnectKind::UserRequested;
                         }
                     }
                     Ok(Message::Close(frame)) => {
-                        let safe_frame = crate::error::redacted_provider_diagnostic(
-                            &format!("{frame:?}"),
-                            [api_key],
-                        );
-                        log::info!("Soniox: server closed connection: {safe_frame}");
                         if user_disconnected.load(Ordering::SeqCst) || finishing {
                             return DisconnectKind::UserRequested;
                         }
-                        let reason = frame
-                            .map(|f| {
-                                crate::error::redacted_provider_diagnostic(
-                                    &format!("{} {}", f.code, f.reason),
-                                    [api_key],
-                                )
-                            })
-                            .unwrap_or_else(|| "no frame".into());
-                        return DisconnectKind::ServerClose(reason);
+                        let diagnostic = websocket_close(frame.as_ref());
+                        log::info!("Soniox: server closed connection {diagnostic}");
+                        return DisconnectKind::ServerClose(diagnostic);
                     }
                     Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
                     Ok(Message::Binary(_)) => {
@@ -1014,16 +986,13 @@ async fn run_io_with_keepalive_interval(
                     }
                     Err(tungstenite::Error::ConnectionClosed)
                     | Err(tungstenite::Error::AlreadyClosed) => {
-                        return DisconnectKind::NetworkError("connection closed".into());
+                        return DisconnectKind::NetworkError(websocket_diagnostic(Code::NetworkUnreachable));
                     }
-                    Err(tungstenite::Error::Protocol(e)) => {
-                        let message =
-                            crate::error::redacted_provider_diagnostic(&e.to_string(), [api_key]);
-                        return DisconnectKind::ProtocolError(message);
+                    Err(error @ tungstenite::Error::Protocol(_)) => {
+                        return DisconnectKind::ProtocolError(websocket_error(&error));
                     }
                     Err(e) => {
-                        let message =
-                            crate::error::redacted_provider_diagnostic(&e.to_string(), [api_key]);
+                        let message = websocket_error(&e);
                         log::error!("Soniox: WebSocket read error: {message}");
                         return DisconnectKind::NetworkError(message);
                     }
@@ -1033,34 +1002,22 @@ async fn run_io_with_keepalive_interval(
     }
 }
 
-#[cfg(test)]
-fn handle_server_message(
+pub(super) fn handle_server_message(
     text: &str,
     tx: &crossbeam_channel::Sender<SonioxEvent>,
     parser: &mut SonioxRealtimeParser,
-) -> bool {
-    handle_server_message_with_key(text, tx, parser, "")
-}
-
-fn handle_server_message_with_key(
-    text: &str,
-    tx: &crossbeam_channel::Sender<SonioxEvent>,
-    parser: &mut SonioxRealtimeParser,
-    api_key: &str,
 ) -> bool {
     let parsed = match parser.parse_message(text, current_unix_millis()) {
         Ok(parsed) => parsed,
-        Err(SonioxParseError::InvalidJson(error)) => {
+        Err(error) => {
             let _ = tx.send(SonioxEvent::Error {
-                message: format!("Invalid server JSON: {error}"),
+                message: error.into(),
             });
             return false;
         }
     };
 
-    if let Some(error) = parsed.error {
-        let message =
-            crate::error::redacted_provider_diagnostic(&format_soniox_error(&error), [api_key]);
+    if let Some(message) = parsed.error {
         let _ = tx.send(SonioxEvent::Error { message });
     }
 
@@ -1090,21 +1047,6 @@ fn soniox_session_config_payload(config: &SonioxConfig) -> Value {
         payload["language_hints"] = json!(config.language_hints);
     }
     payload
-}
-
-fn format_soniox_error(error: &SonioxProviderError) -> String {
-    let mut message = String::from("Soniox error");
-    if let Some(code) = &error.code {
-        message.push_str(&format!(" code={code}"));
-    }
-    if let Some(error_type) = &error.error_type {
-        message.push_str(&format!(" type={error_type}"));
-    }
-    message.push_str(&format!(": {}", error.message));
-    if let Some(request_id) = &error.request_id {
-        message.push_str(&format!(" request_id={request_id}"));
-    }
-    message
 }
 
 fn current_unix_millis() -> u64 {
@@ -1207,17 +1149,56 @@ fn is_marker_only(text: &str) -> bool {
     trimmed == "<end>" || trimmed == "<fin>"
 }
 
-fn json_value_to_string(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(value) => value.clone(),
-        _ => value.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::asr::ws_fixture;
+
+    #[tokio::test]
+    #[ignore = "runs in the isolated ASR log-capture subprocess"]
+    async fn remote_close_diagnostic_log_canary() {
+        use crate::asr::diagnostic_tests::{CLOSE_REASON, LogCapture, assert_safe};
+        use tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+
+        let (url, server) = ws_fixture::spawn_server(|mut socket| async move {
+            socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Library(4763),
+                    reason: CLOSE_REASON.into(),
+                })))
+                .await
+                .unwrap();
+        })
+        .await;
+        let (mut writer, mut reader) = ws_fixture::connect_client(&url).await.split();
+        let (_audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, _) = crossbeam_channel::unbounded();
+        let capture = LogCapture::start();
+        let disconnect = run_io(
+            &mut writer,
+            &mut reader,
+            &mut audio_rx,
+            &event_tx,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &mut SonioxRealtimeParser::new("source"),
+            &AsrWsWriteGuard::new(
+                "asr.soniox",
+                crate::asr::ProviderContentEgressPolicy::allow(),
+            ),
+        )
+        .await;
+        assert_safe(&format!("{disconnect:?}"));
+        let DisconnectKind::ServerClose(diagnostic) = disconnect else {
+            panic!("expected a server close");
+        };
+        assert_eq!(diagnostic, websocket_diagnostic(Code::ProviderUnavailable));
+        let logs = capture.finish().join("\n");
+        assert!(logs.contains("Soniox: server closed connection runtime/provider_unavailable"));
+        assert!(!logs.contains("4763"));
+        assert_safe(&logs);
+        server.await.unwrap();
+    }
     use crate::projections::{TranscriptEvent, TranscriptLedger};
 
     #[test]
@@ -1321,10 +1302,7 @@ mod tests {
 
         let error = client.send_audio(&[0.5, -0.3]).unwrap_err();
 
-        assert!(error.contains("Privacy policy blocked"));
-        assert!(error.contains("asr.soniox"));
-        assert!(error.contains("local_only"));
-        assert!(!error.contains("Audio channel not initialized"));
+        assert_eq!(error, "runtime/policy_blocked");
     }
 
     #[test]
@@ -1442,10 +1420,8 @@ mod tests {
             .await
             .expect_err("blocked policy should reject Soniox session config write");
 
-        assert!(error.contains("Privacy policy blocked"));
-        assert!(error.contains("asr.soniox"));
-        assert!(error.contains("local_only"));
-        assert!(!error.contains("soniox-private-api-key"));
+        assert_eq!(error, websocket_diagnostic(Code::PolicyBlocked));
+        assert!(!error.to_string().contains("soniox-private-api-key"));
 
         let observed = tokio::time::timeout(Duration::from_secs(1), frame_rx)
             .await
@@ -1523,7 +1499,6 @@ mod tests {
                     &pending_chunks,
                     &mut parser,
                     &write_guard,
-                    "soniox-test-key",
                 )
                 .await
             }
@@ -1620,7 +1595,6 @@ mod tests {
                     &pending_chunks,
                     &mut parser,
                     &write_guard,
-                    "soniox-private-api-key",
                 )
                 .await
             }
@@ -1636,10 +1610,8 @@ mod tests {
             .expect("run_io task panicked");
         match disconnect {
             DisconnectKind::PolicyBlocked(message) => {
-                assert!(message.contains("Privacy policy blocked"));
-                assert!(message.contains("asr.soniox"));
-                assert!(message.contains("local_only"));
-                assert!(!message.contains("soniox-private-api-key"));
+                assert_eq!(message, websocket_diagnostic(Code::PolicyBlocked));
+                assert!(!format!("{message:?} {message}").contains("soniox-private-api-key"));
             }
             other => panic!("expected policy-blocked disconnect, got {other:?}"),
         }
@@ -1686,7 +1658,7 @@ mod tests {
                 let opener_calls = Arc::clone(&opener_calls);
                 Box::pin(async move {
                     opener_calls.fetch_add(1, Ordering::SeqCst);
-                    Err("fake Soniox reconnect failure".to_string())
+                    Err(websocket_diagnostic(Code::NetworkUnreachable))
                 })
             })
         };
@@ -1722,7 +1694,7 @@ mod tests {
 
         match recv_event(&event_rx, Duration::from_secs(2)).await {
             SonioxEvent::Error { message } => {
-                assert!(message.contains("Reconnect attempt 1 failed"));
+                assert_eq!(message, websocket_diagnostic(Code::NetworkUnreachable));
             }
             other => panic!("expected reconnect failure error, got {other:?}"),
         }
@@ -1978,12 +1950,9 @@ mod tests {
             language_hints: vec!["en".to_string()],
             content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
         };
-        let (mut writer, mut reader) = open_ws(&config).await.unwrap_or_else(|error| {
-            panic!(
-                "Soniox live smoke connect/config failed: {}",
-                crate::error::redacted_provider_diagnostic(&error, [&api_key])
-            )
-        });
+        let (mut writer, mut reader) = open_ws(&config)
+            .await
+            .unwrap_or_else(|error| panic!("Soniox live smoke connect/config failed: {}", error));
 
         let one_second_silence_pcm16 = vec![0_u8; 16_000 * 2];
         writer
@@ -1992,7 +1961,7 @@ mod tests {
             .unwrap_or_else(|error| {
                 panic!(
                     "Soniox live smoke audio send failed: {}",
-                    crate::error::redacted_provider_diagnostic(&error.to_string(), [&api_key])
+                    websocket_error(&error)
                 )
             });
         writer
@@ -2001,7 +1970,7 @@ mod tests {
             .unwrap_or_else(|error| {
                 panic!(
                     "Soniox live smoke finalization send failed: {}",
-                    crate::error::redacted_provider_diagnostic(&error.to_string(), [&api_key])
+                    websocket_error(&error)
                 )
             });
 
@@ -2021,23 +1990,19 @@ mod tests {
             };
 
             match message.unwrap_or_else(|error| {
-                panic!(
-                    "Soniox live smoke read failed: {}",
-                    crate::error::redacted_provider_diagnostic(&error.to_string(), [&api_key])
-                )
+                panic!("Soniox live smoke read failed: {}", websocket_error(&error))
             }) {
                 Message::Text(text) => {
                     saw_text_response = true;
-                    if handle_server_message_with_key(&text, &event_tx, &mut parser, &api_key) {
+                    if handle_server_message(&text, &event_tx, &mut parser) {
                         saw_finished = true;
                     }
                     while let Ok(event) = event_rx.try_recv() {
                         match event {
                             SonioxEvent::Finished => saw_finished = true,
-                            SonioxEvent::Error { message } => panic!(
-                                "Soniox live smoke provider error: {}",
-                                crate::error::redacted_provider_diagnostic(&message, [&api_key])
-                            ),
+                            SonioxEvent::Error { message } => {
+                                panic!("Soniox live smoke provider error: {}", message)
+                            }
                             _ => {}
                         }
                     }
@@ -2049,10 +2014,7 @@ mod tests {
                     if !saw_finished {
                         panic!(
                             "Soniox live smoke closed before finished response: {}",
-                            crate::error::redacted_provider_diagnostic(
-                                &format!("{frame:?}"),
-                                [&api_key],
-                            )
+                            websocket_close(frame.as_ref())
                         );
                     }
                     break;
@@ -2078,13 +2040,12 @@ mod tests {
         let api_key = "soniox-server-secret";
         let mut parser = SonioxRealtimeParser::new("mixed");
 
-        handle_server_message_with_key(
+        handle_server_message(
             &format!(
                 r#"{{"tokens":[],"error_code":401,"error_type":"unauthorized","error_message":"bad key {api_key} Authorization: Bearer bearer-soniox-secret wss://user:pass@example.com?api_key=url-soniox-secret"}}"#
             ),
             &tx,
             &mut parser,
-            api_key,
         );
 
         match rx.recv().expect("error event") {
@@ -2096,11 +2057,11 @@ mod tests {
                     "url-soniox-secret",
                 ] {
                     assert!(
-                        !message.contains(leaked),
+                        !format!("{message:?} {message}").contains(leaked),
                         "Soniox server error leaked {leaked}: {message}"
                     );
                 }
-                assert!(message.contains("<redacted>"));
+                assert_eq!(message, websocket_diagnostic(Code::RequestRejected));
             }
             other => panic!("expected error event, got {other:?}"),
         }
@@ -2115,7 +2076,7 @@ mod tests {
 
         match rx.recv().expect("error event") {
             SonioxEvent::Error { message } => {
-                assert!(message.contains("Invalid server JSON"));
+                assert_eq!(message, websocket_diagnostic(Code::InvalidResponse));
             }
             other => panic!("expected error event, got {other:?}"),
         }
@@ -2468,15 +2429,7 @@ mod tests {
         assert!(parsed.revisions.is_empty());
         assert_eq!(
             parsed.error,
-            Some(SonioxProviderError {
-                code: Some("503".to_string()),
-                error_type: Some("service_unavailable".to_string()),
-                message: "Cannot continue request".to_string(),
-                request_id: Some("req-123".to_string()),
-                more_info: Some(
-                    "https://soniox.com/docs/api-reference/errors#service-unavailable".to_string()
-                ),
-            })
+            Some(websocket_diagnostic(Code::ProviderUnavailable))
         );
     }
 
@@ -2495,6 +2448,6 @@ mod tests {
     fn invalid_json_is_reported_as_parse_error() {
         let mut parser = SonioxRealtimeParser::new("mic-1");
         let error = parser.parse_message("{", 1).unwrap_err();
-        assert!(matches!(error, SonioxParseError::InvalidJson(_)));
+        assert_eq!(error, SonioxParseError::InvalidJson);
     }
 }

@@ -39,19 +39,13 @@
       "received_at_ms": 1700000000304,
       "raw": "{\"session_id\":\"session-1\",\"type\":\"audio_chunk\",\"acknowledged\":false,\"error\":{\"code\":\"invalid_audio\",\"message\":\"Audio chunk cannot be decoded\"},\"data\":{}}",
       "expected_revision_count": 0,
-      "expected_session_id": "session-1",
-      "expected_provider_error": {
-        "message_type": "audio_chunk",
-        "code": "invalid_audio",
-        "message": "Audio chunk cannot be decoded"
-      }
+      "expected_provider_error": "request_rejected"
     },
     {
       "received_at_ms": 1700000000305,
       "raw": "{\"type\":\"future_event\"}",
       "expected_parse_error": {
-        "kind": "unsupported_message_type",
-        "value": "future_event"
+        "kind": "unsupported_message_type"
       }
     },
     {

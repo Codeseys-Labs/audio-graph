@@ -40,6 +40,14 @@
 //! uses the same 1s/2s/5s/10s exponential backoff ladder as the other
 //! streaming clients (`backoff_for_attempt`).
 
+use super::{
+    asr_diagnostic, websocket_close, websocket_diagnostic, websocket_error, websocket_write_error,
+};
+use crate::error::AppError;
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeErrorCode as Code, RuntimeTransport,
+};
+
 #[cfg(test)]
 use super::reconnect::backoff_for_attempt;
 use super::reconnect::{ReconnectStep, next_reconnect_step};
@@ -285,9 +293,9 @@ impl OpenAiRealtimeClient {
     /// background session task on an internal tokio runtime. The session task
     /// handles audio writing, server message reading, and automatic reconnect
     /// with exponential backoff (re-sending `session.update` on each reconnect).
-    pub fn connect(&mut self) -> Result<(), String> {
+    pub fn connect(&mut self) -> Result<(), AppError> {
         if self.config.api_key.trim().is_empty() {
-            return Err("OpenAI API key is not configured".to_string());
+            return Err(websocket_diagnostic(Code::RequestRejected).into());
         }
 
         // Build a dedicated multi-threaded (1 worker) tokio runtime for the WS.
@@ -296,7 +304,7 @@ impl OpenAiRealtimeClient {
             .enable_all()
             .thread_name("openai-realtime-ws-rt")
             .build()
-            .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
+            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native, None))?;
 
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
@@ -348,7 +356,7 @@ impl OpenAiRealtimeClient {
                 run_io_entries: None,
             }));
 
-            Ok::<_, String>((atx, session_handle))
+            Ok::<_, RuntimeDiagnostic>((atx, session_handle))
         })?;
 
         self.audio_tx = Some(audio_tx);
@@ -385,7 +393,8 @@ impl OpenAiRealtimeClient {
 
         self.config
             .content_egress_policy
-            .check_audio(OPENAI_REALTIME_ASR_PROVIDER)?;
+            .check_audio(OPENAI_REALTIME_ASR_PROVIDER)
+            .map_err(|_| websocket_diagnostic(Code::PolicyBlocked).to_string())?;
 
         let tx = self
             .audio_tx
@@ -521,10 +530,10 @@ impl Drop for OpenAiRealtimeClient {
 #[derive(Debug)]
 #[allow(dead_code)]
 enum DisconnectKind {
-    ServerClose(String),
-    NetworkError(String),
-    ProtocolError(String),
-    PolicyBlocked(String),
+    ServerClose(RuntimeDiagnostic),
+    NetworkError(RuntimeDiagnostic),
+    ProtocolError(RuntimeDiagnostic),
+    PolicyBlocked(RuntimeDiagnostic),
     UserRequested,
     WriterEnded,
 }
@@ -585,7 +594,7 @@ fn realtime_url() -> String {
 /// time. We do **not** wait synchronously for `session.updated`; the server
 /// buffers `input_audio_buffer.append` frames sent right after, and the reader
 /// loop surfaces `session.updated`/`error` as they arrive.
-async fn open_ws(config: &OpenAiRealtimeConfig) -> Result<(WsWriter, WsReader), String> {
+async fn open_ws(config: &OpenAiRealtimeConfig) -> Result<(WsWriter, WsReader), RuntimeDiagnostic> {
     let url = realtime_url();
     open_ws_url(config, &url).await
 }
@@ -593,29 +602,24 @@ async fn open_ws(config: &OpenAiRealtimeConfig) -> Result<(WsWriter, WsReader), 
 async fn open_ws_url(
     config: &OpenAiRealtimeConfig,
     url_str: &str,
-) -> Result<(WsWriter, WsReader), String> {
+) -> Result<(WsWriter, WsReader), RuntimeDiagnostic> {
     // `IntoClientRequest` fills in the mandatory WebSocket upgrade headers; we
     // only layer `Authorization` on top. NO `OpenAI-Beta` header (GA only).
     let mut request = url_str
         .into_client_request()
-        .map_err(|e| format!("Failed to build WebSocket request: {e}"))?;
+        .map_err(|_| websocket_diagnostic(Code::RequestRejected))?;
     request.headers_mut().insert(
         "Authorization",
         format!("Bearer {}", config.api_key)
             .parse()
-            .map_err(|e| format!("Invalid Authorization header: {e}"))?,
+            .map_err(|_| websocket_diagnostic(Code::RequestRejected))?,
     );
 
     // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
     // ordinary connect error instead of hanging the reconnect ladder forever.
     let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
         .await
-        .map_err(|e| {
-            crate::error::redacted_provider_diagnostic(
-                &format!("WebSocket connect failed: {e}"),
-                [&config.api_key],
-            )
-        })?;
+        .map_err(|error| websocket_error(&error))?;
 
     let (mut writer, reader) = ws_stream.split();
 
@@ -624,19 +628,14 @@ async fn open_ws_url(
     AsrWsWriteGuard::new(OPENAI_REALTIME_ASR_PROVIDER, config.content_egress_policy)
         .send_text(&mut writer, AsrTransportPayloadKind::SessionJson, update)
         .await
-        .map_err(|e| {
-            crate::error::redacted_provider_diagnostic(
-                &format!("Failed to send session.update: {e}"),
-                [&config.api_key],
-            )
-        })?;
+        .map_err(|error| websocket_write_error(&error))?;
 
     Ok((writer, reader))
 }
 
 #[cfg(test)]
 type ReconnectOpenFuture =
-    Pin<Box<dyn Future<Output = Result<(WsWriter, WsReader), String>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<(WsWriter, WsReader), RuntimeDiagnostic>> + Send>>;
 
 #[cfg(test)]
 type ReconnectOpener = Arc<dyn Fn(OpenAiRealtimeConfig) -> ReconnectOpenFuture + Send + Sync>;
@@ -645,7 +644,7 @@ type ReconnectOpener = Arc<dyn Fn(OpenAiRealtimeConfig) -> ReconnectOpenFuture +
 async fn open_reconnect_ws(
     config: &OpenAiRealtimeConfig,
     opener: Option<&ReconnectOpener>,
-) -> Result<(WsWriter, WsReader), String> {
+) -> Result<(WsWriter, WsReader), RuntimeDiagnostic> {
     if let Some(opener) = opener {
         opener(config.clone()).await
     } else {
@@ -736,7 +735,6 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
             connected: &connected,
             user_disconnected: &user_disconnected,
             pending_chunks: &pending_chunks,
-            api_key: &config.api_key,
             write_guard: &write_guard,
             ready_event: &ready_event,
             disconnected_emitted: &disconnected_emitted,
@@ -755,7 +753,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
             }
             DisconnectKind::PolicyBlocked(message) => {
                 log::warn!("OpenAI Realtime session: content egress blocked: {message}");
-                let _ = event_tx.send(OpenAiRealtimeEvent::Error { message });
+                emit_error(&event_tx, &message);
                 emit_disconnected_once(&event_tx, &disconnected_emitted);
                 break;
             }
@@ -781,9 +779,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                             log::error!(
                                 "OpenAI Realtime session: reconnect budget exhausted after {attempted} attempts"
                             );
-                            let _ = event_tx.send(OpenAiRealtimeEvent::Error {
-                                message: "OpenAI Realtime reconnect attempts exhausted".into(),
-                            });
+                            emit_error(&event_tx, &websocket_diagnostic(Code::ProviderUnavailable));
                             break false;
                         }
                     };
@@ -840,16 +836,9 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                             reconnect_attempts = 0;
                             break true;
                         }
-                        Err(e) => {
-                            // Redact: a reconnect error can embed the upgrade
-                            // request (Authorization header) or URL userinfo, so
-                            // scrub the api_key before it reaches logs or the UI.
-                            let diag = crate::error::redacted_provider_diagnostic(
-                                &format!("Reconnect attempt {attempt} failed: {e}"),
-                                [&config.api_key],
-                            );
+                        Err(diag) => {
                             log::warn!("OpenAI Realtime session: {diag}");
-                            let _ = event_tx.send(OpenAiRealtimeEvent::Error { message: diag });
+                            emit_error(&event_tx, &diag);
                             // Stay in the reconnect ladder. Do not loop back
                             // through run_io with the previous closed socket.
                             continue;
@@ -881,7 +870,6 @@ struct RunIoCtx<'a> {
     connected: &'a Arc<AtomicBool>,
     user_disconnected: &'a Arc<AtomicBool>,
     pending_chunks: &'a Arc<std::sync::atomic::AtomicUsize>,
-    api_key: &'a str,
     write_guard: &'a AsrWsWriteGuard,
     /// The event to emit once the server confirms the session (`Connected` on
     /// the first socket, `Reconnected` after a reconnect).
@@ -900,10 +888,9 @@ struct RunIoCtx<'a> {
     keepalive_interval: Duration,
 }
 
-#[derive(Debug)]
 enum AudioWriteError {
-    PolicyBlocked(String),
-    Unsent(AudioCmd),
+    PolicyBlocked(RuntimeDiagnostic),
+    Unsent(AudioCmd, RuntimeDiagnostic),
 }
 
 /// Serialize and write a single [`AudioCmd`] to the socket.
@@ -918,7 +905,6 @@ enum AudioWriteError {
 async fn write_audio_cmd(
     writer: &mut WsWriter,
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
-    api_key: &str,
     write_guard: &AsrWsWriteGuard,
     cmd: AudioCmd,
 ) -> Result<(), AudioWriteError> {
@@ -949,8 +935,7 @@ async fn write_audio_cmd(
         }
         Err(e) => {
             let policy_blocked = e.is_policy_blocked();
-            let message =
-                crate::error::redacted_provider_diagnostic(&format!("send failed: {e}"), [api_key]);
+            let message = websocket_write_error(&e);
             if is_chunk {
                 log::error!("OpenAI Realtime: failed to send audio: {message}");
             } else {
@@ -963,7 +948,7 @@ async fn write_audio_cmd(
                 Err(AudioWriteError::PolicyBlocked(message))
             } else {
                 // Preserve the unsent command for replay on the next socket.
-                Err(AudioWriteError::Unsent(cmd))
+                Err(AudioWriteError::Unsent(cmd, message))
             }
         }
     }
@@ -987,7 +972,6 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
         connected,
         user_disconnected,
         pending_chunks,
-        api_key,
         write_guard,
         ready_event,
         disconnected_emitted,
@@ -1009,13 +993,13 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
     // pulling new work, preserving ordering. If the replay also fails the
     // command is put back into `pending_cmd` for the next reconnect.
     if let Some(cmd) = pending_cmd.take()
-        && let Err(error) = write_audio_cmd(writer, pending_chunks, api_key, write_guard, cmd).await
+        && let Err(error) = write_audio_cmd(writer, pending_chunks, write_guard, cmd).await
     {
         return match error {
             AudioWriteError::PolicyBlocked(message) => DisconnectKind::PolicyBlocked(message),
-            AudioWriteError::Unsent(unsent) => {
+            AudioWriteError::Unsent(unsent, message) => {
                 *pending_cmd = Some(unsent);
-                DisconnectKind::NetworkError("replay of in-flight command failed".into())
+                DisconnectKind::NetworkError(message)
             }
         };
     }
@@ -1029,10 +1013,7 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
             _ = keep_alive.tick() => {
                 if last_outbound.elapsed() >= keepalive_interval {
                     if let Err(e) = write_guard.send_ping(writer, Vec::new()).await {
-                        let message = crate::error::redacted_provider_diagnostic(
-                            &format!("keepalive failed: {e}"),
-                            [api_key],
-                        );
+                        let message = websocket_write_error(&e);
                         log::error!("OpenAI Realtime: failed to send keepalive: {message}");
                         return DisconnectKind::NetworkError(message);
                     }
@@ -1044,18 +1025,18 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                 match cmd {
                     Some(cmd @ (AudioCmd::Chunk(_) | AudioCmd::Commit)) => {
                         if let Err(error) =
-                            write_audio_cmd(writer, pending_chunks, api_key, write_guard, cmd).await
+                            write_audio_cmd(writer, pending_chunks, write_guard, cmd).await
                         {
                             return match error {
                                 AudioWriteError::PolicyBlocked(message) => {
                                     DisconnectKind::PolicyBlocked(message)
                                 }
-                                AudioWriteError::Unsent(unsent) => {
+                                AudioWriteError::Unsent(unsent, message) => {
                                     // Hold the unsent command so the reconnected socket
                                     // replays it instead of silently dropping audio or
                                     // the utterance commit.
                                     *pending_cmd = Some(unsent);
-                                    DisconnectKind::NetworkError("send failed".into())
+                                    DisconnectKind::NetworkError(message)
                                 }
                             };
                         }
@@ -1074,10 +1055,7 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                             )
                             .await
                         {
-                            let message = crate::error::redacted_provider_diagnostic(
-                                &format!("terminal commit failed: {e}"),
-                                [api_key],
-                            );
+                            let message = websocket_write_error(&e);
                             log::debug!("OpenAI Realtime: terminal commit skipped: {message}");
                         }
                         let _ = writer.close().await;
@@ -1093,16 +1071,15 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
 
             result = reader.next() => {
                 let Some(result) = result else {
-                    return DisconnectKind::NetworkError("reader stream ended".into());
+                    return DisconnectKind::NetworkError(websocket_diagnostic(Code::NetworkUnreachable));
                 };
 
                 match result {
                     Ok(Message::Text(text)) => {
-                        if handle_server_message_with_key(
+                        if handle_server_message(
                             &text,
                             event_tx,
                             &mut accumulator,
-                            api_key,
                         )
                             && !session_confirmed
                         {
@@ -1116,7 +1093,7 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                         }
                     }
                     Ok(Message::Close(frame)) => {
-                        let diagnostic = openai_realtime_close_frame_diagnostic(frame.as_ref());
+                        let diagnostic = websocket_close(frame.as_ref());
                         log::info!("OpenAI Realtime: server closed connection {diagnostic}");
                         if user_disconnected.load(Ordering::SeqCst) {
                             return DisconnectKind::UserRequested;
@@ -1131,16 +1108,13 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                     }
                     Err(tungstenite::Error::ConnectionClosed)
                     | Err(tungstenite::Error::AlreadyClosed) => {
-                        return DisconnectKind::NetworkError("connection closed".into());
+                        return DisconnectKind::NetworkError(websocket_diagnostic(Code::NetworkUnreachable));
                     }
-                    Err(tungstenite::Error::Protocol(e)) => {
-                        let message =
-                            crate::error::redacted_provider_diagnostic(&e.to_string(), [api_key]);
-                        return DisconnectKind::ProtocolError(message);
+                    Err(error @ tungstenite::Error::Protocol(_)) => {
+                        return DisconnectKind::ProtocolError(websocket_error(&error));
                     }
                     Err(e) => {
-                        let message =
-                            crate::error::redacted_provider_diagnostic(&e.to_string(), [api_key]);
+                        let message = websocket_error(&e);
                         log::error!("OpenAI Realtime: WebSocket read error: {message}");
                         return DisconnectKind::NetworkError(message);
                     }
@@ -1171,28 +1145,17 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
 /// `Connected`/`Reconnected`. The readiness *event* is emitted by the caller
 /// (so the once-only gating lives next to the `connected` flag), keeping this
 /// parser free of cross-message state.
-#[cfg(test)]
 pub(super) fn handle_server_message(
     text: &str,
     tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>,
     accumulator: &mut HashMap<String, String>,
 ) -> bool {
-    handle_server_message_with_key(text, tx, accumulator, "")
-}
-
-fn handle_server_message_with_key(
-    text: &str,
-    tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>,
-    accumulator: &mut HashMap<String, String>,
-    _api_key: &str,
-) -> bool {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
-        Err(e) => {
-            log::warn!("OpenAI Realtime: invalid JSON: {e}");
-            let _ = tx.send(OpenAiRealtimeEvent::Error {
-                message: format!("Invalid server JSON: {e}"),
-            });
+        Err(_) => {
+            let message = websocket_diagnostic(Code::InvalidResponse);
+            log::warn!("OpenAI Realtime: {message}");
+            emit_error(tx, &message);
             return false;
         }
     };
@@ -1249,81 +1212,46 @@ fn handle_server_message_with_key(
             if !item_id.is_empty() {
                 accumulator.remove(item_id);
             }
-            let message = openai_realtime_error_diagnostic(parsed.get("error"));
-            let _ = tx.send(OpenAiRealtimeEvent::Error {
-                message: format!(
-                    "transcription failed item_id={} {message}",
-                    safe_diagnostic_token(Some(item_id))
-                ),
-            });
+            emit_error(tx, &openai_realtime_error_diagnostic(parsed.get("error")));
             false
         }
         "error" => {
             let message = openai_realtime_error_diagnostic(parsed.get("error"));
-            let _ = tx.send(OpenAiRealtimeEvent::Error { message });
+            emit_error(tx, &message);
             false
         }
         "session.updated" | "session.created" => {
             log::debug!("OpenAI Realtime: {msg_type} (session configured)");
             true
         }
-        other => {
+        _ => {
             // Many informational events (speech_started/stopped, item.added,
             // rate_limits.updated, etc.) are expected and not actionable on the
             // STT-only path.
-            log::debug!("OpenAI Realtime: unhandled message type '{other}'");
+            log::debug!("OpenAI Realtime: unhandled message type");
             false
         }
     }
 }
 
-fn openai_realtime_close_frame_diagnostic(
-    frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
-) -> String {
-    let Some(frame) = frame else {
-        return "code=none reason_len=0".to_string();
-    };
-    let code: u16 = frame.code.into();
-    format!("code={code} reason_len={}", frame.reason.chars().count())
+// Converse consumes this event through a String field. Render only the
+// closed diagnostic at this compatibility boundary.
+fn emit_error(tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>, diagnostic: &RuntimeDiagnostic) {
+    let _ = tx.send(OpenAiRealtimeEvent::Error {
+        message: diagnostic.to_string(),
+    });
 }
 
-fn safe_diagnostic_token(value: Option<&str>) -> String {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return "none".to_string();
-    };
-
-    if value.len() <= 128
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
-    {
-        value.to_string()
-    } else {
-        format!("present_len_{}", value.chars().count())
-    }
-}
-
-fn openai_realtime_error_diagnostic(error: Option<&Value>) -> String {
-    let error_type = error.and_then(|e| e.get("type")).and_then(Value::as_str);
-    let code = error.and_then(|e| e.get("code")).and_then(Value::as_str);
-    let param = error.and_then(|e| e.get("param")).and_then(Value::as_str);
-    let event_id = error
-        .and_then(|e| e.get("event_id"))
+fn openai_realtime_error_diagnostic(error: Option<&Value>) -> RuntimeDiagnostic {
+    let code = error
+        .and_then(|error| error.get("code"))
         .and_then(Value::as_str);
-    let message_len = error
-        .and_then(|e| e.get("message"))
-        .and_then(Value::as_str)
-        .map(|message| message.chars().count())
-        .map(|len| len.to_string())
-        .unwrap_or_else(|| "none".to_string());
-
-    format!(
-        "OpenAI Realtime provider_error type={} code={} param={} event_id={} message_len={message_len}",
-        safe_diagnostic_token(error_type),
-        safe_diagnostic_token(code),
-        safe_diagnostic_token(param),
-        safe_diagnostic_token(event_id)
-    )
+    websocket_diagnostic(match code {
+        Some("rate_limit_exceeded") => Code::RateLimited,
+        Some("invalid_api_key" | "invalid_value") => Code::RequestRejected,
+        Some("session_expired") => Code::Timeout,
+        _ => Code::ProviderUnavailable,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1461,13 +1389,12 @@ mod tests {
         let api_key = "sk-realtime-server-secret";
         let mut acc = HashMap::new();
 
-        handle_server_message_with_key(
+        handle_server_message(
             &format!(
                 r#"{{"type":"error","error":{{"message":"bad key {api_key} Authorization: Bearer bearer-realtime-secret-12345 wss://user:pass@example.com?api_key=url-realtime-secret-12345 AKIA1234567890ABCDEF"}}}}"#
             ),
             &tx,
             &mut acc,
-            api_key,
         );
 
         match rx.recv().expect("error event") {
@@ -1481,12 +1408,14 @@ mod tests {
                     "AKIA1234567890ABCDEF",
                 ] {
                     assert!(
-                        !message.contains(leaked),
+                        !format!("{message:?} {message}").contains(leaked),
                         "OpenAI Realtime server error leaked {leaked}: {message}"
                     );
                 }
-                assert!(message.contains("OpenAI Realtime provider_error"));
-                assert!(message.contains("message_len="));
+                assert_eq!(
+                    message,
+                    websocket_diagnostic(Code::ProviderUnavailable).to_string()
+                );
             }
             other => panic!("expected error event, got {other:?}"),
         }
@@ -1518,7 +1447,10 @@ mod tests {
         let mut client = OpenAiRealtimeClient::new(config);
         let result = client.connect();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("API key"));
+        assert!(matches!(
+            result.unwrap_err(),
+            AppError::RuntimeDiagnostic(diagnostic) if diagnostic == websocket_diagnostic(Code::RequestRejected)
+        ));
     }
 
     #[test]
@@ -1542,10 +1474,7 @@ mod tests {
 
         let error = client.send_audio(&[0.5, -0.3]).unwrap_err();
 
-        assert!(error.contains("Privacy policy blocked"));
-        assert!(error.contains("asr.openai_realtime_transcription"));
-        assert!(error.contains("local_only"));
-        assert!(!error.contains("Audio channel not initialized"));
+        assert_eq!(error, "runtime/policy_blocked");
     }
 
     #[test]
@@ -1685,10 +1614,8 @@ mod tests {
             .await
             .expect_err("blocked policy should reject OpenAI Realtime session.update write");
 
-        assert!(error.contains("Privacy policy blocked"));
-        assert!(error.contains(OPENAI_REALTIME_ASR_PROVIDER));
-        assert!(error.contains("local_only"));
-        assert!(!error.contains("sk-private-realtime-key"));
+        assert_eq!(error, websocket_diagnostic(Code::PolicyBlocked));
+        assert!(!error.to_string().contains("sk-private-realtime-key"));
 
         let observed = tokio::time::timeout(Duration::from_secs(1), frame_rx)
             .await
@@ -1872,12 +1799,7 @@ mod tests {
         );
         match rx.try_recv().unwrap() {
             OpenAiRealtimeEvent::Error { message } => {
-                assert!(!message.contains("Rate limit reached"));
-                assert!(message.contains("OpenAI Realtime provider_error"));
-                assert!(message.contains("type=invalid_request_error"));
-                assert!(message.contains("code=rate_limit_exceeded"));
-                assert!(message.contains("message_len=18"));
-                assert!(message.contains("item_003"));
+                assert_eq!(message, websocket_diagnostic(Code::RateLimited).to_string());
             }
             other => panic!("Expected Error, got {other:?}"),
         }
@@ -1898,12 +1820,10 @@ mod tests {
         );
         match rx.try_recv().unwrap() {
             OpenAiRealtimeEvent::Error { message } => {
-                assert!(!message.contains("Something went wrong"));
-                assert!(message.contains("OpenAI Realtime provider_error"));
-                assert!(message.contains("type=server_error"));
-                assert!(message.contains("code=internal"));
-                assert!(message.contains("event_id=evt_1"));
-                assert!(message.contains("message_len=20"));
+                assert_eq!(
+                    message,
+                    websocket_diagnostic(Code::ProviderUnavailable).to_string()
+                );
             }
             other => panic!("Expected Error, got {other:?}"),
         }
@@ -1916,7 +1836,10 @@ mod tests {
         handle_server_message("not json", &tx, &mut acc);
         match rx.try_recv().unwrap() {
             OpenAiRealtimeEvent::Error { message } => {
-                assert!(message.contains("Invalid server JSON"));
+                assert_eq!(
+                    message,
+                    websocket_diagnostic(Code::InvalidResponse).to_string()
+                );
             }
             other => panic!("Expected Error, got {other:?}"),
         }
@@ -2001,7 +1924,7 @@ mod tests {
                 is_final: true,
             },
             OpenAiRealtimeEvent::Error {
-                message: "oops".into(),
+                message: websocket_diagnostic(Code::Internal).to_string(),
             },
             OpenAiRealtimeEvent::Connected,
             OpenAiRealtimeEvent::Disconnected,
@@ -2217,7 +2140,6 @@ mod tests {
         let res = write_audio_cmd(
             &mut writer,
             &pending,
-            "sk-test",
             &write_guard,
             AudioCmd::Chunk("YWJj".into()),
         )
@@ -2257,7 +2179,6 @@ mod tests {
             last = write_audio_cmd(
                 &mut writer,
                 &pending,
-                "sk-test",
                 &write_guard,
                 AudioCmd::Chunk("YWJj".into()),
             )
@@ -2269,8 +2190,8 @@ mod tests {
         let returned = last.expect_err("write to a closed socket must eventually fail");
         // The exact command is handed back for replay.
         match returned {
-            AudioWriteError::Unsent(AudioCmd::Chunk(b64)) => assert_eq!(b64, "YWJj"),
-            other => panic!("expected the chunk to be preserved, got {other:?}"),
+            AudioWriteError::Unsent(AudioCmd::Chunk(b64), _) => assert_eq!(b64, "YWJj"),
+            _ => panic!("expected the chunk to be preserved"),
         }
         // The *failing* call must not have decremented the counter: a held chunk
         // still counts toward the backlog cap and is never under-counted.
@@ -2291,21 +2212,14 @@ mod tests {
         let write_guard = allow_write_guard();
         let mut last = Ok(());
         for _ in 0..50 {
-            last = write_audio_cmd(
-                &mut writer,
-                &pending,
-                "sk-test",
-                &write_guard,
-                AudioCmd::Commit,
-            )
-            .await;
+            last = write_audio_cmd(&mut writer, &pending, &write_guard, AudioCmd::Commit).await;
             if last.is_err() {
                 break;
             }
         }
         let returned = last.expect_err("commit to a closed socket must eventually fail");
         assert!(
-            matches!(returned, AudioWriteError::Unsent(AudioCmd::Commit)),
+            matches!(returned, AudioWriteError::Unsent(AudioCmd::Commit, _)),
             "the utterance commit must be preserved for replay"
         );
     }
@@ -2346,7 +2260,6 @@ mod tests {
                 connected: &connected,
                 user_disconnected: &user_disconnected,
                 pending_chunks: &pending_chunks,
-                api_key: &config.api_key,
                 write_guard: &write_guard,
                 ready_event: &ready_event,
                 disconnected_emitted: &disconnected_emitted,
@@ -2359,12 +2272,10 @@ mod tests {
 
         match disconnect {
             DisconnectKind::PolicyBlocked(message) => {
-                assert!(message.contains("Privacy policy blocked"));
-                assert!(message.contains(OPENAI_REALTIME_ASR_PROVIDER));
-                assert!(message.contains("local_only"));
+                assert_eq!(message, websocket_diagnostic(Code::PolicyBlocked));
                 for forbidden in ["sk-private-realtime-key", "YWJj"] {
                     assert!(
-                        !message.contains(forbidden),
+                        !format!("{message:?} {message}").contains(forbidden),
                         "policy error leaked {forbidden}: {message}"
                     );
                 }
@@ -2415,7 +2326,7 @@ mod tests {
                 let opener_calls = Arc::clone(&opener_calls);
                 Box::pin(async move {
                     opener_calls.fetch_add(1, Ordering::SeqCst);
-                    Err("fake reconnect failure".to_string())
+                    Err(websocket_diagnostic(Code::NetworkUnreachable))
                 })
             })
         };
@@ -2456,7 +2367,10 @@ mod tests {
 
         match recv_event(&event_rx, Duration::from_secs(2)).await {
             OpenAiRealtimeEvent::Error { message } => {
-                assert!(message.contains("Reconnect attempt 1 failed"));
+                assert_eq!(
+                    message,
+                    websocket_diagnostic(Code::NetworkUnreachable).to_string()
+                );
             }
             other => panic!("expected reconnect failure error, got {other:?}"),
         }
@@ -2588,12 +2502,7 @@ mod tests {
                     )
                     .send_text(&mut writer, AsrTransportPayloadKind::SessionJson, update)
                     .await
-                    .map_err(|e| {
-                        crate::error::redacted_provider_diagnostic(
-                            &format!("Failed to send fake session.update: {e}"),
-                            [&config.api_key],
-                        )
-                    })?;
+                    .map_err(|error| websocket_write_error(&error))?;
 
                     Ok((writer, reader))
                 })

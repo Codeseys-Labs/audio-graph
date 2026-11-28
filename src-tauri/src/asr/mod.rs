@@ -8,6 +8,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeStatusClass, RuntimeTransport,
+};
+use tokio_tungstenite::tungstenite::{
+    self, protocol::CloseFrame, protocol::frame::coding::CloseCode,
+};
+
 #[cfg(feature = "asr-whisper")]
 use log::debug;
 #[cfg(feature = "asr-whisper")]
@@ -38,6 +46,545 @@ pub mod speechmatics;
 mod transport;
 #[cfg(test)]
 mod ws_fixture;
+
+/// Convert a structural ASR failure before it can reach an event or log.
+fn websocket_diagnostic(code: RuntimeErrorCode) -> RuntimeDiagnostic {
+    asr_diagnostic(code, RuntimeTransport::Websocket, None)
+}
+
+fn asr_diagnostic(
+    code: RuntimeErrorCode,
+    transport: RuntimeTransport,
+    status: Option<RuntimeStatusClass>,
+) -> RuntimeDiagnostic {
+    use RuntimeErrorCode as Code;
+    use RuntimeSafeRecoveryAction as Recovery;
+
+    let (retryable, recovery) = match code {
+        Code::RateLimited => (true, Recovery::RetryAfterDelay),
+        Code::NetworkUnreachable => (true, Recovery::CheckNetwork),
+        Code::Timeout | Code::ProviderUnavailable => (true, Recovery::Retry),
+        Code::RequestRejected | Code::CapacityExhausted => (false, Recovery::ReviewConfiguration),
+        Code::PolicyBlocked => (false, Recovery::ReviewPolicy),
+        _ => (false, Recovery::None),
+    };
+    let mut context =
+        RuntimeDiagnosticContext::new(RuntimeOperation::Transcription).with_transport(transport);
+    if let Some(status) = status {
+        context = context.with_status_class(status);
+    }
+    RuntimeErrorDiagnostic::new(code, retryable, recovery, context).into()
+}
+
+fn websocket_error(error: &tungstenite::Error) -> RuntimeDiagnostic {
+    use RuntimeErrorCode as Code;
+    use tungstenite::Error;
+
+    let code = match error {
+        Error::Http(response) => {
+            let status = response.status();
+            let class = match status.as_u16() {
+                300..=399 => Some(RuntimeStatusClass::Redirect),
+                400..=499 => Some(RuntimeStatusClass::ClientError),
+                500..=599 => Some(RuntimeStatusClass::ServerError),
+                _ => None,
+            };
+            let code = match status.as_u16() {
+                408 | 504 => Code::Timeout,
+                429 => Code::RateLimited,
+                500..=599 => Code::ProviderUnavailable,
+                _ => Code::RequestRejected,
+            };
+            return asr_diagnostic(code, RuntimeTransport::Websocket, class);
+        }
+        Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => Code::Timeout,
+        Error::Io(_) | Error::Tls(_) | Error::ConnectionClosed | Error::AlreadyClosed => {
+            Code::NetworkUnreachable
+        }
+        Error::Protocol(_) | Error::Utf8(_) => Code::ProtocolError,
+        Error::Capacity(_) => Code::CapacityExhausted,
+        Error::Url(_) => Code::RequestRejected,
+        _ => Code::Internal,
+    };
+    websocket_diagnostic(code)
+}
+
+fn websocket_write_error(error: &transport::AsrTransportWriteError) -> RuntimeDiagnostic {
+    let code = if error.is_policy_blocked() {
+        RuntimeErrorCode::PolicyBlocked
+    } else {
+        RuntimeErrorCode::NetworkUnreachable
+    };
+    websocket_diagnostic(code)
+}
+
+fn websocket_close(frame: Option<&CloseFrame>) -> RuntimeDiagnostic {
+    use RuntimeErrorCode as Code;
+
+    let code = match frame.map(|frame| frame.code) {
+        Some(CloseCode::Normal) => Code::Cancelled,
+        Some(CloseCode::Protocol | CloseCode::Unsupported | CloseCode::Invalid) => {
+            Code::ProtocolError
+        }
+        Some(CloseCode::Policy) => Code::PolicyBlocked,
+        Some(CloseCode::Size) => Code::CapacityExhausted,
+        Some(CloseCode::Again) => Code::RateLimited,
+        _ => Code::ProviderUnavailable,
+    };
+    websocket_diagnostic(code)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsrParseError {
+    InvalidJson,
+    UnsupportedMessageType,
+}
+
+impl From<AsrParseError> for RuntimeDiagnostic {
+    fn from(error: AsrParseError) -> Self {
+        websocket_diagnostic(match error {
+            AsrParseError::InvalidJson => RuntimeErrorCode::InvalidResponse,
+            AsrParseError::UnsupportedMessageType => RuntimeErrorCode::Unsupported,
+        })
+    }
+}
+
+impl std::fmt::Display for AsrParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&RuntimeDiagnostic::from(*self), f)
+    }
+}
+
+impl std::error::Error for AsrParseError {}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use crate::error::AppError;
+    use serde_json::json;
+    use std::{cell::RefCell, sync::Once};
+
+    const SECRET: &str = "asr-secret-canary";
+    const REQUEST_ID: &str = "asr-request-id-canary";
+    const PROSE: &str = "asr-provider-prose-canary";
+    const UNKNOWN: &str = "asr-unknown-code-canary";
+    pub(super) const CLOSE_REASON: &str = "asr-close-reason-canary";
+    const NATIVE_PROSE: &str = "asr-native-transport-canary";
+    const BODY_CHARS: usize = 379;
+    const BODY_BYTES: usize = 691;
+
+    thread_local! {
+        static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    struct CaptureLogger;
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            let asr_module = module_path!().strip_suffix("::diagnostic_tests").unwrap();
+            metadata.target().starts_with(asr_module)
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                CAPTURE.with_borrow_mut(|capture| {
+                    if let Some(lines) = capture {
+                        lines.push(record.args().to_string());
+                    }
+                });
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    pub(super) struct LogCapture;
+
+    impl LogCapture {
+        pub(super) fn start() -> Self {
+            static INIT: Once = Once::new();
+            INIT.call_once(|| {
+                log::set_logger(&CaptureLogger).expect("install ASR test logger");
+                log::set_max_level(log::LevelFilter::Trace);
+            });
+            CAPTURE.with_borrow_mut(|capture| assert!(capture.replace(Vec::new()).is_none()));
+            Self
+        }
+
+        pub(super) fn finish(self) -> Vec<String> {
+            CAPTURE.with_borrow_mut(|capture| capture.take().expect("active capture"))
+        }
+    }
+
+    impl Drop for LogCapture {
+        fn drop(&mut self) {
+            CAPTURE.with_borrow_mut(|capture| *capture = None);
+        }
+    }
+
+    fn wire_prose() -> String {
+        let canaries = format!("{PROSE}{SECRET}");
+        // Give both the exact character count and the exact byte count their own canary.
+        let padding = "é".repeat(BODY_BYTES - BODY_CHARS);
+        let filler = "x".repeat(BODY_CHARS - canaries.len() - padding.chars().count());
+        format!("{canaries}{filler}{padding}")
+    }
+
+    pub(super) fn assert_safe(value: &str) {
+        for private in [
+            SECRET,
+            REQUEST_ID,
+            PROSE,
+            UNKNOWN,
+            CLOSE_REASON,
+            NATIVE_PROSE,
+        ] {
+            assert!(!value.contains(private), "diagnostic exposed {private}");
+        }
+        for exact_length in [BODY_CHARS, BODY_BYTES] {
+            assert!(
+                !value.contains(&exact_length.to_string()),
+                "diagnostic exposed an exact length"
+            );
+        }
+    }
+
+    fn assert_diagnostic(diagnostic: &RuntimeDiagnostic, code: RuntimeErrorCode) {
+        let RuntimeDiagnostic::Runtime(detail) = diagnostic else {
+            panic!("expected a runtime diagnostic");
+        };
+        assert_eq!(detail.code, code);
+        assert_eq!(detail.context.operation, RuntimeOperation::Transcription);
+        assert_eq!(detail.context.transport, Some(RuntimeTransport::Websocket));
+        let app_error = AppError::from(diagnostic.clone());
+        assert!(matches!(app_error, AppError::RuntimeDiagnostic(_)));
+        assert_safe(&format!(
+            "{diagnostic:?} {diagnostic} {app_error:?} {app_error}"
+        ));
+        assert_safe(&serde_json::to_string(&app_error).unwrap());
+    }
+
+    fn assert_parse_error(error: AsrParseError, expected: AsrParseError) {
+        assert_eq!(error, expected);
+        assert_safe(&format!("{error:?} {error}"));
+    }
+
+    #[test]
+    fn asr_logs_discard_private_wire_details() {
+        // Logger and level are process-global. Isolate them from the rest of
+        // the test suite, which also tests changes to the global log level.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "diagnostic_log_canary"])
+            .output()
+            .expect("run the ASR log-capture subprocess");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("8 passed; 0 failed"),
+            "ASR log canaries failed\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn websocket_handshake_transport_and_close_discard_private_inputs() {
+        use RuntimeErrorCode as Code;
+        use tungstenite::{
+            Error,
+            http::{Response, StatusCode},
+        };
+
+        for (status, code, class) in [
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                Code::RequestRejected,
+                RuntimeStatusClass::Redirect,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                Code::RequestRejected,
+                RuntimeStatusClass::ClientError,
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                Code::RequestRejected,
+                RuntimeStatusClass::ClientError,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Code::RateLimited,
+                RuntimeStatusClass::ClientError,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Code::ProviderUnavailable,
+                RuntimeStatusClass::ServerError,
+            ),
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Code::Timeout,
+                RuntimeStatusClass::ServerError,
+            ),
+        ] {
+            let error = Error::Http(Box::new(
+                Response::builder()
+                    .status(status)
+                    .header("x-request-id", REQUEST_ID)
+                    .header("x-provider-info", SECRET)
+                    .body(Some(wire_prose().into_bytes()))
+                    .unwrap(),
+            ));
+            let diagnostic = websocket_error(&error);
+            assert_diagnostic(&diagnostic, code);
+            let RuntimeDiagnostic::Runtime(detail) = diagnostic else {
+                unreachable!();
+            };
+            assert_eq!(detail.context.status_class, Some(class));
+            assert!(!format!("{detail:?}").contains(&status.as_u16().to_string()));
+        }
+
+        for (error, code) in [
+            (
+                Error::Io(std::io::Error::other(NATIVE_PROSE)),
+                Code::NetworkUnreachable,
+            ),
+            (
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    NATIVE_PROSE,
+                )),
+                Code::Timeout,
+            ),
+            (Error::Utf8(NATIVE_PROSE.into()), Code::ProtocolError),
+        ] {
+            assert_diagnostic(&websocket_error(&error), code);
+        }
+        let error = transport::AsrTransportWriteError::Write {
+            provider: "fixture",
+            payload_kind: transport::AsrTransportPayloadKind::Audio,
+            message: format!("{NATIVE_PROSE} {SECRET} {}", wire_prose()),
+        };
+        assert_diagnostic(&websocket_write_error(&error), Code::NetworkUnreachable);
+        let close = CloseFrame {
+            code: CloseCode::Library(4763),
+            reason: format!("{CLOSE_REASON} {REQUEST_ID} {SECRET}").into(),
+        };
+        let diagnostic = websocket_close(Some(&close));
+        assert_diagnostic(&diagnostic, Code::ProviderUnavailable);
+        assert!(!format!("{diagnostic:?}").contains("4763"));
+        assert_diagnostic(&websocket_close(None), Code::ProviderUnavailable);
+    }
+
+    #[test]
+    #[ignore = "runs in the isolated ASR log-capture subprocess"]
+    fn deepgram_diagnostic_log_canary() {
+        let capture = LogCapture::start();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for payload in [
+            json!({"type": "Metadata", "request_id": REQUEST_ID}),
+            json!({"type": UNKNOWN, "request_id": REQUEST_ID}),
+            json!({"type": "TurnInfo", "event": UNKNOWN, "request_id": REQUEST_ID}),
+        ] {
+            deepgram::handle_server_message(&payload.to_string(), &tx);
+        }
+        assert!(rx.try_recv().is_err());
+        let payload = json!({
+            "type": "Error", "err_code": UNKNOWN, "description": wire_prose(),
+            "request_id": REQUEST_ID,
+        });
+        deepgram::handle_server_message(&payload.to_string(), &tx);
+        let event = rx.try_recv().unwrap();
+        assert_safe(&format!("{event:?}"));
+        assert_safe(&serde_json::to_string(&event).unwrap());
+        let deepgram::DeepgramEvent::Error { message } = event else {
+            panic!("expected Deepgram error event");
+        };
+        assert_diagnostic(&message, RuntimeErrorCode::ProviderUnavailable);
+        let logs = capture.finish().join("\n");
+        assert!(logs.contains("received metadata"));
+        assert!(logs.contains("unhandled Flux TurnInfo event"));
+        assert_safe(&logs);
+    }
+
+    #[test]
+    #[ignore = "runs in the isolated ASR log-capture subprocess"]
+    fn assemblyai_diagnostic_log_canary() {
+        let capture = LogCapture::start();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut parser = assemblyai::AssemblyAiV3Parser::new("source");
+        let payload = json!({
+            "type": "Error", "code": UNKNOWN, "error": wire_prose(), "request_id": REQUEST_ID,
+            "token": SECRET,
+        });
+        let payload = payload.to_string();
+        let parsed = parser.parse_message(&payload, 0).unwrap();
+        assert_safe(&format!("{parsed:?}"));
+        assert_diagnostic(
+            &parsed.error.unwrap().message,
+            RuntimeErrorCode::RequestRejected,
+        );
+        assemblyai::handle_server_message(&payload, &tx);
+        let event = rx.try_recv().unwrap();
+        assert_safe(&format!("{event:?}"));
+        assert_safe(&serde_json::to_string(&event).unwrap());
+        let assemblyai::AssemblyAIEvent::Error { message } = event else {
+            panic!("expected AssemblyAI error event");
+        };
+        assert_diagnostic(&message, RuntimeErrorCode::RequestRejected);
+        let unknown = json!({"type": UNKNOWN, "request_id": REQUEST_ID}).to_string();
+        assemblyai::handle_server_message(&unknown, &tx);
+        assert!(rx.try_recv().is_err());
+        assert_parse_error(
+            parser.parse_message(&unknown, 0).unwrap_err(),
+            AsrParseError::UnsupportedMessageType,
+        );
+        let turn = json!({
+            "type": "Turn", "turn_order": 1, "transcript": "hello",
+            "request_id": REQUEST_ID, "id": REQUEST_ID, "token": SECRET,
+            "error": wire_prose(), "words": [{"text": "hello", "more_info": SECRET}],
+        });
+        assemblyai::handle_server_message(&turn.to_string(), &tx);
+        let assemblyai::AssemblyAIEvent::ServerMessage { frame, .. } = rx.try_recv().unwrap()
+        else {
+            panic!("expected AssemblyAI transcript frame");
+        };
+        assert_safe(frame.as_str());
+        let parsed = parser.parse_message(frame.as_str(), 0).unwrap();
+        assert_eq!(parsed.revisions[0].payload.text, "hello");
+        let logs = capture.finish().join("\n");
+        assert!(logs.contains("server error"));
+        assert!(logs.contains("unsupported server message"));
+        assert_safe(&logs);
+    }
+
+    #[test]
+    #[ignore = "runs in the isolated ASR log-capture subprocess"]
+    fn openai_diagnostic_log_canary() {
+        let capture = LogCapture::start();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut accumulator = std::collections::HashMap::new();
+        let payload = json!({
+            "type": "conversation.item.input_audio_transcription.failed", "item_id": REQUEST_ID,
+            "error": {"type": UNKNOWN, "code": UNKNOWN, "message": wire_prose(),
+                "param": SECRET, "event_id": REQUEST_ID},
+        });
+        openai_realtime::handle_server_message(&payload.to_string(), &tx, &mut accumulator);
+        let event = rx.try_recv().unwrap();
+        assert_safe(&format!("{event:?}"));
+        assert_safe(&serde_json::to_string(&event).unwrap());
+        let openai_realtime::OpenAiRealtimeEvent::Error { message } = event else {
+            panic!("expected OpenAI error event");
+        };
+        assert_eq!(message, "runtime/provider_unavailable");
+        let unknown = json!({"type": UNKNOWN, "request_id": REQUEST_ID});
+        openai_realtime::handle_server_message(&unknown.to_string(), &tx, &mut accumulator);
+        assert!(rx.try_recv().is_err());
+        let logs = capture.finish().join("\n");
+        assert!(logs.contains("unhandled message type"));
+        assert_safe(&logs);
+    }
+
+    #[test]
+    #[ignore = "runs in the isolated ASR log-capture subprocess"]
+    fn soniox_diagnostic_log_canary() {
+        let capture = LogCapture::start();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut parser = soniox::SonioxRealtimeParser::new("source");
+        let payload = json!({
+            "error_type": UNKNOWN, "error_code": {"detail": UNKNOWN}, "error_message": wire_prose(),
+            "request_id": REQUEST_ID, "more_info": SECRET, "total_audio_proc_ms": BODY_BYTES,
+        });
+        let payload = payload.to_string();
+        let parsed = parser.parse_message(&payload, 0).unwrap();
+        assert_safe(&format!("{parsed:?}"));
+        assert_diagnostic(
+            &parsed.error.unwrap(),
+            RuntimeErrorCode::ProviderUnavailable,
+        );
+        soniox::handle_server_message(&payload, &tx, &mut parser);
+        let event = rx.try_recv().unwrap();
+        assert_safe(&format!("{event:?}"));
+        let soniox::SonioxEvent::Error { message } = event else {
+            panic!("expected Soniox error event");
+        };
+        assert_diagnostic(&message, RuntimeErrorCode::ProviderUnavailable);
+        assert_safe(&capture.finish().join("\n"));
+    }
+
+    #[test]
+    #[ignore = "runs in the isolated ASR log-capture subprocess"]
+    fn gladia_diagnostic_log_canary() {
+        let capture = LogCapture::start();
+        let mut parser = gladia::GladiaLiveParser::new("source");
+        let payload = json!({
+            "type": UNKNOWN, "session_id": REQUEST_ID, "acknowledged": false,
+            "error": {"code": UNKNOWN, "message": wire_prose(), "token": SECRET},
+            "data": {"byte_range": [0, BODY_BYTES]},
+        });
+        let parsed = parser.parse_message(&payload.to_string(), 0).unwrap();
+        assert_safe(&format!("{parsed:?}"));
+        assert_diagnostic(
+            &parsed.error.unwrap(),
+            RuntimeErrorCode::ProviderUnavailable,
+        );
+        let unknown = json!({"type": UNKNOWN, "request_id": REQUEST_ID});
+        assert_parse_error(
+            parser.parse_message(&unknown.to_string(), 0).unwrap_err(),
+            AsrParseError::UnsupportedMessageType,
+        );
+        assert_safe(&capture.finish().join("\n"));
+    }
+
+    #[test]
+    #[ignore = "runs in the isolated ASR log-capture subprocess"]
+    fn speechmatics_diagnostic_log_canary() {
+        let capture = LogCapture::start();
+        let mut parser = speechmatics::SpeechmaticsRealtimeParser::new("source");
+        let payload = json!({
+            "message": "Error", "type": UNKNOWN, "reason": wire_prose(), "code": BODY_CHARS,
+            "seq_no": BODY_BYTES, "id": REQUEST_ID, "token": SECRET,
+        });
+        let parsed = parser.parse_message(&payload.to_string(), 0).unwrap();
+        assert_safe(&format!("{parsed:?}"));
+        assert_diagnostic(
+            &parsed.error.unwrap(),
+            RuntimeErrorCode::ProviderUnavailable,
+        );
+        let unknown = json!({"message": UNKNOWN, "id": REQUEST_ID});
+        assert_parse_error(
+            parser.parse_message(&unknown.to_string(), 0).unwrap_err(),
+            AsrParseError::UnsupportedMessageType,
+        );
+        assert_diagnostic(
+            &speechmatics::classify_close_code(4763),
+            RuntimeErrorCode::Internal,
+        );
+        assert_safe(&capture.finish().join("\n"));
+    }
+
+    #[test]
+    #[ignore = "runs in the isolated ASR log-capture subprocess"]
+    fn revai_diagnostic_log_canary() {
+        let capture = LogCapture::start();
+        let mut parser = revai::RevAiStreamingParser::new("source");
+        let payload = json!({
+            "type": UNKNOWN, "id": REQUEST_ID, "reason": wire_prose(), "token": SECRET,
+        });
+        assert_parse_error(
+            parser.parse_message(&payload.to_string(), 0).unwrap_err(),
+            AsrParseError::UnsupportedMessageType,
+        );
+        let malformed = json!({"type": wire_prose(), "elements": SECRET, "id": REQUEST_ID});
+        assert_parse_error(
+            parser.parse_message(&malformed.to_string(), 0).unwrap_err(),
+            AsrParseError::InvalidJson,
+        );
+        assert_diagnostic(
+            &revai::classify_close_code(4763),
+            RuntimeErrorCode::Internal,
+        );
+        assert_safe(&capture.finish().join("\n"));
+    }
+}
 
 /// Provider-client defense-in-depth guard for session content egress.
 ///

@@ -1,21 +1,18 @@
-use std::fmt::Debug;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode};
 use serde::Deserialize;
 
 use crate::events::{AsrSpanRevisionPayload, AsrSpanStability};
 use crate::projections::{TranscriptEvent, TranscriptLedger, TranscriptLedgerError};
 
-use super::assemblyai::{AssemblyAiV3ParseError, AssemblyAiV3ParsedMessage, AssemblyAiV3Parser};
-use super::gladia::{
-    GladiaLiveParser, GladiaParseError, GladiaParsedMessage, GladiaSpeechEventType,
-};
-use super::revai::{RevAiParseError, RevAiParsedMessage, RevAiStreamingParser};
-use super::soniox::{SonioxParseError, SonioxParsedMessage, SonioxRealtimeParser};
-use super::speechmatics::{
-    SpeechmaticsParseError, SpeechmaticsParsedMessage, SpeechmaticsRealtimeParser,
-};
+use super::AsrParseError;
+use super::assemblyai::{AssemblyAiV3ParsedMessage, AssemblyAiV3Parser};
+use super::gladia::{GladiaLiveParser, GladiaParsedMessage, GladiaSpeechEventType};
+use super::revai::{RevAiParsedMessage, RevAiStreamingParser};
+use super::soniox::{SonioxParsedMessage, SonioxRealtimeParser};
+use super::speechmatics::{SpeechmaticsParsedMessage, SpeechmaticsRealtimeParser};
 
 #[derive(Debug, Deserialize)]
 struct AsrParserFixture {
@@ -54,7 +51,7 @@ struct FixtureMessage {
     #[serde(default)]
     expected_finished: Option<bool>,
     #[serde(default)]
-    expected_provider_error: Option<ExpectedProviderError>,
+    expected_provider_error: Option<RuntimeErrorCode>,
     #[serde(default)]
     expected_session_id: Option<String>,
     #[serde(default)]
@@ -76,8 +73,6 @@ struct FixtureMessage {
 #[derive(Debug, Deserialize)]
 struct ExpectedParseError {
     kind: ExpectedParseErrorKind,
-    #[serde(default)]
-    value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,26 +80,6 @@ struct ExpectedParseError {
 enum ExpectedParseErrorKind {
     InvalidJson,
     UnsupportedMessageType,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExpectedProviderError {
-    #[serde(default)]
-    message_type: Option<String>,
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    error_type: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    more_info: Option<String>,
-    #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
-    seq_no: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,7 +351,7 @@ fn parse_fixture_messages(
                         parsed
                     }
                     Err(error) => {
-                        assert_assemblyai_v3_parse_error(error, message, relative_path, index);
+                        assert_parse_error(error, message, relative_path, index);
                         continue;
                     }
                 };
@@ -406,7 +381,7 @@ fn parse_fixture_messages(
                         parsed
                     }
                     Err(error) => {
-                        assert_gladia_parse_error(error, message, relative_path, index);
+                        assert_parse_error(error, message, relative_path, index);
                         continue;
                     }
                 };
@@ -436,7 +411,7 @@ fn parse_fixture_messages(
                         parsed
                     }
                     Err(error) => {
-                        assert_revai_parse_error(error, message, relative_path, index);
+                        assert_parse_error(error, message, relative_path, index);
                         continue;
                     }
                 };
@@ -466,7 +441,7 @@ fn parse_fixture_messages(
                         parsed
                     }
                     Err(error) => {
-                        assert_soniox_parse_error(error, message, relative_path, index);
+                        assert_parse_error(error, message, relative_path, index);
                         continue;
                     }
                 };
@@ -496,7 +471,7 @@ fn parse_fixture_messages(
                         parsed
                     }
                     Err(error) => {
-                        assert_speechmatics_parse_error(error, message, relative_path, index);
+                        assert_parse_error(error, message, relative_path, index);
                         continue;
                     }
                 };
@@ -545,121 +520,39 @@ fn assert_unexpected_parse_error_expectation(
     );
 }
 
-fn expected_parse_error<'a>(
-    message: &'a FixtureMessage,
+fn assert_parse_error(
+    actual: AsrParseError,
+    message: &FixtureMessage,
     relative_path: &str,
     index: usize,
-    error: &impl Debug,
-) -> &'a ExpectedParseError {
+) {
     let Some(expected) = &message.expected_parse_error else {
-        panic!("{relative_path}: parser rejected message {index}: {error:?}");
+        panic!("{relative_path}: parser rejected message {index}: {actual:?}");
     };
-    expected
+    let expected = match expected.kind {
+        ExpectedParseErrorKind::InvalidJson => AsrParseError::InvalidJson,
+        ExpectedParseErrorKind::UnsupportedMessageType => AsrParseError::UnsupportedMessageType,
+    };
+    assert_eq!(
+        actual, expected,
+        "{relative_path}: message {index} parse error"
+    );
 }
 
-fn assert_revai_parse_error(
-    error: RevAiParseError,
+fn assert_provider_error(
+    actual: Option<&RuntimeDiagnostic>,
     message: &FixtureMessage,
     relative_path: &str,
     index: usize,
 ) {
-    let expected = expected_parse_error(message, relative_path, index, &error);
-    match (&expected.kind, error) {
-        (ExpectedParseErrorKind::InvalidJson, RevAiParseError::InvalidJson(_)) => {}
-        (
-            ExpectedParseErrorKind::UnsupportedMessageType,
-            RevAiParseError::UnsupportedMessageType(actual),
-        ) => assert_expected_parse_error_value(&actual, expected, relative_path, index),
-        (kind, actual) => {
-            panic!("{relative_path}: message {index} expected parse error {kind:?}, got {actual:?}")
-        }
-    }
-}
-
-fn assert_assemblyai_v3_parse_error(
-    error: AssemblyAiV3ParseError,
-    message: &FixtureMessage,
-    relative_path: &str,
-    index: usize,
-) {
-    let expected = expected_parse_error(message, relative_path, index, &error);
-    match (&expected.kind, error) {
-        (ExpectedParseErrorKind::InvalidJson, AssemblyAiV3ParseError::InvalidJson(_)) => {}
-        (
-            ExpectedParseErrorKind::UnsupportedMessageType,
-            AssemblyAiV3ParseError::UnsupportedMessageType(actual),
-        ) => assert_expected_parse_error_value(&actual, expected, relative_path, index),
-        (kind, actual) => {
-            panic!("{relative_path}: message {index} expected parse error {kind:?}, got {actual:?}")
-        }
-    }
-}
-
-fn assert_soniox_parse_error(
-    error: SonioxParseError,
-    message: &FixtureMessage,
-    relative_path: &str,
-    index: usize,
-) {
-    let expected = expected_parse_error(message, relative_path, index, &error);
-    match (&expected.kind, error) {
-        (ExpectedParseErrorKind::InvalidJson, SonioxParseError::InvalidJson(_)) => {}
-        (kind, actual) => {
-            panic!("{relative_path}: message {index} expected parse error {kind:?}, got {actual:?}")
-        }
-    }
-}
-
-fn assert_gladia_parse_error(
-    error: GladiaParseError,
-    message: &FixtureMessage,
-    relative_path: &str,
-    index: usize,
-) {
-    let expected = expected_parse_error(message, relative_path, index, &error);
-    match (&expected.kind, error) {
-        (ExpectedParseErrorKind::InvalidJson, GladiaParseError::InvalidJson(_)) => {}
-        (
-            ExpectedParseErrorKind::UnsupportedMessageType,
-            GladiaParseError::UnsupportedMessageType(actual),
-        ) => assert_expected_parse_error_value(&actual, expected, relative_path, index),
-        (kind, actual) => {
-            panic!("{relative_path}: message {index} expected parse error {kind:?}, got {actual:?}")
-        }
-    }
-}
-
-fn assert_speechmatics_parse_error(
-    error: SpeechmaticsParseError,
-    message: &FixtureMessage,
-    relative_path: &str,
-    index: usize,
-) {
-    let expected = expected_parse_error(message, relative_path, index, &error);
-    match (&expected.kind, error) {
-        (ExpectedParseErrorKind::InvalidJson, SpeechmaticsParseError::InvalidJson(_)) => {}
-        (
-            ExpectedParseErrorKind::UnsupportedMessageType,
-            SpeechmaticsParseError::UnsupportedMessageType(actual),
-        ) => assert_expected_parse_error_value(&actual, expected, relative_path, index),
-        (kind, actual) => {
-            panic!("{relative_path}: message {index} expected parse error {kind:?}, got {actual:?}")
-        }
-    }
-}
-
-fn assert_expected_parse_error_value(
-    actual: &str,
-    expected: &ExpectedParseError,
-    relative_path: &str,
-    index: usize,
-) {
-    if let Some(expected_value) = expected.value.as_deref() {
-        assert_eq!(
-            actual, expected_value,
-            "{relative_path}: message {index} parse error value"
-        );
-    }
+    let actual = actual.map(|diagnostic| match diagnostic {
+        RuntimeDiagnostic::Runtime(error) => error.code,
+        RuntimeDiagnostic::Credential(_) => panic!("{relative_path}: unexpected credential error"),
+    });
+    assert_eq!(
+        actual, message.expected_provider_error,
+        "{relative_path}: message {index} provider error code"
+    );
 }
 
 fn assert_revai_sideband(
@@ -696,16 +589,12 @@ fn assert_assemblyai_v3_sideband(
             "{relative_path}: message {index} AssemblyAI v3 termination flag"
         );
     }
-    if let Some(expected) = &message.expected_provider_error {
-        let actual = parsed.error.as_ref().unwrap_or_else(|| {
-            panic!("{relative_path}: message {index} missing AssemblyAI v3 provider error")
-        });
-        assert_eq!(
-            Some(actual.message.as_str()),
-            expected.message.as_deref(),
-            "{relative_path}: message {index} AssemblyAI v3 error message"
-        );
-    }
+    assert_provider_error(
+        parsed.error.as_ref().map(|error| &error.message),
+        message,
+        relative_path,
+        index,
+    );
     assert_eq!(
         parsed.speaker_revisions.len(),
         message.expected_speaker_revisions.len(),
@@ -781,36 +670,7 @@ fn assert_soniox_sideband(
             "{relative_path}: message {index} Soniox finished flag"
         );
     }
-    if let Some(expected) = &message.expected_provider_error {
-        let actual = parsed.error.as_ref().unwrap_or_else(|| {
-            panic!("{relative_path}: message {index} missing Soniox provider error")
-        });
-        assert_eq!(
-            actual.code.as_deref(),
-            expected.code.as_deref(),
-            "{relative_path}: message {index} Soniox error code"
-        );
-        assert_eq!(
-            actual.error_type.as_deref(),
-            expected.error_type.as_deref(),
-            "{relative_path}: message {index} Soniox error type"
-        );
-        assert_eq!(
-            Some(actual.message.as_str()),
-            expected.message.as_deref(),
-            "{relative_path}: message {index} Soniox error message"
-        );
-        assert_eq!(
-            actual.request_id.as_deref(),
-            expected.request_id.as_deref(),
-            "{relative_path}: message {index} Soniox request id"
-        );
-        assert_eq!(
-            actual.more_info.as_deref(),
-            expected.more_info.as_deref(),
-            "{relative_path}: message {index} Soniox more_info"
-        );
-    }
+    assert_provider_error(parsed.error.as_ref(), message, relative_path, index);
     if !message.expected_soniox_revision_sidebands.is_empty() {
         assert_eq!(
             parsed.revisions.len(),
@@ -909,26 +769,7 @@ fn assert_gladia_sideband(
             "{relative_path}: message {index} Gladia lifecycle event"
         );
     }
-    if let Some(expected) = &message.expected_provider_error {
-        let actual = parsed.error.as_ref().unwrap_or_else(|| {
-            panic!("{relative_path}: message {index} missing Gladia provider error")
-        });
-        assert_eq!(
-            Some(actual.message_type.as_str()),
-            expected.message_type.as_deref(),
-            "{relative_path}: message {index} Gladia error message type"
-        );
-        assert_eq!(
-            actual.code.as_deref(),
-            expected.code.as_deref(),
-            "{relative_path}: message {index} Gladia error code"
-        );
-        assert_eq!(
-            actual.message.as_deref(),
-            expected.message.as_deref(),
-            "{relative_path}: message {index} Gladia error message"
-        );
-    }
+    assert_provider_error(parsed.error.as_ref(), message, relative_path, index);
 }
 
 fn assert_speechmatics_sideband(
@@ -966,30 +807,7 @@ fn assert_speechmatics_sideband(
             "{relative_path}: message {index} Speechmatics end-of-utterance channel"
         );
     }
-    if let Some(expected) = &message.expected_provider_error {
-        let actual = parsed.error.as_ref().unwrap_or_else(|| {
-            panic!("{relative_path}: message {index} missing Speechmatics provider error")
-        });
-        assert_eq!(
-            actual.error_type.as_deref(),
-            expected.error_type.as_deref(),
-            "{relative_path}: message {index} Speechmatics error type"
-        );
-        assert_eq!(
-            actual.reason.as_deref(),
-            expected.reason.as_deref(),
-            "{relative_path}: message {index} Speechmatics error reason"
-        );
-        assert_eq!(
-            actual.code.map(|code| code.to_string()).as_deref(),
-            expected.code.as_deref(),
-            "{relative_path}: message {index} Speechmatics error code"
-        );
-        assert_eq!(
-            actual.seq_no, expected.seq_no,
-            "{relative_path}: message {index} Speechmatics error sequence"
-        );
-    }
+    assert_provider_error(parsed.error.as_ref(), message, relative_path, index);
 }
 
 fn gladia_event_type_name(event_type: &GladiaSpeechEventType) -> &'static str {

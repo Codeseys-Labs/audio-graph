@@ -22,6 +22,14 @@
 //! via an unbounded `tokio::sync::mpsc` channel, and events flow back through
 //! a `crossbeam_channel` that the speech processor consumes.
 
+use super::{
+    asr_diagnostic, websocket_close, websocket_diagnostic, websocket_error, websocket_write_error,
+};
+use crate::error::AppError;
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeErrorCode as Code, RuntimeTransport,
+};
+
 #[cfg(test)]
 use super::reconnect::backoff_for_attempt;
 use super::reconnect::{ReconnectStep, next_reconnect_step};
@@ -61,7 +69,7 @@ pub enum DeepgramEvent {
     },
     /// A non-fatal error occurred.
     #[serde(rename = "error")]
-    Error { message: String },
+    Error { message: RuntimeDiagnostic },
     /// The connection has been established.
     #[serde(rename = "connected")]
     Connected,
@@ -395,26 +403,10 @@ impl DeepgramStreamingClient {
     /// session task on an internal tokio runtime. The session task handles
     /// audio writing, server message reading, and automatic reconnection with
     /// exponential backoff if the WebSocket drops mid-session.
-    pub fn connect(&mut self) -> Result<(), String> {
+    pub fn connect(&mut self) -> Result<(), AppError> {
         if self.config.api_key.is_empty() {
-            return Err("Deepgram API key is not configured".to_string());
+            return Err(websocket_diagnostic(Code::RequestRejected).into());
         }
-
-        // Record resolved-key PRESENCE + LENGTH + a non-secret FINGERPRINT
-        // (never the value) so logs can distinguish an empty-key failure
-        // (Fork A) from a stale/revoked-key 401 (Fork B) on the next incident.
-        // The redaction helper only emits a "<present>" / "<missing>" sentinel;
-        // the length is non-sensitive. The fingerprint is a one-way sha256
-        // prefix (see `credentials::secret_fingerprint`) — comparing it against
-        // the fingerprint logged by `save_credential_cmd` reveals whether the
-        // key that reached the wire is the SAME one the user just saved (a
-        // stale in-memory cache would make them differ). NEVER the raw key.
-        log::debug!(
-            "Deepgram connect: api_key {} len={} fingerprint={}",
-            crate::credentials::redacted_secret_presence(Some(&self.config.api_key)),
-            self.config.api_key.len(),
-            crate::credentials::secret_fingerprint(Some(&self.config.api_key))
-        );
 
         // Build a dedicated single-threaded tokio runtime for the WebSocket.
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -422,7 +414,7 @@ impl DeepgramStreamingClient {
             .enable_all()
             .thread_name("deepgram-ws-rt")
             .build()
-            .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
+            .map_err(|_| asr_diagnostic(Code::Internal, RuntimeTransport::Native, None))?;
 
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
@@ -473,7 +465,7 @@ impl DeepgramStreamingClient {
                 run_io_entries: None,
             });
 
-            Ok::<_, String>((atx, session_handle, session_done_rx))
+            Ok::<_, RuntimeDiagnostic>((atx, session_handle, session_done_rx))
         })?;
 
         self.audio_tx = Some(audio_tx);
@@ -514,7 +506,8 @@ impl DeepgramStreamingClient {
 
         self.config
             .content_egress_policy
-            .check_audio("asr.deepgram")?;
+            .check_audio("asr.deepgram")
+            .map_err(|_| websocket_diagnostic(Code::PolicyBlocked).to_string())?;
 
         let tx = self
             .audio_tx
@@ -694,13 +687,13 @@ impl Drop for DeepgramStreamingClient {
 enum DisconnectKind {
     /// Remote server sent a Close frame. Typically a graceful server-side
     /// teardown (e.g. `GoAway`, idle timeout).
-    ServerClose(String),
+    ServerClose(RuntimeDiagnostic),
     /// Transport-level error (TLS, TCP reset, DNS flap, tungstenite I/O).
-    NetworkError(String),
+    NetworkError(RuntimeDiagnostic),
     /// Protocol violation — malformed frame, invalid sequence, etc.
-    ProtocolError(String),
+    ProtocolError(RuntimeDiagnostic),
     /// Content-bearing send was blocked by the runtime privacy policy.
-    PolicyBlocked(String),
+    PolicyBlocked(RuntimeDiagnostic),
     /// User called `disconnect()`. No reconnect attempt should be made.
     UserRequested,
     /// Writer task exhausted the audio command stream (caller dropped the
@@ -713,7 +706,7 @@ enum DisconnectKind {
 /// Used both for the initial connect and for each reconnect attempt. The
 /// query-string-only "handshake" means a reconnect is just re-running this
 /// function — no replay of a setup frame is required.
-async fn open_ws(config: &DeepgramConfig) -> Result<(AsrWsWriter, AsrWsReader), String> {
+async fn open_ws(config: &DeepgramConfig) -> Result<(AsrWsWriter, AsrWsReader), RuntimeDiagnostic> {
     let url_str = deepgram_listen_url(config);
 
     let request = tungstenite::http::Request::builder()
@@ -728,86 +721,20 @@ async fn open_ws(config: &DeepgramConfig) -> Result<(AsrWsWriter, AsrWsReader), 
         .header("Upgrade", "websocket")
         .header("Host", "api.deepgram.com")
         .body(())
-        .map_err(|e| format!("Failed to build WebSocket request: {e}"))?;
+        .map_err(|_| websocket_diagnostic(Code::RequestRejected))?;
 
     // Bounded connect: a stalled TLS/HTTP-upgrade handshake would otherwise hang
     // this future (and the reconnect ladder) forever — see `connect_async_bounded`.
     let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
         .await
-        .map_err(|e| {
-            // Prefer a typed, actionable message for auth failures (401) so a
-            // user can tell "my key is rejected" from a generic network error.
-            // Everything else falls through to the generic redacted diagnostic.
-            // Both branches pass through the redaction wrapper so no secret can
-            // leak into logs / UI-visible events.
-            let message = classify_connect_error(&e)
-                .unwrap_or_else(|| format!("WebSocket connect failed: {e}"));
-            crate::error::redacted_provider_diagnostic(&message, [&config.api_key])
-        })?;
+        .map_err(|error| websocket_error(&error))?;
 
     Ok(ws_stream.split())
 }
 
-/// Message surfaced when the Deepgram real-time handshake is rejected with an
-/// HTTP `401 Unauthorized`. Extracted as a constant so the unit test asserts
-/// against the exact string the user sees.
-const DEEPGRAM_AUTH_FAILED_MESSAGE: &str = "Deepgram authentication failed (401): API key rejected — re-enter your Deepgram key in Settings";
-
-/// Message surfaced when the Deepgram real-time handshake is rejected with an
-/// HTTP `400 Bad Request`. The overwhelmingly common cause on the upgrade is an
-/// invalid/unsupported `model` enum value (e.g. a stale `general` from an older
-/// config) — `model` is a required enum on `v1/listen`, so a value outside it
-/// is a 400, not a 401. Extracted as a constant so the unit test asserts the
-/// exact user-visible string.
-///
-/// KNOWN GAP (audio-graph-6470): the `keyterm` query params added by the
-/// keyterm-prompting seam are also a plausible (if defensively capped —
-/// see [`DEEPGRAM_MAX_KEYTERMS`]) contributor to a 400 on this same upgrade
-/// (e.g. a term Deepgram rejects). This message still names only `model`;
-/// widening the user-visible copy to cover keyterms was left out of this
-/// change to avoid unnecessary user-facing string churn for what should now
-/// be a rare case post-cap, but a future edit touching this message should
-/// account for that second cause.
-const DEEPGRAM_BAD_REQUEST_MESSAGE: &str = "Deepgram rejected the request (400): invalid or unsupported model. Reselect a model in Settings";
-
-/// Classify a tungstenite connect error into a typed, actionable message.
-///
-/// The Deepgram WebSocket handshake authenticates via the `Authorization`
-/// header on the HTTP upgrade. A stale / revoked key comes back as an HTTP
-/// `401 Unauthorized` on the upgrade response, which tungstenite surfaces as
-/// [`tungstenite::Error::Http`] carrying the response. We turn that into a
-/// human-actionable message ("re-enter your key") instead of a raw
-/// `HTTP error: 401 Unauthorized`.
-///
-/// Returns `None` for every other error so the caller falls back to the
-/// generic (redacted) diagnostic. The returned message carries no secret, but
-/// the caller still passes it through the redaction wrapper so a future edit
-/// cannot accidentally leak one.
-fn classify_connect_error(err: &tungstenite::Error) -> Option<String> {
-    match err {
-        tungstenite::Error::Http(response)
-            if response.status() == tungstenite::http::StatusCode::UNAUTHORIZED =>
-        {
-            Some(DEEPGRAM_AUTH_FAILED_MESSAGE.to_string())
-        }
-        // A 400 on the upgrade almost always means the `model` enum value is
-        // invalid/unsupported (the required `model` param failed validation).
-        // Surface an actionable "reselect a model" message instead of a raw
-        // `HTTP error: 400 Bad Request`. The sanitizer should prevent a
-        // known-bad `general` from reaching the wire, but this arm still gives
-        // a clear diagnostic for any other server-side model rejection.
-        tungstenite::Error::Http(response)
-            if response.status() == tungstenite::http::StatusCode::BAD_REQUEST =>
-        {
-            Some(DEEPGRAM_BAD_REQUEST_MESSAGE.to_string())
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 type ReconnectOpenFuture =
-    Pin<Box<dyn Future<Output = Result<(AsrWsWriter, AsrWsReader), String>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<(AsrWsWriter, AsrWsReader), RuntimeDiagnostic>> + Send>>;
 
 #[cfg(test)]
 type ReconnectOpener = Arc<dyn Fn(DeepgramConfig) -> ReconnectOpenFuture + Send + Sync>;
@@ -816,7 +743,7 @@ type ReconnectOpener = Arc<dyn Fn(DeepgramConfig) -> ReconnectOpenFuture + Send 
 async fn open_reconnect_ws(
     config: &DeepgramConfig,
     opener: Option<&ReconnectOpener>,
-) -> Result<(AsrWsWriter, AsrWsReader), String> {
+) -> Result<(AsrWsWriter, AsrWsReader), RuntimeDiagnostic> {
     if let Some(opener) = opener {
         opener(config.clone()).await
     } else {
@@ -950,21 +877,17 @@ pub(crate) fn is_valid_deepgram_streaming_model(model: &str) -> bool {
 ///      families like `nova-3-general`) passes through UNCHANGED.
 ///   3. Anything else is clamped to [`DEEPGRAM_DEFAULT_STREAMING_MODEL`].
 ///
-/// When a rewrite happens we `log::warn!` the offending value; a model name is
-/// not a secret, so logging it verbatim is safe and aids diagnosis of stale
-/// configs.
+/// Model rewrites are logged without the supplied value.
 pub(crate) fn sanitize_deepgram_model(model: &str) -> String {
     if let Some(upgraded) = upgrade_deepgram_model_alias(model) {
-        log::info!("Deepgram model alias '{model}' upgraded to canonical id '{upgraded}'.");
+        log::info!("Deepgram: upgraded a model alias");
         return upgraded.to_string();
     }
     if is_valid_deepgram_streaming_model(model) {
         return model.to_string();
     }
     log::warn!(
-        "Deepgram model '{model}' is not a valid streaming model id; \
-         clamping to '{DEEPGRAM_DEFAULT_STREAMING_MODEL}'. \
-         Reselect a model in Settings to silence this."
+        "Deepgram: invalid streaming model fell back to '{DEEPGRAM_DEFAULT_STREAMING_MODEL}'"
     );
     DEEPGRAM_DEFAULT_STREAMING_MODEL.to_string()
 }
@@ -975,8 +898,7 @@ pub(crate) fn sanitize_deepgram_model(model: &str) -> String {
 /// whether one exists — it exists purely as a URL-length safety margin. A
 /// review probe with 500 hostile keyterms produced a 43k-character `wss`
 /// URL; HTTP front ends commonly reject request targets above roughly
-/// 8-16KB (`414`/`431`), which [`classify_connect_error`] has no arm for and
-/// which would otherwise surface as an opaque "WebSocket connect failed".
+/// 8-16KB (`414`/`431`), which the handshake classifier reports as client errors.
 /// 100 terms is a generous ceiling for a hand-curated domain glossary while
 /// keeping the worst case comfortably under that range.
 const DEEPGRAM_MAX_KEYTERMS: usize = 100;
@@ -1239,7 +1161,6 @@ async fn session_task(ctx: DeepgramSessionCtx) {
             &user_disconnected,
             &pending_chunks,
             &write_guard,
-            &config.api_key,
         )
         .await;
 
@@ -1295,7 +1216,7 @@ async fn session_task(ctx: DeepgramSessionCtx) {
                                 "Deepgram session: reconnect budget exhausted after {attempted} attempts"
                             );
                             let _ = event_tx.send(DeepgramEvent::Error {
-                                message: "Deepgram reconnect attempts exhausted".into(),
+                                message: websocket_diagnostic(Code::ProviderUnavailable),
                             });
                             break false;
                         }
@@ -1346,14 +1267,7 @@ async fn session_task(ctx: DeepgramSessionCtx) {
                             reconnect_attempts = 0;
                             break true;
                         }
-                        Err(e) => {
-                            // Redact: a reconnect error can embed the upgrade
-                            // request (api_key header/query) or URL userinfo, so
-                            // scrub the key before it reaches logs or the UI.
-                            let diag = crate::error::redacted_provider_diagnostic(
-                                &format!("Reconnect attempt {attempt} failed: {e}"),
-                                [&config.api_key],
-                            );
+                        Err(diag) => {
                             log::warn!("Deepgram session: {diag}");
                             let _ = event_tx.send(DeepgramEvent::Error { message: diag });
                             // Stay in this inner loop: the next iteration drives
@@ -1380,7 +1294,7 @@ async fn session_task(ctx: DeepgramSessionCtx) {
 
 /// After we have sent the `Terminal` (empty-binary `CloseStream`) frame,
 /// keep reading through the SAME message-handling path the live loop uses
-/// (`handle_server_message_with_key` — transcript parsing, policy
+/// (`handle_server_message` — transcript parsing, policy
 /// classification, event emission, all unchanged) until either the server
 /// sends its own WS Close frame or `deadline` elapses.
 ///
@@ -1404,7 +1318,6 @@ async fn session_task(ctx: DeepgramSessionCtx) {
 async fn drain_after_terminal(
     reader: &mut AsrWsReader,
     event_tx: &crossbeam_channel::Sender<DeepgramEvent>,
-    api_key: &str,
     deadline: Duration,
 ) {
     let sleep = tokio::time::sleep(deadline);
@@ -1432,7 +1345,7 @@ async fn drain_after_terminal(
                         // Same handling path as the live loop: a final
                         // transcript the server flushes in response to
                         // Terminal lands exactly like a live-phase message.
-                        handle_server_message_with_key(&text, event_tx, api_key);
+                        handle_server_message(&text, event_tx);
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
                         // Protocol-level frames; nothing to do.
@@ -1447,10 +1360,7 @@ async fn drain_after_terminal(
                         // tungstenite error variants carry provider-supplied
                         // text (e.g. an embedded upgrade request), so scrub
                         // the key before it reaches logs.
-                        let diag = crate::error::redacted_provider_diagnostic(
-                            &format!("close-drain reader error (treated as clean end): {e}"),
-                            [api_key],
-                        );
+                        let diag = websocket_error(&e);
                         log::info!("Deepgram: {diag}");
                         return;
                     }
@@ -1474,7 +1384,6 @@ async fn run_io(
     user_disconnected: &Arc<AtomicBool>,
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     write_guard: &AsrWsWriteGuard,
-    api_key: &str,
 ) -> DisconnectKind {
     run_io_with_keepalive_interval(
         writer,
@@ -1484,7 +1393,6 @@ async fn run_io(
         user_disconnected,
         pending_chunks,
         write_guard,
-        api_key,
         Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
     )
     .await
@@ -1499,7 +1407,6 @@ async fn run_io_with_keepalive_interval(
     user_disconnected: &Arc<AtomicBool>,
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     write_guard: &AsrWsWriteGuard,
-    api_key: &str,
     keepalive_interval: Duration,
 ) -> DisconnectKind {
     let mut keep_alive = tokio::time::interval(keepalive_interval);
@@ -1521,10 +1428,7 @@ async fn run_io_with_keepalive_interval(
                         .await
                     {
                         let policy_blocked = e.is_policy_blocked();
-                        let message = crate::error::redacted_provider_diagnostic(
-                            &format!("keepalive failed: {e}"),
-                            [api_key],
-                        );
+                        let message = websocket_write_error(&e);
                         log::error!("Deepgram: failed to send keepalive: {message}");
                         return if policy_blocked {
                             DisconnectKind::PolicyBlocked(message)
@@ -1558,10 +1462,7 @@ async fn run_io_with_keepalive_interval(
                             .await
                         {
                             let policy_blocked = e.is_policy_blocked();
-                            let message = crate::error::redacted_provider_diagnostic(
-                                &format!("send failed: {e}"),
-                                [api_key],
-                            );
+                            let message = websocket_write_error(&e);
                             log::error!("Deepgram: failed to send audio: {message}");
                             return if policy_blocked {
                                 DisconnectKind::PolicyBlocked(message)
@@ -1590,7 +1491,6 @@ async fn run_io_with_keepalive_interval(
                         drain_after_terminal(
                             reader,
                             event_tx,
-                            api_key,
                             DEEPGRAM_CLOSE_DRAIN_TIMEOUT,
                         )
                         .await;
@@ -1610,7 +1510,6 @@ async fn run_io_with_keepalive_interval(
                         drain_after_terminal(
                             reader,
                             event_tx,
-                            api_key,
                             DEEPGRAM_CLOSE_DRAIN_TIMEOUT,
                         )
                         .await;
@@ -1625,12 +1524,12 @@ async fn run_io_with_keepalive_interval(
                 let Some(result) = result else {
                     // Reader stream ended without a Close frame — treat as a
                     // network-layer drop.
-                    return DisconnectKind::NetworkError("reader stream ended".into());
+                    return DisconnectKind::NetworkError(websocket_diagnostic(Code::NetworkUnreachable));
                 };
 
                 match result {
                     Ok(Message::Text(text)) => {
-                        handle_server_message_with_key(&text, event_tx, api_key);
+                        handle_server_message(&text, event_tx);
                     }
                     Ok(Message::Close(frame)) => {
                         // If the user was the one asking to close, honour that;
@@ -1639,14 +1538,9 @@ async fn run_io_with_keepalive_interval(
                         if user_disconnected.load(Ordering::SeqCst) {
                             return DisconnectKind::UserRequested;
                         }
-                        let reason = frame
-                            .map(|f| {
-                                let code: u16 = f.code.into();
-                                close_frame_diagnostic(code, f.reason.as_ref())
-                            })
-                            .unwrap_or_else(|| "no_frame".into());
-                        log::info!("Deepgram: server closed connection {reason}");
-                        return DisconnectKind::ServerClose(reason);
+                        let diagnostic = websocket_close(frame.as_ref());
+                        log::info!("Deepgram: server closed connection {diagnostic}");
+                        return DisconnectKind::ServerClose(diagnostic);
                     }
                     Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {
                         // Protocol-level frames; nothing to do.
@@ -1657,16 +1551,13 @@ async fn run_io_with_keepalive_interval(
                     }
                     Err(tungstenite::Error::ConnectionClosed)
                     | Err(tungstenite::Error::AlreadyClosed) => {
-                        return DisconnectKind::NetworkError("connection closed".into());
+                        return DisconnectKind::NetworkError(websocket_diagnostic(Code::NetworkUnreachable));
                     }
-                    Err(tungstenite::Error::Protocol(e)) => {
-                        let message =
-                            crate::error::redacted_provider_diagnostic(&e.to_string(), [api_key]);
-                        return DisconnectKind::ProtocolError(message);
+                    Err(error @ tungstenite::Error::Protocol(_)) => {
+                        return DisconnectKind::ProtocolError(websocket_error(&error));
                     }
                     Err(e) => {
-                        let message =
-                            crate::error::redacted_provider_diagnostic(&e.to_string(), [api_key]);
+                        let message = websocket_error(&e);
                         log::error!("Deepgram: WebSocket read error: {message}");
                         return DisconnectKind::NetworkError(message);
                     }
@@ -1677,23 +1568,13 @@ async fn run_io_with_keepalive_interval(
 }
 
 /// Parse a single Deepgram server JSON message and emit appropriate events.
-#[cfg(test)]
 pub(crate) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEvent>) {
-    handle_server_message_with_key(text, tx, "");
-}
-
-fn handle_server_message_with_key(
-    text: &str,
-    tx: &crossbeam_channel::Sender<DeepgramEvent>,
-    api_key: &str,
-) {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
-        Err(e) => {
-            log::warn!("Deepgram: invalid JSON: {e}");
-            let _ = tx.send(DeepgramEvent::Error {
-                message: format!("Invalid server JSON: {e}"),
-            });
+        Err(_) => {
+            let message = websocket_diagnostic(Code::InvalidResponse);
+            log::warn!("Deepgram: {message}");
+            let _ = tx.send(DeepgramEvent::Error { message });
             return;
         }
     };
@@ -1708,7 +1589,7 @@ fn handle_server_message_with_key(
 
     if msg_type == "Error" || looks_like_deepgram_error_object(&parsed) {
         let _ = tx.send(DeepgramEvent::Error {
-            message: deepgram_error_message(&parsed, text, api_key),
+            message: deepgram_error_diagnostic(&parsed),
         });
         return;
     }
@@ -1811,7 +1692,7 @@ fn handle_server_message_with_key(
             }
         }
         "TurnInfo" => {
-            handle_flux_turn_info(&parsed, tx, api_key);
+            handle_flux_turn_info(&parsed, tx);
         }
         "StartOfTurn" => {
             emit_simple_deepgram_turn(&parsed, tx, DeepgramTurnKind::StartOfTurn);
@@ -1826,12 +1707,7 @@ fn handle_server_message_with_key(
             emit_simple_deepgram_turn(&parsed, tx, DeepgramTurnKind::TurnResumed);
         }
         "Metadata" => {
-            log::debug!(
-                "Deepgram: received metadata request_id={} fields={}",
-                json_string_field(&parsed, &["request_id", "requestId"])
-                    .unwrap_or_else(|| "none".to_string()),
-                json_field_count(&parsed)
-            );
+            log::debug!("Deepgram: received metadata");
         }
         "UtteranceEnd" => {
             let last_word_end = parsed
@@ -1872,12 +1748,7 @@ fn handle_server_message_with_key(
             });
         }
         _ => {
-            log::debug!(
-                "Deepgram: unhandled message type='{msg_type}' request_id={} fields={}",
-                json_string_field(&parsed, &["request_id", "requestId"])
-                    .unwrap_or_else(|| "none".to_string()),
-                json_field_count(&parsed)
-            );
+            log::debug!("Deepgram: unhandled message type");
         }
     }
 }
@@ -1889,57 +1760,20 @@ fn looks_like_deepgram_error_object(parsed: &Value) -> bool {
         || parsed.get("error").is_some()
 }
 
-fn deepgram_error_message(parsed: &Value, _raw_text: &str, api_key: &str) -> String {
+fn deepgram_error_diagnostic(parsed: &Value) -> RuntimeDiagnostic {
     let code = parsed
-        .get("code")
-        .or_else(|| parsed.get("err_code"))
-        .or_else(|| parsed.get("category"))
-        .and_then(|value| value.as_str());
-    let description_len = parsed
-        .get("description")
-        .or_else(|| parsed.get("message"))
-        .or_else(|| parsed.get("err_msg"))
-        .or_else(|| parsed.get("details"))
-        .or_else(|| parsed.get("error"))
-        .and_then(|value| value.as_str())
-        .map(|value| value.chars().count());
-    let request_id = parsed.get("request_id").and_then(|value| value.as_str());
-
-    let message = match (code, request_id, description_len) {
-        (Some(code), Some(request_id), Some(description_len)) => {
-            format!(
-                "Deepgram error code={code} request_id={request_id} description_len={description_len}"
-            )
-        }
-        (Some(code), None, Some(description_len)) => {
-            format!("Deepgram error code={code} description_len={description_len}")
-        }
-        (Some(code), Some(request_id), None) => {
-            format!("Deepgram error code={code} request_id={request_id}")
-        }
-        (Some(code), None, None) => format!("Deepgram error code={code}"),
-        (None, Some(request_id), Some(description_len)) => {
-            format!("Deepgram error request_id={request_id} description_len={description_len}")
-        }
-        (None, None, Some(description_len)) => {
-            format!("Deepgram error description_len={description_len}")
-        }
-        (None, Some(request_id), None) => format!("Deepgram error request_id={request_id}"),
-        (None, None, None) => format!(
-            "Deepgram error frame type={} fields={}",
-            json_string_field(parsed, &["type", "event"]).unwrap_or_else(|| "unknown".to_string()),
-            json_field_count(parsed)
-        ),
-    };
-
-    crate::error::redacted_provider_diagnostic(&message, [api_key])
+        .get("err_code")
+        .or_else(|| parsed.get("code"))
+        .and_then(Value::as_str);
+    websocket_diagnostic(match code {
+        Some("INVALID_AUTH" | "INSUFFICIENT_PERMISSIONS" | "BAD_REQUEST") => Code::RequestRejected,
+        Some("CLIENT_MESSAGE_TIMEOUT") => Code::Timeout,
+        Some("RATE_LIMIT_EXCEEDED") => Code::RateLimited,
+        _ => Code::ProviderUnavailable,
+    })
 }
 
-fn handle_flux_turn_info(
-    parsed: &Value,
-    tx: &crossbeam_channel::Sender<DeepgramEvent>,
-    _api_key: &str,
-) {
+fn handle_flux_turn_info(parsed: &Value, tx: &crossbeam_channel::Sender<DeepgramEvent>) {
     let event_name = parsed
         .get("event")
         .or_else(|| parsed.get("turn_event"))
@@ -1952,29 +1786,9 @@ fn handle_flux_turn_info(
         "EndOfTurn" => emit_simple_deepgram_turn(parsed, tx, DeepgramTurnKind::EndOfTurn),
         "TurnResumed" => emit_simple_deepgram_turn(parsed, tx, DeepgramTurnKind::TurnResumed),
         _ => {
-            log::debug!(
-                "Deepgram: unhandled Flux TurnInfo event='{event_name}' request_id={} fields={}",
-                json_string_field(parsed, &["request_id", "requestId"])
-                    .unwrap_or_else(|| "none".to_string()),
-                json_field_count(parsed)
-            );
+            log::debug!("Deepgram: unhandled Flux TurnInfo event");
         }
     }
-}
-
-fn json_string_field(parsed: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| parsed.get(*key).and_then(|value| value.as_str()))
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn json_field_count(parsed: &Value) -> usize {
-    parsed.as_object().map_or(0, serde_json::Map::len)
-}
-
-fn close_frame_diagnostic(code: u16, reason: &str) -> String {
-    format!("code={code} reason_len={}", reason.chars().count())
 }
 
 fn emit_simple_deepgram_turn(
@@ -2291,80 +2105,10 @@ mod tests {
         let mut client = DeepgramStreamingClient::new(config);
         let result = client.connect();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("API key"));
-    }
-
-    /// Build a tungstenite `Error::Http` carrying the given HTTP status, to
-    /// simulate the upgrade-response path without a live socket.
-    fn http_error_with_status(status: tungstenite::http::StatusCode) -> tungstenite::Error {
-        let response = tungstenite::http::Response::builder()
-            .status(status)
-            .body(None)
-            .expect("build http response");
-        tungstenite::Error::Http(Box::new(response))
-    }
-
-    #[test]
-    fn classify_connect_error_maps_401_to_reenter_key_message() {
-        let err = http_error_with_status(tungstenite::http::StatusCode::UNAUTHORIZED);
-        let message = classify_connect_error(&err).expect("401 should be classified");
-        // The user-facing message must tell them to re-enter the key.
-        assert!(
-            message.contains("re-enter your Deepgram key"),
-            "unexpected message: {message}"
-        );
-        assert!(
-            message.contains("401"),
-            "message should name the status: {message}"
-        );
-        assert!(
-            message.contains("authentication failed"),
-            "message should name auth failure: {message}"
-        );
-    }
-
-    #[test]
-    fn classify_connect_error_passes_through_non_401() {
-        // A different HTTP status (that we don't specifically classify) is NOT
-        // the auth message — falls through so the caller emits the generic
-        // redacted diagnostic. 400 and 401 are handled explicitly and tested
-        // separately.
-        let forbidden = http_error_with_status(tungstenite::http::StatusCode::FORBIDDEN);
-        assert!(classify_connect_error(&forbidden).is_none());
-
-        let server_err =
-            http_error_with_status(tungstenite::http::StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(classify_connect_error(&server_err).is_none());
-
-        // A non-HTTP transport error also falls through.
-        let transport = tungstenite::Error::ConnectionClosed;
-        assert!(classify_connect_error(&transport).is_none());
-    }
-
-    #[test]
-    fn classify_connect_error_maps_400_to_reselect_model_message() {
-        // Mirror of the 401 test: a 400 on the upgrade (the shape a bad/stale
-        // `model` enum produces) becomes an actionable "reselect a model"
-        // message, distinct from the 401 auth message.
-        let err = http_error_with_status(tungstenite::http::StatusCode::BAD_REQUEST);
-        let message = classify_connect_error(&err).expect("400 should be classified");
-        assert!(
-            message.contains("400"),
-            "message should name the status: {message}"
-        );
-        assert!(
-            message.to_lowercase().contains("model"),
-            "message should mention the model: {message}"
-        );
-        assert!(
-            message.contains("Reselect a model in Settings"),
-            "message should tell the user to reselect a model: {message}"
-        );
-        // It must NOT be confused with the auth (401) message.
-        assert!(
-            !message.contains("re-enter your Deepgram key"),
-            "400 must not surface the auth message: {message}"
-        );
+        assert!(matches!(
+            result.unwrap_err(),
+            AppError::RuntimeDiagnostic(diagnostic) if diagnostic == websocket_diagnostic(Code::RequestRejected)
+        ));
     }
 
     #[test]
@@ -2821,10 +2565,7 @@ mod tests {
 
         let error = client.send_audio(&[0.5, -0.3]).unwrap_err();
 
-        assert!(error.contains("Privacy policy blocked"));
-        assert!(error.contains("asr.deepgram"));
-        assert!(error.contains("local_only"));
-        assert!(!error.contains("Audio channel not initialized"));
+        assert_eq!(error, "runtime/policy_blocked");
     }
 
     #[test]
@@ -3167,7 +2908,7 @@ mod tests {
                 }],
             },
             DeepgramEvent::Error {
-                message: "oops".into(),
+                message: websocket_diagnostic(Code::Internal),
             },
             DeepgramEvent::Connected,
             DeepgramEvent::Disconnected,
@@ -3375,7 +3116,6 @@ mod tests {
                     &user_disconnected,
                     &pending_chunks,
                     &write_guard,
-                    "test-key",
                 )
                 .await
             }
@@ -3505,7 +3245,6 @@ mod tests {
                     &user_disconnected,
                     &pending_chunks,
                     &write_guard,
-                    "test-key",
                     Duration::from_millis(20),
                 )
                 .await
@@ -3602,7 +3341,7 @@ mod tests {
         let started = std::time::Instant::now();
         tokio::time::timeout(
             Duration::from_millis(500),
-            drain_after_terminal(&mut reader, &event_tx, "test-key", Duration::from_secs(5)),
+            drain_after_terminal(&mut reader, &event_tx, Duration::from_secs(5)),
         )
         .await
         .expect("drain should resolve via server Close, not the 5s deadline");
@@ -3667,7 +3406,7 @@ mod tests {
 
         let deadline = Duration::from_millis(60);
         let started = std::time::Instant::now();
-        drain_after_terminal(&mut reader, &event_tx, "test-key", deadline).await;
+        drain_after_terminal(&mut reader, &event_tx, deadline).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -3731,7 +3470,6 @@ mod tests {
                     &user_disconnected,
                     &pending_chunks,
                     &write_guard,
-                    "test-key",
                 )
                 .await
             }
@@ -3847,7 +3585,6 @@ mod tests {
                     &user_disconnected,
                     &pending_chunks,
                     &write_guard,
-                    "test-key",
                 )
                 .await
             }
@@ -3952,7 +3689,6 @@ mod tests {
                     &user_disconnected,
                     &pending_chunks,
                     &write_guard,
-                    "test-key",
                 )
                 .await
             }
@@ -4046,7 +3782,6 @@ mod tests {
                     &user_disconnected,
                     &pending_chunks,
                     &write_guard,
-                    "dg-private-api-key",
                 )
                 .await
             }
@@ -4062,10 +3797,8 @@ mod tests {
             .expect("run_io task panicked");
         match disconnect {
             DisconnectKind::PolicyBlocked(message) => {
-                assert!(message.contains("Privacy policy blocked"));
-                assert!(message.contains("asr.deepgram"));
-                assert!(message.contains("local_only"));
-                assert!(!message.contains("dg-private-api-key"));
+                assert_eq!(message, websocket_diagnostic(Code::PolicyBlocked));
+                assert!(!format!("{message:?} {message}").contains("dg-private-api-key"));
             }
             other => panic!("expected policy-blocked disconnect, got {other:?}"),
         }

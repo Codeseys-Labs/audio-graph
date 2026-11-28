@@ -5,6 +5,10 @@
 //! normalized ASR span-revision contract without opening a socket or touching
 //! the local credentials store.
 
+pub use super::AsrParseError as SpeechmaticsParseError;
+use super::websocket_diagnostic;
+use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
+
 use serde::Deserialize;
 use serde_json::json;
 
@@ -117,8 +121,9 @@ impl SpeechmaticsRealtimeConfig {
         }
     }
 
-    pub fn websocket_url(&self) -> Result<url::Url, url::ParseError> {
-        let mut url = url::Url::parse(self.region.endpoint())?;
+    pub fn websocket_url(&self) -> Result<url::Url, RuntimeDiagnostic> {
+        let mut url = url::Url::parse(self.region.endpoint())
+            .map_err(|_| websocket_diagnostic(Code::Internal))?;
         if let SpeechmaticsRealtimeAuth::TemporaryJwt(jwt) = &self.auth {
             url.query_pairs_mut().append_pair("jwt", jwt.trim());
         }
@@ -193,7 +198,7 @@ pub struct SpeechmaticsParsedMessage {
     pub recognition_id: Option<String>,
     pub revisions: Vec<SpeechmaticsParsedRevision>,
     pub end_of_utterance: Option<SpeechmaticsEndOfUtterance>,
-    pub error: Option<SpeechmaticsProviderError>,
+    pub error: Option<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,27 +213,6 @@ pub struct SpeechmaticsEndOfUtterance {
     pub start_time: f64,
     pub end_time: f64,
     pub channel: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpeechmaticsProviderError {
-    pub error_type: Option<String>,
-    pub reason: Option<String>,
-    pub code: Option<i64>,
-    pub seq_no: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SpeechmaticsParseError {
-    InvalidJson(String),
-    UnsupportedMessageType(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpeechmaticsCloseClassification {
-    pub code: u16,
-    pub reason: &'static str,
-    pub retryable: bool,
 }
 
 #[derive(Debug)]
@@ -246,7 +230,7 @@ struct SpeechmaticsActiveSegment {
     revision_number: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct SpeechmaticsResponse {
     message: String,
     #[serde(default)]
@@ -261,12 +245,18 @@ struct SpeechmaticsResponse {
     channel: Option<String>,
     #[serde(default)]
     r#type: Option<String>,
-    #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
-    code: Option<i64>,
-    #[serde(default)]
-    seq_no: Option<u64>,
+}
+
+impl SpeechmaticsResponse {
+    /// Only allowlisted error categories cross the parser boundary.
+    fn error_diagnostic(&self) -> RuntimeDiagnostic {
+        let code = match self.r#type.as_deref() {
+            Some("not_authorised" | "not_allowed" | "invalid_model") => Code::RequestRejected,
+            Some("quota_exceeded") => Code::CapacityExhausted,
+            _ => Code::ProviderUnavailable,
+        };
+        websocket_diagnostic(code)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -319,8 +309,8 @@ impl SpeechmaticsRealtimeParser {
         text: &str,
         received_at_ms: u64,
     ) -> Result<SpeechmaticsParsedMessage, SpeechmaticsParseError> {
-        let response: SpeechmaticsResponse = serde_json::from_str(text)
-            .map_err(|error| SpeechmaticsParseError::InvalidJson(error.to_string()))?;
+        let response: SpeechmaticsResponse =
+            serde_json::from_str(text).map_err(|_| SpeechmaticsParseError::InvalidJson)?;
         self.response_sequence += 1;
 
         match response.message.as_str() {
@@ -373,16 +363,9 @@ impl SpeechmaticsRealtimeParser {
                 recognition_id: None,
                 revisions: Vec::new(),
                 end_of_utterance: None,
-                error: Some(SpeechmaticsProviderError {
-                    error_type: response.r#type,
-                    reason: response.reason,
-                    code: response.code,
-                    seq_no: response.seq_no,
-                }),
+                error: Some(response.error_diagnostic()),
             }),
-            other => Err(SpeechmaticsParseError::UnsupportedMessageType(
-                other.to_string(),
-            )),
+            _ => Err(SpeechmaticsParseError::UnsupportedMessageType),
         }
     }
 
@@ -467,64 +450,16 @@ impl SpeechmaticsRealtimeParser {
     }
 }
 
-pub fn classify_close_code(code: u16) -> SpeechmaticsCloseClassification {
-    match code {
-        1000 => SpeechmaticsCloseClassification {
-            code,
-            reason: "normal",
-            retryable: false,
-        },
-        1003 => SpeechmaticsCloseClassification {
-            code,
-            reason: "protocol_error",
-            retryable: false,
-        },
-        1008 => SpeechmaticsCloseClassification {
-            code,
-            reason: "policy_violation",
-            retryable: false,
-        },
-        1011 => SpeechmaticsCloseClassification {
-            code,
-            reason: "internal_error",
-            retryable: true,
-        },
-        4001 => SpeechmaticsCloseClassification {
-            code,
-            reason: "not_authorised",
-            retryable: false,
-        },
-        4003 => SpeechmaticsCloseClassification {
-            code,
-            reason: "not_allowed",
-            retryable: false,
-        },
-        4004 => SpeechmaticsCloseClassification {
-            code,
-            reason: "invalid_model",
-            retryable: false,
-        },
-        4005 => SpeechmaticsCloseClassification {
-            code,
-            reason: "quota_exceeded",
-            retryable: false,
-        },
-        4006 => SpeechmaticsCloseClassification {
-            code,
-            reason: "timelimit_exceeded",
-            retryable: false,
-        },
-        4013 => SpeechmaticsCloseClassification {
-            code,
-            reason: "job_error",
-            retryable: true,
-        },
-        _ => SpeechmaticsCloseClassification {
-            code,
-            reason: "unknown",
-            retryable: false,
-        },
-    }
+pub fn classify_close_code(code: u16) -> RuntimeDiagnostic {
+    websocket_diagnostic(match code {
+        1000 => Code::Cancelled,
+        1003 => Code::ProtocolError,
+        1008 => Code::PolicyBlocked,
+        1011 | 4013 => Code::ProviderUnavailable,
+        4001 | 4003 | 4004 | 4006 => Code::RequestRejected,
+        4005 => Code::CapacityExhausted,
+        _ => Code::Internal,
+    })
 }
 
 fn transcript_text(response: &SpeechmaticsResponse) -> String {
@@ -1043,12 +978,7 @@ mod tests {
         assert!(parsed.revisions.is_empty());
         assert_eq!(
             parsed.error,
-            Some(SpeechmaticsProviderError {
-                error_type: Some("invalid_model".to_string()),
-                reason: Some("Model is not available".to_string()),
-                code: Some(4004),
-                seq_no: Some(7),
-            })
+            Some(websocket_diagnostic(Code::RequestRejected))
         );
     }
 
@@ -1070,16 +1000,20 @@ mod tests {
 
     #[test]
     fn close_code_classifier_matches_speechmatics_realtime_codes() {
-        assert_eq!(classify_close_code(1003).reason, "protocol_error");
-        assert_eq!(classify_close_code(1008).reason, "policy_violation");
-        assert!(classify_close_code(1011).retryable);
-        assert_eq!(classify_close_code(4001).reason, "not_authorised");
-        assert_eq!(classify_close_code(4003).reason, "not_allowed");
-        assert_eq!(classify_close_code(4004).reason, "invalid_model");
-        assert_eq!(classify_close_code(4005).reason, "quota_exceeded");
-        assert_eq!(classify_close_code(4006).reason, "timelimit_exceeded");
-        assert_eq!(classify_close_code(4013).reason, "job_error");
-        assert_eq!(classify_close_code(4999).reason, "unknown");
+        for (wire_code, code) in [
+            (1003, Code::ProtocolError),
+            (1008, Code::PolicyBlocked),
+            (1011, Code::ProviderUnavailable),
+            (4001, Code::RequestRejected),
+            (4003, Code::RequestRejected),
+            (4004, Code::RequestRejected),
+            (4005, Code::CapacityExhausted),
+            (4006, Code::RequestRejected),
+            (4013, Code::ProviderUnavailable),
+            (4999, Code::Internal),
+        ] {
+            assert_eq!(classify_close_code(wire_code), websocket_diagnostic(code));
+        }
     }
 
     #[test]
@@ -1088,12 +1022,11 @@ mod tests {
 
         assert!(matches!(
             parser.parse_message("{", 1),
-            Err(SpeechmaticsParseError::InvalidJson(_))
+            Err(SpeechmaticsParseError::InvalidJson)
         ));
         assert!(matches!(
             parser.parse_message(r#"{ "message": "NewFutureMessage" }"#, 2),
-            Err(SpeechmaticsParseError::UnsupportedMessageType(message))
-                if message == "NewFutureMessage"
+            Err(SpeechmaticsParseError::UnsupportedMessageType)
         ));
     }
 }

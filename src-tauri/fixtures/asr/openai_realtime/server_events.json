@@ -71,15 +71,15 @@
     },
     {
       "type": "error",
-      "message": "transcription failed item_id=b OpenAI Realtime provider_error type=none code=none param=none event_id=none message_len=12"
+      "message": "runtime/provider_unavailable"
     },
     {
       "type": "error",
-      "message": "OpenAI Realtime provider_error type=none code=none param=none event_id=none message_len=11"
+      "message": "runtime/provider_unavailable"
     },
     {
       "type": "error",
-      "message": "Invalid server JSON: EOF while parsing an object at line 1 column 1"
+      "message": "runtime/invalid_response"
     }
   ]
 }

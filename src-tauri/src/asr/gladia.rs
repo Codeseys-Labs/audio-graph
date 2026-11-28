@@ -4,6 +4,10 @@
 //! REST with a backend API key and then streamed over the returned WebSocket
 //! URL; that runtime lifecycle is intentionally out of scope here.
 
+pub use super::AsrParseError as GladiaParseError;
+use super::websocket_diagnostic;
+use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
+
 use std::collections::HashMap;
 
 use serde::Deserialize;
@@ -132,8 +136,10 @@ impl GladiaLiveConfig {
         }
     }
 
-    pub fn init_url(&self) -> Result<url::Url, url::ParseError> {
-        let mut url = url::Url::parse(GLADIA_LIVE_INIT_ENDPOINT)?;
+    pub fn init_url(&self) -> Result<url::Url, RuntimeDiagnostic> {
+        let mut url = url::Url::parse(GLADIA_LIVE_INIT_ENDPOINT).map_err(|_| {
+            super::asr_diagnostic(Code::Internal, super::RuntimeTransport::Http, None)
+        })?;
         if let Some(region) = self.region {
             url.query_pairs_mut()
                 .append_pair("region", region.query_value());
@@ -178,7 +184,7 @@ pub struct GladiaParsedMessage {
     pub speech_event: Option<GladiaSpeechEvent>,
     pub acknowledgment: Option<GladiaAcknowledgment>,
     pub lifecycle_event: Option<String>,
-    pub error: Option<GladiaProviderError>,
+    pub error: Option<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,19 +214,6 @@ pub struct GladiaAcknowledgment {
     pub time_range: Option<(f64, f64)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GladiaProviderError {
-    pub message_type: String,
-    pub code: Option<String>,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GladiaParseError {
-    InvalidJson(String),
-    UnsupportedMessageType(String),
-}
-
 #[derive(Debug)]
 pub struct GladiaLiveParser {
     source_id: String,
@@ -236,7 +229,7 @@ struct GladiaActiveUtterance {
     revision_number: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct GladiaResponse {
     #[serde(default)]
     session_id: Option<String>,
@@ -245,17 +238,9 @@ struct GladiaResponse {
     #[serde(default)]
     acknowledged: Option<bool>,
     #[serde(default)]
-    error: Option<GladiaErrorPayload>,
+    error: Option<serde_json::Value>,
     #[serde(default)]
     data: Option<GladiaData>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GladiaErrorPayload {
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -322,15 +307,22 @@ impl GladiaLiveParser {
         text: &str,
         received_at_ms: u64,
     ) -> Result<GladiaParsedMessage, GladiaParseError> {
-        let response: GladiaResponse = serde_json::from_str(text)
-            .map_err(|error| GladiaParseError::InvalidJson(error.to_string()))?;
+        let response: GladiaResponse =
+            serde_json::from_str(text).map_err(|_| GladiaParseError::InvalidJson)?;
         self.response_sequence += 1;
 
-        let error = response.error.as_ref().map(|error| GladiaProviderError {
-            message_type: response.message_type.clone(),
-            code: error.code.clone(),
-            message: error.message.clone(),
-        });
+        // Stop at the wire-to-public boundary on an error frame. A provider
+        // can attach arbitrary identifiers, prose or acknowledgment ranges.
+        if let Some(error) = response.error.as_ref() {
+            return Ok(GladiaParsedMessage {
+                session_id: None,
+                revisions: Vec::new(),
+                speech_event: None,
+                acknowledgment: None,
+                lifecycle_event: None,
+                error: Some(gladia_error_diagnostic(error)),
+            });
+        }
 
         match response.message_type.as_str() {
             "transcript" => Ok(GladiaParsedMessage {
@@ -342,7 +334,7 @@ impl GladiaLiveParser {
                 speech_event: None,
                 acknowledgment: None,
                 lifecycle_event: None,
-                error,
+                error: None,
             }),
             "speech_start" | "speech_end" => Ok(GladiaParsedMessage {
                 session_id: response.session_id.clone(),
@@ -350,7 +342,7 @@ impl GladiaLiveParser {
                 speech_event: speech_event(&response),
                 acknowledgment: None,
                 lifecycle_event: None,
-                error,
+                error: None,
             }),
             "audio_chunk" | "stop_recording" => Ok(GladiaParsedMessage {
                 session_id: response.session_id.clone(),
@@ -358,7 +350,7 @@ impl GladiaLiveParser {
                 speech_event: None,
                 acknowledgment: acknowledgment(&response),
                 lifecycle_event: None,
-                error,
+                error: None,
             }),
             "start_session" | "start_recording" | "end_recording" | "end_session" => {
                 Ok(GladiaParsedMessage {
@@ -367,7 +359,7 @@ impl GladiaLiveParser {
                     speech_event: None,
                     acknowledgment: None,
                     lifecycle_event: Some(response.message_type),
-                    error,
+                    error: None,
                 })
             }
             "translation"
@@ -382,9 +374,9 @@ impl GladiaLiveParser {
                 speech_event: None,
                 acknowledgment: None,
                 lifecycle_event: None,
-                error,
+                error: None,
             }),
-            other => Err(GladiaParseError::UnsupportedMessageType(other.to_string())),
+            _ => Err(GladiaParseError::UnsupportedMessageType),
         }
     }
 
@@ -550,6 +542,14 @@ fn utterance_confidence(utterance: &GladiaUtterance) -> f32 {
     } else {
         total / count as f32
     }
+}
+
+fn gladia_error_diagnostic(error: &serde_json::Value) -> RuntimeDiagnostic {
+    let code = match error.get("code").and_then(serde_json::Value::as_str) {
+        Some("invalid_audio") => Code::RequestRejected,
+        _ => Code::ProviderUnavailable,
+    };
+    websocket_diagnostic(code)
 }
 
 fn speech_event(response: &GladiaResponse) -> Option<GladiaSpeechEvent> {
@@ -919,11 +919,7 @@ mod tests {
         assert!(parsed.revisions.is_empty());
         assert_eq!(
             parsed.error,
-            Some(GladiaProviderError {
-                message_type: "audio_chunk".to_string(),
-                code: Some("invalid_audio".to_string()),
-                message: Some("Audio chunk cannot be decoded".to_string()),
-            })
+            Some(websocket_diagnostic(Code::RequestRejected))
         );
     }
 
@@ -948,11 +944,11 @@ mod tests {
         assert!(empty.revisions.is_empty());
         assert!(matches!(
             parser.parse_message(r#"{ "type": "future_event" }"#, 2),
-            Err(GladiaParseError::UnsupportedMessageType(message)) if message == "future_event"
+            Err(GladiaParseError::UnsupportedMessageType)
         ));
         assert!(matches!(
             parser.parse_message("{", 3),
-            Err(GladiaParseError::InvalidJson(_))
+            Err(GladiaParseError::InvalidJson)
         ));
     }
 }
