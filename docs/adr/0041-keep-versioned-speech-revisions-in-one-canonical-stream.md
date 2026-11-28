@@ -166,30 +166,43 @@ close or unblock a Seed, and queue changes remain conductor-owned.
 
 ### First published release and interrupted writes
 
-Framed JSON payloads use shortest round-trip decimal spellings for finite
-floating-point values. Readers must recover the exact IEEE value, including
-signed zero, to verify the committed payload digest. This applies throughout
-nested payloads, including transcript start and end times and confidence.
-Readers preserve existing valid commitments and the original hash anchors
-of legacy JSONL prefixes.
+Amended 2026-11-27 (#139, #176).
+
+Writers emit shortest round-trip decimal spellings for finite floating-point
+values in framed JSON payloads. The payload digest commits to the parsed
+values as re-serialized by the `serde_json` version pinned in `Cargo.lock`;
+it does not hash the stored spelling. Any spelling that parses to the same
+IEEE value therefore verifies, and a change in that formatter's output is a
+format change. Readers must recover the exact IEEE value, including signed
+zero, to verify the committed payload digest. This applies throughout nested
+payloads, including transcript start and end times and confidence. Readers
+preserve existing valid commitments and the original hash anchors of legacy
+JSONL prefixes, whose rows keep their original parse.
 
 At the adoption of this amendment AudioGraph has never published a release.
-The first published release must include the precise framed reader and may
-also include the durable-receipt writer. Pre-amendment development builds are
-outside the downgrade boundary. The first published release establishes the
-minimum supported predecessor. For subsequent format changes item 9 requires
-the reader-first contract in the preceding release. Release qualification is
-tracked in #176.
+The only release object is the draft `v0.1.0-rc.1`, which was never published
+and has no assets. The first published release must include the precise
+framed reader and may also include the durable-receipt writer. Pre-amendment
+development builds are outside the downgrade boundary. The first published
+release establishes the minimum supported predecessor. For subsequent format
+changes item 9 requires the reader-first contract in the preceding release.
+This boundary is reversible until the first release is published: if a build
+that predates the precise reader turns out to have been distributed, it must
+be reconsidered first. Release qualification is tracked in #176.
 
-While a writer is alive it retains the exact attempted frame for retry.
-After restart, recovery verifies the preceding head. A complete matching frame
-crosses a fresh durability barrier and replays once. An interrupted attempt
-with only a torn suffix preserves those bytes as evidence outside replay.
-Recovery restores the verified prefix (including original absence), durably
-records a typed gap for load, timeline and export, and admits the next event
-at the sequence following that prefix. Exact provider redelivery after process
-death cannot be required because the provider connection and source audio may
-both be gone. Conflicting history remains a typed refusal.
+The following disposition of interrupted writes is decided here ahead of the
+durable-receipt writer that implements it (#139); it does not describe the
+reader-only change that carries this amendment. While a writer is alive it
+retains the exact attempted frame for retry. After restart, recovery verifies
+the preceding head. A complete matching frame crosses a fresh durability
+barrier and replays once. An interrupted attempt with only a torn suffix
+preserves those bytes as evidence outside replay. Recovery restores the
+verified prefix (including original absence), durably records a typed gap,
+and admits the next event at the sequence following that prefix. Presenting
+that gap in load, timeline and export is tracked on #139. Exact provider
+redelivery after process death cannot be required because the provider
+connection and source audio may both be gone. Conflicting history remains a
+typed refusal.
 
 ## Consequences
 
