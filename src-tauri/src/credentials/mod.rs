@@ -1365,11 +1365,19 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
         match self.keychain.set(key, value) {
             Ok(()) if value.trim().is_empty() => Ok(None),
             Ok(()) => {
+                let mut was_deleted = false;
                 if let Err(error) = self.state.update(|state| {
+                    was_deleted = state.is_deleted(key);
                     state.mark_migrated(key);
                     state.superseded_keys.insert(key.to_owned());
                     Ok(())
                 }) {
+                    if was_deleted {
+                        // The durable tombstone still hides this write. Leave the native
+                        // value in place: a successful retry replaces it and clears the
+                        // tombstone without requiring a compensating keychain delete.
+                        return Err(error);
+                    }
                     log::warn!("Credential saved without migration bookkeeping: {error}");
                     let warning = if self.yaml.clear_key(key).is_err() {
                         LegacyCredentialError(Code::LegacyCleanupRequired)
@@ -2077,6 +2085,78 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn keychain_backend_in(dir: &Path) -> DefaultCredentialBackend<FakeKeychainStore> {
+        DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(FakeKeychainStore::default()),
+            yaml: YamlCredentialBackend::with_path(dir.join("credentials.yaml")),
+            state: CredentialMigrationStateBackend::with_path(dir.join("state.yaml")),
+            file_backend: false,
+            fallback_to_yaml: false,
+        }
+    }
+
+    #[test]
+    fn failed_state_write_keeps_a_resaved_deleted_key_hidden() {
+        let dir = std::env::temp_dir().join(format!("canary-pear-path-{}", uuid::Uuid::new_v4()));
+        let backend = keychain_backend_in(&dir);
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        let key = "aws_region";
+        backend.set(key, "canary-pear-old").unwrap();
+        backend.delete(key).unwrap();
+        let blocked = dir.join("state.yaml.tmp");
+        fs::create_dir(&blocked).unwrap();
+
+        let result = backend.set_with_warning(key, "canary-pear-new");
+        assert_eq!(
+            backend.keychain.get(key).unwrap().as_deref(),
+            Some("canary-pear-new")
+        );
+        assert_eq!(backend.get(key).unwrap(), None);
+        assert_eq!(backend.load().unwrap().aws_region, None);
+        fs::remove_dir(blocked).unwrap();
+        assert_eq!(
+            backend.set_with_warning(key, "canary-pear-retry").unwrap(),
+            None
+        );
+        assert_eq!(
+            backend.load().unwrap().aws_region.as_deref(),
+            Some("canary-pear-retry")
+        );
+        fs::remove_dir_all(dir).unwrap();
+        assert_closed(
+            result.unwrap_err(),
+            Code::LegacyCleanupRequired,
+            &["canary-pear"],
+        );
+    }
+
+    #[test]
+    fn failed_state_write_returns_a_warning_when_cleanup_makes_the_save_visible() {
+        let dir = std::env::temp_dir().join(format!("canary-plum-path-{}", uuid::Uuid::new_v4()));
+        let backend = keychain_backend_in(&dir);
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        let key = "aws_region";
+        backend.set(key, "canary-plum-old").unwrap();
+        backend.yaml.set(key, "canary-plum-file").unwrap();
+        fs::create_dir(dir.join("state.yaml.tmp")).unwrap();
+
+        let warning = backend
+            .set_with_warning(key, "canary-plum-new")
+            .unwrap()
+            .unwrap();
+        assert_eq!(backend.yaml.get(key).unwrap(), None);
+        assert_eq!(
+            backend.get(key).unwrap().as_deref(),
+            Some("canary-plum-new")
+        );
+        assert_eq!(
+            backend.load().unwrap().aws_region.as_deref(),
+            Some("canary-plum-new")
+        );
+        fs::remove_dir_all(dir).unwrap();
+        assert_closed(warning, Code::LegacyCleanupRequired, &["canary-plum"]);
     }
 
     #[test]
