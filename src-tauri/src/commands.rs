@@ -4324,8 +4324,14 @@ pub async fn send_chat_message(
     // report 0 because their `chat_with_history` signatures don't carry usage
     // yet — never fabricated.
     let executor = state.llm_executor.clone();
+    let admitted_routing_policy = settings.openrouter_routing_policy;
     let outcome = bounded_blocking_llm_call(BLOCKING_LLM_CALL_TIMEOUT, move || {
-        executor.chat_with_history(messages, graph_context, llm_provider)
+        executor.chat_with_history(
+            messages,
+            graph_context,
+            llm_provider,
+            admitted_routing_policy,
+        )
     })
     .await
     .map_err(|diagnostic| {
@@ -4415,9 +4421,18 @@ pub async fn synthesize_notes(
         content: prompt,
     }];
 
+    // The executor takes its client inside this call, later than the gate
+    // above. It refuses the job if a settings save in between left the client
+    // with another routing policy than the one this request was admitted with.
     let executor = state.llm_executor.clone();
+    let admitted_routing_policy = settings.openrouter_routing_policy;
     let outcome = bounded_blocking_llm_call(BLOCKING_LLM_CALL_TIMEOUT, move || {
-        executor.chat_with_history(messages, graph_context, llm_provider)
+        executor.chat_with_history(
+            messages,
+            graph_context,
+            llm_provider,
+            admitted_routing_policy,
+        )
     })
     .await
     .map_err(|diagnostic| {

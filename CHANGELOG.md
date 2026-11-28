@@ -77,6 +77,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was started under (zero data retention, deny data collection, provider
   pinning) when settings are saved while it starts. A provider switch at that
   moment could send the prompt to OpenRouter without them (#519).
+- Notes synthesis, notes and graph projections, and entity extraction through
+  OpenRouter are sent under the routing restrictions in force when the work was
+  queued. Saving looser settings while the work waited, or between a
+  projection's draft and its repair, could send it without them. Notes
+  synthesis is refused when the routing settings changed between its approval
+  and its start (#551).
+- A projection whose worker ended after its request was sent is now recorded
+  under the destination it was sent to, not the one the session started with
+  (#551).
 
 ## [0.1.0-rc.1] - 2026-05-20
 
