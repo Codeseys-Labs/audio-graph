@@ -248,11 +248,11 @@ impl CredentialEntryStore for FakeCredentialStore {
     /// operation a guard names and those the journal history records, so a
     /// staging record neither names stays. Every staging record of a set is
     /// untracked here except the one of the journal's pending activation and
-    /// the one of `observed`. What the native repair can and cannot find is
+    /// those of `observed`. What the native repair can and cannot find is
     /// tested against the native store in `native_keyring.rs`.
     fn repair_untracked_records(
         &self,
-        observed: Option<&ObservedActivation>,
+        observed: &[ObservedActivation],
         admit: &dyn Fn(&AuthorityJournal) -> bool,
     ) -> Result<Option<Vec<UntrackedRecordRepair>>, CredentialStoreFailure> {
         let mut state = self
@@ -275,6 +275,7 @@ impl CredentialEntryStore for FakeCredentialStore {
                 .map(|pending| &pending.operation_id)
                 .chain(
                     observed
+                        .iter()
                         .filter(|observed| observed.set_id == set_id)
                         .map(|observed| &observed.operation_id),
                 )

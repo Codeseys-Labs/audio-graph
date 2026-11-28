@@ -1268,27 +1268,178 @@ pub(super) mod tests {
         std::fs::remove_dir_all(&base).expect("remove isolated stray-sweep directory");
     }
 
-    /// A stray that cannot be removed is reported as a closed failure
-    /// rather than left behind in silence, and nothing is published.
+    /// A stray that does not qualify, or cannot be removed, is reported as a
+    /// closed failure rather than left behind in silence or deleted, and
+    /// nothing is published. Under a staged name only a regular file with
+    /// no other name is deleted: a directory, a second name of another
+    /// file, and a link (a Unix symlink, a Windows junction) stay as they
+    /// are, and so does what a link or the other name reaches.
     #[test]
-    fn a_stray_that_cannot_be_removed_fails_the_replace_closed() {
-        let base = scratch("stray-refused");
-        let root = base.join("journal");
-        let journal = boundary(&base, "journal", "namespace").expect("open boundary");
-        journal.replace(b"first-journal").expect("first replace");
-        std::fs::create_dir(root.join(format!(
-            ".{JOURNAL_FILE_NAME}.{}.tmp",
-            uuid::Uuid::new_v4().simple()
-        )))
-        .expect("plant unremovable stray");
+    fn a_stray_that_does_not_qualify_fails_the_replace_closed() {
+        let mut kinds = vec!["directory", "hard link"];
+        kinds.push(if cfg!(windows) { "junction" } else { "symlink" });
+        for kind in kinds {
+            let base = scratch("stray-refused");
+            let root = base.join("journal");
+            let journal = boundary(&base, "journal", "namespace").expect("open boundary");
+            journal.replace(b"first-journal").expect("first replace");
+            let outside = base.join("outside");
+            std::fs::create_dir(&outside).expect("create the outside directory");
+            let outside_file = outside.join("file.json");
+            std::fs::write(&outside_file, b"outside").expect("write the outside file");
+            let stray = root.join(format!(
+                ".{JOURNAL_FILE_NAME}.{}.tmp",
+                uuid::Uuid::new_v4().simple()
+            ));
+            match kind {
+                "directory" => std::fs::create_dir(&stray).expect("plant a directory stray"),
+                "hard link" => {
+                    std::fs::hard_link(&outside_file, &stray).expect("plant a hard link")
+                }
+                _ => plant_link(&stray, &outside, &outside_file),
+            }
+
+            assert_eq!(
+                journal.replace(b"second-journal"),
+                Err(CredentialStoreFailure::Unavailable),
+                "{kind}"
+            );
+            assert_eq!(
+                journal.read(),
+                Ok(Some(b"first-journal".to_vec())),
+                "{kind}"
+            );
+            assert!(
+                std::fs::symlink_metadata(&stray).is_ok(),
+                "{kind} stray stays"
+            );
+            assert_eq!(
+                std::fs::read(&outside_file).expect("the outside file stays"),
+                b"outside",
+                "{kind}"
+            );
+            drop(journal);
+            if kind != "hard link" && kind != "directory" {
+                remove_link(&stray);
+            }
+            std::fs::remove_dir_all(&base).expect("remove isolated stray-refused directory");
+        }
+    }
+
+    /// A publication replaces the journal's entry only when it is a regular
+    /// file with no other name, or absent. A directory, a second name of
+    /// another file, and a link there refuse it before any effect, and what
+    /// the entry named is left as it was.
+    #[test]
+    fn a_publication_never_replaces_an_entry_that_does_not_qualify() {
+        let mut kinds = vec!["directory", "hard link"];
+        kinds.push(if cfg!(windows) { "junction" } else { "symlink" });
+        for kind in kinds {
+            let base = scratch("publication-target");
+            let target = base.join("journal").join(JOURNAL_FILE_NAME);
+            let journal = boundary(&base, "journal", "namespace").expect("open boundary");
+            journal.replace(b"first-journal").expect("first replace");
+            let outside = base.join("outside");
+            std::fs::create_dir(&outside).expect("create the outside directory");
+            let outside_file = outside.join("file.json");
+            std::fs::write(&outside_file, b"outside").expect("write the outside file");
+            match kind {
+                "directory" => {
+                    std::fs::remove_file(&target).expect("remove the journal");
+                    std::fs::create_dir(&target).expect("put a directory at the journal");
+                }
+                "hard link" => {
+                    std::fs::remove_file(&target).expect("remove the journal");
+                    std::fs::hard_link(&outside_file, &target).expect("link the journal");
+                }
+                _ => {
+                    std::fs::remove_file(&target).expect("remove the journal");
+                    plant_link(&target, &outside, &outside_file);
+                }
+            }
+
+            assert_eq!(
+                journal.replace(b"second-journal"),
+                Err(CredentialStoreFailure::Unavailable),
+                "{kind}"
+            );
+            assert!(
+                std::fs::symlink_metadata(&target).is_ok(),
+                "{kind} entry stays"
+            );
+            assert_eq!(
+                std::fs::read(&outside_file).expect("the outside file stays"),
+                b"outside",
+                "{kind}"
+            );
+            drop(journal);
+            if kind != "hard link" && kind != "directory" {
+                remove_link(&target);
+            }
+            std::fs::remove_dir_all(&base).expect("remove isolated publication-target directory");
+        }
+    }
+
+    /// Plants a link at `at`: on Windows a junction to the directory
+    /// `directory`, which needs no privilege; on Unix a symlink to `file`.
+    fn plant_link(at: &Path, directory: &Path, file: &Path) {
+        #[cfg(windows)]
+        {
+            let _ = file;
+            windows_command(
+                "cmd.exe",
+                &[
+                    "/d".as_ref(),
+                    "/c".as_ref(),
+                    "mklink".as_ref(),
+                    "/j".as_ref(),
+                    at.as_os_str(),
+                    directory.as_os_str(),
+                ],
+                directory,
+            );
+        }
+        #[cfg(unix)]
+        {
+            let _ = directory;
+            std::os::unix::fs::symlink(file, at).expect("plant a symlink");
+        }
+    }
+
+    /// Removes the link [`plant_link`] put at `at`, never what it reaches.
+    fn remove_link(at: &Path) {
+        #[cfg(windows)]
+        std::fs::remove_dir(at).expect("remove the junction");
+        #[cfg(unix)]
+        std::fs::remove_file(at).expect("remove the symlink");
+    }
+
+    /// The deepest directory found present on the way to a missing root is
+    /// synced in the directory that holds it, reached through its own
+    /// descriptor, also when the path reached it through a symlink: a link
+    /// is never a reason to skip the identity check or the barrier.
+    #[cfg(unix)]
+    #[test]
+    fn unix_a_symlinked_ancestor_is_synced_where_it_lives() {
+        use super::held_directory::faults::parent_syncs;
+
+        let base = scratch("unix-symlinked-ancestor");
+        std::fs::create_dir_all(base.join("real")).expect("create the real ancestor");
+        std::os::unix::fs::symlink(base.join("real"), base.join("link"))
+            .expect("link the ancestor");
+        let before = parent_syncs();
+
+        let held = HeldDirectory::open_or_create(&base.join("link").join("journal"))
+            .expect("open through the link");
 
         assert_eq!(
-            journal.replace(b"second-journal"),
-            Err(CredentialStoreFailure::Unavailable)
+            parent_syncs() - before,
+            2,
+            "the ancestor's entry and the new root's entry are both synced"
         );
-        assert_eq!(journal.read(), Ok(Some(b"first-journal".to_vec())));
-        drop(journal);
-        std::fs::remove_dir_all(&base).expect("remove isolated stray-refused directory");
+        assert!(base.join("real").join("journal").is_dir());
+        drop(held);
+        std::fs::remove_dir_all(&base).expect("remove isolated symlinked-ancestor directory");
     }
 
     #[cfg(unix)]
@@ -2257,15 +2408,17 @@ pub(super) mod tests {
         base
     }
 
-    /// The root is created already carrying its protected owner-only DACL;
-    /// it is inspected before anything opens or hardens it.
+    /// A root is created relative to its held parent already carrying its
+    /// protected owner-only DACL; it is inspected before anything hardens
+    /// it. Creating it again opens the existing root and changes nothing.
     #[cfg(windows)]
     #[test]
     fn windows_new_root_is_owner_only_from_the_moment_it_is_created() {
         let base = permissive_base("windows-create-protected");
         let root = base.join("journal");
 
-        crate::fs_util::create_owner_only_directory(&root).expect("create protected root");
+        super::held_directory::create_root_for_test(&base, "journal")
+            .expect("create protected root");
 
         let dacl = windows_dacl(&root, &base);
         assert_protected_owner_only(&dacl);
@@ -2273,10 +2426,9 @@ pub(super) mod tests {
             dacl.contains("(A;OICI;FA;;;"),
             "owner ACE is not inherited by children: {dacl}"
         );
-        assert_eq!(
-            crate::fs_util::create_owner_only_directory(&root).map_err(|error| error.kind()),
-            Err(std::io::ErrorKind::AlreadyExists)
-        );
+        super::held_directory::create_root_for_test(&base, "journal")
+            .expect("open the existing root");
+        assert_eq!(windows_dacl(&root, &base), dacl);
         std::fs::remove_dir_all(&base).expect("remove isolated protected-create directory");
     }
 
@@ -2642,5 +2794,84 @@ pub(super) mod tests {
             assert_eq!(windows_dacl(&entry, &base), entry_dacl, "{case}");
             std::fs::remove_dir_all(&base).expect("remove isolated repair-qualify directory");
         }
+    }
+
+    /// The ownership repair holds every object it qualified, sharing no
+    /// delete, until it has changed it, so another principal cannot move a
+    /// qualified journal out of the root, or put another file under its
+    /// name, between the qualification and the change.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_qualified_file_stays_put_until_the_repair_changes_it() {
+        use super::held_directory::faults::{Point, at};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let base = scratch("windows-repair-holds");
+        let root = base.join("journal");
+        std::fs::create_dir_all(&root).expect("create the journal root");
+        let journal_file = root.join(JOURNAL_FILE_NAME);
+        std::fs::write(&journal_file, b"journal").expect("write the journal");
+        super::held_directory::record_refused_owner_for_test(&root, None);
+        let moved = Rc::new(Cell::new(None));
+        at(Point::RepairQualified, {
+            let moved = Rc::clone(&moved);
+            let journal_file = journal_file.clone();
+            let away = base.join("moved.json");
+            move || moved.set(Some(std::fs::rename(&journal_file, &away).is_ok()))
+        });
+
+        assert_eq!(
+            super::take_ownership_if_refused(&root, &[JOURNAL_FILE_NAME]),
+            Ok(false)
+        );
+        assert_eq!(moved.get(), Some(false), "the qualified journal moved");
+        assert_eq!(
+            std::fs::read(&journal_file).expect("journal stays"),
+            b"journal"
+        );
+        assert_protected_owner_only(&windows_dacl(&journal_file, &base));
+        std::fs::remove_dir_all(&base).expect("remove isolated repair-holds directory");
+    }
+
+    /// A missing root is created and qualified relative to the parent the
+    /// open holds. A junction on the path repointed in between, at a decoy
+    /// directory that already holds an entry of the root's name, cannot get
+    /// that decoy's DACL changed: the root is created in the held parent,
+    /// and the decoy is left as it was.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_root_is_created_in_the_held_parent_not_where_a_path_points_by_then() {
+        use super::held_directory::faults::{Point, at};
+
+        let base = scratch("windows-create-relative");
+        std::fs::create_dir_all(base.join("held")).expect("create the held parent");
+        let decoy_root = base.join("decoy").join("journal");
+        std::fs::create_dir_all(&decoy_root).expect("create the decoy root");
+        windows_command(
+            "icacls.exe",
+            &[
+                decoy_root.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-1-0:(OI)(CI)R".as_ref(),
+            ],
+            &base,
+        );
+        let decoy_dacl = windows_dacl(&decoy_root, &base);
+        point_parent_junction(&base, "held");
+        at(Point::RootParentHeld, {
+            let base = base.clone();
+            move || point_parent_junction(&base, "decoy")
+        });
+
+        let held = HeldDirectory::open_or_create(&base.join("parent").join("journal"))
+            .expect("create the root in the held parent");
+
+        assert_eq!(windows_dacl(&decoy_root, &base), decoy_dacl);
+        assert!(base.join("held").join("journal").is_dir());
+        assert_protected_owner_only(&windows_dacl(&base.join("held").join("journal"), &base));
+        drop(held);
+        std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
+        std::fs::remove_dir_all(&base).expect("remove isolated create-relative directory");
     }
 }

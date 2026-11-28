@@ -1673,7 +1673,7 @@ mod tests {
 
         fn repair_untracked_records(
             &self,
-            _observed: Option<&ObservedActivation>,
+            _observed: &[ObservedActivation],
             _admit: &dyn Fn(&AuthorityJournal) -> bool,
         ) -> Result<Option<Vec<UntrackedRecordRepair>>, CredentialStoreFailure> {
             unreachable!("no runtime test repairs through the delayed store")

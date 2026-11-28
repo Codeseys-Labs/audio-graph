@@ -65,6 +65,20 @@ recovery-required. The floor lives only in memory, so a restarted process
 accepts an older valid journal of the same authority; durable ordering
 evidence outside the journal is owed before any consumer cutover (#521).
 
+The store's file state is built against one adversary: another local
+principal who can create, rename or replace entries in the store's
+directories or in one of their ancestors while the app runs, trying to make
+the app change, delete or publish over an object it did not qualify. The
+rule that follows: every mutation acts on an object qualified through a
+handle, and nothing can change which object that is between the
+qualification and the act. The one act by path is resolving a root's path
+when the store opens; what it reaches is qualified on its handle before
+anything changes. Inside a held root, which is owner-only once held, names
+are resolved relative to its handle, and only this user can change what
+they name. An ancestor writable by another principal can still choose
+which of this user's directories the path resolution reaches, which stays
+owed under #521 before the store is enabled.
+
 Atomic admission allows one live operation, not a backlog of mutations. An
 async deadline limits only the caller's wait: it neither cancels nor retries
 the worker call, and it does not release admission. The worker reconciles a

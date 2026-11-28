@@ -99,9 +99,10 @@ pub(crate) struct UntrackedRecordRepair {
     pub(crate) outcome: UntrackedRecordOutcome,
 }
 
-/// The pending activation a service last observed. A journal restored at
-/// the same epoch can omit an activation that is still live, so an explicit
-/// repair keeps the staging of this one as well as the journal's.
+/// A pending activation a service observed and has not seen settled. A
+/// journal restored at the same epoch can omit an activation that is still
+/// live, so an explicit repair keeps the staging of each of these as well as
+/// the journal's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObservedActivation {
     pub(crate) set_id: CredentialSetId,
@@ -149,11 +150,12 @@ pub(crate) trait CredentialEntryStore: Send + Sync {
     /// Explicit repair only; no ordinary operation calls it. Reads the
     /// authoritative journal and, only if `admit` adopts that journal,
     /// removes the native records it does not track, both under one lock.
-    /// The staging of `observed`, and a guard naming it, is kept too.
-    /// `None` when `admit` refused the journal and nothing was touched.
+    /// The staging of every activation in `observed`, and a guard naming
+    /// one, is kept too. `None` when `admit` refused the journal and nothing
+    /// was touched.
     fn repair_untracked_records(
         &self,
-        observed: Option<&ObservedActivation>,
+        observed: &[ObservedActivation],
         admit: &dyn Fn(&AuthorityJournal) -> bool,
     ) -> Result<Option<Vec<UntrackedRecordRepair>>, CredentialStoreFailure>;
 
@@ -605,11 +607,18 @@ pub(crate) struct CredentialService {
     worker: WorkerAdmission,
     events: Mutex<CredentialEventLog>,
     settings_activation: Arc<dyn CredentialSettingsActivationPort>,
-    /// The pending activation this service last saw in a journal it adopted,
-    /// until a journal it adopts records that activation's completion or
-    /// rollback, or this service aborts it. A journal that merely lacks it,
-    /// such as one restored at the same epoch, does not reconcile it.
-    observed_activation: Mutex<Option<ObservedActivation>>,
+    /// Every pending activation this service saw in a journal it adopted
+    /// and has not seen settled. An entry goes only when a journal this
+    /// service adopts records that activation's receipt (its completion, or
+    /// a recovery that settled it), or when this service aborts it; a
+    /// journal that merely lacks it, such as one restored at the same epoch,
+    /// settles nothing. A journal holds at most one pending activation, and
+    /// a cooperating process admits a new one only once the previous one has
+    /// left the journal, so the set grows by at most one entry per
+    /// activation this service observed. An entry another process settled
+    /// without a receipt (its abort) stays until this service ends, but
+    /// spares nothing once that activation's staging is gone.
+    observed_activations: Mutex<Vec<ObservedActivation>>,
     #[cfg(test)]
     event_snapshot_test_hook: Mutex<Option<TestPause>>,
     #[cfg(test)]
@@ -690,10 +699,11 @@ impl CredentialService {
         event_capacity: usize,
     ) -> Self {
         let service_start_epoch = journal.global_epoch;
-        let observed_activation = journal
+        let observed_activations = journal
             .pending_activation
-            .as_ref()
-            .map(ObservedActivation::of);
+            .iter()
+            .map(ObservedActivation::of)
+            .collect();
         Self {
             store,
             journal: Mutex::new(journal),
@@ -701,7 +711,7 @@ impl CredentialService {
             worker: WorkerAdmission::new(),
             events: Mutex::new(CredentialEventLog::new(event_capacity, service_start_epoch)),
             settings_activation,
-            observed_activation: Mutex::new(observed_activation),
+            observed_activations: Mutex::new(observed_activations),
             #[cfg(test)]
             event_snapshot_test_hook: Mutex::new(None),
             #[cfg(test)]
@@ -893,22 +903,25 @@ impl CredentialService {
         true
     }
 
-    /// Remembers the pending activation `journal` records, and forgets the
-    /// remembered one once `journal` records it as completed or rolled back.
+    /// Remembers the pending activation `journal` records, and forgets every
+    /// remembered one whose receipt `journal` records.
     fn observe_activation(&self, journal: &AuthorityJournal) {
         let mut observed = self
-            .observed_activation
+            .observed_activations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(pending) = &journal.pending_activation {
-            *observed = Some(ObservedActivation::of(pending));
-        } else if observed.as_ref().is_some_and(|observed| {
-            journal.idempotency_history.iter().any(|entry| {
+        observed.retain(|observed| {
+            !journal.idempotency_history.iter().any(|entry| {
                 entry.mutation_kind == CredentialMutationKind::Activate
                     && entry.receipt.operation_id == observed.operation_id
             })
-        }) {
-            *observed = None;
+        });
+        if let Some(pending) = &journal.pending_activation
+            && !observed
+                .iter()
+                .any(|observed| observed.operation_id == pending.operation_id)
+        {
+            observed.push(ObservedActivation::of(pending));
         }
     }
 
@@ -1100,20 +1113,20 @@ impl CredentialService {
     /// failure cannot leave it deciding on an older journal than one it
     /// acted on; a journal older than the one this service observed is
     /// refused instead, since it can omit staging that is still in use. The
-    /// staging of the pending activation this service last observed is kept
-    /// as well. It changes no journal, so it emits no event.
+    /// staging of every activation this service observed and has not seen
+    /// settled is kept as well. It changes no journal, so it emits no event.
     pub(crate) fn repair_untracked_records(
         &self,
     ) -> Result<Vec<UntrackedRecordRepair>, CredentialError> {
         let operation_id = self.token_source.next_operation_id();
         let _permit = self.worker.admit_for(&operation_id, None)?;
         let observed = self
-            .observed_activation
+            .observed_activations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         self.store
-            .repair_untracked_records(observed.as_ref(), &|journal| {
+            .repair_untracked_records(&observed, &|journal| {
                 self.cache_journal(journal.clone(), JournalOrigin::Authority)
             })
             .map_err(|failure| {
@@ -2405,16 +2418,10 @@ impl CredentialService {
             journal
         };
         self.cache_journal(committed_journal, JournalOrigin::ThisService);
-        let mut observed = self
-            .observed_activation
+        self.observed_activations
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if observed
-            .as_ref()
-            .is_some_and(|observed| observed.operation_id == prepared.operation_id)
-        {
-            *observed = None;
-        }
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|observed| observed.operation_id != prepared.operation_id);
         Ok(())
     }
 }
@@ -2512,7 +2519,7 @@ mod tests {
 
         fn repair_untracked_records(
             &self,
-            observed: Option<&ObservedActivation>,
+            observed: &[ObservedActivation],
             admit: &dyn Fn(&AuthorityJournal) -> bool,
         ) -> Result<Option<Vec<UntrackedRecordRepair>>, CredentialStoreFailure> {
             self.inner.repair_untracked_records(observed, admit)
@@ -5904,10 +5911,11 @@ mod tests {
             .outcome
     }
 
-    /// A staging record whose recording journal publication was lost is
-    /// removed by the explicit repair, while the staging record a pending
-    /// activation still owns is kept. Neither ordinary operations nor the
-    /// repair emit an event, and the repair itself is a single store call.
+    /// A staging record whose recording journal publication was lost, from
+    /// an activation this service never observed, is removed by the explicit
+    /// repair, while the staging record a pending activation still owns is
+    /// kept. Neither ordinary operations nor the repair emit an event, and
+    /// the repair itself is a single store call.
     #[test]
     fn explicit_repair_removes_staging_the_journal_lost_and_keeps_tracked_staging() {
         let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
@@ -5918,14 +5926,11 @@ mod tests {
             AuthorityJournal::new(CredentialBackendKind::Native),
             Arc::new(DeterministicTokenSource::default()),
         );
-        let unrecorded = store.journal_snapshot();
-        service
-            .prepare_settings_activation(activation_request(
-                BuiltInCredentialSetId::Deepgram,
-                "60606060-6060-4060-8060-606060606060",
-            ))
-            .expect("prepare the activation whose publication is lost");
-        store.restore_journal(unrecorded);
+        store.plant_staging(
+            CredentialOperationId::parse("60606060-6060-4060-8060-606060606060")
+                .expect("canonical operation id"),
+            BuiltInCredentialSetId::Deepgram.into(),
+        );
         service
             .prepare_settings_activation(activation_request(
                 BuiltInCredentialSetId::Openai,

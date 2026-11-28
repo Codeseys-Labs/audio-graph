@@ -410,9 +410,10 @@ impl NativeKeyringCredentialStore {
     /// before it releases that lock, so the only staging a live operation
     /// owns is that of the journal's pending activation for the set; that
     /// staging record, and a guard naming it, are never touched. Nor is the
-    /// staging of `observed`, the pending activation the repairing service
-    /// last saw, while that record exists: a journal restored at the same
-    /// epoch can omit an activation that is still live.
+    /// staging of any activation in `observed`, those the repairing service
+    /// saw pending and has not seen settled, while that record exists: a
+    /// journal restored at the same epoch can omit an activation that is
+    /// still live.
     ///
     /// Candidates are the operation the guard names and every operation the
     /// journal's history records for the set, which also finds staging a
@@ -425,7 +426,7 @@ impl NativeKeyringCredentialStore {
         &self,
         interaction: &mut NativeInteractionLease<'_>,
         journal: &AuthorityJournal,
-        observed: Option<&ObservedActivation>,
+        observed: &[ObservedActivation],
         set_id: &CredentialSetId,
     ) -> Result<UntrackedRecordOutcome, CredentialStoreFailure> {
         let tracked = journal
@@ -433,26 +434,25 @@ impl NativeKeyringCredentialStore {
             .as_ref()
             .filter(|pending| pending.set_id == *set_id)
             .map(|pending| &pending.operation_id);
-        let observed = match observed.filter(|observed| {
-            observed.set_id == *set_id && tracked != Some(&observed.operation_id)
-        }) {
-            Some(observed)
-                if self
+        let mut live_observed = Vec::new();
+        for observed in observed {
+            if observed.set_id == *set_id
+                && tracked != Some(&observed.operation_id)
+                && self
                     .entries
                     .read(
                         interaction,
                         &EntryLocator::staging(&observed.operation_id, set_id),
                     )?
-                    .is_some() =>
+                    .is_some()
             {
-                Some(&observed.operation_id)
+                live_observed.push(&observed.operation_id);
             }
-            _ => None,
-        };
+        }
         let spared = |operation_id: &CredentialOperationId| {
-            tracked == Some(operation_id) || observed == Some(operation_id)
+            tracked == Some(operation_id) || live_observed.contains(&operation_id)
         };
-        let any_spared = tracked.is_some() || observed.is_some();
+        let any_spared = tracked.is_some() || !live_observed.is_empty();
         let guard_locator = EntryLocator::staging_guard(set_id);
         let guard_bytes = self.entries.read(interaction, &guard_locator)?;
         let guard = StagingGuard::classify(guard_bytes.as_deref().map(Vec::as_slice));
@@ -544,7 +544,7 @@ impl CredentialEntryStore for NativeKeyringCredentialStore {
     /// touches no record.
     fn repair_untracked_records(
         &self,
-        observed: Option<&ObservedActivation>,
+        observed: &[ObservedActivation],
         admit: &dyn Fn(&AuthorityJournal) -> bool,
     ) -> Result<Option<Vec<UntrackedRecordRepair>>, CredentialStoreFailure> {
         let mut interaction = self.interaction_gate.acquire()?;
@@ -3973,6 +3973,71 @@ mod tests {
         repair_keeps_the_staging("repair after an ordinary commit");
     }
 
+    /// An activation stays remembered when another one is observed after
+    /// it: activation A is observed, a same-epoch restore drops it from the
+    /// journal, and activation B is then prepared on another set. Neither
+    /// overwrites the other, so every repair keeps both stagings and A's
+    /// guard, and reports both sets as tracked.
+    #[test]
+    fn every_observed_activation_keeps_its_staging_after_another_is_prepared() {
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let journal = Arc::new(MemoryJournalBoundary::default());
+        let (_store, service) = activation_service(&keyring, &journal);
+        let deepgram = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let openai = CredentialSetId::from(BuiltInCredentialSetId::Openai);
+        let before = journal.bytes.lock().expect("memory journal lock").clone();
+        service
+            .prepare_settings_activation(deepgram_activation(
+                "7d7d7d7d-7d7d-4d7d-8d7d-7d7d7d7d7d7d",
+            ))
+            .expect("prepare activation A");
+        let first = service
+            .snapshot_status()
+            .pending_activation
+            .expect("the service observed A")
+            .operation_id;
+        *journal.bytes.lock().expect("memory journal lock") = before;
+        service
+            .prepare_settings_activation(PrepareCredentialActivation {
+                set_id: openai.clone(),
+                ..deepgram_activation("7e7e7e7e-7e7e-4e7e-8e7e-7e7e7e7e7e7e")
+            })
+            .expect("prepare activation B on another set");
+        let second = service
+            .snapshot_status()
+            .pending_activation
+            .expect("the service observed B")
+            .operation_id;
+        let kept = [
+            EntryLocator::staging(&first, &deepgram),
+            EntryLocator::staging_guard(&deepgram),
+            EntryLocator::staging(&second, &openai),
+        ]
+        .map(|locator| locator.account().to_owned());
+
+        for repair in ["first repair", "second repair"] {
+            let sets = service
+                .repair_untracked_records()
+                .expect("repair untracked records");
+            repaired_outcomes(
+                &sets,
+                &[
+                    (
+                        BuiltInCredentialSetId::Deepgram,
+                        UntrackedRecordOutcome::Tracked,
+                    ),
+                    (
+                        BuiltInCredentialSetId::Openai,
+                        UntrackedRecordOutcome::Tracked,
+                    ),
+                ],
+            );
+            for account in &kept {
+                assert!(native_entry(&keyring, account).is_some(), "{repair}");
+            }
+        }
+    }
+
     /// The Windows power-loss case: the journal publication that recorded an
     /// activation was lost while its guard and staging record survived. No
     /// journal tracks that operation, yet its guard refuses every later
@@ -4002,7 +4067,7 @@ mod tests {
         assert!(native_entry(&keyring, &orphan_account).is_some());
 
         let sets = store
-            .repair_untracked_records(None, &|_| true)
+            .repair_untracked_records(&[], &|_| true)
             .expect("repair untracked records")
             .expect("the journal is admitted");
         repaired_outcomes(
@@ -4155,7 +4220,7 @@ mod tests {
         let before = snapshot();
 
         let refused = store
-            .repair_untracked_records(None, &|_| false)
+            .repair_untracked_records(&[], &|_| false)
             .expect("a refused journal is not a failure");
         assert!(refused.is_none());
         assert_eq!(snapshot(), before);

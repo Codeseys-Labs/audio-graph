@@ -65,14 +65,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stalls the whole process: a refusal before any native record changed is a
   retryable `operation_in_progress` and leaves the runtime ready, and one at
   the final journal commit leaves that operation for recovery. On every open
-  the roots' directory entries are synced into the parent reached through
-  the held root; a parent that cannot be opened fails the open. Hardening
-  refuses a file with a second name and changes no existing child. One
-  explicit repair takes ownership of a refused journal root (Windows) only
-  after every object it would change passes those checks through its handle,
-  and removes staging records and guards the journal does not track, except
-  the staging of an activation the service saw pending. A reopen never
-  adopts another authority or an older journal.
+  the roots' directory entries are synced into the directory that holds
+  them, reached through the held directory itself, never skipped for a
+  link; a parent that cannot be opened fails the open. A missing root is
+  created and hardened relative to the parent the open holds. Hardening
+  refuses a file with a second name and changes no existing child, and
+  neither the stray sweep nor a publication deletes or replaces anything
+  but a regular file with one name. One explicit repair takes ownership of
+  a refused journal root (Windows) only after every object it would change
+  passes those checks through its handle, holding each one so it cannot be
+  moved until it is changed, and removes staging records and guards the
+  journal does not track, except the staging of every activation the
+  service saw pending and has not seen settled. A reopen never adopts
+  another authority or an older journal.
 
 ### Fixed
 

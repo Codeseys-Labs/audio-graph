@@ -47,13 +47,16 @@ pub(crate) fn try_set_owner_only_directory_handle(
     windows_owner_only_acl::set_directory_handle_dacl(directory)
 }
 
-/// Create `path` as a directory that carries the current user's protected,
-/// inheritable owner-only DACL from the moment it exists, so no other
-/// principal can open it before it is hardened. Fails with `AlreadyExists` if
-/// something is already at `path`.
+/// Runs `create` with a security descriptor carrying the current user's
+/// protected, inheritable owner-only DACL, for the directory `create` makes,
+/// so that directory is owner-only from the moment it exists and no other
+/// principal can open it before it is hardened. The descriptor lives only
+/// for the call.
 #[cfg(windows)]
-pub(crate) fn create_owner_only_directory(path: &Path) -> std::io::Result<()> {
-    windows_owner_only_acl::create_owner_only_directory(path)
+pub(crate) fn with_owner_only_directory_descriptor<T>(
+    create: impl FnOnce(*const std::ffi::c_void) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    windows_owner_only_acl::with_owner_only_directory_descriptor(create)
 }
 
 /// Whether a trusted principal owns the open object: the current user,
@@ -400,26 +403,13 @@ mod windows_owner_only_acl {
         Ok(())
     }
 
-    pub(super) fn create_owner_only_directory(path: &Path) -> std::io::Result<()> {
-        use windows::Win32::Security::SECURITY_ATTRIBUTES;
-        use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+    pub(super) fn with_owner_only_directory_descriptor<T>(
+        create: impl FnOnce(*const std::ffi::c_void) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
         let (descriptor, _dacl) =
             build_owner_only_dacl_with_ace_flags(Path::new("new directory"), "OICI")
                 .map_err(std::io::Error::other)?;
-        let attributes = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor.0.0,
-            bInheritHandle: false.into(),
-        };
-        let path_wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        // SAFETY: `path_wide` is NUL-terminated and `attributes` points to the
-        // descriptor owned by `descriptor`; both outlive the call.
-        unsafe { CreateDirectoryW(PCWSTR(path_wide.as_ptr()), Some(&attributes)) }
-            .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
+        create(descriptor.0.0.cast_const())
     }
 
     const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
