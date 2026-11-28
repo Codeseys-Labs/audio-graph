@@ -109,6 +109,25 @@ struct NativePasswordBuffer {
     data: *mut c_void,
     length: usize,
     armed: bool,
+    /// Releases `data`: `SecKeychainItemFreeContent` outside tests.
+    free: unsafe fn(*mut c_void) -> OSStatus,
+}
+
+/// # Safety
+/// `data` must be a password buffer Keychain Services returned and that has
+/// not been freed.
+#[cfg(target_os = "macos")]
+unsafe fn free_keychain_content(data: *mut c_void) -> OSStatus {
+    // SAFETY: the caller passes a live Keychain password buffer.
+    unsafe { SecKeychainItemFreeContent(ptr::null_mut(), data) }
+}
+
+/// The one copy of an admitted native password into process memory.
+#[cfg(target_os = "macos")]
+fn copy_native(bytes: &[u8]) -> Zeroizing<Vec<u8>> {
+    #[cfg(test)]
+    tests::COPIES.with(|copies| copies.set(copies.get() + 1));
+    Zeroizing::new(bytes.to_vec())
 }
 
 #[cfg(target_os = "macos")]
@@ -118,6 +137,7 @@ impl NativePasswordBuffer {
             data,
             length: length as usize,
             armed: true,
+            free: free_keychain_content,
         }
     }
 
@@ -136,7 +156,7 @@ impl NativePasswordBuffer {
             Zeroizing::new(Vec::new())
         } else {
             let bytes = unsafe { std::slice::from_raw_parts(self.data.cast::<u8>(), self.length) };
-            Zeroizing::new(bytes.to_vec())
+            copy_native(bytes)
         };
         self.release_checked()?;
         Ok(secret)
@@ -160,7 +180,7 @@ impl NativePasswordBuffer {
                 unsafe { std::slice::from_raw_parts_mut(self.data.cast::<u8>(), self.length) };
             native_secret.zeroize();
         }
-        let status = unsafe { SecKeychainItemFreeContent(ptr::null_mut(), self.data) };
+        let status = unsafe { (self.free)(self.data) };
         self.data = ptr::null_mut();
         self.length = 0;
         NativeStatus::checked(status)
@@ -372,5 +392,69 @@ impl SecurityFrameworkCore {
             readable: status_bits & READABLE_STATUS_BIT != 0,
             writable: status_bits & WRITABLE_STATUS_BIT != 0,
         })
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{NativePasswordBuffer, NativeStatus, OSStatus};
+    use std::cell::{Cell, RefCell};
+    use std::ffi::c_void;
+
+    thread_local! {
+        pub(super) static COPIES: Cell<usize> = const { Cell::new(0) };
+        static FREED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Records the release instead of handing a test buffer to Keychain
+    /// Services, which never allocated it.
+    unsafe fn record_free(data: *mut c_void) -> OSStatus {
+        FREED.with(|freed| freed.borrow_mut().push(data as usize));
+        0
+    }
+
+    fn native_buffer(bytes: &mut [u8]) -> NativePasswordBuffer {
+        NativePasswordBuffer {
+            data: bytes.as_mut_ptr().cast(),
+            length: bytes.len(),
+            armed: true,
+            free: record_free,
+        }
+    }
+
+    #[test]
+    fn oversized_password_is_scrubbed_and_freed_without_ever_being_copied() {
+        let mut native = vec![0xa5_u8; 4];
+        let address = native.as_ptr() as usize;
+        COPIES.with(|copies| copies.set(0));
+
+        let refused = native_buffer(&mut native).copy_and_release(3);
+
+        assert!(matches!(refused, Err(status) if status == NativeStatus::DATA_TOO_LARGE));
+        assert_eq!(COPIES.with(Cell::get), 0, "the refused password was copied");
+        assert_eq!(FREED.with(RefCell::take), [address]);
+        assert!(
+            native.iter().all(|byte| *byte == 0),
+            "native buffer not scrubbed"
+        );
+    }
+
+    #[test]
+    fn password_at_the_limit_is_copied_once_then_scrubbed_and_freed() {
+        let mut native = vec![0xa5_u8; 3];
+        let address = native.as_ptr() as usize;
+        COPIES.with(|copies| copies.set(0));
+
+        let Ok(secret) = native_buffer(&mut native).copy_and_release(3) else {
+            panic!("a password at the limit is admitted");
+        };
+
+        assert_eq!(secret.as_slice(), [0xa5_u8; 3]);
+        assert_eq!(COPIES.with(Cell::get), 1);
+        assert_eq!(FREED.with(RefCell::take), [address]);
+        assert!(
+            native.iter().all(|byte| *byte == 0),
+            "native buffer not scrubbed"
+        );
     }
 }

@@ -11,7 +11,6 @@
 //! leaves this module.
 
 use crate::credentials::domain::CredentialStoreFailure;
-use std::fs::File;
 use std::io::Read;
 
 #[cfg(unix)]
@@ -21,11 +20,12 @@ pub(in crate::credentials::adapters) use windows_held::{
     HeldDirectory, StagedFile, token_profile_directory,
 };
 
-/// Reads at most `limit` bytes, so an oversized journal is classified by its
-/// decoder without first being allocated in full.
-fn read_at_most(file: File, limit: usize) -> Result<Vec<u8>, CredentialStoreFailure> {
+/// Reads at most `limit` bytes: the reader is never asked for more, so an
+/// oversized journal reaches its decoder without first being read in full.
+fn read_at_most(reader: impl Read, limit: usize) -> Result<Vec<u8>, CredentialStoreFailure> {
     let mut bytes = Vec::new();
-    file.take(u64::try_from(limit).map_err(|_| CredentialStoreFailure::Internal)?)
+    reader
+        .take(u64::try_from(limit).map_err(|_| CredentialStoreFailure::Internal)?)
         .read_to_end(&mut bytes)
         .map_err(|_| CredentialStoreFailure::Unavailable)?;
     Ok(bytes)
@@ -629,5 +629,36 @@ mod windows_held {
                 let _ = dispose(&file);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_at_most;
+
+    /// An endless source that counts every byte handed out.
+    struct CountingReader {
+        handed_out: usize,
+    }
+
+    impl std::io::Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            buffer.fill(b' ');
+            self.handed_out += buffer.len();
+            Ok(buffer.len())
+        }
+    }
+
+    /// A reader that would hand out unbounded bytes is asked for exactly the
+    /// limit, so nothing past it is ever read, let alone allocated.
+    #[test]
+    fn reading_stops_at_the_limit_instead_of_truncating_a_full_read() {
+        let limit = 256 * 1024 + 1;
+        let mut reader = CountingReader { handed_out: 0 };
+
+        let bytes = read_at_most(&mut reader, limit).expect("bounded read");
+
+        assert_eq!(bytes.len(), limit);
+        assert_eq!(reader.handed_out, limit);
     }
 }

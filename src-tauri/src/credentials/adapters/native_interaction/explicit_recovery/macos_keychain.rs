@@ -1709,12 +1709,13 @@ mod tests {
             assert!(!other_adapter_sources.contains(raw_type));
         }
         assert!(ffi.contains("Zeroize"));
-        assert!(ffi.contains("SecKeychainItemFreeContent"));
+        assert!(ffi.contains("SecKeychainItemFreeContent(ptr::null_mut(), data)"));
+        assert!(ffi.contains("free: free_keychain_content,"));
         let native_zeroize = ffi
             .find("native_secret.zeroize();")
             .expect("native buffer zeroization");
         let checked_free = ffi
-            .find("SecKeychainItemFreeContent(ptr::null_mut(), self.data)")
+            .find("(self.free)(self.data)")
             .expect("checked native buffer free");
         assert!(native_zeroize < checked_free);
         assert!(
