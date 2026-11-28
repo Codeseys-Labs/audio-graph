@@ -30,8 +30,8 @@ use super::http_diag::{SchemaRejection, diagnostic};
 use super::route::{
     AttemptedRouteIdentity, AuthorizedRoute, BlockingBackend, ConstrainedDecodingGrade,
     ModelIdentitySource, RequestOutputForm, RouteRecord, TerminalStatus, WireOutcome,
-    authorize_route_dispatch, retry_class_for_terminal_status, route_for_api_endpoint,
-    route_for_openrouter_policy,
+    authorize_route_dispatch, model_id_without_path, retry_class_for_terminal_status,
+    route_for_api_endpoint, route_for_openrouter_policy,
 };
 
 /// Models where the structured-outputs (`response_format: json_schema`) request
@@ -1231,6 +1231,11 @@ fn projection_openrouter(
 /// trusted code; `model` is the SERVED id when the response reported one, and
 /// `model_source` records which it is so no reader can mistake a config echo for
 /// served identity (ADR-0038 defect 3).
+///
+/// This is the one place a model id enters provenance, so it is where a path
+/// is cut away. A served id was already cut where it was read. The requested
+/// id is the user's own configuration, which for a local server is often the
+/// path of the model file.
 fn projection_output_from_wire(
     route: &AuthorizedRoute,
     live: &'static crate::llm::route::RouteDescriptor,
@@ -1239,10 +1244,11 @@ fn projection_output_from_wire(
     tokens_used: u32,
     wire: WireOutcome,
 ) -> ProjectionBackendOutput {
-    let (model, model_source) = match wire.served_model.clone() {
+    let (model, model_source) = match wire.served_model.as_deref() {
         Some(served) => (served, ModelIdentitySource::Served),
-        None => (requested_model, ModelIdentitySource::Requested),
+        None => (requested_model.as_str(), ModelIdentitySource::Requested),
     };
+    let model = model_id_without_path(model).to_string();
     ProjectionBackendOutput {
         raw_json,
         route_id: live.id,
@@ -2613,10 +2619,14 @@ mod tests {
     }
 
     fn handles_with_only_api_client(endpoint: &str) -> BackendHandles {
+        handles_with_api_model(endpoint, "probe-model")
+    }
+
+    fn handles_with_api_model(endpoint: &str, model: &str) -> BackendHandles {
         let client = ApiClient::new(crate::llm::ApiConfig {
             endpoint: endpoint.to_string(),
             api_key: Some("sk-route-removal-probe".to_string()),
-            model: "probe-model".to_string(),
+            model: model.to_string(),
             max_tokens: 64,
             temperature: 0.1,
         })
@@ -2900,6 +2910,90 @@ mod tests {
         assert!(!json.contains("sk-route-removal-probe"), "got: {json}");
         assert!(!json.contains("Alice met Bob"), "got: {json}");
         assert!(!json.contains("note:a"), "got: {json}");
+    }
+
+    #[test]
+    fn a_model_path_never_reaches_projection_provenance() {
+        use ModelIdentitySource::{Requested, Served};
+
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        for (served, configured, recorded, source) in [
+            // A local server reports the file it loaded.
+            (
+                Some("/home/numbat-user/models/private.gguf"),
+                "probe-model",
+                "private.gguf",
+                Served,
+            ),
+            (
+                Some("C:\\Users\\numbat-user\\models\\private.gguf"),
+                "probe-model",
+                "private.gguf",
+                Served,
+            ),
+            (
+                Some("numbat-org/probe-model-turbo"),
+                "probe-model",
+                "numbat-org/probe-model-turbo",
+                Served,
+            ),
+            // It reports nothing, so the configured id is recorded: often the
+            // same path, because that is what such a server is asked for.
+            (
+                None,
+                "/home/numbat-user/models/private.gguf",
+                "private.gguf",
+                Requested,
+            ),
+            (
+                None,
+                "C:\\Users\\numbat-user\\models\\private.gguf",
+                "private.gguf",
+                Requested,
+            ),
+            (
+                None,
+                "numbat-org/probe-model",
+                "numbat-org/probe-model",
+                Requested,
+            ),
+        ] {
+            let mut body = serde_json::json!({
+                "choices": [{
+                    "message": { "content": "{\"operations\":[{\"type\":\"upsert_note\",\
+            \"id\":\"note:a\",\"title\":\"T\",\"body\":\"B\",\"tags\":[],\
+            \"evidence\":{\"claim_class\":\"grounded_inference\",\"span_id\":\"span-1\"}}],\
+            \"confidence\":0.7}" },
+                    "finish_reason": "stop"
+                }]
+            });
+            if let Some(served) = served {
+                body["model"] = served.into();
+            }
+            let (base, _count) = rt.block_on(spawn_counting_mock(vec![body.to_string()]));
+
+            let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+            let handles = handles_with_api_model(&base, configured);
+            let provider = LlmProvider::Api {
+                endpoint: base.clone(),
+                api_key: "sk-route-removal-probe".to_string(),
+                model: configured.to_string(),
+            };
+            let patch = std::thread::spawn(move || {
+                run_projection_patch(&handles, &provider, &job, &ledger, None.into(), 1, 100)
+            })
+            .join()
+            .expect("worker thread panic")
+            .outcome
+            .expect("a valid notes draft")
+            .patch;
+
+            assert_eq!(patch.provenance.model, recorded, "{served:?} {configured}");
+            assert_eq!(patch.provenance.model_source, source);
+            // Nothing in the patch as persisted names the directory.
+            let persisted = serde_json::to_string(&patch).expect("serialize the patch");
+            assert!(!persisted.contains("numbat-user"), "{persisted}");
+        }
     }
 
     #[test]

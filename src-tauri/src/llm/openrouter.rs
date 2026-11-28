@@ -912,7 +912,7 @@ impl OpenRouterRoutingTelemetry {
         usage: StreamUsage,
     ) -> Self {
         let selected_provider = selected_provider.and_then(sanitize_metadata_value);
-        let served_model = served_model.and_then(sanitize_metadata_value);
+        let served_model = served_model.and_then(crate::llm::route::sanitize_served_model);
         let fallback_from_preferred = fallback_evidence(
             preferred_provider
                 .and_then(sanitize_metadata_value)

@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::graph::entities::ExtractionResult;
 use crate::llm::http_diag::{HttpFailure, INFERENCE, SchemaRejection, same_origin_redirects};
 use crate::llm::route::{
-    RequestOutputForm, WireOutcome, sanitize_route_metadata, terminal_status_from_finish_reason,
+    RequestOutputForm, WireOutcome, sanitize_served_model, terminal_status_from_finish_reason,
 };
 
 const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -454,13 +454,11 @@ impl ApiClient {
         // A missing `usage` block (or a provider that omits `total_tokens`)
         // reports 0 — never fabricated.
         let total_tokens = completion.usage.map(|u| u.total_tokens).unwrap_or(0);
-        // Sanitized through the same three guards the OpenRouter telemetry path
-        // uses, so a hostile upstream that echoes a key into `model` cannot
-        // smuggle it into persisted provenance.
-        let served_model = completion
-            .model
-            .as_deref()
-            .and_then(sanitize_route_metadata);
+        // Cut to its final path component, then sanitized through the same
+        // three guards the OpenRouter telemetry path uses, so neither a local
+        // server's model path nor a key a hostile upstream echoes into `model`
+        // can reach persisted provenance.
+        let served_model = completion.model.as_deref().and_then(sanitize_served_model);
 
         let choice = completion
             .choices
