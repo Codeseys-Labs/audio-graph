@@ -41,9 +41,9 @@
 //! streaming clients (`backoff_for_attempt`).
 
 use super::{
-    BuiltInCredentialSetId, asr_diagnostic, is_terminal_reconnect_error, required_api_key,
-    websocket_close, websocket_diagnostic, websocket_error, websocket_upgrade_error,
-    websocket_write_error,
+    AsrSessionStop, AsrStopReason, BuiltInCredentialSetId, asr_diagnostic,
+    is_terminal_reconnect_error, required_api_key, websocket_close, websocket_diagnostic,
+    websocket_error, websocket_upgrade_error, websocket_write_error,
 };
 use crate::error::AppError;
 use audio_graph_ipc_contract::runtime_diagnostic::{
@@ -180,7 +180,7 @@ impl Default for OpenAiRealtimeConfig {
 
 /// Steady-state cap on the audio-chunk backlog (see `pending_chunks` on
 /// [`OpenAiRealtimeClient`]). ~6.4s worth of 32ms chunks — mirrors the Deepgram
-/// / AssemblyAI clients. Overflow is **fail-fast** (flip `user_disconnected`,
+/// / AssemblyAI clients. Overflow is **fail-fast** (flip `stop_signal`,
 /// end the session) — the shared ASR overflow policy documented on
 /// `asr::deepgram::AUDIO_BUFFER_MAX_CHUNKS` (deliberately the opposite of
 /// Gemini's lossy-drop; review m2). While a reconnect is climbing the ladder
@@ -247,7 +247,7 @@ pub struct OpenAiRealtimeClient {
     /// Used by the session task to distinguish a user-initiated teardown (do
     /// not auto-reconnect) from a network error or server close (auto-reconnect
     /// with exponential backoff).
-    user_disconnected: Arc<AtomicBool>,
+    stop_signal: Arc<AsrSessionStop>,
     /// One-shot guard ensuring `Disconnected` is emitted **at most once** per
     /// teardown. `disconnect()`/`Drop` and the session task can both observe the
     /// same shutdown; routing every `Disconnected` emission through this guard
@@ -278,7 +278,7 @@ impl OpenAiRealtimeClient {
             event_tx,
             event_rx,
             connected: Arc::new(AtomicBool::new(false)),
-            user_disconnected: Arc::new(AtomicBool::new(false)),
+            stop_signal: Arc::new(AsrSessionStop::default()),
             disconnected_emitted: Arc::new(AtomicBool::new(false)),
             rt: None,
             audio_tx: None,
@@ -313,11 +313,11 @@ impl OpenAiRealtimeClient {
         let config = self.config.clone();
         let event_tx = self.event_tx.clone();
         let connected = Arc::clone(&self.connected);
-        let user_disconnected = Arc::clone(&self.user_disconnected);
+        let stop_signal = Arc::clone(&self.stop_signal);
         let disconnected_emitted = Arc::clone(&self.disconnected_emitted);
         // Reset on (re)connect so any prior teardown flag does not poison a
         // fresh session.
-        user_disconnected.store(false, Ordering::SeqCst);
+        stop_signal.reset();
         // A fresh session has not been confirmed yet — `connected` flips to
         // `true` only when the reader parses `session.updated`.
         connected.store(false, Ordering::SeqCst);
@@ -351,7 +351,7 @@ impl OpenAiRealtimeClient {
                 config,
                 event_tx,
                 connected,
-                user_disconnected,
+                stop_signal,
                 disconnected_emitted,
                 pending_chunks: Arc::clone(&pending_chunks),
                 #[cfg(test)]
@@ -383,12 +383,18 @@ impl OpenAiRealtimeClient {
     ///
     /// # Behaviour during auto-reconnect
     ///
-    /// Only `user_disconnected` is checked — not the transient `connected`
+    /// The stop signal is checked independently of the transient `connected`
     /// flag — so the caller can keep streaming audio during a reconnect cycle.
     /// Queued chunks flush as soon as the new socket is open.
     pub fn send_audio(&self, audio: &[f32]) -> Result<(), String> {
-        if self.user_disconnected.load(Ordering::SeqCst) {
-            return Err("OpenAI Realtime client has been disconnected".to_string());
+        match self.stop_signal.reason() {
+            Some(AsrStopReason::UserRequested) => {
+                return Err("OpenAI Realtime client has been disconnected".to_string());
+            }
+            Some(AsrStopReason::BacklogTimeout) => {
+                return Err(websocket_diagnostic(Code::Timeout).to_string());
+            }
+            None => {}
         }
 
         if audio.is_empty() {
@@ -419,9 +425,8 @@ impl OpenAiRealtimeClient {
             RECONNECT_AUDIO_BUFFER_MAX_CHUNKS,
         );
         if depth >= cap {
-            self.user_disconnected
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            return Err(websocket_diagnostic(Code::Internal).to_string());
+            self.stop_signal.request(AsrStopReason::BacklogTimeout);
+            return Err(websocket_diagnostic(Code::Timeout).to_string());
         }
 
         // f32 16 kHz -> 24 kHz -> i16 LE PCM -> base64.
@@ -444,8 +449,14 @@ impl OpenAiRealtimeClient {
     /// `gpt-realtime-whisper` has no server VAD, so the caller drives turns by
     /// calling this at the end of each utterance. Non-blocking.
     pub fn commit(&self) -> Result<(), String> {
-        if self.user_disconnected.load(Ordering::SeqCst) {
-            return Err("OpenAI Realtime client has been disconnected".to_string());
+        match self.stop_signal.reason() {
+            Some(AsrStopReason::UserRequested) => {
+                return Err("OpenAI Realtime client has been disconnected".to_string());
+            }
+            Some(AsrStopReason::BacklogTimeout) => {
+                return Err(websocket_diagnostic(Code::Timeout).to_string());
+            }
+            None => {}
         }
         let tx = self
             .audio_tx
@@ -482,12 +493,12 @@ impl OpenAiRealtimeClient {
     /// Disconnect from OpenAI and clean up resources.
     ///
     /// Sends a close frame, waits for background tasks to finish, and shuts
-    /// down the internal tokio runtime on Drop. Setting `user_disconnected`
+    /// down the internal tokio runtime on Drop. Setting `stop_signal`
     /// prevents the session task from attempting to auto-reconnect.
     pub fn disconnect(&self) {
-        log::info!("OpenAiRealtimeClient: disconnecting (user-initiated)");
+        log::info!("OpenAiRealtimeClient: disconnecting");
 
-        self.user_disconnected.store(true, Ordering::SeqCst);
+        self.stop_signal.request(AsrStopReason::UserRequested);
         self.connected.store(false, Ordering::SeqCst);
 
         if let Some(ref tx) = self.audio_tx {
@@ -496,7 +507,7 @@ impl OpenAiRealtimeClient {
 
         // Emit `Disconnected` through the one-shot guard so the session task —
         // which will independently observe this teardown via the `Stop` command
-        // / `user_disconnected` flag — does not emit a second one.
+        // / `stop_signal` flag — does not emit a second one.
         emit_disconnected_once(&self.event_tx, &self.disconnected_emitted);
     }
 }
@@ -505,7 +516,7 @@ impl Drop for OpenAiRealtimeClient {
     fn drop(&mut self) {
         // Mark teardown as user-initiated so the session task exits cleanly
         // instead of trying to reconnect after we shut the runtime down.
-        self.user_disconnected.store(true, Ordering::SeqCst);
+        self.stop_signal.request(AsrStopReason::UserRequested);
         self.connected.store(false, Ordering::SeqCst);
 
         if let Some(ref tx) = self.audio_tx {
@@ -673,7 +684,7 @@ struct OpenAiRealtimeSessionCtx {
     config: OpenAiRealtimeConfig,
     event_tx: crossbeam_channel::Sender<OpenAiRealtimeEvent>,
     connected: Arc<AtomicBool>,
-    user_disconnected: Arc<AtomicBool>,
+    stop_signal: Arc<AsrSessionStop>,
     /// One-shot guard shared with the client; see [`emit_disconnected_once`].
     disconnected_emitted: Arc<AtomicBool>,
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
@@ -728,7 +739,7 @@ async fn session_task_with_timing(
     let config = ctx.config;
     let event_tx = ctx.event_tx;
     let connected = ctx.connected;
-    let user_disconnected = ctx.user_disconnected;
+    let stop_signal = ctx.stop_signal;
     let disconnected_emitted = ctx.disconnected_emitted;
     let pending_chunks = ctx.pending_chunks;
     #[cfg(test)]
@@ -755,22 +766,25 @@ async fn session_task_with_timing(
         }
 
         let mut ready_at = None;
-        let disconnect = run_io(RunIoCtx {
-            writer: &mut writer,
-            reader: &mut reader,
-            audio_rx: &mut audio_rx,
-            event_tx: &event_tx,
-            connected: &connected,
-            user_disconnected: &user_disconnected,
-            pending_chunks: &pending_chunks,
-            write_guard: &write_guard,
-            ready_event: &ready_event,
-            disconnected_emitted: &disconnected_emitted,
-            pending_cmd: &mut pending_cmd,
-            keepalive_interval: Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
-            ready_at: &mut ready_at,
-            setup_timeout,
-        })
+        let disconnect = run_io(
+            RunIoCtx {
+                writer: &mut writer,
+                reader: &mut reader,
+                audio_rx: &mut audio_rx,
+                event_tx: &event_tx,
+                connected: &connected,
+                stop_signal: &stop_signal,
+                pending_chunks: &pending_chunks,
+                write_guard: &write_guard,
+                ready_event: &ready_event,
+                disconnected_emitted: &disconnected_emitted,
+                pending_cmd: &mut pending_cmd,
+                keepalive_interval: Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
+                ready_at: &mut ready_at,
+                setup_timeout,
+            },
+            &now,
+        )
         .await;
 
         // A confirmed session only earns a fresh budget after it stays up
@@ -780,6 +794,15 @@ async fn session_task_with_timing(
             reconnect_attempts = 0;
         }
 
+        let disconnect = if stop_signal.reason() == Some(AsrStopReason::BacklogTimeout)
+            && !matches!(
+                disconnect,
+                DisconnectKind::TerminalError(_) | DisconnectKind::PolicyBlocked(_)
+            ) {
+            DisconnectKind::TerminalError(websocket_diagnostic(Code::Timeout))
+        } else {
+            disconnect
+        };
         match disconnect {
             DisconnectKind::UserRequested | DisconnectKind::WriterEnded => {
                 log::info!("OpenAI Realtime session: ending ({disconnect:?})");
@@ -798,7 +821,7 @@ async fn session_task_with_timing(
                 break;
             }
             _ => {
-                if user_disconnected.load(Ordering::SeqCst) {
+                if stop_signal.reason() == Some(AsrStopReason::UserRequested) {
                     emit_disconnected_once(&event_tx, &disconnected_emitted);
                     break;
                 }
@@ -814,6 +837,14 @@ async fn session_task_with_timing(
                 }
 
                 let reconnected = loop {
+                    match stop_signal.reason() {
+                        Some(AsrStopReason::UserRequested) => break false,
+                        Some(AsrStopReason::BacklogTimeout) => {
+                            emit_error(&event_tx, websocket_diagnostic(Code::Timeout));
+                            break false;
+                        }
+                        None => {}
+                    }
                     let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
                         ReconnectStep::Retry {
                             attempt,
@@ -842,27 +873,11 @@ async fn session_task_with_timing(
                         backoff_secs: backoff,
                     });
 
-                    // Sleep for the backoff window, but bail out early on user
-                    // cancellation so shutdown doesn't wait up to 10s.
-                    let sleep = tokio::time::sleep(backoff_duration(backoff));
-                    tokio::pin!(sleep);
-                    loop {
-                        tokio::select! {
-                            _ = &mut sleep => break,
-                            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                                if user_disconnected.load(Ordering::SeqCst) {
-                                    log::info!("OpenAI Realtime session: user cancelled during backoff");
-                                    emit_disconnected_once(&event_tx, &disconnected_emitted);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-
-                    if user_disconnected.load(Ordering::SeqCst) {
-                        log::info!("OpenAI Realtime session: user cancelled before reconnect open");
-                        emit_disconnected_once(&event_tx, &disconnected_emitted);
-                        return;
+                    stop_signal
+                        .wait_for_backoff(backoff_duration(backoff))
+                        .await;
+                    if stop_signal.reason().is_some() {
+                        continue;
                     }
 
                     // Reconnect: `open_ws` re-sends `session.update` (no resume).
@@ -873,6 +888,7 @@ async fn session_task_with_timing(
                     let reconnect_result = open_ws(&config).await;
 
                     match reconnect_result {
+                        Ok(_) if stop_signal.reason().is_some() => continue,
                         Ok((new_writer, new_reader)) => {
                             writer = new_writer;
                             reader = new_reader;
@@ -920,7 +936,7 @@ struct RunIoCtx<'a> {
     event_tx: &'a crossbeam_channel::Sender<OpenAiRealtimeEvent>,
     /// Flipped to `true` when this socket's `session.updated` is parsed.
     connected: &'a Arc<AtomicBool>,
-    user_disconnected: &'a Arc<AtomicBool>,
+    stop_signal: &'a AsrSessionStop,
     pending_chunks: &'a Arc<std::sync::atomic::AtomicUsize>,
     write_guard: &'a AsrWsWriteGuard,
     /// The event to emit once the server confirms the session (`Connected` on
@@ -1017,14 +1033,14 @@ async fn write_audio_cmd(
 ///
 /// Returns the classified [`DisconnectKind`] when the socket breaks or the
 /// caller asks to stop.
-async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
+async fn run_io(ctx: RunIoCtx<'_>, now: impl Fn() -> tokio::time::Instant) -> DisconnectKind {
     let RunIoCtx {
         writer,
         reader,
         audio_rx,
         event_tx,
         connected,
-        user_disconnected,
+        stop_signal,
         pending_chunks,
         write_guard,
         ready_event,
@@ -1069,7 +1085,7 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
         tokio::select! {
             _ = &mut setup_deadline, if ready_at.is_none() => {
                 let _ = tokio::time::timeout(SOCKET_CLOSE_TIMEOUT, writer.close()).await;
-                if user_disconnected.load(Ordering::SeqCst) || audio_rx.is_closed() {
+                if stop_signal.reason().is_some() || audio_rx.is_closed() {
                     return DisconnectKind::UserRequested;
                 }
                 emit_error(event_tx, websocket_diagnostic(Code::Timeout));
@@ -1077,7 +1093,7 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
             }
 
             _ = tokio::time::sleep(Duration::from_millis(100)), if ready_at.is_none() => {
-                if user_disconnected.load(Ordering::SeqCst) || audio_rx.is_closed() {
+                if stop_signal.reason().is_some() || audio_rx.is_closed() {
                     let _ = tokio::time::timeout(SOCKET_CLOSE_TIMEOUT, writer.close()).await;
                     return DisconnectKind::UserRequested;
                 }
@@ -1155,12 +1171,16 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                     Ok(Message::Text(text)) => {
                         match handle_server_message(&text, event_tx, &mut accumulator) {
                             ServerMessage::SessionUpdated if ready_at.is_none() => {
-                                *ready_at = Some(tokio::time::Instant::now());
+                                *ready_at = Some(now());
                                 connected.store(true, Ordering::SeqCst);
                                 disconnected_emitted.store(false, Ordering::SeqCst);
                                 let _ = event_tx.send(ready_event.clone());
                             }
                             ServerMessage::TerminalError(message) => {
+                                if stop_signal.reason() == Some(AsrStopReason::UserRequested) {
+                                    log::warn!("OpenAI Realtime: terminal response during teardown {message}");
+                                    return DisconnectKind::UserRequested;
+                                }
                                 return DisconnectKind::TerminalError(message);
                             }
                             ServerMessage::SessionExpired => {
@@ -1171,7 +1191,7 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                         }
                     }
                     Ok(Message::Close(frame)) => {
-                        let locally_closed = user_disconnected.load(Ordering::SeqCst);
+                        let locally_closed = stop_signal.reason() == Some(AsrStopReason::UserRequested);
                         let diagnostic = if locally_closed {
                             websocket_diagnostic(Code::Cancelled)
                         } else {
@@ -1482,9 +1502,128 @@ mod tests {
             .store(RECONNECT_AUDIO_BUFFER_MAX_CHUNKS, Ordering::SeqCst);
         assert_eq!(
             client.send_audio(&[0.0]).unwrap_err(),
-            websocket_diagnostic(Code::Internal).to_string(),
+            websocket_diagnostic(Code::Timeout).to_string(),
         );
-        assert!(client.user_disconnected.load(Ordering::SeqCst));
+        assert!(client.stop_signal.reason() == Some(AsrStopReason::BacklogTimeout));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backlog_timeout_preserves_a_terminal_provider_frame() {
+        for (frame, expected) in [
+            (
+                ws_fixture::ServerStep::send_text(
+                    r#"{"type":"error","error":{"code":"credit_balance_exhausted","message":"private rollover note"}}"#,
+                ),
+                Code::CapacityExhausted,
+            ),
+            (ws_fixture::ServerStep::send_close(), Code::Timeout),
+        ] {
+            let (url, peer) = ws_fixture::spawn_scripted_server(vec![
+                ws_fixture::ServerStep::expect_any_text(),
+                frame,
+            ])
+            .await;
+            let config = test_config();
+            let (writer, reader) = open_ws_url(&config, &url).await.unwrap();
+            let mut client = OpenAiRealtimeClient::new(config.clone());
+            let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+            client.audio_tx = Some(audio_tx);
+            client
+                .pending_chunks
+                .store(RECONNECT_AUDIO_BUFFER_MAX_CHUNKS, Ordering::SeqCst);
+            assert_eq!(client.send_audio(&[0.1]).unwrap_err(), "runtime/timeout");
+            // Model the caller cleaning up after the failed audio send.
+            client.disconnect();
+            assert_eq!(client.commit().unwrap_err(), "runtime/timeout");
+
+            peer.await.unwrap();
+            let (event_tx, event_rx) = crossbeam_channel::unbounded();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                session_task(OpenAiRealtimeSessionCtx {
+                    writer,
+                    reader,
+                    config,
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(false)),
+                    stop_signal: Arc::clone(&client.stop_signal),
+                    disconnected_emitted: Arc::new(AtomicBool::new(false)),
+                    pending_chunks: Arc::clone(&client.pending_chunks),
+                    reconnect_opener: Some(Arc::new(|_| {
+                        panic!("backlog timeout must not reconnect")
+                    })),
+                    run_io_entries: None,
+                }),
+            )
+            .await
+            .expect("backlog timeout must end the session");
+            let events: Vec<_> = event_rx.try_iter().collect();
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [OpenAiRealtimeEvent::Disconnected, OpenAiRealtimeEvent::Error { message }]
+                        if *message == websocket_diagnostic(expected)
+                ),
+                "unexpected events: {events:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_frame_during_user_stop_logs_only_the_closed_code() {
+        use crate::test_log_capture::ThreadLogCapture;
+
+        let (url, peer) = ws_fixture::spawn_scripted_server(vec![
+            ws_fixture::ServerStep::expect_any_text(),
+            ws_fixture::ServerStep::send_text(
+                r#"{"type":"error","error":{"code":"credit_balance_exhausted","message":"private stop balance note"}}"#,
+            ),
+        ])
+        .await;
+        let config = test_config();
+        let (writer, reader) = open_ws_url(&config, &url).await.unwrap();
+        peer.await.unwrap();
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let stop_signal = Arc::new(AsrSessionStop::default());
+        stop_signal.request(AsrStopReason::UserRequested);
+        let capture = ThreadLogCapture::start();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            session_task(OpenAiRealtimeSessionCtx {
+                writer,
+                reader,
+                config,
+                audio_rx,
+                event_tx,
+                connected: Arc::new(AtomicBool::new(false)),
+                stop_signal,
+                disconnected_emitted: Arc::new(AtomicBool::new(false)),
+                pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                reconnect_opener: Some(Arc::new(|_| panic!("user stop must not reconnect"))),
+                run_io_entries: None,
+            }),
+        )
+        .await
+        .expect("terminal frame must complete teardown");
+        let records = capture.finish();
+        let terminal: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record
+                    .message
+                    .starts_with("OpenAI Realtime: terminal response during teardown")
+            })
+            .map(|record| record.message.as_str())
+            .collect();
+        assert_eq!(
+            terminal,
+            ["OpenAI Realtime: terminal response during teardown runtime/capacity_exhausted"]
+        );
+        assert!(!crate::test_log_capture::render(&records).contains("private stop balance note"));
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert_eq!(events, [OpenAiRealtimeEvent::Disconnected]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1500,7 +1639,7 @@ mod tests {
         let (writer, reader) = open_ws_url(&config, &url).await.unwrap();
         let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let task = tokio::spawn(session_task(OpenAiRealtimeSessionCtx {
             writer,
             reader,
@@ -1508,7 +1647,7 @@ mod tests {
             audio_rx,
             event_tx,
             connected: Arc::new(AtomicBool::new(false)),
-            user_disconnected: Arc::clone(&user_disconnected),
+            stop_signal: Arc::clone(&stop_signal),
             disconnected_emitted: Arc::new(AtomicBool::new(false)),
             pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             reconnect_opener: Some(Arc::new(|_| panic!("stop must not reconnect"))),
@@ -1517,7 +1656,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(5), async {
             setup_received.await.unwrap();
-            user_disconnected.store(true, Ordering::SeqCst);
+            stop_signal.request(AsrStopReason::UserRequested);
             task.await.unwrap();
             server.await.unwrap();
         })
@@ -1599,7 +1738,7 @@ mod tests {
                         audio_rx,
                         event_tx,
                         connected: Arc::new(AtomicBool::new(false)),
-                        user_disconnected: Arc::new(AtomicBool::new(false)),
+                        stop_signal: Arc::new(AsrSessionStop::default()),
                         disconnected_emitted: Arc::new(AtomicBool::new(false)),
                         pending_chunks: Arc::clone(&pending_chunks),
                         reconnect_opener: Some(opener),
@@ -1660,7 +1799,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn reconnect_expiry_reaches_ready_and_exhausts_fresh_budget_with_last_diagnostic() {
-        use super::super::diagnostic_tests::{assert_fresh_outage, fresh_outage};
+        use super::super::diagnostic_tests::{assert_fresh_outage, fresh_outage, session_clock};
         use std::sync::atomic::AtomicUsize;
 
         let (initial_url, initial) = ws_fixture::spawn_scripted_server(vec![
@@ -1704,7 +1843,7 @@ mod tests {
                     audio_rx,
                     event_tx,
                     connected: Arc::new(AtomicBool::new(false)),
-                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    stop_signal: Arc::new(AsrSessionStop::default()),
                     disconnected_emitted: Arc::new(AtomicBool::new(false)),
                     pending_chunks: Arc::new(AtomicUsize::new(0)),
                     reconnect_opener: Some(opener),
@@ -1712,7 +1851,9 @@ mod tests {
                 },
                 |_| Duration::ZERO,
                 SESSION_SETUP_TIMEOUT,
-                || tokio::time::Instant::now() + crate::reconnect::HEALTHY_SESSION_RESET_AFTER,
+                session_clock(
+                    crate::reconnect::HEALTHY_SESSION_RESET_AFTER + Duration::from_secs(1),
+                ),
             ),
         )
         .await
@@ -1821,7 +1962,7 @@ mod tests {
                     audio_rx,
                     event_tx,
                     connected: Arc::new(AtomicBool::new(false)),
-                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    stop_signal: Arc::new(AsrSessionStop::default()),
                     disconnected_emitted: Arc::new(AtomicBool::new(false)),
                     pending_chunks: Arc::new(AtomicUsize::new(0)),
                     reconnect_opener: Some(opener),
@@ -1912,7 +2053,7 @@ mod tests {
                 audio_rx,
                 event_tx,
                 connected: Arc::new(AtomicBool::new(true)),
-                user_disconnected: Arc::new(AtomicBool::new(false)),
+                stop_signal: Arc::new(AsrSessionStop::default()),
                 disconnected_emitted: Arc::new(AtomicBool::new(false)),
                 pending_chunks: Arc::new(AtomicUsize::new(0)),
                 reconnect_opener: Some(opener),
@@ -2102,7 +2243,7 @@ mod tests {
                 let (mut writer, mut reader) = socket.split();
                 let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
                 let (event_tx, event_rx) = crossbeam_channel::unbounded();
-                let user_disconnected = Arc::new(AtomicBool::new(false));
+                let stop_signal = Arc::new(AsrSessionStop::default());
                 let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(usize::from(
                     audio.is_some(),
                 )));
@@ -2113,22 +2254,25 @@ mod tests {
                 if let Some(audio) = audio {
                     audio_tx.send(AudioCmd::Chunk(audio)).unwrap();
                 }
-                let disconnect = run_io(RunIoCtx {
-                    writer: &mut writer,
-                    reader: &mut reader,
-                    audio_rx: &mut audio_rx,
-                    event_tx: &event_tx,
-                    connected: &Arc::new(AtomicBool::new(false)),
-                    user_disconnected: &user_disconnected,
-                    pending_chunks: &pending_chunks,
-                    write_guard: &write_guard,
-                    ready_event: &OpenAiRealtimeEvent::Connected,
-                    disconnected_emitted: &Arc::new(AtomicBool::new(false)),
-                    pending_cmd: &mut None,
-                    keepalive_interval,
-                    ready_at: &mut Some(tokio::time::Instant::now()),
-                    setup_timeout: SESSION_SETUP_TIMEOUT,
-                })
+                let disconnect = run_io(
+                    RunIoCtx {
+                        writer: &mut writer,
+                        reader: &mut reader,
+                        audio_rx: &mut audio_rx,
+                        event_tx: &event_tx,
+                        connected: &Arc::new(AtomicBool::new(false)),
+                        stop_signal: &stop_signal,
+                        pending_chunks: &pending_chunks,
+                        write_guard: &write_guard,
+                        ready_event: &OpenAiRealtimeEvent::Connected,
+                        disconnected_emitted: &Arc::new(AtomicBool::new(false)),
+                        pending_cmd: &mut None,
+                        keepalive_interval,
+                        ready_at: &mut Some(tokio::time::Instant::now()),
+                        setup_timeout: SESSION_SETUP_TIMEOUT,
+                    },
+                    tokio::time::Instant::now,
+                )
                 .await;
                 let diagnostic = match disconnect {
                     DisconnectKind::ServerClose(diagnostic)
@@ -3058,7 +3202,7 @@ mod tests {
         let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, _event_rx) = crossbeam_channel::bounded(16);
         let connected = Arc::new(AtomicBool::new(false));
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let disconnected_emitted = Arc::new(AtomicBool::new(false));
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let config = with_blocked_content_egress(test_config());
@@ -3073,22 +3217,25 @@ mod tests {
 
         let disconnect = tokio::time::timeout(
             Duration::from_secs(1),
-            run_io(RunIoCtx {
-                writer: &mut writer,
-                reader: &mut reader,
-                audio_rx: &mut audio_rx,
-                event_tx: &event_tx,
-                connected: &connected,
-                user_disconnected: &user_disconnected,
-                pending_chunks: &pending_chunks,
-                write_guard: &write_guard,
-                ready_event: &ready_event,
-                disconnected_emitted: &disconnected_emitted,
-                pending_cmd: &mut pending_cmd,
-                keepalive_interval: Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
-                ready_at: &mut Some(tokio::time::Instant::now()),
-                setup_timeout: SESSION_SETUP_TIMEOUT,
-            }),
+            run_io(
+                RunIoCtx {
+                    writer: &mut writer,
+                    reader: &mut reader,
+                    audio_rx: &mut audio_rx,
+                    event_tx: &event_tx,
+                    connected: &connected,
+                    stop_signal: &stop_signal,
+                    pending_chunks: &pending_chunks,
+                    write_guard: &write_guard,
+                    ready_event: &ready_event,
+                    disconnected_emitted: &disconnected_emitted,
+                    pending_cmd: &mut pending_cmd,
+                    keepalive_interval: Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
+                    ready_at: &mut Some(tokio::time::Instant::now()),
+                    setup_timeout: SESSION_SETUP_TIMEOUT,
+                },
+                tokio::time::Instant::now,
+            ),
         )
         .await
         .expect("run_io should exit after policy block");
@@ -3138,7 +3285,7 @@ mod tests {
         let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
         let connected = Arc::new(AtomicBool::new(true));
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let disconnected_emitted = Arc::new(AtomicBool::new(false));
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let run_io_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3161,7 +3308,7 @@ mod tests {
             config: test_config(),
             event_tx,
             connected: Arc::clone(&connected),
-            user_disconnected: Arc::clone(&user_disconnected),
+            stop_signal: Arc::clone(&stop_signal),
             disconnected_emitted,
             pending_chunks,
             reconnect_opener: Some(opener),
@@ -3211,7 +3358,7 @@ mod tests {
             "failed reconnect must stay in the reconnect ladder, not re-enter run_io with stale socket halves"
         );
 
-        user_disconnected.store(true, Ordering::SeqCst);
+        stop_signal.request(AsrStopReason::UserRequested);
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("session task should exit during reconnect backoff")
@@ -3247,7 +3394,7 @@ mod tests {
         let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = crossbeam_channel::bounded(32);
         let connected = Arc::new(AtomicBool::new(true));
-        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AsrSessionStop::default());
         let disconnected_emitted = Arc::new(AtomicBool::new(false));
         let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let run_io_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3336,7 +3483,7 @@ mod tests {
             config: test_config(),
             event_tx,
             connected: Arc::clone(&connected),
-            user_disconnected: Arc::clone(&user_disconnected),
+            stop_signal: Arc::clone(&stop_signal),
             disconnected_emitted,
             pending_chunks: Arc::clone(&pending_chunks),
             reconnect_opener: Some(opener),
