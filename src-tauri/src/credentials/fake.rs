@@ -11,8 +11,9 @@ use super::service::{
 use audio_graph_ipc_contract::credential_contract::{
     BUILT_IN_CREDENTIAL_SET_IDS, CredentialOperationId, CredentialSetId,
 };
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,118 @@ pub(crate) enum FakeSettingsCall {
     ClearPending,
 }
 
+/// Where a [`FaultPlan`] injects a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FaultPoint {
+    Store(FakeStoreCall),
+    Settings(FakeSettingsCall),
+}
+
+/// One failure of a [`FaultPlan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlannedFault {
+    pub(crate) point: FaultPoint,
+    /// Calls at `point` let through first, counted from when the fault
+    /// before this one fired.
+    pub(crate) skip: usize,
+    pub(crate) failure: CredentialStoreFailure,
+    /// Whether the call takes effect before it fails. Only the fake calls
+    /// that change state honour it.
+    pub(crate) after_effect: bool,
+}
+
+/// Failures injected in order across a fake store and a fake settings
+/// port that share the plan: only the first unfired fault is armed, so a
+/// fault's count starts once the one before it fired, whichever fake that
+/// was.
+pub(crate) struct FaultPlan {
+    state: Mutex<FaultPlanState>,
+}
+
+struct FaultPlanState {
+    pending: VecDeque<PlannedFault>,
+    /// The first pending fault reached its call and fails once the call
+    /// took effect.
+    armed: bool,
+    fired: Vec<PlannedFault>,
+}
+
+impl FaultPlan {
+    pub(crate) fn new(faults: impl IntoIterator<Item = PlannedFault>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(FaultPlanState {
+                pending: faults.into_iter().collect(),
+                armed: false,
+                fired: Vec::new(),
+            }),
+        })
+    }
+
+    /// The faults that fired since the last call, in order.
+    pub(crate) fn take_fired(&self) -> Vec<PlannedFault> {
+        std::mem::take(&mut self.lock().fired)
+    }
+
+    /// Drops every fault that has not fired.
+    pub(crate) fn disarm(&self) {
+        let mut state = self.lock();
+        state.pending.clear();
+        state.armed = false;
+    }
+
+    fn lock(&self) -> MutexGuard<'_, FaultPlanState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Before the call at `point` takes effect.
+    fn before(&self, point: FaultPoint) -> Result<(), CredentialStoreFailure> {
+        let mut state = self.lock();
+        let Some(head) = state.pending.front_mut() else {
+            return Ok(());
+        };
+        if head.point != point {
+            return Ok(());
+        }
+        if head.skip > 0 {
+            head.skip -= 1;
+            return Ok(());
+        }
+        if head.after_effect {
+            state.armed = true;
+            return Ok(());
+        }
+        Err(state.fire())
+    }
+
+    /// After the call at `point` took effect.
+    fn after(&self, point: FaultPoint) -> Result<(), CredentialStoreFailure> {
+        let mut state = self.lock();
+        if !state.armed || state.pending.front().is_none_or(|head| head.point != point) {
+            return Ok(());
+        }
+        state.armed = false;
+        Err(state.fire())
+    }
+}
+
+impl FaultPlanState {
+    fn fire(&mut self) -> CredentialStoreFailure {
+        let fault = self
+            .pending
+            .pop_front()
+            .expect("only the first pending fault fires");
+        self.fired.push(fault);
+        fault.failure
+    }
+}
+
+/// An in-memory store that makes the same scope and admission decisions as
+/// the native one, without its native parts: it has no staging guards and
+/// no uncertainty latch, so an unknown outcome it reports does not refuse
+/// the next call the way the native store does. Tests that depend on either
+/// run against the native store over an in-memory keyring.
 pub(crate) struct FakeCredentialStore {
     state: Mutex<FakeCredentialState>,
     entry_reads: AtomicUsize,
@@ -61,6 +174,10 @@ struct FakeCredentialState {
     calls: Vec<FakeStoreCall>,
     failures: Vec<(FakeStoreCall, usize, CredentialStoreFailure)>,
     corrupt_next_readback: bool,
+    /// A journal to put back as the persisted one right before a session
+    /// load, once this many more loads have passed.
+    restore_before_load: Option<(usize, AuthorityJournal)>,
+    plan: Option<Arc<FaultPlan>>,
 }
 
 impl FakeCredentialStore {
@@ -79,6 +196,8 @@ impl FakeCredentialStore {
                 calls: Vec::new(),
                 failures: Vec::new(),
                 corrupt_next_readback: false,
+                restore_before_load: None,
+                plan: None,
             }),
             entry_reads: AtomicUsize::new(0),
             active_writes: AtomicUsize::new(0),
@@ -169,6 +288,43 @@ impl FakeCredentialStore {
             .journal = journal;
     }
 
+    /// Puts `journal` back as the persisted journal right before the session
+    /// load that follows `loads_before` more loads, as another process's
+    /// restore between two sessions of one operation would.
+    pub(crate) fn restore_journal_before_load(
+        &self,
+        loads_before: usize,
+        journal: AuthorityJournal,
+    ) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .restore_before_load = Some((loads_before, journal));
+    }
+
+    /// Puts `record` in place as `set_id`'s active record without any
+    /// journal change, as another process writing the native record
+    /// directly would.
+    pub(crate) fn substitute_active(
+        &self,
+        set_id: &CredentialSetId,
+        record: &EncodedCredentialRecord,
+    ) {
+        let bytes = Zeroizing::new(record.as_bytes().to_vec());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state
+            .active
+            .iter_mut()
+            .find(|(candidate, _)| candidate == set_id)
+        {
+            Some((_, active)) => *active = bytes,
+            None => state.active.push((set_id.clone(), bytes)),
+        }
+    }
+
     /// Leaves a staging record for `operation_id` in `set_id` that no journal
     /// records, as a lost journal publication would.
     pub(crate) fn plant_staging(
@@ -181,6 +337,37 @@ impl FakeCredentialStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .staging
             .push((operation_id, set_id, Zeroizing::new(b"planted".to_vec())));
+    }
+
+    /// Puts `record` in `operation_id`'s staging slot for `set_id`, in
+    /// place of whatever it holds, as another process writing the native
+    /// staging record directly would.
+    pub(crate) fn substitute_staging(
+        &self,
+        operation_id: &CredentialOperationId,
+        set_id: &CredentialSetId,
+        record: &EncodedCredentialRecord,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .staging
+            .retain(|(operation, staged, _)| operation != operation_id || staged != set_id);
+        state.staging.push((
+            operation_id.clone(),
+            set_id.clone(),
+            Zeroizing::new(record.as_bytes().to_vec()),
+        ));
+    }
+
+    /// Injects the store's part of `plan`.
+    pub(crate) fn set_fault_plan(&self, plan: Arc<FaultPlan>) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .plan = Some(plan);
     }
 }
 
@@ -195,7 +382,18 @@ impl FakeCredentialState {
             }
             *remaining -= 1;
         }
+        if let Some(plan) = &self.plan {
+            plan.before(FaultPoint::Store(call))?;
+        }
         Ok(())
+    }
+
+    /// After `call` took effect.
+    fn took_effect(&self, call: FakeStoreCall) -> Result<(), CredentialStoreFailure> {
+        match &self.plan {
+            Some(plan) => plan.after(FaultPoint::Store(call)),
+            None => Ok(()),
+        }
     }
 }
 
@@ -321,6 +519,13 @@ impl Drop for FakeMutationSession<'_> {
 impl CredentialMutationSession for FakeMutationSession<'_> {
     fn load_journal(&mut self) -> Result<AuthorityJournal, CredentialStoreFailure> {
         self.state.record_call(FakeStoreCall::LoadJournal)?;
+        match self.state.restore_before_load.take() {
+            Some((0, journal)) => self.state.journal = journal,
+            Some((remaining, journal)) => {
+                self.state.restore_before_load = Some((remaining - 1, journal));
+            }
+            None => {}
+        }
         Ok(self.state.journal.clone())
     }
 
@@ -342,7 +547,7 @@ impl CredentialMutationSession for FakeMutationSession<'_> {
     fn persist_intent(&mut self, journal: &AuthorityJournal) -> Result<(), CredentialStoreFailure> {
         self.state.record_call(FakeStoreCall::PersistIntent)?;
         self.state.journal = journal.clone();
-        Ok(())
+        self.state.took_effect(FakeStoreCall::PersistIntent)
     }
 
     fn replace_active(
@@ -364,7 +569,7 @@ impl CredentialMutationSession for FakeMutationSession<'_> {
                 .active
                 .push((set_id.clone(), Zeroizing::new(record.as_bytes().to_vec())));
         }
-        Ok(())
+        self.state.took_effect(FakeStoreCall::ReplaceActive)
     }
 
     fn readback_active(
@@ -400,7 +605,7 @@ impl CredentialMutationSession for FakeMutationSession<'_> {
             set_id.clone(),
             Zeroizing::new(record.as_bytes().to_vec()),
         ));
-        Ok(())
+        self.state.took_effect(FakeStoreCall::WriteStaging)
     }
 
     fn read_staging(
@@ -428,13 +633,13 @@ impl CredentialMutationSession for FakeMutationSession<'_> {
         self.state
             .staging
             .retain(|(operation, candidate, _)| operation != operation_id || candidate != set_id);
-        Ok(())
+        self.state.took_effect(FakeStoreCall::DeleteStaging)
     }
 
     fn commit_journal(&mut self, journal: &AuthorityJournal) -> Result<(), CredentialStoreFailure> {
         self.state.record_call(FakeStoreCall::CommitJournal)?;
         self.state.journal = journal.clone();
-        Ok(())
+        self.state.took_effect(FakeStoreCall::CommitJournal)
     }
 }
 
@@ -448,6 +653,7 @@ struct FakeSettingsState {
     calls: Vec<FakeSettingsCall>,
     failures: Vec<(FakeSettingsCall, CredentialStoreFailure)>,
     after_effect_failures: Vec<(FakeSettingsCall, CredentialStoreFailure)>,
+    plan: Option<Arc<FaultPlan>>,
 }
 
 impl FakeSettingsActivationPort {
@@ -459,6 +665,7 @@ impl FakeSettingsActivationPort {
                 calls: Vec::new(),
                 failures: Vec::new(),
                 after_effect_failures: Vec::new(),
+                plan: None,
             }),
         }
     }
@@ -505,6 +712,14 @@ impl FakeSettingsActivationPort {
             .after_effect_failures
             .push((call, failure));
     }
+
+    /// Injects the settings part of `plan`.
+    pub(crate) fn set_fault_plan(&self, plan: Arc<FaultPlan>) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .plan = Some(plan);
+    }
 }
 
 impl FakeSettingsState {
@@ -517,6 +732,9 @@ impl FakeSettingsState {
         {
             return Err(self.failures.remove(0).1);
         }
+        if let Some(plan) = &self.plan {
+            plan.before(FaultPoint::Settings(call))?;
+        }
         Ok(())
     }
 
@@ -527,6 +745,9 @@ impl FakeSettingsState {
             .is_some_and(|(expected, _)| *expected == call)
         {
             return Err(self.after_effect_failures.remove(0).1);
+        }
+        if let Some(plan) = &self.plan {
+            plan.after(FaultPoint::Settings(call))?;
         }
         Ok(())
     }
@@ -614,14 +835,14 @@ impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.record_call(FakeSettingsCall::RestoreBackup)?;
         let Some((pending_operation, backup, _)) = state.pending.as_ref() else {
-            return Ok(());
+            return state.fail_after_effect(FakeSettingsCall::RestoreBackup);
         };
         if pending_operation != operation_id || *backup != expected_revision {
             return Err(CredentialStoreFailure::RevisionConflict);
         }
         state.current_revision = *backup;
         state.pending = None;
-        Ok(())
+        state.fail_after_effect(FakeSettingsCall::RestoreBackup)
     }
 
     fn clear_pending_settings(
@@ -635,7 +856,7 @@ impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.record_call(FakeSettingsCall::ClearPending)?;
         if state.current_revision == committed_revision && state.pending.is_none() {
-            return Ok(());
+            return state.fail_after_effect(FakeSettingsCall::ClearPending);
         }
         if state.current_revision != committed_revision
             || state
@@ -648,6 +869,6 @@ impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
             return Err(CredentialStoreFailure::RevisionConflict);
         }
         state.pending = None;
-        Ok(())
+        state.fail_after_effect(FakeSettingsCall::ClearPending)
     }
 }

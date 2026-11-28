@@ -78,6 +78,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   journal does not track, except the staging of every activation the
   service saw pending and has not seen settled. A reopen never adopts
   another authority or an older journal.
+- Dormant credential v2 runtime (#521): a recovery-required outcome that
+  concerns only one set no longer closes the runtime; other sets stay usable
+  and the next request for that set rereads the authority, so it sees another
+  process's recovery without a restart. Store-wide outcomes, a rolled-back
+  journal met by a request for one set included, still need explicit
+  diagnosis, and an activation's cleanup or compensation never narrows a
+  store-wide failure, from the store or the settings, or an unknown outcome
+  to its set; failures met together keep the same result in either order.
+  Every write refuses a record whose kind disagrees with the journal, as
+  reads do. An open refused by contention (another program holding the
+  journal, another process holding the lock) is a retryable
+  `operation_in_progress` and leaves the runtime as it was. A commit
+  observed from another process, including one found by a reopen through
+  diagnosis or an ownership repair, now emits a content-free signal telling
+  consumers to drop resolved uses and take a fresh snapshot; a commit of
+  this process whose outcome was unknown is reported with its receipt and
+  that signal both once the journal shows it. An activation commit refuses
+  a set whose record changed, or a staging record that is not its own,
+  before any setting changes, and a retry of an activation that already
+  took a step is left for recovery instead of aborting it.
 
 ### Fixed
 
