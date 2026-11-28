@@ -95,12 +95,7 @@ pub(crate) fn handle_write_error(
     err: &std::io::Error,
 ) {
     if events::is_storage_full(err) {
-        log::error!(
-            "Storage full while writing {:?} ({} bytes lost): {}",
-            path,
-            bytes_lost,
-            err
-        );
+        log::error!("persistence.write_failed reason=storage_full");
         // Debounce emission: first ENOSPC after a clear flips the flag and
         // emits; subsequent ENOSPC while the flag is set logs only (the UI
         // already has a banner up and we don't want to spam events).
@@ -117,14 +112,11 @@ pub(crate) fn handle_write_error(
                     },
                 );
             } else {
-                log::warn!(
-                    "Storage-full event suppressed — no AppHandle registered yet for {:?}",
-                    path
-                );
+                log::warn!("persistence.storage_full_event_suppressed reason=no_app_handle");
             }
         }
     } else {
-        log::warn!("Write to {:?} failed: {}", path, err);
+        log::warn!("persistence.write_failed kind={:?}", err.kind());
     }
 }
 

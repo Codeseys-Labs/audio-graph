@@ -2043,7 +2043,17 @@ fn entry_exists(path: &Path) -> Result<bool, ManifestLoadError> {
 }
 
 fn load_manifest_file(path: &Path) -> Result<(SessionArtifactManifestV1, File), ManifestLoadError> {
-    load_manifest_file_with_after_open(path, || {})
+    load_manifest_file_with_after_open(path, || {
+        #[cfg(test)]
+        if let Some(after_open) = AFTER_MANIFEST_OPEN.take() {
+            after_open();
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static AFTER_MANIFEST_OPEN: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
 }
 
 fn load_manifest_file_with_after_open(
