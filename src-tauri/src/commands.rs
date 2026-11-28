@@ -26678,10 +26678,17 @@ mod tests {
 
         let error = serde_json::to_value(&error).expect("serialize the IPC error");
         assert_eq!(error["code"], "runtime_diagnostic", "{error}");
-        assert_eq!(error["diagnostic"]["kind"], "runtime", "{error}");
+        // The provider's 500 is classified; its body never crosses.
+        assert_eq!(
+            error["diagnostic"]["detail"]["code"], "provider_unavailable",
+            "{error}"
+        );
         assert_eq!(frame["event"], "failed", "{frame}");
         assert_eq!(frame["data"]["full_text"], "", "{frame}");
-        assert_eq!(frame["data"]["diagnostic"]["kind"], "runtime", "{frame}");
+        assert_eq!(
+            frame["data"]["diagnostic"]["detail"]["code"], "provider_unavailable",
+            "{frame}"
+        );
         assert_eq!(chat_history_json(&state), prior);
         let history = chat_history_json(&state).to_string();
         for surface in [error.to_string(), frame.to_string(), history, logs.clone()] {
@@ -26751,9 +26758,17 @@ mod tests {
         // failed turn.
         assert_eq!(frame["event"], "failed", "{frame}");
         assert_eq!(frame["data"]["full_text"], PARTIAL_REPLY, "{frame}");
+        assert_eq!(
+            frame["data"]["diagnostic"]["detail"]["code"], "invalid_response",
+            "{frame}"
+        );
         // The accumulating command discards it: its contract is a whole reply.
         let error = serde_json::to_value(&error).expect("serialize the IPC error");
         assert_eq!(error["code"], "runtime_diagnostic", "{error}");
+        assert_eq!(
+            error["diagnostic"]["detail"]["code"], "invalid_response",
+            "{error}"
+        );
         assert!(!error.to_string().contains(PARTIAL_REPLY), "{error}");
 
         // Neither failed call recorded a turn, so the next request sends the
@@ -26826,7 +26841,11 @@ mod tests {
         let answer = answered.answer.as_ref().expect("answer persisted");
         assert_eq!(answer.status, events::CardAnswerStatus::Failed);
         assert_eq!(answer.finish_reason, None);
-        assert_eq!(answer.diagnostic, Some(llm_internal_diagnostic()));
+        let diagnostic = serde_json::to_value(&answer.diagnostic).expect("serialize");
+        assert_eq!(
+            diagnostic["detail"]["code"], "provider_unavailable",
+            "{diagnostic}"
+        );
         let record = serde_json::to_string(&answered).expect("serialize the card");
         assert!(!record.contains(CHAT_PROVIDER_CANARY), "{record}");
         assert!(!record.contains("error:"), "{record}");
