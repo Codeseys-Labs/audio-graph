@@ -6146,8 +6146,23 @@ fn finalize_card_answer(
     );
     append_assist_answer_ledger_event(&ctx.session_id, &terminal_event);
 
-    let persisted = match existing_live_assist_card(&ctx.session_id, &ctx.card_id) {
-        Some(mut card) => {
+    // A card that cannot be read is a failure; one that is gone is not.
+    let card = FileMemoryRepository::user_data()
+        .load_live_assist_cards(&ctx.session_id)
+        .map(|cards| {
+            cards
+                .into_iter()
+                .find(|card| card.proposal.id == ctx.card_id)
+        });
+    let persisted = match card {
+        Err(_) => {
+            log::warn!(
+                "Failed to read the card for card_id={}; answer not persisted",
+                ctx.card_id
+            );
+            Err(llm_internal_diagnostic())
+        }
+        Ok(Some(mut card)) => {
             card.answer = Some(answer);
             card.updated_at_ms = unix_millis();
             // The write error names the session's file path, so only a fixed
@@ -6171,7 +6186,7 @@ fn finalize_card_answer(
                 }
             }
         }
-        None => {
+        Ok(None) => {
             log::warn!(
                 "Card answer terminal frame arrived but card_id={} no longer exists; answer not persisted",
                 ctx.card_id
@@ -27155,7 +27170,7 @@ mod tests {
             let lifecycle = state.session_lifecycle.lock().await;
             let error = match command {
                 ChatCommand::Streaming => {
-                    let (channel, _frames) = recording_chat_channel();
+                    let (channel, mut frames) = recording_chat_channel();
                     let mut call = std::pin::pin!(start_streaming_chat(
                         CLEARED_QUESTION.to_string(),
                         channel,
@@ -27169,7 +27184,11 @@ mod tests {
                     }
                     clear_chat_history(manager.state()).await.expect("clear");
                     drop(lifecycle);
-                    serde_json::to_value(call.await.expect_err("a cleared request is refused"))
+                    let error = call.await.expect_err("a cleared request is refused");
+                    // The refused command dropped its channel, so no stream
+                    // task exists that could still contact the provider.
+                    assert_eq!(frames.recv().await, None);
+                    serde_json::to_value(error)
                 }
                 ChatCommand::Blocking => {
                     let mut call = std::pin::pin!(send_chat_message(
@@ -27184,12 +27203,12 @@ mod tests {
                     }
                     clear_chat_history(manager.state()).await.expect("clear");
                     drop(lifecycle);
+                    // This command awaits its own stream, so any provider
+                    // request would have finished before it returned.
                     serde_json::to_value(call.await.expect_err("a cleared request is refused"))
                 }
             }
             .expect("serialize the IPC error");
-            // Give a stray request time to reach the provider.
-            tokio::time::sleep(Duration::from_millis(200)).await;
             (error, contacted.load(Ordering::SeqCst))
         });
         let history = chat_history_json(&state);
@@ -27721,6 +27740,80 @@ mod tests {
         assert_eq!(
             existing_live_assist_card(&session_id, card_id).and_then(|card| card.answer),
             None
+        );
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_card_answer_whose_card_cannot_be_read_ends_on_a_failed_frame() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("card-answer-read-failure");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        let card_id = "unreadable-card";
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_id, &seed)
+            .expect("seed the card");
+
+        // A current-thread runtime runs the answer task only at the next
+        // await, so the card file breaks after dispatch, before finalizing.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let seen = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(complete_sse_response("an answer nobody can store")).await,
+            );
+            let (channel, mut frames) = recording_chat_channel();
+            let dispatch = answer_question_card_impl(
+                card_id.to_string(),
+                false,
+                channel,
+                app_handle,
+                &state,
+            )
+            .await
+            .expect("the dispatch call itself must not error");
+            assert!(matches!(dispatch, AnswerDispatch::Dispatched { .. }));
+            let current = crate::user_data::resolve_live_assist_current_path(&session_id)
+                .expect("resolve the card file");
+            std::fs::remove_file(&current).expect("remove the card file");
+            std::fs::create_dir(&current).expect("make the card file unreadable");
+            chat_frames_through_terminal(&mut frames).await
+        });
+
+        let frame = seen.last().expect("a terminal frame");
+        assert_eq!(frame["event"], "failed", "{frame}");
+        assert_eq!(
+            frame["data"]["diagnostic"]["detail"]["code"], "internal",
+            "{frame}"
+        );
+        assert_eq!(
+            frame["data"]["full_text"], "an answer nobody can store",
+            "{frame}"
         );
 
         state
