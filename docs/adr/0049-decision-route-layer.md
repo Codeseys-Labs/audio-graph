@@ -1,53 +1,64 @@
 ---
-status: proposed
-date: 2026-10-18
+status: accepted
+date: 2026-11-27
 deciders: [maintainer]
-consulted: [seed audio-graph-8b3e, epic audio-graph-6dfb, seeds audio-graph-ad35 / d273 / 0e61 / 60c7]
+consulted: [seed audio-graph-8b3e, epic #133 (audio-graph-6dfb), seeds audio-graph-ad35 / d273 / 0e61 / 60c7 / 4bc6 / 0ac0]
 ---
 
 # ADR-0049: Route System-One Decisions Through a Named Decision Route Table
 
-> **Provenance.** Drafted for seed `audio-graph-8b3e` (S1-T6). One element is
-> already maintainer-decided and is restated here, not reopened: **native
-> engines report the calibrated probability of the reported answer (`max(p)`;
-> noul `max(p, 1 - p)`), HTTP engines pass vendor confidence through unchanged,
-> and confidence thresholds are therefore per route, not global.** That rule is
-> already in the frozen contract's rustdoc
-> (`decision-contract/src/lib.rs:118`, `src/decision/mod.rs:378-379`,
-> `decision-engine/src/d3/mod.rs:230-233`). Everything else here is proposed and
-> needs sign-off before S1-T7 (`audio-graph-0ac0`) starts.
+> **Provenance.** Originally drafted for seed `audio-graph-8b3e` (S1-T6) on
+> 2026-10-18 and reconciled/ratified on 2026-11-27 after S1-T7
+> (`audio-graph-0ac0`, PR `#112`, commit `44fa668`), native Clef-flash
+> (`audio-graph-4bc6`), and [ADR-0050](0050-lazy-speaker-identity-relabels.md)
+> (which embeds ADR-0049 `DecisionRecord`s). One element was maintainer-decided
+> prior to drafting and remains unchanged: **native engines report the
+> calibrated probability of the reported answer (`max(p)`; noul `max(p, 1 - p)`),
+> HTTP engines pass vendor confidence through unchanged, and confidence
+> thresholds are therefore per route, not global.** That rule is encoded in the
+> frozen contract and engine rustdoc
+> (`decision-contract/src/lib.rs:159`, `src/decision/mod.rs:395-396`,
+> `decision-engine/src/clef/mod.rs:61-63`).
 
 ## Context and Problem Statement
 
-The System-1 work (epic `audio-graph-6dfb`) added typed decisions: a
+The System-1 work (epic `#133` / `audio-graph-6dfb`) added typed decisions: a
 `DecisionRequest { state, questions }` of `choice` / `noul` / `score` questions,
 answered with probabilities and a `confidence`, with no text generation
-(`src-tauri/crates/decision-contract/src/lib.rs:12-127`). Four engine families
+(`src-tauri/crates/decision-contract/src/lib.rs:12-168`). Four engine families
 now implement `DecisionEngine`:
 
-- **HTTP** (`src-tauri/src/decision/mod.rs:20-35`): TypeSafe Jev, Cloudflare
-  Workers AI (Jev, Clef-flash), Ollama, and vLLM. The module doc says
-  "Evaluation-only... No product route or UI selectability" (`:1`). Local
-  endpoints must be loopback IP literals, and Ollama `:cloud` model names are
-  rejected (`:98-124`). Cloud credentials live in the existing keychain slots
-  `typesafe_api_key` and `cloudflare_workers_ai_token` (`:38-44`).
+- **HTTP** (`src-tauri/src/decision/mod.rs:1-37`): TypeSafe Jev, Cloudflare
+  Workers AI (Jev, Clef-flash), Ollama, and vLLM. The module hosts both the
+  HTTP transport (`SystemOneHttpEngine`) and the shadow-only product decision
+  route layer (`decision::route`, `decision::shadow`); every `decision.*`
+  provider descriptor remains `ui_selectable: false`. Local endpoints must be
+  loopback IP literals, and Ollama `:cloud` model names are rejected
+  (`:100-126`). Cloud credentials live in the existing keychain slots
+  `typesafe_api_key` and `cloudflare_workers_ai_token` (`:40-46`).
 - **Native Laya** (ONNX Runtime). English is pinned to
   `receptron/laya-onnx@d42786bdff8a7550316339c5fbf8f46caa83ea1b`
   (`src-tauri/src/models/mod.rs:160-161`). Multilingual comes from a hashed
-  local export (seed `audio-graph-fb61`, `export/multilingual-manifest.json`).
-  Per-type/cardinality temperatures from `laya_config.json` are applied in the
-  engine.
+  local export (issue `#324` / seed `audio-graph-fb61`,
+  `export/multilingual-manifest.json`). Per-type/cardinality temperatures from
+  `laya_config.json` are applied in the engine.
 - **Native D3** (candle). `vllm-sr/d3-{edge,lite,nano,mini}` are pinned by HF
   revision (`models/mod.rs:195-202`). Temperature is 1.0. FP32 runs everywhere
   except BF16 for nano/mini on CUDA. BF16 moves probabilities by up to 2.1e-2
   and flipped one d3-edge near-tie with a 0.0031 margin
   (`docs/designs/d3-native-runtime-2026-10-18.md:189-192, :330-331`).
-- **Native Clef**: reserved. `EngineRegistry::create("clef-flash")` returns
-  `EngineUnavailable { feature: "decision-clef" }`
-  (`decision-engine/src/lib.rs:104-109`; seed `audio-graph-4bc6`).
+- **Native Clef** (candle): implemented behind `feature = "decision-clef"` in
+  `src-tauri/crates/decision-engine/src/clef/` (`crates/decision-engine/src/lib.rs:1-2`,
+  `clef::register` for `clef-flash`; seed `audio-graph-4bc6`). In the product
+  route table (`src-tauri/src/decision/route.rs:213-215`), `EngineKind::NativeClef`
+  remains reserved (`Err("engine_reserved")`) until product route rows and
+  model-manager pins are wired.
 
-Product code calls none of these yet. The judgments the epic targets are still
-hand-written:
+S1-T7 (`audio-graph-0ac0`, PR `#112`) wired `DECISION_ROUTES` and opt-in
+shadow-only dispatch (`decision_routes.shadow_enabled`, default `false`) for
+M1/M2 live-assist observation while keeping heuristics as the sole authoritative
+answer (`DecisionAuthority` has only `Shadow` today). The judgments the epic
+targets remain authoritatively hand-written:
 
 - `agent_proposal_kind` (`src-tauri/src/speech/mod.rs:975-999`): `ends_with('?')`,
   six English interrogative prefixes, and English keyword lists.
@@ -141,8 +152,8 @@ A decision route is a row in one `const DECISION_ROUTES` table in the app crate
 | Field | Meaning |
 | --- | --- |
 | `id` | Stable `route.decision.<name>`, stamped into provenance by trusted code. Never a registry id or settings tag. |
-| `provider_id` | A `decision.*` registry descriptor the route authorizes against under ADR-0033. This requires a new `ProviderStage::Decision` (`crates/provider-registry/src/lib.rs:82-88`). Every descriptor starts `ui_selectable: false`. |
-| `engine` | `EngineKind`: `hosted_jev`, `hosted_cloudflare`, `local_http`, `native_laya`, `native_d3`, or `native_clef`. `native_clef` is a reserved variant with no constructor until `4bc6` lands. Like ADR-0038's reserved skins, it has no dispatch path at all. |
+| `provider_id` | A `decision.*` registry descriptor in `ProviderStage::Decision` (`crates/provider-registry/src/lib.rs`). Every descriptor starts `ui_selectable: false`. Admission splits by egress class (§2, matching `src-tauri/src/decision/route.rs:207-218` and `docs/DATA_FLOW.md:925-932`): `Egress::Cloud` routes must pass ADR-0033's `ensure_provider_id_start_enabled` gate and the session privacy gate; `Egress::Local` routes are admitted for shadow observation via §2 zero-egress/loopback evidence without UI promotion. |
+| `engine` | `EngineKind`: `hosted_jev`, `hosted_cloudflare`, `local_http`, `native_laya`, `native_d3`, or `native_clef`. Although `ClefEngine` exists behind `feature = "decision-clef"` (`crates/decision-engine/src/clef/mod.rs`), `EngineKind::NativeClef` stays reserved in the product route table (`authorize_decision_route` returns `"engine_reserved"` and `DECISION_ROUTES` has no native Clef row yet) until product route wiring and pins land. |
 | `egress` | **Derived from `engine`, never configured**. `hosted_*` → `Egress::Cloud`. `local_http` and `native_*` → `Egress::Local`. A table test pins the mapping. |
 | `model_pin` | Native: HF repo, 40-hex revision, and the SHA-256 of every component file, plus `precision` (`fp32`/`bf16`). Hosted: the requested alias (`jev-latest`, `typesafe/jev`, `clef-flash`) plus the served model read from `DecisionResponse.model`, tagged `Served`/`Requested` exactly like `ModelIdentitySource` (`llm/route.rs:730-741`). `local_http`: the configured model name plus a server-reported digest when one exists. |
 | `limits` | The engine's `EngineLimits`, checked before dispatch (`lib.rs:143-170`). |
@@ -169,43 +180,78 @@ Sub-decisions:
    local, has zero egress, and is recorded with `source: heuristic`. Using it
    is not a substitution in ADR-0038's sense: nothing leaves the device that
    would not have left it anyway, and provenance names what answered.
-4. **One route per decision family, chosen in settings.** There are three
-   families: `live_assist` (§4 M1-M2), `projection` (M3-M5), and `world`
-   (M6). This mirrors ADR-0038 sub-decision 1. Every family defaults to
-   **no route**, which means the heuristic. A Cloud route is never a default.
-   The only automatic default allowed later is an installed, calibrated native
-   route.
+4. **One route per decision family, chosen in settings; distinguish authoritative
+   default from opt-in shadow auto-selection.** There are three families:
+   `live_assist` (§4 M1-M2), `projection` (M3-M5), and `world` (M6), alongside
+   sibling consumers such as [ADR-0050](0050-lazy-speaker-identity-relabels.md)
+   speaker-identity questions. This mirrors ADR-0038 sub-decision 1.
+   - **Authoritative default:** Every family defaults to **no authoritative
+     route** (the heuristic answers). `DecisionAuthority` has only `Shadow`
+     today (`src-tauri/src/decision/route.rs:353-355`);
+     `DecisionAuthority::Authoritative` remains unimplemented and fail-closed
+     until G1-G6, independent-holdout G3 verification (`#327`), and per-file
+     `ComponentPin.sha256` verification land in `#328`. Even once authoritative
+     promotion is implemented, a Cloud or `local_http` route is never an
+     automatic default — only an installed, verified, calibrated native route
+     may later become an authoritative default.
+   - **Opt-in shadow auto-selection:** `decision_routes.shadow_enabled` defaults
+     to `false`, so no decision route runs by default. When the user explicitly
+     opts into shadow evaluation with `live_assist_route_id == None`,
+     `select_shadow_route` (`src-tauri/src/decision/route.rs:182-196`) performs
+     one pre-dispatch availability check over complete model-manager caches for
+     installed local native shadow engines (`route.decision.d3_edge`, then
+     `route.decision.laya`, else `None`). This is pre-dispatch selection, never
+     a retry walker, and it never auto-selects Cloud or `local_http` routes.
 5. **Laya's script router.** It switches between English and multilingual
    checkpoints inside one engine. `route.decision.laya` pins **both**
    checkpoints and stamps the served one per decision. Calibration is looked up
    by the served checkpoint. When that checkpoint has no record, the decision
    runs in shadow (§3). The multilingual pin stays unreachable until
-   `audio-graph-4022` approves a distribution source (`fb61`).
+   `audio-graph-4022` approves a distribution source (`#324` / `fb61`).
 6. **Pin gaps close before authority.** English Laya and D3 are pinned by
-   revision only today. Per-file SHA-256 exists only in the multilingual export
-   manifest. A native route may not hold authority (§3) until every component
-   file of its pin has a recorded digest that the model manager verifies.
-7. **Authorization uses ADR-0038's seal.** `authorize_decision_route` is the
-   only constructor of `AuthorizedDecisionRoute`, mirroring the `_seal`
-   discipline at `llm/route.rs:378-392`. Every dispatch site takes one.
+   revision only today (`ComponentPin.sha256` is `None` in
+   `src-tauri/src/decision/route.rs:266-273`). Per-file SHA-256 exists only in
+   the multilingual export manifest. A native route may not hold authority (§3)
+   until every component file of its pin has a recorded digest that the model
+   manager verifies (`#328`).
+7. **Authorization uses ADR-0038's seal with egress-split admission.**
+   `authorize_decision_route` is the only constructor of
+   `AuthorizedDecisionRoute`, mirroring the `_seal` discipline at
+   `llm/route.rs:378-392`. Every dispatch site takes one. It enforces
+   `DECISION_ROUTES` membership, reserved-engine rejection (`native_clef`),
+   ADR-0033 `ensure_provider_id_start_enabled` plus session privacy checks for
+   `Egress::Cloud`, and §2 local-shadow admission for `Egress::Local`.
 
 ### 2. Egress
 
-**Cloud routes** (`hosted_jev`, `hosted_cloudflare`) are content egress from the
-first question. Before any content-bearing use, including shadow mode, a Cloud
-route must have all of the following:
+**Local-shadow vs. content-egress admission asymmetry.** Product admission
+distinguishes `Egress::Cloud` content egress from `Egress::Local` shadow
+observation (`src-tauri/src/decision/route.rs:207-218`,
+`docs/DATA_FLOW.md:925-932`):
 
-- the full Provider Addition Content-Egress Checklist
-  (`docs/designs/provider-architecture.md:28-77`):
-  - registry privacy metadata naming `TranscriptText` (M1-M2), plus `Notes` and
-    `GraphContext` for M3-M5;
-  - a no-content readiness probe;
-  - a session command gate;
-  - a low-level guard before the HTTP write;
-  - a blocked-policy fixture proving no body is sent;
-  - no payload echo;
-- ADR-0033 promotion through the single registry table;
-- a producer row in ADR-0034's versioned coverage inventory.
+- **Cloud routes** (`hosted_jev`, `hosted_cloudflare`, `Egress::Cloud`) are
+  content egress from the first question, including shadow mode. They MUST pass
+  ADR-0033's `ensure_provider_id_start_enabled(route.provider_id)` gate and the
+  session privacy gate (`privacy.allows_session_cloud_content_transfer()`) in
+  `authorize_decision_route`, and before promotion must satisfy all of the
+  following:
+  - the full Provider Addition Content-Egress Checklist
+    (`docs/designs/provider-architecture.md:28-77`):
+    - registry privacy metadata naming `TranscriptText` (M1-M2), plus `Notes` and
+      `GraphContext` for M3-M5;
+    - a no-content readiness probe;
+    - a session command gate;
+    - a low-level guard before the HTTP write;
+    - a blocked-policy fixture proving no body is sent;
+    - no payload echo;
+  - ADR-0033 promotion through the single registry table;
+  - a producer row in ADR-0034's versioned coverage inventory.
+- **Local shadow routes** (`native_*`, `local_http`, `Egress::Local`) remain
+  `ui_selectable: false` in `ProviderStage::Decision` and skip
+  `ensure_provider_id_start_enabled` specifically for shadow observation,
+  relying instead on the zero-egress / loopback evidence below and the session
+  data-movement ledger. No existing ASR, LLM, TTS, or realtime ADR-0033
+  admission rule changes.
 
 The evaluation CLI's `--allow-cloud` switch is explicitly not this gate
 (`docs/research/system-one-eval-2026-10-18.md:41`). The `world` family (M6)
@@ -217,16 +263,27 @@ the following zero-egress evidence, recorded where stated:
 
 | Evidence | Where it is recorded |
 | --- | --- |
-| Native inference links no HTTP client. `decision-engine` disables `tokenizers` default features (no `http`) and uses `ort` with `load-dynamic` (no binary download) (`crates/decision-engine/Cargo.toml:26-27`). On 2026-10-18, `cargo tree --offline -p audio-graph-decision-engine --features decision-laya,decision-d3 -e normal` listed no `reqwest`/`hyper`/`ureq`/`hf-hub`/`rustls`/`native-tls`/`curl`. | A CI check runs the same `cargo tree` assertion for every native feature combination. Its result is the route table's evidence reference. |
+| Native inference links no HTTP client. `decision-engine` disables `tokenizers` default features (no `http`) and uses `ort` with `load-dynamic` (no binary download) (`crates/decision-engine/Cargo.toml:25-26`). `cargo tree --locked -p audio-graph-decision-engine ... --target all --edges normal` lists zero `reqwest`/`hyper`/`tokio-tungstenite`/`ureq`/`curl`/`rustls`/`native-tls`/`openssl`/`hf-hub` crates across `--no-default-features`, `decision-laya`, `decision-d3`, `decision-clef`, and their union. | Enforced in `.github/workflows/ci.yml` (`lints` job: "Verify decision-engine native zero-egress dependency graph (ADR-0049)"). Its CI check is the route table's evidence reference. |
 | Model weights arrive only through the existing model manager, as a pinned, non-content download. English Laya uses a `resolve/<revision>` URL (`models/mod.rs:160-161`), and a test asserts pinned D3 revisions (`models/mod.rs:1652-1655`). | The model manager's download events, and the route's `model_pin`. |
-| `local_http` reaches loopback IP literals only, with `:cloud` names rejected (`src/decision/mod.rs:98-124`) and proxies and redirects disabled (`docs/research/system-one-eval-2026-10-18.md:41`). | Existing decision tests. A route-table test pins that `local_http` cannot be constructed with a non-loopback URL. |
+| `local_http` reaches loopback IP literals only, with `:cloud` names rejected (`src/decision/mod.rs:100-126`) and proxies and redirects disabled (`src/decision/mod.rs:203-208`). | Existing decision tests. A route-table test pins that `local_http` cannot be constructed with a non-loopback URL. |
 | Every dispatch, local or cloud, writes `ProviderCallStarted` / `Succeeded` / `Failed` rows with `DestinationBoundary::Local` or `Provider` and its data classes (`crates/ipc-contract/src/session_data_movement.rs:54-123`). | The session data-movement ledger. Each `decision.*` producer joins ADR-0034's inventory **before** it is enabled. |
 
-`local_http` keeps one residual risk that AudioGraph cannot observe: a loopback
-server can relay to the cloud (Ollama serves cloud models). So `local_http`
-descriptors use `ProviderDataBoundary::UserConfiguredEndpoint`, not `LocalOnly`
-(`crates/provider-registry/src/lib.rs:273-276`). Only `native_*` routes are
-`LocalOnly`.
+**`local_http` (`UserConfiguredEndpoint`) boundary and opt-in discipline.**
+`local_http` keeps one residual risk that AudioGraph cannot observe: a
+user-configured loopback server (such as Ollama or vLLM) can relay requests
+upstream beyond AudioGraph's visibility. Therefore:
+
+- `local_http` descriptors use `ProviderDataBoundary::UserConfiguredEndpoint`,
+  never `LocalOnly` (`crates/provider-registry/src/lib.rs:274-276`); only
+  `native_*` routes are `LocalOnly`.
+- `local_http` routes must **never be auto-selected** (matching
+  `select_shadow_route` in `src-tauri/src/decision/route.rs:182-196`, which
+  only considers cached native routes when `live_assist_route_id` is `None`).
+- Dispatching a `local_http` route requires **explicit route selection** (e.g.
+  `live_assist_route_id = Some("route.decision.ollama_loopback")` or the
+  corresponding family route setting) together with **explicit user opt-in
+  disclosure** of the user-configured endpoint boundary before any UI or
+  settings surface exposes it.
 
 ### 3. Calibration policy
 
@@ -257,10 +314,13 @@ wire, `lib.rs:59-65`) counts as below `abstain`.
 
 **Authority is derived, not configured.** A route is **authoritative** for a
 question only when a record matches the decision's actual served pin,
-precision, and schema version. Otherwise it runs in **shadow**: the decision is
-dispatched and stamped, and the heuristic answers. No setting can make an
-uncalibrated route authoritative. Each of these drops the route to shadow on
-the next decision:
+precision, and schema version, and the route passes G1-G6 plus per-file
+component digest verification (`#328`). Otherwise it runs in **shadow**: the
+decision is dispatched and stamped, and the heuristic answers. No setting can
+make an uncalibrated route authoritative. Today `DecisionAuthority` defines
+only `Shadow` (`src-tauri/src/decision/route.rs:353-355`), so authoritative
+promotion is structurally unimplemented and fail-closed until `#328`. Each of
+these drops an authoritative route to shadow on the next decision:
 
 - editing question text (which bumps the schema version);
 - a BF16/FP32 switch;
@@ -299,7 +359,10 @@ content-free `DecisionRecord`:
 - **Route:** route id, provider id, engine kind, egress.
 - **Model:** requested model, served model and its source, model pin digest,
   precision.
-- **Question:** question id and schema version.
+- **Question:** question id and parameterized `schema_version` supplied per
+  question family via `DispatchContext::schema_version` (never hardcoded to
+  live-assist, so M3-M6 and ADR-0050 speaker-identity families record and match
+  their own schema versions).
 - **Input:** a state digest (SHA-256 of the canonical state JSON, never the
   text) and the basis, as span ids plus revision numbers.
 - **Answer:** the raw answer, raw probabilities, and raw confidence.
@@ -319,6 +382,10 @@ Where the record goes:
 - M3-M5: one record per question per projection patch, with items referencing
   it by id. Per-item byte cost governs `ProjectionProvenance`
   (`projections.rs:1791-1792`).
+- Speaker identity ([ADR-0050](0050-lazy-speaker-identity-relabels.md),
+  `#451`): embedded once at batch level in `SpeakerRelabelBatch.decision_records`
+  on the existing `speaker_revisions` v2 stream, referenced by
+  `decision_record_id` from identity stamps.
 
 No new canonical stream is opened
 ([ADR-0043](0043-freeze-canonical-event-stream-registry.md)). Decisions ride
@@ -329,12 +396,15 @@ the artifact they decide about.
 Every migration passes the same gates before it gets authority. G1-G5 apply in
 shadow; G6 is the switch.
 
-- **G1:** The route exists in `DECISION_ROUTES`, is ADR-0033-gated, and has an
-  ADR-0034 producer row. For Cloud routes, the §2 checklist is complete.
+- **G1:** The route exists in `DECISION_ROUTES`, satisfies its egress-class
+  admission rule (§1-§2: ADR-0033 `ensure_provider_id_start_enabled` + session
+  privacy + full §2 checklist for Cloud routes; §2 zero-egress/loopback
+  evidence and explicit selection for `local_http` for Local routes), and has
+  an ADR-0034 producer row.
 - **G2:** A matching `CalibrationRecord` exists (§3).
-- **G3:** On the record's labeled set, at the chosen thresholds, the route beats
-  the heuristic on the migration's target metric and does not regress its
-  safety metric.
+- **G3:** On an independent holdout split disjoint from the calibration fit set
+  (`#327`), at the chosen thresholds, the route beats the heuristic on the
+  migration's target metric and does not regress its safety metric.
 - **G4:** p95 latency is recorded for CPU and for each execution provider the
   route claims, on the reference machine. A route whose CPU p95 exceeds 500 ms
   is not offered on CPU-only machines. By today's numbers, that keeps
@@ -374,8 +444,9 @@ Migrations run in order. Later ones start only when their host contract exists.
    - **Target metric:** `Fragment` recall on truncated utterances.
    - **Safety metric:** `Strong` precision, because each false `Strong` buys a
      paid answer.
-   - **Owner:** `audio-graph-0ac0`, which also decides whether `agentQueue.ts`
-     consumes the backend grade or stays byte-identical as fallback.
+   - **Owner:** `audio-graph-0ac0` (shadow dispatch and card-record stamp
+     landed in PR `#112`); authoritative activation and `agentQueue.ts`
+     consumption decision owned by `#328` (`audio-graph-05a5`).
 3. **M3 claim support** (`projection`; ADR-0037). This starts only after
    ADR-0038's fallback removal and ADR-0037's validator have shipped.
    - **Question:** `choice` `claim_support` with criteria `supports`,
@@ -516,31 +587,48 @@ Migrations run in order. Later ones start only when their host contract exists.
   - [ADR-0045](0045-schedule-projections-on-per-kind-coalescing-slots-with-derived-coverage-heads.md):
     M3-M5 decisions run inside the projection lane's attempt and inherit its
     retry shape. A crash re-derives them.
+  - [ADR-0050](0050-lazy-speaker-identity-relabels.md): embeds ADR-0049
+    `DecisionRecord`s at batch level in `speaker_revisions` v2 relabel batches,
+    relying on parameterized `schema_version` per question family.
 - **Ownership.**
-  - `audio-graph-0ac0`: implements the route table, M1, M2, and the
-    card-record stamp.
-  - `audio-graph-f284`: owns the labeled set and the fitting.
-  - `audio-graph-ad35`: owns live Jev numbers, which are pending a credential.
-  - `audio-graph-fb61` / `audio-graph-4022`: own multilingual distribution.
-  - `audio-graph-377a`, `audio-graph-26b4`, `audio-graph-7e3d`: own Metal,
-    Vulkan, and DirectML coverage.
+  - `audio-graph-0ac0` (landed PR `#112`): route table, M1/M2 shadow dispatch,
+    and card-record provenance stamp.
+  - `#328` (`audio-graph-05a5`): authoritative activation after G1-G6,
+    independent-holdout G3 (`#327`), labeled calibration (`#321`), and per-file
+    `ComponentPin.sha256` verification.
+  - `#321` (`audio-graph-f284`): owns the labeled set and calibration fitting.
+  - `#331` / `#332` / `#451`: own M3 claim support, M4 same-referent, and
+    ADR-0050 speaker-identity shadow question families.
+  - `audio-graph-ad35`: owns live Jev evaluation numbers.
+  - `#324` (`audio-graph-fb61`) / `audio-graph-4022`: own multilingual Laya
+    distribution.
+  - `#322` (`audio-graph-377a`), `#441` (`audio-graph-26b4`), `#323`
+    (`audio-graph-7e3d`): own Metal, Vulkan, and DirectML coverage.
 - **Non-goals.**
-  - Fine-tuning (`f284`). A fine-tuned checkpoint is simply a new pin with a
-    new calibration record.
+  - Fine-tuning (`#321` / `f284`). A fine-tuned checkpoint is simply a new pin
+    with a new calibration record.
   - Clef (27B) and Clef-omni, which are out per the epic.
   - Any System-1 text generation or entity minting.
   - Cloud routes for the `world` family.
   - Recalibrating vendor HTTP confidence inside the engine.
-- **Open questions.**
+- **Deferred and fail-closed items (open questions).**
+  - **Authoritative promotion:** `DecisionAuthority` has only `Shadow` today;
+    authoritative promotion remains deferred and fail-closed until G1-G6,
+    independent-holdout verification (`#327`), and per-file
+    `ComponentPin.sha256` verification land in `#328`.
+  - **Mutable local model pinning:** how `local_http` pins a mutable Ollama
+    tag (server digest availability is unverified) remains deferred and
+    fail-closed — `local_http` routes stay in `Shadow` without a verified
+    pinned digest.
+  - **Decisions without host artifacts:** where a decision lives when it has no
+    host artifact (M6 has none today) remains deferred and fail-closed — no
+    new canonical stream or unhosted sidecar is opened.
   - Whether HTTP routes should get a fitted T ≠ 1 once vendor probability
     vectors are proven complete for every question type.
-  - How `local_http` pins a mutable Ollama tag. Server digest availability is
-    unverified here.
-  - Where a decision lives when it has no host artifact. M6 has none today.
   - Whether multilingual Laya ships at all before `4022`.
-  - How D3 routes behave on macOS until `377a`: CPU-only, and therefore subject
-    to G4.
-  - Whether Vulkan-only machines get CPU native routes or none (`26b4`).
+  - How D3 routes behave on macOS until `#322` (`377a`): CPU-only, and
+    therefore subject to G4.
+  - Whether Vulkan-only machines get CPU native routes or none (`#441` / `26b4`).
 - **Reversal cost.** Low for the table: empty settings are the heuristic-only
   state, and dropping a route is additive in reverse. Higher for the
   `DecisionRecord` and calibration-record shapes once persisted (ADR-0027

@@ -219,6 +219,7 @@ async fn dispatch_outcomes_stamp_raw_calibrated_identity_usage_and_redacted_ledg
             settings: &settings,
             privacy: PrivacyMode::LocalOnly,
             models_dir: &dir,
+            schema_version: crate::decision::shadow::LIVE_ASSIST_SCHEMA_VERSION,
             basis: &basis,
             repository: &repo,
             engines: &EngineCache::default(),
@@ -300,6 +301,7 @@ async fn preflight_and_product_gate_refuse_before_engine_call() {
         settings: &settings,
         privacy: PrivacyMode::LocalOnly,
         models_dir: &dir,
+        schema_version: crate::decision::shadow::LIVE_ASSIST_SCHEMA_VERSION,
         basis: &[],
         repository: &repo,
         engines: &EngineCache::default(),
@@ -391,6 +393,7 @@ async fn normal_shadow_dispatch_admits_native_without_ui_promotion_and_never_gra
         settings: &settings,
         privacy: PrivacyMode::LocalOnly,
         models_dir: &dir,
+        schema_version: crate::decision::shadow::LIVE_ASSIST_SCHEMA_VERSION,
         basis: &[],
         repository: &repo,
         engines: &engines,
@@ -457,5 +460,188 @@ fn native_selection_uses_complete_cache_then_one_route_without_cloud_default() {
         select_shadow_route(&explicit, &dir),
         Some("route.decision.jev_typesafe")
     );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn non_live_assist_question_family_preserves_parameterized_schema_version() {
+    struct SpeakerIdentityFixture;
+    #[async_trait]
+    impl DecisionEngine for SpeakerIdentityFixture {
+        fn id(&self) -> &str {
+            "d3-edge"
+        }
+        fn egress(&self) -> Egress {
+            Egress::Local
+        }
+        fn limits(&self) -> EngineLimits {
+            NATIVE
+        }
+        async fn system_one(&self, _: &DecisionRequest) -> Result<DecisionResponse, DecisionError> {
+            Ok(DecisionResponse {
+                answers: OrderedMap::from([(
+                    "speaker_identity_same_person".into(),
+                    Answer::Choice {
+                        choice: "same".into(),
+                        probabilities: [
+                            ("same".into(), 0.94),
+                            ("different".into(), 0.04),
+                            ("unsure".into(), 0.02),
+                        ]
+                        .into(),
+                        confidence: 0.94,
+                    },
+                )]),
+                usage: Usage {
+                    input_tokens: 18,
+                    output_tokens: 0,
+                },
+                engine_id: "d3-edge".into(),
+                model: "vllm-sr/d3-edge".into(),
+            })
+        }
+    }
+
+    const SPEAKER_IDENTITY_SCHEMA_VERSION: u32 = 2;
+    let request = DecisionRequest {
+        state: DecisionState::Json(serde_json::json!({
+            "cluster_id": "speaker-c-3",
+            "candidate": "person-1"
+        })),
+        questions: OrderedMap::from([(
+            "speaker_identity_same_person".into(),
+            Question::Choice {
+                instructions: "Determine whether the cluster refers to the candidate.".into(),
+                criteria: ["same", "different", "unsure"]
+                    .into_iter()
+                    .map(|key| (key.into(), None))
+                    .collect(),
+            },
+        )]),
+    };
+
+    use std::sync::LazyLock;
+    static PIN: LazyLock<String> = LazyLock::new(|| {
+        digest_pin(
+            &route_by_id("route.decision.d3_edge")
+                .unwrap()
+                .pin(&DecisionRouteSettings::default()),
+        )
+    });
+    static FIT: LazyLock<[CalibrationRecord; 1]> = LazyLock::new(|| {
+        [CalibrationRecord {
+            id: "fit-speaker-identity-v2",
+            route_id: "route.decision.d3_edge",
+            served_model: "vllm-sr/d3-edge",
+            model_pin_digest: &PIN,
+            precision: "fp32",
+            question_id: "speaker_identity_same_person",
+            schema_version: SPEAKER_IDENTITY_SCHEMA_VERSION,
+            temperature: 1.0,
+            accept: 0.9,
+            abstain: 0.7,
+            dataset_id: "held-out-speaker-identity-v2",
+            sample_count: 210,
+            per_option_counts: &[70, 70, 70],
+            ece_before: 0.12,
+            ece_after: 0.06,
+            target_metric: 0.96,
+        }]
+    });
+    static FITTED: LazyLock<DecisionRoute> = LazyLock::new(|| {
+        let base = route_by_id("route.decision.d3_edge").unwrap();
+        DecisionRoute {
+            id: base.id,
+            provider_id: base.provider_id,
+            engine: base.engine,
+            engine_id: base.engine_id,
+            model: base.model,
+            limits: base.limits,
+            calibrations: &*FIT,
+        }
+    });
+
+    let dir = std::env::temp_dir().join(format!("decision-schema-ver-{}", uuid::Uuid::new_v4()));
+    let repo = FileMemoryRepository::with_data_root(&dir);
+    let settings = DecisionRouteSettings::default();
+    let engines = EngineCache::default();
+    engines.set_fixture(Arc::new(SpeakerIdentityFixture));
+    let context_v2 = DispatchContext {
+        session_id: "session-speaker-identity",
+        settings: &settings,
+        privacy: PrivacyMode::LocalOnly,
+        models_dir: &dir,
+        schema_version: SPEAKER_IDENTITY_SCHEMA_VERSION,
+        basis: &[],
+        repository: &repo,
+        engines: &engines,
+    };
+
+    // Normal dispatch preserves non-live-assist schema_version on both success and preflight error.
+    let ok_records = dispatch(
+        Some("route.decision.d3_edge"),
+        &request,
+        &context_v2,
+        &[("speaker_identity_same_person", "unsure")],
+    )
+    .await;
+    assert_eq!(ok_records.len(), 1);
+    assert_eq!(
+        ok_records[0].schema_version,
+        SPEAKER_IDENTITY_SCHEMA_VERSION
+    );
+    assert_ne!(
+        ok_records[0].schema_version,
+        crate::decision::shadow::LIVE_ASSIST_SCHEMA_VERSION
+    );
+
+    let err_records = dispatch(
+        Some("route.decision.unknown"),
+        &request,
+        &context_v2,
+        &[("speaker_identity_same_person", "unsure")],
+    )
+    .await;
+    assert_eq!(err_records[0].outcome, DecisionOutcome::Unavailable);
+    assert_eq!(
+        err_records[0].schema_version,
+        SPEAKER_IDENTITY_SCHEMA_VERSION
+    );
+
+    // Calibration matching honors the parameterized schema_version and drops to identity on mismatch.
+    let matched = dispatch_fixture(
+        &FITTED,
+        &SpeakerIdentityFixture,
+        &request,
+        &context_v2,
+        &[("speaker_identity_same_person", "unsure")],
+    )
+    .await;
+    assert_eq!(matched[0].schema_version, SPEAKER_IDENTITY_SCHEMA_VERSION);
+    assert_eq!(
+        matched[0].calibration.record_id.as_deref(),
+        Some("fit-speaker-identity-v2")
+    );
+    assert_eq!(matched[0].outcome, DecisionOutcome::Decided);
+
+    let context_v3 = DispatchContext {
+        schema_version: SPEAKER_IDENTITY_SCHEMA_VERSION + 1,
+        ..context_v2
+    };
+    let mismatched = dispatch_fixture(
+        &FITTED,
+        &SpeakerIdentityFixture,
+        &request,
+        &context_v3,
+        &[("speaker_identity_same_person", "unsure")],
+    )
+    .await;
+    assert_eq!(
+        mismatched[0].schema_version,
+        SPEAKER_IDENTITY_SCHEMA_VERSION + 1
+    );
+    assert_eq!(mismatched[0].calibration, CalibrationSnapshot::identity());
+    assert_eq!(mismatched[0].outcome, DecisionOutcome::Abstained);
+
     std::fs::remove_dir_all(dir).unwrap();
 }

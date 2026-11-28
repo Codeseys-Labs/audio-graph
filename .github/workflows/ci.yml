@@ -103,6 +103,36 @@ jobs:
           fi
           echo "rsac resolved: ${resolved}"
 
+      - name: Verify decision-engine native zero-egress dependency graph (ADR-0049)
+        working-directory: audio-graph/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden_re='^(reqwest|hyper|tokio-tungstenite|ureq|curl|rustls|native-tls|openssl|hf-hub)(-|$)'
+          combos=(
+            ""
+            "decision-laya"
+            "decision-d3"
+            "decision-clef"
+            "decision-laya,decision-d3,decision-clef"
+          )
+          for features in "${combos[@]}"; do
+            if [ -z "$features" ]; then
+              label="--no-default-features"
+              tree=$(cargo tree --locked -p audio-graph-decision-engine --no-default-features --target all --edges normal --format '{p}' --prefix none)
+            else
+              label="--features ${features}"
+              tree=$(cargo tree --locked -p audio-graph-decision-engine --features "$features" --target all --edges normal --format '{p}' --prefix none)
+            fi
+            hits=$(printf '%s\n' "$tree" | awk -v re="$forbidden_re" '$1 ~ re { print $1 " " $2 }' | sort -u)
+            if [ -n "$hits" ]; then
+              echo "::error::ADR-0049 native zero-egress violation for audio-graph-decision-engine (${label}):"
+              printf '%s\n' "$hits"
+              exit 1
+            fi
+            echo "decision-engine zero-egress OK: ${label}"
+          done
+
       - name: Clippy
         working-directory: audio-graph/src-tauri
         # Hard gate: the full default-feature tree (incl. local-ml) is
