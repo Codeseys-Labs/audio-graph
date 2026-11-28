@@ -690,6 +690,97 @@ fn a_projection_receipt_survives_a_failed_witness_write() {
 }
 
 #[test]
+fn projection_disk_full_leaves_the_previous_head_and_records_the_empty_attempt_once() {
+    let f = Fixture::new();
+    let mut patch = f.seeded_patch();
+    let first = f.projection.commit_after(&patch, Some(1)).unwrap();
+    let prefix = fs::read(&f.projection.path).unwrap();
+    patch.sequence = 2;
+    CUT.set(Some(Cut::Full));
+    assert_eq!(
+        f.projection.commit_after(&patch, Some(1)),
+        Err(TranscriptCommitError::FrameWriteStorageFull)
+    );
+    assert_eq!(fs::read(&f.projection.path).unwrap(), prefix);
+    for _ in 0..2 {
+        f.projection.resolve_pending().unwrap();
+        assert!(f.projection.take_recovered().is_empty());
+    }
+    let gaps = transcript_gaps(&f.projection.path).unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].after, Some(first.head));
+    assert_eq!(gaps[0].projection_lanes, [ProjectionKind::Notes]);
+    assert_eq!(
+        f.projection
+            .commit_after(&patch, Some(1))
+            .unwrap()
+            .head
+            .sequence,
+        2
+    );
+    assert!(
+        f.projection
+            .commit_after(&patch, Some(1))
+            .unwrap()
+            .already_accepted
+    );
+}
+
+#[test]
+fn pre_placement_pending_projection_keeps_its_physical_hash_on_recovery_and_exact_retry() {
+    let f = Fixture::new();
+    let mut original = f.seeded_patch();
+    original.provenance.model = "garden/fern".into();
+    original.apply_latency_ms = Some(7);
+    super::tests::kill_at_writer_checkpoint(&f.projection.path, "projection-pre-placement", || {});
+    let physical = fs::read(&f.projection.path).unwrap();
+    let raw = std::str::from_utf8(&physical).unwrap();
+    assert!(raw.contains("garden/fern"));
+    assert!(!raw.contains("model_placement"));
+    assert!(f.projection.path.with_added_extension("attempt").exists());
+    f.projection.resolve_pending().unwrap();
+    let recovered = f.projection.take_recovered();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].event.provenance.model, "fern");
+    assert!(transcript_gaps(&f.projection.path).unwrap().is_empty());
+    // Both an original caller and a later caller holding a decoded row can
+    // recover the old receipt, even when the caller has no generated timing.
+    original.apply_latency_ms = None;
+    for request in [&original, &recovered[0].event] {
+        let (retry, _) = f
+            .projection
+            .accepted_patch(request, &[], Some(0))
+            .unwrap()
+            .unwrap();
+        assert!(retry.already_accepted);
+        assert_eq!(retry.head.sequence, 1);
+        assert_eq!(retry.head.record_hash, recovered[0].record_hash);
+    }
+    assert!(
+        f.projection
+            .commit_after(&recovered[0].event, Some(1))
+            .unwrap()
+            .already_accepted
+    );
+    let other_cause = [format!("projection-gap-{}", Uuid::new_v4())];
+    assert!(matches!(
+        f.projection
+            .accepted_patch(&original, &other_cause, Some(0)),
+        Err(TranscriptCommitError::Frame(
+            CanonicalAppendRejection::EventIdConflict
+        ))
+    ));
+    original.provenance.model = "birch".into();
+    assert!(matches!(
+        f.projection.accepted_patch(&original, &[], None),
+        Err(TranscriptCommitError::Frame(
+            CanonicalAppendRejection::EventIdConflict
+        ))
+    ));
+    assert_eq!(fs::read(&f.projection.path).unwrap(), physical);
+}
+
+#[test]
 fn verified_projection_member_with_a_lost_transcript_basis_is_quarantined() {
     let fixture = Fixture::new();
     let patch = fixture.seeded_patch();
@@ -723,6 +814,11 @@ pub(super) fn interrupt_patch(path: &Path, checkpoint: &str) -> ! {
     let mut patch = projection_patch(1, "note");
     patch.basis = ProjectionBasis::from_transcript_events(&[transcript_event("branch", "wood")]);
     CUT.set(Some(match checkpoint {
+        "pre-placement" => {
+            patch.provenance.model = "garden/fern".into();
+            patch.apply_latency_ms = Some(7);
+            Cut::KillComplete
+        }
         "complete" => Cut::KillComplete,
         "torn" => Cut::KillPartial,
         _ => panic!("unknown projection checkpoint"),
