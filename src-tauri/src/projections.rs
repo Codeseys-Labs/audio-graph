@@ -6136,7 +6136,7 @@ mod tests {
             confidence: 0.86,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
@@ -6345,7 +6345,7 @@ mod tests {
             confidence: 0.86,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
@@ -7228,7 +7228,7 @@ mod tests {
             confidence: 0.86,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
@@ -7274,7 +7274,7 @@ mod tests {
             confidence: 0.81,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
@@ -11759,7 +11759,7 @@ mod tests {
                 confidence: 0.9,
                 provenance: ProjectionProvenance {
                     provider: "openrouter".to_string(),
-                    model: "anthropic/claude-sonnet-4".to_string(),
+                    model: "claude-sonnet-4".to_string(),
                     prompt_id: "graph-v1".to_string(),
                     route_id: None,
                     model_source: crate::llm::route::ModelIdentitySource::Requested,
@@ -11881,7 +11881,7 @@ mod tests {
             confidence: 0.9,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
@@ -11937,7 +11937,7 @@ mod tests {
             confidence: 0.9,
             provenance: ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "graph-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,

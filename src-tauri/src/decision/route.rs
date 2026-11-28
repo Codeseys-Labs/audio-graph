@@ -1,7 +1,8 @@
 //! Named, sealed, single-attempt decision dispatch (ADR-0049). No route walker.
 use super::{CloudflareModel, EndpointKind, SystemOneHttpEngine};
 use crate::llm::route::{
-    ModelIdentitySource, owned_model_id_for_place, sanitize_model_id, sanitize_route_metadata,
+    LOCAL_MODEL_PLACEHOLDER, ModelIdentitySource, owned_model_id_for_place, sanitize_model_id,
+    sanitize_route_metadata,
 };
 use crate::persistence::{self, LocalMemoryRepository};
 use crate::settings::{DecisionRouteSettings, PrivacyMode};
@@ -280,17 +281,25 @@ impl DecisionRoute {
     /// keyed on the pin as configured. A record shows a local model by a
     /// display name (see `ipc_contract::model_id`), never by the path a user
     /// configured for a local server.
+    ///
+    /// Egress answers where a decision model ran: a hosted engine dials a
+    /// fixed public host, and a local HTTP engine only a loopback IP literal
+    /// (`EndpointKind::url`).
     fn stored_pin(&self, mut pin: ModelPin, settings: &DecisionRouteSettings) -> ModelPin {
         if self.engine.egress() == Egress::Cloud {
             return pin;
         }
         pin.requested = if self.engine == EngineKind::LocalHttp {
             // From the setting itself: the filter in `pin` has already dropped
-            // the separators of a Windows path.
+            // the separators of a Windows path. A setting that leaves no name
+            // to keep is stored as the placeholder a stored record reads as.
             settings
                 .local_http_model
                 .as_deref()
-                .and_then(|model| sanitize_model_id(model, false))
+                .map(|model| {
+                    sanitize_model_id(model, false)
+                        .unwrap_or_else(|| LOCAL_MODEL_PLACEHOLDER.to_string())
+                })
                 .unwrap_or_default()
         } else {
             owned_model_id_for_place(pin.requested, false)

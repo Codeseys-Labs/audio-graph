@@ -636,20 +636,23 @@ mod tests {
 
     #[test]
     fn a_stored_model_id_is_read_by_where_its_model_ran_and_the_file_is_left_alone() {
-        use crate::llm::route::model_id_fixtures::{PATH_CANARY, STORED};
+        use crate::llm::route::model_id_fixtures::{PATH_CANARY, SECRET_CANARY, STORED};
 
-        // (provider, route, whether a record from it says the model ran
-        // remotely)
+        // (provider, route, whether a record from it says the model ran off
+        // the user's network)
         for (provider, route_id, remote) in [
             ("llm.api", Some("route.openai_compatible"), false),
             ("llm.local_llama", Some("route.local_llama"), false),
             // A record written before ADR-0038 named the provider this way.
             ("local_llama", None, false),
-            ("llm.openrouter", Some("route.openrouter"), true),
-            ("openrouter", None, true),
+            // A custom base URL can put OpenRouter on the user's machine.
+            ("llm.openrouter", Some("route.openrouter"), false),
+            ("openrouter", None, false),
+            ("llm.cerebras", Some("route.cerebras_direct"), true),
+            ("llm.aws_bedrock", None, true),
         ] {
-            for (stored, local) in STORED {
-                let expected = if remote { stored } else { local };
+            for (stored, local, hosted) in STORED {
+                let expected = if remote { hosted } else { local };
                 let root = unique_tempdir("stored-model-id");
                 let path = root.join("projection.jsonl");
                 let session_id = "session-stored-model-id";
@@ -675,6 +678,7 @@ mod tests {
                 .expect("replay the patch");
                 assert_eq!(replayed.notes.notes[0].provenance.model, expected);
                 let rewritten = serde_json::to_string(patch).expect("serialize the read patch");
+                assert!(!rewritten.contains(SECRET_CANARY), "{rewritten}");
                 if !remote {
                     assert!(!rewritten.contains(PATH_CANARY), "{rewritten}");
                 }

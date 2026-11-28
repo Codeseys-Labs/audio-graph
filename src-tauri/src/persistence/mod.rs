@@ -6700,7 +6700,7 @@ mod autosave_shutdown_tests {
         .data_classes([DataClass::TranscriptText, DataClass::Prompts])
         .model(MovementModel {
             provider_id: Some("llm.openrouter".to_string()),
-            model_id: Some("anthropic/claude-sonnet-4".to_string()),
+            model_id: Some("claude-sonnet-4".to_string()),
         })
         .counts(MovementCounts {
             audio_ms: None,
@@ -6837,7 +6837,7 @@ mod autosave_shutdown_tests {
         );
         assert_eq!(
             event.model.as_ref().and_then(|m| m.model_id.as_deref()),
-            Some("anthropic/claude-sonnet-4")
+            Some("claude-sonnet-4")
         );
         // Counts recorded.
         let counts = event.counts.as_ref().expect("counts recorded");

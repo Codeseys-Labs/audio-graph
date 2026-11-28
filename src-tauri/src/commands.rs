@@ -14787,7 +14787,7 @@ mod tests {
             confidence: 0.9,
             provenance: crate::projections::ProjectionProvenance {
                 provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4".to_string(),
+                model: "claude-sonnet-4".to_string(),
                 prompt_id: "notes-v1".to_string(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
@@ -16616,7 +16616,7 @@ mod tests {
         .data_classes([DataClass::Prompts, DataClass::TranscriptText])
         .model(MovementModel {
             provider_id: Some("llm.openrouter".to_string()),
-            model_id: Some("openai/gpt-4o-mini".to_string()),
+            model_id: Some("gpt-4o-mini".to_string()),
         })
         .build();
 
@@ -16636,8 +16636,8 @@ mod tests {
     }
 
     #[test]
-    fn load_session_data_movement_cmd_reads_a_model_id_by_where_its_data_went() {
-        use crate::llm::route::model_id_fixtures::{PATH_CANARY, STORED};
+    fn load_session_data_movement_cmd_reads_a_model_id_by_where_its_model_ran() {
+        use crate::llm::route::model_id_fixtures::{PATH_CANARY, SECRET_CANARY, STORED};
         use crate::persistence::{
             DataClass, DataMovementActor, DataMovementDestination, DataMovementEventType,
             DataMovementLedgerBuilder, DestinationBoundary, MovementModel, MovementPolicy,
@@ -16651,36 +16651,45 @@ mod tests {
         let _guard = HomeGuard::set(&dir);
 
         let session_id = "session-with-model-ids";
-        // Every id once as a local movement and once as one that left the
-        // device for a provider.
-        let rows: Vec<_> = [DestinationBoundary::Local, DestinationBoundary::Provider]
+        // (boundary, provider, whether the row says its model ran off the
+        // user's network). A generic OpenAI-compatible server can sit on the
+        // user's LAN, which egress still calls a provider.
+        let places = [
+            (DestinationBoundary::Local, "llm.api", false),
+            (DestinationBoundary::Provider, "llm.api", false),
+            (DestinationBoundary::Provider, "llm.openrouter", false),
+            (DestinationBoundary::Provider, "llm.cerebras", true),
+        ];
+        let rows: Vec<_> = places
             .into_iter()
-            .flat_map(|boundary| STORED.into_iter().map(move |ids| (boundary, ids)))
+            .flat_map(|place| STORED.into_iter().map(move |ids| (place, ids)))
             .zip(1_000..)
-            .map(|((boundary, (model_id, _)), created_at_ms)| {
-                DataMovementLedgerBuilder::new(
-                    session_id,
-                    DataMovementActor::System,
-                    DataMovementEventType::ProviderCallSucceeded,
-                    MovementPolicy {
-                        privacy_mode: PrivacyMode::ByokCloud,
-                        user_visible: true,
-                        retention_class: RetentionClass::Transient,
-                    },
-                    DataMovementDestination {
-                        boundary,
-                        provider_id: Some("llm.api".to_string()),
-                        endpoint_class: Some("chat_completions".to_string()),
-                    },
-                )
-                .created_at_ms(created_at_ms)
-                .data_classes([DataClass::Prompts])
-                .model(MovementModel {
-                    provider_id: Some("llm.api".to_string()),
-                    model_id: Some(model_id.to_string()),
-                })
-                .build()
-            })
+            .map(
+                |(((boundary, provider, _), (model_id, _, _)), created_at_ms)| {
+                    DataMovementLedgerBuilder::new(
+                        session_id,
+                        DataMovementActor::System,
+                        DataMovementEventType::ProviderCallSucceeded,
+                        MovementPolicy {
+                            privacy_mode: PrivacyMode::ByokCloud,
+                            user_visible: true,
+                            retention_class: RetentionClass::Transient,
+                        },
+                        DataMovementDestination {
+                            boundary,
+                            provider_id: Some(provider.to_string()),
+                            endpoint_class: Some("chat_completions".to_string()),
+                        },
+                    )
+                    .created_at_ms(created_at_ms)
+                    .data_classes([DataClass::Prompts])
+                    .model(MovementModel {
+                        provider_id: Some(provider.to_string()),
+                        model_id: Some(model_id.to_string()),
+                    })
+                    .build()
+                },
+            )
             .collect();
         seed_data_movement_ledger(session_id, &rows);
         let ledger_path =
@@ -16698,17 +16707,23 @@ mod tests {
                     .and_then(|model| model.model_id.as_deref())
             })
             .collect();
-        let expected: Vec<_> = STORED
+        let expected: Vec<_> = places
             .iter()
-            .map(|(_, local)| Some(*local))
-            .chain(STORED.iter().map(|(hosted, _)| Some(*hosted)))
+            .flat_map(|(_, _, remote)| {
+                STORED
+                    .iter()
+                    .map(move |(_, local, hosted)| Some(if *remote { *hosted } else { *local }))
+            })
             .collect();
         assert_eq!(model_ids, expected);
-        // The serialized form is what the frontend receives: no local row
-        // names a directory.
-        for event in &loaded[..STORED.len()] {
+        // The serialized form is what the frontend receives: no row a model
+        // could have run nearby names a directory, and none keeps a secret.
+        for (index, event) in loaded.iter().enumerate() {
             let reply = serde_json::to_string(event).expect("serialize a loaded row");
-            assert!(!reply.contains(PATH_CANARY), "{reply}");
+            assert!(!reply.contains(SECRET_CANARY), "{reply}");
+            if !places[index / STORED.len()].2 {
+                assert!(!reply.contains(PATH_CANARY), "{reply}");
+            }
         }
         // The stored rows were read, not rewritten.
         assert_eq!(
@@ -17916,7 +17931,7 @@ mod tests {
 
     #[test]
     fn export_session_bundle_carries_each_model_id_by_where_its_model_ran() {
-        use crate::llm::route::model_id_fixtures::{PATH_CANARY, STORED};
+        use crate::llm::route::model_id_fixtures::{PATH_CANARY, SECRET_CANARY, STORED};
 
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
@@ -17925,14 +17940,17 @@ mod tests {
         let _guard = HomeGuard::set(&dir);
         let repository = FileMemoryRepository::user_data();
 
-        // (provider, route, whether its records say the model ran remotely)
+        // (provider, route, whether its records say the model ran off the
+        // user's network). OpenRouter can be given a base URL on the user's
+        // machine, and its records do not keep it.
         let places = [
             ("llm.api", "route.openai_compatible", false),
-            ("llm.openrouter", "route.openrouter", true),
+            ("llm.openrouter", "route.openrouter", false),
+            ("llm.cerebras", "route.cerebras_direct", true),
         ];
-        for (index, (stored, local)) in STORED.into_iter().enumerate() {
-            for (provider, route_id, remote) in places {
-                let session_id = format!("export-model-id-{index}-{remote}");
+        for (index, (stored, local, hosted)) in STORED.into_iter().enumerate() {
+            for (place, (provider, route_id, remote)) in places.into_iter().enumerate() {
+                let session_id = format!("export-model-id-{index}-{place}");
                 let session_id = session_id.as_str();
                 let stamp = |provenance: &mut crate::projections::ProjectionProvenance| {
                     provenance.provider = provider.to_string();
@@ -17967,14 +17985,22 @@ mod tests {
                     .save_materialized_graph(session_id, &graph)
                     .expect("save materialized graph artifact");
 
-                let events_path = crate::user_data::resolve_projection_events_path(session_id)
-                    .expect("projection events path");
-                let stored_events =
-                    std::fs::read(&events_path).expect("read the projection events");
+                let stored_paths = [
+                    crate::user_data::resolve_projection_events_path(session_id)
+                        .expect("projection events path"),
+                    crate::user_data::resolve_notes_path(session_id)
+                        .expect("materialized notes path"),
+                    crate::user_data::resolve_materialized_graph_path(session_id)
+                        .expect("materialized graph path"),
+                ];
+                let stored_bytes: Vec<_> = stored_paths
+                    .iter()
+                    .map(|path| std::fs::read(path).expect("read a stored artifact"))
+                    .collect();
 
                 let bundle = session_export_bundle(session_id).expect("export bundle");
 
-                let expected = if remote { stored } else { local };
+                let expected = if remote { hosted } else { local };
                 assert_eq!(bundle.projection_events.len(), 2);
                 for patch in &bundle.projection_events {
                     assert_eq!(patch.provenance.model, expected, "{stored} {remote}");
@@ -17983,16 +18009,17 @@ mod tests {
                 assert_eq!(notes.notes[0].provenance.model, expected);
                 let graph = bundle.materialized_graph.as_ref().expect("exported graph");
                 assert_eq!(graph.nodes[0].provenance.model, expected);
+                let json = serde_json::to_string(&bundle).expect("bundle serializes");
+                assert!(!json.contains(SECRET_CANARY), "{json}");
                 if !remote {
-                    let json = serde_json::to_string(&bundle).expect("bundle serializes");
                     assert!(!json.contains(PATH_CANARY), "{json}");
                 }
 
-                // The stored patches were read, not rewritten.
-                assert_eq!(
-                    std::fs::read(&events_path).expect("re-read the projection events"),
-                    stored_events
-                );
+                // The stored patches and materialized artifacts were read,
+                // not rewritten.
+                for (path, bytes) in stored_paths.iter().zip(&stored_bytes) {
+                    assert_eq!(&std::fs::read(path).expect("re-read an artifact"), bytes);
+                }
             }
         }
 

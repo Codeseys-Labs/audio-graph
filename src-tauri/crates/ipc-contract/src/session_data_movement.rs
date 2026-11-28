@@ -384,11 +384,11 @@ pub struct DataMovementEvent {
 
 /// A [`DataMovementEvent`] as a ledger row holds it.
 ///
-/// A row's model id is read by where the row says its data went (see
+/// A row's model id is read by where the row says its model ran (see
 /// [`crate::model_id`]): a hosted identifier is kept when the data left the
-/// device for a provider, and a local model shows a display name. Rows written
-/// before that rule can hold a local model's path. The stored row is left as
-/// it is.
+/// device for a provider that only dials fixed public hosts, and any other
+/// model shows a display name. Rows written before that rule can hold a local
+/// model's path. The stored row is left as it is.
 #[derive(Deserialize)]
 struct StoredDataMovementEvent {
     event_id: String,
@@ -416,7 +416,17 @@ struct StoredDataMovementEvent {
 
 impl From<StoredDataMovementEvent> for DataMovementEvent {
     fn from(stored: StoredDataMovementEvent) -> Self {
-        let ran_remotely = stored.destination.boundary == DestinationBoundary::Provider;
+        // A provider boundary is the egress classification, which calls a
+        // server on the user's LAN remote. Only a provider whose every
+        // endpoint is a fixed public host says the model ran off the user's
+        // network; any other row is read by the local rule.
+        let provider_id = stored
+            .destination
+            .provider_id
+            .as_deref()
+            .or_else(|| stored.model.as_ref()?.provider_id.as_deref());
+        let ran_remotely = stored.destination.boundary == DestinationBoundary::Provider
+            && provider_id.is_some_and(crate::model_id::provider_dials_only_public_hosts);
         Self {
             event_id: stored.event_id,
             schema_version: stored.schema_version,
@@ -694,7 +704,7 @@ mod tests {
                 source_id: Some("transcript_events".to_string()),
                 source_label: Some("Transcript revision log".to_string()),
             }),
-            destination: DataMovementDestination::provider("llm.openrouter", "chat_completions"),
+            destination: DataMovementDestination::provider("llm.cerebras", "chat_completions"),
             artifact_refs: vec![ArtifactRef {
                 kind: "materialized_notes".to_string(),
                 storage: ArtifactStorageKind::File,
@@ -705,8 +715,8 @@ mod tests {
                 projection_sequence: Some(4),
             }),
             model: Some(MovementModel {
-                provider_id: Some("llm.openrouter".to_string()),
-                model_id: Some("anthropic/claude-sonnet-4".to_string()),
+                provider_id: Some("llm.cerebras".to_string()),
+                model_id: Some("cerebras/llama-3.3-70b".to_string()),
             }),
             counts: Some(MovementCounts {
                 audio_ms: None,
@@ -731,7 +741,7 @@ mod tests {
         assert_eq!(value["actor"], "system");
         assert_eq!(value["event_type"], "provider_call_succeeded");
         assert_eq!(value["destination"]["boundary"], "provider");
-        assert_eq!(value["destination"]["provider_id"], "llm.openrouter");
+        assert_eq!(value["destination"]["provider_id"], "llm.cerebras");
         assert_eq!(value["policy"]["privacy_mode"], "byok_cloud");
         assert_eq!(value["result"]["status"], "succeeded");
         assert_eq!(value["data_classes"][0], "transcript_text");
@@ -741,10 +751,12 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_model_id_is_read_by_where_the_row_says_its_data_went() {
-        let stored_row = |boundary: &str, model_id: serde_json::Value| {
+    fn a_stored_model_id_is_read_by_where_the_row_says_its_model_ran() {
+        let stored_row = |boundary: &str, provider: &str, model_id: serde_json::Value| {
             let mut row = serde_json::to_value(sample_event()).expect("serialize");
             row["destination"]["boundary"] = boundary.into();
+            row["destination"]["provider_id"] = provider.into();
+            row["model"]["provider_id"] = provider.into();
             row["model"]["model_id"] = model_id;
             row
         };
@@ -775,22 +787,35 @@ mod tests {
             ("org/model@rev1", "model@rev1"),
             ("llama3.2:latest", "llama3.2:latest"),
         ] {
-            // Data that left the device for a provider: the hosted identifier.
+            // Data that left the device for a provider that only dials
+            // public hosts: the hosted identifier.
             assert_eq!(
-                read(stored_row("provider", stored.into())).as_deref(),
+                read(stored_row("provider", "llm.cerebras", stored.into())).as_deref(),
                 Some(stored)
             );
+            // A provider that takes a user-chosen base URL could have run the
+            // model on the user's network, and the row does not say.
+            for provider in ["llm.openrouter", "llm.api", "asr.wombat"] {
+                assert_eq!(
+                    read(stored_row("provider", provider, stored.into())).as_deref(),
+                    Some(local),
+                    "{stored} at {provider}"
+                );
+            }
             // Every other boundary reads as a local model.
             for boundary in ["local", "org", "export"] {
                 assert_eq!(
-                    read(stored_row(boundary, stored.into())).as_deref(),
+                    read(stored_row(boundary, "llm.cerebras", stored.into())).as_deref(),
                     Some(local),
                     "{stored} at {boundary}"
                 );
             }
         }
         // A row with a null model id still reads as none.
-        assert_eq!(read(stored_row("local", serde_json::Value::Null)), None);
+        assert_eq!(
+            read(stored_row("local", "llm.cerebras", serde_json::Value::Null)),
+            None
+        );
     }
 
     #[test]

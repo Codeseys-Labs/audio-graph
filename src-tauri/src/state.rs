@@ -1557,7 +1557,7 @@ mod rotation_tests {
             confidence: 0.91,
             provenance: crate::projections::ProjectionProvenance {
                 provider: "openrouter".into(),
-                model: "anthropic/claude-sonnet-4".into(),
+                model: "claude-sonnet-4".into(),
                 prompt_id: "notes-v1".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,
@@ -1587,7 +1587,7 @@ mod rotation_tests {
             confidence: 0.87,
             provenance: crate::projections::ProjectionProvenance {
                 provider: "openrouter".into(),
-                model: "anthropic/claude-sonnet-4".into(),
+                model: "claude-sonnet-4".into(),
                 prompt_id: "graph-v1".into(),
                 route_id: None,
                 model_source: crate::llm::route::ModelIdentitySource::Requested,

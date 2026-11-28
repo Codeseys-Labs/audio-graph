@@ -1788,10 +1788,21 @@ impl OpenRouterClient {
             .map(Usage::into_stream_usage)
             .unwrap_or_default();
 
+        // A custom base URL can put the "OpenRouter" endpoint on the user's
+        // own machine, where the served id is the path of a model file. The
+        // id is placed by the endpoint dialled, before the telemetry filter,
+        // which would otherwise drop a Windows path's separators and keep its
+        // directory names.
+        let ran_remotely =
+            !crate::llm::route::endpoint_may_be_on_users_network(&self.config.base_url);
+        let served_model = completion
+            .model
+            .as_deref()
+            .and_then(|served| crate::llm::route::sanitize_model_id(served, ran_remotely));
         let telemetry = OpenRouterRoutingTelemetry::from_completion(
             request_id,
             completion.provider.as_deref(),
-            completion.model.as_deref(),
+            served_model.as_deref(),
             self.config.preferred_provider().as_deref(),
             latency_ms,
             usage,
@@ -4722,7 +4733,9 @@ mod tests {
         .join()
         .expect("worker thread panic")
         .expect("ok");
-        assert_eq!(wire.served_model.as_deref(), Some("openai/gpt-5.2-turbo"));
+        // The mock is on loopback, so the base URL puts the model on the
+        // user's machine and the served id is its display name.
+        assert_eq!(wire.served_model.as_deref(), Some("gpt-5.2-turbo"));
         assert_eq!(wire.served_upstream_provider.as_deref(), Some("Cerebras"));
     }
 
@@ -4905,7 +4918,8 @@ mod tests {
 
         assert_eq!(reply, "the routed reply text");
         assert_eq!(telemetry.selected_provider.as_deref(), Some("Together"));
-        assert_eq!(telemetry.served_model.as_deref(), Some("openai/gpt-5.2"));
+        // A loopback base URL: the served id is a display name.
+        assert_eq!(telemetry.served_model.as_deref(), Some("gpt-5.2"));
         assert_eq!(telemetry.usage.total_tokens, Some(20));
         assert_eq!(telemetry.usage.prompt_tokens, Some(12));
         assert_eq!(

@@ -11,8 +11,8 @@ use std::time::Duration;
 use crate::graph::entities::ExtractionResult;
 use crate::llm::http_diag::{HttpFailure, INFERENCE, SchemaRejection, same_origin_redirects};
 use crate::llm::route::{
-    AttemptedRouteIdentity, RequestOutputForm, WireOutcome, route_for_api_endpoint,
-    sanitize_model_id, terminal_status_from_finish_reason,
+    RequestOutputForm, WireOutcome, route_for_api_endpoint, sanitize_model_id,
+    terminal_status_from_finish_reason,
 };
 
 const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -421,10 +421,11 @@ impl ApiClient {
         // `GuaranteedConstrained`.
         let route = route_for_api_endpoint(&self.config.endpoint);
         let constrained_decoding_ceiling = route.capability.constrained_decoding;
-        // Where this client's model runs, by the app's own classification of
-        // its endpoint.
-        let ran_remotely = AttemptedRouteIdentity::for_route(route, Some(&self.config.endpoint))
-            .requires_cloud_transfer;
+        // Where this client's model runs: whether its endpoint could be on
+        // the user's own machine or network. Not the egress classification,
+        // which calls a LAN server remote.
+        let ran_remotely =
+            !crate::llm::route::endpoint_may_be_on_users_network(&self.config.endpoint);
 
         let mut req = client.post(&url).json(&request);
 

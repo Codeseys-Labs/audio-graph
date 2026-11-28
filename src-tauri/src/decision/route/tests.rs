@@ -656,7 +656,7 @@ async fn non_live_assist_question_family_preserves_parameterized_schema_version(
 
 #[test]
 fn a_stored_decision_record_is_read_by_where_its_model_ran() {
-    use crate::llm::route::model_id_fixtures::{PATH_CANARY, STORED};
+    use crate::llm::route::model_id_fixtures::{PATH_CANARY, SECRET_CANARY, STORED};
 
     let dir = std::env::temp_dir().join(format!("decision-record-{}", uuid::Uuid::new_v4()));
     let repo = FileMemoryRepository::with_data_root(&dir);
@@ -680,8 +680,8 @@ fn a_stored_decision_record_is_read_by_where_its_model_ran() {
     .remove(0);
     let template = serde_json::to_value(&record).unwrap();
 
-    for (stored, local) in STORED {
-        for (egress, expected) in [("local", local), ("cloud", stored)] {
+    for (stored, local, remote) in STORED {
+        for (egress, expected) in [("local", local), ("cloud", remote)] {
             let mut row = template.clone();
             row["egress"] = egress.into();
             row["served_model"] = stored.into();
@@ -692,8 +692,9 @@ fn a_stored_decision_record_is_read_by_where_its_model_ran() {
             assert_eq!(read.model_pin.as_ref().unwrap().requested, expected);
             // The digest is kept as stored.
             assert_eq!(read.model_pin_digest, record.model_pin_digest);
+            let shown = serde_json::to_string(&read).unwrap();
+            assert!(!shown.contains(SECRET_CANARY), "{shown}");
             if egress == "local" {
-                let shown = serde_json::to_string(&read).unwrap();
                 assert!(!shown.contains(PATH_CANARY), "{shown}");
             }
         }
@@ -701,16 +702,153 @@ fn a_stored_decision_record_is_read_by_where_its_model_ran() {
 }
 
 #[test]
-fn a_local_http_model_is_recorded_by_its_display_name() {
-    let route = route_by_id("route.decision.ollama_loopback").unwrap();
-    for (configured, recorded) in [
-        ("C:\\Users\\numbat\\models\\private.gguf", "private.gguf"),
-        ("/home/numbat/models/private.gguf", "private.gguf"),
-        ("numbat/checkpoint", "checkpoint"),
-        ("file:///home/numbat/checkpoint", "checkpoint"),
-        ("org/repo/model.safetensors", "model.safetensors"),
-        ("llama3.2:latest", "llama3.2:latest"),
+fn a_stored_card_file_is_read_by_where_its_decision_model_ran_and_left_alone() {
+    use crate::llm::route::model_id_fixtures::{PATH_CANARY, SECRET_CANARY, STORED};
+
+    let dir = std::env::temp_dir().join(format!("decision-card-{}", uuid::Uuid::new_v4()));
+    let repo = FileMemoryRepository::with_data_root(&dir);
+    let settings = DecisionRouteSettings::default();
+    let session_id = "session-stored-card";
+    let context = DispatchContext {
+        session_id,
+        settings: &settings,
+        privacy: PrivacyMode::LocalOnly,
+        models_dir: &dir,
+        schema_version: crate::decision::shadow::LIVE_ASSIST_SCHEMA_VERSION,
+        basis: &[],
+        repository: &repo,
+        engines: &EngineCache::default(),
+    };
+    let template = records(
+        route_by_id("route.decision.d3_edge"),
+        &request(),
+        &context,
+        &[],
+    )
+    .remove(0);
+
+    // Each record as an older build wrote it: the id whole, whatever the
+    // egress. Serializing applies no rule, so the files hold these bytes.
+    let mut rows = Vec::new();
+    for (stored, _, _) in STORED {
+        for egress in ["local", "cloud"] {
+            let mut row = template.clone();
+            row.egress = egress.to_string();
+            row.served_model = Some(stored.to_string());
+            row.model_pin.as_mut().unwrap().requested = stored.to_string();
+            rows.push(row);
+        }
+    }
+    let proposal = crate::events::AgentProposalPayload {
+        id: "card-stored".to_string(),
+        source_segment_id: "segment-1".to_string(),
+        source_id: "source-1".to_string(),
+        speaker_label: None,
+        kind: crate::events::AgentProposalKind::Note,
+        title: "Stored card".to_string(),
+        body: "A card an older build wrote.".to_string(),
+        confidence: 0.9,
+        created_at_ms: 1_700_000_000_000,
+        signal: None,
+        decision_provenance: Some(rows.clone()),
+    };
+    let card = crate::events::LiveAssistCardRecord {
+        session_id: session_id.to_string(),
+        proposal,
+        status: crate::events::LiveAssistCardStatus::Pending,
+        source_span_ids: vec!["span-1".to_string()],
+        graph_context_ids: Vec::new(),
+        outcome: None,
+        projection_patch_sequence: None,
+        created_at_ms: 1_700_000_000_000,
+        updated_at_ms: 1_700_000_000_000,
+        origin: None,
+        answer: None,
+        signal: None,
+        decision_provenance: Some(rows),
+    };
+    repo.upsert_live_assist_card(session_id, &card)
+        .expect("write the card files");
+    let files = [
+        dir.join("live_assist")
+            .join(format!("{session_id}.current.json")),
+        dir.join("live_assist").join(format!("{session_id}.jsonl")),
+    ];
+    let stored_bytes: Vec<_> = files
+        .iter()
+        .map(|path| std::fs::read(path).expect("read a card file"))
+        .collect();
+    assert!(
+        stored_bytes
+            .iter()
+            .all(|bytes| String::from_utf8_lossy(bytes).contains(SECRET_CANARY)),
+        "the fixture files hold the raw ids"
+    );
+
+    for loaded in [
+        repo.load_live_assist_cards(session_id)
+            .expect("current cards"),
+        repo.load_live_assist_card_audit(session_id)
+            .expect("card audit"),
     ] {
+        assert_eq!(loaded.len(), 1);
+        let card = &loaded[0];
+        for records in [
+            card.decision_provenance.as_ref().unwrap(),
+            card.proposal.decision_provenance.as_ref().unwrap(),
+        ] {
+            let expected: Vec<_> = STORED
+                .iter()
+                .flat_map(|(_, local, remote)| [*local, *remote])
+                .collect();
+            let read: Vec<_> = records
+                .iter()
+                .map(|record| record.served_model.as_deref().unwrap())
+                .collect();
+            assert_eq!(read, expected);
+            let pins: Vec<_> = records
+                .iter()
+                .map(|record| record.model_pin.as_ref().unwrap().requested.as_str())
+                .collect();
+            assert_eq!(pins, expected);
+        }
+        let shown = serde_json::to_string(card).unwrap();
+        assert!(!shown.contains(SECRET_CANARY), "{shown}");
+        for record in card.decision_provenance.as_ref().unwrap() {
+            if record.egress == "local" {
+                let shown = serde_json::to_string(record).unwrap();
+                assert!(!shown.contains(PATH_CANARY), "{shown}");
+            }
+        }
+    }
+
+    // The stored files were read, not rewritten.
+    for (path, bytes) in files.iter().zip(&stored_bytes) {
+        assert_eq!(&std::fs::read(path).expect("re-read a card file"), bytes);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_local_http_model_is_recorded_by_its_display_name() {
+    use crate::llm::route::model_id_fixtures::{PATH_CANARY, SECRET_CANARY, STORED};
+    use crate::llm::route::{LOCAL_MODEL_PLACEHOLDER, WITHHELD_MODEL_PLACEHOLDER};
+
+    let route = route_by_id("route.decision.ollama_loopback").unwrap();
+    let windows = (
+        "C:\\Users\\numbat\\models\\private.gguf",
+        "private.gguf",
+        "",
+    );
+    for (configured, local, _) in STORED.into_iter().chain([windows]) {
+        // What a record stored with this pin reads back as, through the
+        // metadata filter, which has never kept `@`. A credential-shaped
+        // setting leaves no name either.
+        let recorded = if local == WITHHELD_MODEL_PLACEHOLDER {
+            LOCAL_MODEL_PLACEHOLDER.to_string()
+        } else {
+            sanitize_route_metadata(local).expect("a name")
+        };
         let settings = DecisionRouteSettings {
             local_http_model: Some(configured.into()),
             ..Default::default()
@@ -720,6 +858,8 @@ fn a_local_http_model_is_recorded_by_its_display_name() {
         let stored = route.stored_pin(pin, &settings);
 
         assert_eq!(stored.requested, recorded, "{configured}");
+        assert!(!stored.requested.contains(PATH_CANARY), "{configured}");
+        assert!(!stored.requested.contains(SECRET_CANARY), "{configured}");
         // The digest calibrations are keyed on is of the pin as configured.
         assert_eq!(digest, digest_pin(&route.pin(&settings)));
     }
