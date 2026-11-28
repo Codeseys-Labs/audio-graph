@@ -108,6 +108,15 @@ pub(crate) struct ObservedActivation {
     pub(crate) operation_id: CredentialOperationId,
 }
 
+impl ObservedActivation {
+    fn of(pending: &PendingSettingsActivation) -> Self {
+        Self {
+            set_id: pending.set_id.clone(),
+            operation_id: pending.operation_id.clone(),
+        }
+    }
+}
+
 /// What an explicit ownership repair of a store's authority state changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StoreOwnershipRepair {
@@ -596,6 +605,11 @@ pub(crate) struct CredentialService {
     worker: WorkerAdmission,
     events: Mutex<CredentialEventLog>,
     settings_activation: Arc<dyn CredentialSettingsActivationPort>,
+    /// The pending activation this service last saw in a journal it adopted,
+    /// until a journal it adopts records that activation's completion or
+    /// rollback, or this service aborts it. A journal that merely lacks it,
+    /// such as one restored at the same epoch, does not reconcile it.
+    observed_activation: Mutex<Option<ObservedActivation>>,
     #[cfg(test)]
     event_snapshot_test_hook: Mutex<Option<TestPause>>,
     #[cfg(test)]
@@ -676,6 +690,10 @@ impl CredentialService {
         event_capacity: usize,
     ) -> Self {
         let service_start_epoch = journal.global_epoch;
+        let observed_activation = journal
+            .pending_activation
+            .as_ref()
+            .map(ObservedActivation::of);
         Self {
             store,
             journal: Mutex::new(journal),
@@ -683,6 +701,7 @@ impl CredentialService {
             worker: WorkerAdmission::new(),
             events: Mutex::new(CredentialEventLog::new(event_capacity, service_start_epoch)),
             settings_activation,
+            observed_activation: Mutex::new(observed_activation),
             #[cfg(test)]
             event_snapshot_test_hook: Mutex::new(None),
             #[cfg(test)]
@@ -869,8 +888,28 @@ impl CredentialService {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .observe(cached.global_epoch, journal.global_epoch);
         }
+        self.observe_activation(&journal);
         *cached = journal;
         true
+    }
+
+    /// Remembers the pending activation `journal` records, and forgets the
+    /// remembered one once `journal` records it as completed or rolled back.
+    fn observe_activation(&self, journal: &AuthorityJournal) {
+        let mut observed = self
+            .observed_activation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pending) = &journal.pending_activation {
+            *observed = Some(ObservedActivation::of(pending));
+        } else if observed.as_ref().is_some_and(|observed| {
+            journal.idempotency_history.iter().any(|entry| {
+                entry.mutation_kind == CredentialMutationKind::Activate
+                    && entry.receipt.operation_id == observed.operation_id
+            })
+        }) {
+            *observed = None;
+        }
     }
 
     fn reconcile_authoritative_journal(
@@ -1069,15 +1108,10 @@ impl CredentialService {
         let operation_id = self.token_source.next_operation_id();
         let _permit = self.worker.admit_for(&operation_id, None)?;
         let observed = self
-            .journal
+            .observed_activation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pending_activation
-            .as_ref()
-            .map(|pending| ObservedActivation {
-                set_id: pending.set_id.clone(),
-                operation_id: pending.operation_id.clone(),
-            });
+            .clone();
         self.store
             .repair_untracked_records(observed.as_ref(), &|journal| {
                 self.cache_journal(journal.clone(), JournalOrigin::Authority)
@@ -2371,6 +2405,16 @@ impl CredentialService {
             journal
         };
         self.cache_journal(committed_journal, JournalOrigin::ThisService);
+        let mut observed = self
+            .observed_activation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if observed
+            .as_ref()
+            .is_some_and(|observed| observed.operation_id == prepared.operation_id)
+        {
+            *observed = None;
+        }
         Ok(())
     }
 }
@@ -2393,14 +2437,14 @@ mod tests {
     };
     use crate::credentials::test_support::DeterministicTokenSource;
     use audio_graph_ipc_contract::credential_contract::{
-        AuthMethodId, AwsPartition, AwsSdkService, BuiltInCredentialSetId, CREDENTIAL_USE_POLICIES,
-        CredentialActivationStage, CredentialAudience, CredentialAudiencePolicyDefinition,
-        CredentialBackendKind, CredentialErrorCode, CredentialIdempotencyToken,
-        CredentialMutationReceipt, CredentialMutationResultCode, CredentialOperationId,
-        CredentialPurpose, CredentialRevision, CredentialSafeRecoveryAction, CredentialSetId,
-        CredentialSetRecordState, CredentialSetRecoveryState,
-        CredentialUsePolicyDecisionDefinition, CredentialWorkerState, CustomCredentialSetId,
-        PORTABLE_ENCODED_RECORD_MAX_BYTES, SecureTransportScheme,
+        AuthMethodId, AwsPartition, AwsSdkService, BUILT_IN_CREDENTIAL_SET_IDS,
+        BuiltInCredentialSetId, CREDENTIAL_USE_POLICIES, CredentialActivationStage,
+        CredentialAudience, CredentialAudiencePolicyDefinition, CredentialBackendKind,
+        CredentialErrorCode, CredentialIdempotencyToken, CredentialMutationReceipt,
+        CredentialMutationResultCode, CredentialOperationId, CredentialPurpose, CredentialRevision,
+        CredentialSafeRecoveryAction, CredentialSetId, CredentialSetRecordState,
+        CredentialSetRecoveryState, CredentialUsePolicyDecisionDefinition, CredentialWorkerState,
+        CustomCredentialSetId, PORTABLE_ENCODED_RECORD_MAX_BYTES, SecureTransportScheme,
     };
     use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::Duration;
@@ -5918,6 +5962,8 @@ mod tests {
     /// A journal older than the one this service observed can omit staging
     /// that is still in use, so the repair is refused on it before any
     /// record is touched, and runs once the authoritative journal is back.
+    /// The orphan here was staged by another process whose journal
+    /// publication was lost, so this service never observed it.
     #[test]
     fn explicit_repair_is_refused_on_a_rolled_back_journal_before_any_record_is_touched() {
         let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
@@ -5929,13 +5975,11 @@ mod tests {
             Arc::new(DeterministicTokenSource::default()),
         );
         let unrecorded = store.journal_snapshot();
-        service
-            .prepare_settings_activation(activation_request(
-                BuiltInCredentialSetId::Deepgram,
-                "62626262-6262-4262-8262-626262626262",
-            ))
-            .expect("prepare the activation whose publication is lost");
-        store.restore_journal(unrecorded.clone());
+        store.plant_staging(
+            CredentialOperationId::parse("62626262-6262-4262-8262-626262626262")
+                .expect("canonical operation id"),
+            BuiltInCredentialSetId::Deepgram.into(),
+        );
         service
             .replace_set(ReplaceCredentialSet {
                 set_id: BuiltInCredentialSetId::Openai.into(),
@@ -5967,9 +6011,10 @@ mod tests {
     }
 
     /// The repair adopts the journal it was admitted on before it removes
-    /// anything. A repair that fails partway, after another process's commit
-    /// raised the epoch, therefore still leaves this service refusing a
-    /// journal older than the one it acted on.
+    /// anything. A repair that removes an orphan from its first set and then
+    /// fails, after another process's commit raised the epoch, therefore
+    /// still leaves this service refusing a journal older than the one it
+    /// acted on.
     #[test]
     fn a_repair_that_fails_partway_still_refuses_an_older_journal_afterwards() {
         let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
@@ -5984,6 +6029,12 @@ mod tests {
         let mut newer = older.clone();
         newer.global_epoch = 1;
         store.restore_journal(newer);
+        let first_set = CredentialSetId::from(BUILT_IN_CREDENTIAL_SET_IDS[0]);
+        store.plant_staging(
+            CredentialOperationId::parse("64646464-6464-4464-8464-646464646464")
+                .expect("canonical operation id"),
+            first_set,
+        );
         store.fail_after(
             FakeStoreCall::RepairSet,
             1,
@@ -5994,6 +6045,11 @@ mod tests {
             .repair_untracked_records()
             .expect_err("the repair fails after its first set");
         assert_eq!(failed.code, CredentialErrorCode::StoreUnavailable);
+        assert_eq!(
+            store.staging_count(),
+            0,
+            "the first set's orphan was removed"
+        );
         assert_eq!(service.snapshot_status().global_epoch, 1);
 
         store.restore_journal(older);

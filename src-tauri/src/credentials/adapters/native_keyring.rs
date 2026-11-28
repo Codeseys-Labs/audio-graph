@@ -3916,8 +3916,10 @@ mod tests {
 
     /// A journal restored at the same epoch can omit an activation this
     /// service observed pending; its staging survives such a restore. The
-    /// repair keeps that staging record and the guard naming it, and reports
-    /// the set as tracked, instead of treating them as untracked.
+    /// service keeps remembering that activation until it is reconciled,
+    /// so every repair keeps that staging record and the guard naming it and
+    /// reports the set as tracked: a second repair, and one after an
+    /// ordinary commit on another set, as much as the first.
     #[test]
     fn the_repair_keeps_the_staging_of_an_activation_the_service_observed() {
         let keyring = Arc::new(MemoryKeyringBoundary::default());
@@ -3939,20 +3941,36 @@ mod tests {
             .account()
             .to_owned();
         let guard = EntryLocator::staging_guard(&set_id).account().to_owned();
+        let repair_keeps_the_staging = |when: &str| {
+            let sets = service
+                .repair_untracked_records()
+                .expect("repair untracked records");
+            repaired_outcomes(
+                &sets,
+                &[(
+                    BuiltInCredentialSetId::Deepgram,
+                    UntrackedRecordOutcome::Tracked,
+                )],
+            );
+            assert!(native_entry(&keyring, &staging).is_some(), "{when}");
+            assert!(native_entry(&keyring, &guard).is_some(), "{when}");
+        };
 
-        let sets = service
-            .repair_untracked_records()
-            .expect("repair untracked records");
-
-        repaired_outcomes(
-            &sets,
-            &[(
-                BuiltInCredentialSetId::Deepgram,
-                UntrackedRecordOutcome::Tracked,
-            )],
-        );
-        assert!(native_entry(&keyring, &staging).is_some());
-        assert!(native_entry(&keyring, &guard).is_some());
+        repair_keeps_the_staging("first repair");
+        repair_keeps_the_staging("second repair");
+        service
+            .replace_set(ReplaceCredentialSet {
+                set_id: BuiltInCredentialSetId::Openai.into(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("other-set-canary").expect("API key"),
+                expected_revision: None,
+                idempotency_token: CredentialIdempotencyToken::parse(
+                    "7c7c7c7c-7c7c-4c7c-8c7c-7c7c7c7c7c7c",
+                )
+                .expect("canonical idempotency token"),
+            })
+            .expect("commit on another set");
+        repair_keeps_the_staging("repair after an ordinary commit");
     }
 
     /// The Windows power-loss case: the journal publication that recorded an
@@ -4269,11 +4287,13 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("remove isolated open-target directory");
     }
 
-    /// The same refusal through the runtime: a program holding the journal
-    /// open without sharing delete refuses the intent before any native
-    /// write, the runtime stays ready with no cached closure, and the same
-    /// request succeeds once that program lets go. Only the scratch journal
-    /// directory and the in-memory keyring are touched.
+    /// The same refusals through the runtime. A program holding the journal
+    /// open without sharing delete refuses the intent's rename, and one that
+    /// does not share reading refuses the journal read before it, both
+    /// before any native write. Each time the runtime stays ready with no
+    /// cached closure, and the same request succeeds once that program lets
+    /// go. Only the scratch journal directory and the in-memory keyring are
+    /// touched.
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_a_runtime_stays_ready_while_another_program_holds_the_journal_open() {
@@ -4409,24 +4429,40 @@ mod tests {
             )
         };
 
-        let refusing = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
-            .open(root.join("journal").join("state.json"))
-            .expect("open the journal as another program");
-        let writes = keyring.writes.load(Ordering::SeqCst);
-        let refused = runtime
-            .replace_set(draft(), Duration::from_secs(5))
-            .await
-            .expect_err("a reader that refuses to share delete blocks the intent");
-        assert_eq!(refused.code, CredentialErrorCode::OperationInProgress);
-        assert!(refused.retryable);
-        assert_eq!(keyring.writes.load(Ordering::SeqCst), writes);
-        assert_eq!(
-            runtime.status().lifecycle,
-            CredentialRuntimeLifecycle::Ready
-        );
-        drop(refusing);
+        for (share, refusal) in [
+            (
+                FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0,
+                "a reader that refuses to share delete blocks the intent",
+            ),
+            (
+                FILE_SHARE_WRITE.0,
+                "a holder that refuses to share reading blocks the journal read",
+            ),
+        ] {
+            let holding = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(share)
+                .open(root.join("journal").join("state.json"))
+                .expect("open the journal as another program");
+            let writes = keyring.writes.load(Ordering::SeqCst);
+            let refused = runtime
+                .replace_set(draft(), Duration::from_secs(5))
+                .await
+                .expect_err(refusal);
+            assert_eq!(
+                refused.code,
+                CredentialErrorCode::OperationInProgress,
+                "{refusal}"
+            );
+            assert!(refused.retryable);
+            assert_eq!(keyring.writes.load(Ordering::SeqCst), writes);
+            assert_eq!(
+                runtime.status().lifecycle,
+                CredentialRuntimeLifecycle::Ready,
+                "{refusal}"
+            );
+            drop(holding);
+        }
 
         let receipt = runtime
             .replace_set(draft(), Duration::from_secs(5))

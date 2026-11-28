@@ -61,7 +61,9 @@ objects whose ownership refusal this process recorded, while their paths
 still reach the same objects. Every reopen, whichever route starts it, keeps
 what the runtime adopted: a service bound to another authority, or over a
 journal older than the highest epoch the runtime observed, is refused as
-recovery-required, and only a restart adopts either.
+recovery-required. The floor lives only in memory, so a restarted process
+accepts an older valid journal of the same authority; durable ordering
+evidence outside the journal is owed before any consumer cutover (#521).
 
 Atomic admission allows one live operation, not a backlog of mutations. An
 async deadline limits only the caller's wait: it neither cancels nor retries

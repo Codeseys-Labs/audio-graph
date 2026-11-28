@@ -4,7 +4,9 @@ use crate::credentials::domain::{AuthorityJournal, CredentialStoreFailure};
 use crate::credentials::filesystem_policy::{
     FilesystemStatusCode, PersistenceTarget, evaluate_filesystem,
 };
-use held_directory::{HeldDirectory, PublishFailure, StagedFile, take_ownership_if_refused};
+use held_directory::{
+    DirectoryLock, HeldDirectory, PublishFailure, StagedFile, take_ownership_if_refused,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::PathBuf;
@@ -14,6 +16,13 @@ mod held_directory;
 
 const JOURNAL_FILE_NAME: &str = "state.json";
 const NAMESPACE_LOCK_FILE_NAME: &str = "v2-authority.lock";
+/// What a journal root holds besides staged journal files: the journal and,
+/// on Windows, the file that stands for a lock on the root itself.
+#[cfg(windows)]
+const JOURNAL_ROOT_FILE_NAMES: &[&str] =
+    &[JOURNAL_FILE_NAME, held_directory::DIRECTORY_LOCK_FILE_NAME];
+#[cfg(not(windows))]
+const JOURNAL_ROOT_FILE_NAMES: &[&str] = &[JOURNAL_FILE_NAME];
 const AUTHORITY_ENVELOPE_SCHEMA_VERSION: u32 = 1;
 pub(super) const MAX_AUTHORITY_JOURNAL_BYTES: usize = 256 * 1024;
 
@@ -378,12 +387,14 @@ pub(super) fn repair_root_ownership(
         &canonical_namespace_lock_root()?,
         &[NAMESPACE_LOCK_FILE_NAME],
     )?;
-    let journal_root = take_ownership_if_refused(&root.into(), &[JOURNAL_FILE_NAME])?;
+    let journal_root = take_ownership_if_refused(&root.into(), JOURNAL_ROOT_FILE_NAMES)?;
     Ok(lock_root || journal_root)
 }
 
+/// The namespace lock and the lock on the journal root, held together.
 struct FileAuthorityMutationLock {
     file: File,
+    _journal_root: DirectoryLock,
 }
 
 impl AuthorityMutationLock for FileAuthorityMutationLock {}
@@ -438,14 +449,18 @@ impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
         self.root.sweep_staged(JOURNAL_FILE_NAME)
     }
 
-    /// The lock counts only while the lock file's name still designates the
-    /// file that was locked and both held roots are still what their paths
-    /// resolve to. Otherwise another process opening those paths now would
-    /// lock a second file, or use another journal, and both would proceed.
-    /// A held root that moved is a closed `Unavailable`: only a reopen, which
-    /// resolves the paths again, can reach the directories other processes
-    /// use. A root moved after this check, while the lock is held, is not
-    /// detected until the next acquisition.
+    /// Takes the namespace lock, which every process addressing the same
+    /// native targets contends on whichever journal root it was given, and
+    /// then a lock on the held journal root itself (see
+    /// `HeldDirectory::lock`), which every process that can publish to this
+    /// journal contends on by construction, wherever the namespace lock
+    /// directory has moved. The namespace lock counts only while its file's
+    /// name still designates the locked file. A held root that is no longer
+    /// at its path is a closed `Unavailable`: only a reopen, which resolves
+    /// the paths again, reaches the directories other processes use. A
+    /// namespace directory moved while the lock is held still leaves two
+    /// processes with two namespace locks; they exclude each other only when
+    /// they publish to the same journal root.
     fn acquire_mutation_lock(
         &self,
     ) -> Result<Box<dyn AuthorityMutationLock>, CredentialStoreFailure> {
@@ -461,7 +476,10 @@ impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
                 return Err(CredentialStoreFailure::Unavailable);
             }
         }
-        let lock = FileAuthorityMutationLock { file };
+        let lock = FileAuthorityMutationLock {
+            _journal_root: self.root.lock()?,
+            file,
+        };
         if self
             .namespace_lock_root
             .names_file(NAMESPACE_LOCK_FILE_NAME, &lock.file)?
@@ -1051,6 +1069,37 @@ pub(super) mod tests {
         }
     }
 
+    /// Two boundaries that publish to one journal root contend on that root
+    /// itself, so moving the namespace lock directory while the first holds
+    /// the lock does not let the second take a lock of its own in the
+    /// replacement directory and publish beside it.
+    #[cfg(unix)]
+    #[test]
+    fn unix_a_namespace_moved_while_locked_still_excludes_a_writer_of_the_same_journal() {
+        let base = scratch("moved-while-locked");
+        let first = boundary(&base, "journal", "namespace").expect("open the first boundary");
+        let held = first
+            .acquire_mutation_lock()
+            .expect("the first boundary locks");
+        std::fs::rename(base.join("namespace"), base.join("moved"))
+            .expect("move the namespace directory while it is locked");
+        let second =
+            boundary(&base, "journal", "namespace").expect("open over the replacement namespace");
+
+        assert!(matches!(
+            second.acquire_mutation_lock(),
+            Err(CredentialStoreFailure::OperationInProgress)
+        ));
+        drop(held);
+        drop(
+            second
+                .acquire_mutation_lock()
+                .expect("the second locks once the first lets go"),
+        );
+        drop((first, second));
+        std::fs::remove_dir_all(&base).expect("remove isolated moved-while-locked directory");
+    }
+
     /// A journal with another name is refused before its mode changes, so
     /// hardening never reaches the file under its other name.
     #[cfg(unix)]
@@ -1156,6 +1205,36 @@ pub(super) mod tests {
         assert_eq!(journal.read(), Ok(None));
         drop(journal);
         std::fs::remove_dir_all(&base).expect("remove isolated parent-sync directory");
+    }
+
+    /// A parent that cannot be opened to flush an existing root's entry is
+    /// not a skipped barrier: the open fails as a failed flush would. Here
+    /// this user is denied adding to the parent after the roots exist, which
+    /// is the right a directory flush needs.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_root_whose_parent_cannot_be_flushed_fails_the_open() {
+        let base = scratch("windows-unflushable-parent");
+        let parent = base.join("parent");
+        drop(boundary(&parent, "journal", "namespace").expect("create both roots"));
+        let sid = windows_current_sid();
+        let deny = format!("*{sid}:(AD)");
+        let denied = format!("*{sid}");
+        windows_command(
+            "icacls.exe",
+            &[parent.as_os_str(), "/deny".as_ref(), deny.as_ref()],
+            &base,
+        );
+
+        let refused = boundary(&parent, "journal", "namespace").err();
+
+        windows_command(
+            "icacls.exe",
+            &[parent.as_os_str(), "/remove:d".as_ref(), denied.as_ref()],
+            &base,
+        );
+        assert_eq!(refused, Some(CredentialStoreFailure::Unavailable));
+        std::fs::remove_dir_all(&base).expect("remove isolated unflushable-parent directory");
     }
 
     /// A staged file whose discard failed is cleaned up by the next staging
@@ -2439,5 +2518,129 @@ pub(super) mod tests {
         drop((first, second));
         std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
         std::fs::remove_dir_all(&base).expect("remove isolated repointed-lock directory");
+    }
+
+    /// The Windows counterpart of a namespace moved while locked: the
+    /// namespace path runs through a junction that is pointed elsewhere
+    /// while the first boundary holds the lock, and the journal path does
+    /// not. The second boundary reaches another namespace directory but the
+    /// same journal root, and contends on that root.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_namespace_repointed_while_locked_still_excludes_a_writer_of_the_same_journal() {
+        let base = scratch("windows-repointed-while-locked");
+        std::fs::create_dir_all(base.join("held")).expect("create the held parent");
+        std::fs::create_dir_all(base.join("decoy")).expect("create the decoy parent");
+        point_parent_junction(&base, "held");
+        let open = || {
+            FileAuthorityJournalBoundary::open_for_test(
+                base.join("journal"),
+                base.join("parent").join("namespace"),
+            )
+        };
+        let first = open().expect("open the first boundary");
+        let held = first
+            .acquire_mutation_lock()
+            .expect("the first boundary locks");
+        point_parent_junction(&base, "decoy");
+        let second = open().expect("open over the repointed namespace");
+
+        assert!(matches!(
+            second.acquire_mutation_lock(),
+            Err(CredentialStoreFailure::OperationInProgress)
+        ));
+        drop(held);
+        drop(
+            second
+                .acquire_mutation_lock()
+                .expect("the second locks once the first lets go"),
+        );
+
+        drop((first, second));
+        std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
+        std::fs::remove_dir_all(&base).expect("remove isolated repointed-while-locked directory");
+    }
+
+    /// Hardening a root sets its DACL on the root alone. A file already in
+    /// it that inherits from it, which this module never opened, keeps the
+    /// ACEs it had; were it another file's second name, a propagated change
+    /// would reach that file too.
+    #[cfg(windows)]
+    #[test]
+    fn windows_hardening_a_root_changes_no_existing_child() {
+        let base = scratch("windows-no-propagation");
+        let root = base.join("journal");
+        std::fs::create_dir_all(&root).expect("create the journal root");
+        windows_command(
+            "icacls.exe",
+            &[
+                root.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-1-0:(OI)(CI)R".as_ref(),
+            ],
+            &base,
+        );
+        let planted = root.join("planted.json");
+        std::fs::write(&planted, b"planted").expect("plant a file that inherits from the root");
+        let planted_dacl = windows_dacl(&planted, &base);
+        assert!(
+            planted_dacl.contains(";;;WD)"),
+            "fixture inheritance missing"
+        );
+
+        let journal = boundary(&base, "journal", "namespace").expect("open boundary");
+
+        assert_protected_owner_only(&windows_dacl(&root, &base));
+        assert_eq!(windows_dacl(&planted, &base), planted_dacl);
+        drop(journal);
+        std::fs::remove_dir_all(&base).expect("remove isolated no-propagation directory");
+    }
+
+    /// An ownership repair of a refused root qualifies every entry on its
+    /// own handle before it changes anything. A staging-shaped directory, or
+    /// a journal with a second name, refuses the whole repair, and neither
+    /// the root nor that entry changes.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_refused_root_changes_nothing_unless_every_entry_qualifies() {
+        for case in ["staged-directory", "hard-linked-journal"] {
+            let base = scratch("windows-repair-qualify");
+            let root = base.join("journal");
+            std::fs::create_dir_all(&root).expect("create the journal root");
+            let entry = match case {
+                "staged-directory" => {
+                    let staged = root.join(format!(
+                        ".{JOURNAL_FILE_NAME}.{}.tmp",
+                        uuid::Uuid::new_v4().simple()
+                    ));
+                    std::fs::create_dir(&staged).expect("plant a staging-shaped directory");
+                    staged
+                }
+                _ => {
+                    let outside = base.join("outside.json");
+                    std::fs::write(&outside, b"outside").expect("write the other name");
+                    std::fs::hard_link(&outside, root.join(JOURNAL_FILE_NAME))
+                        .expect("link the journal name");
+                    outside
+                }
+            };
+            windows_command(
+                "icacls.exe",
+                &[entry.as_os_str(), "/grant".as_ref(), "*S-1-1-0:R".as_ref()],
+                &base,
+            );
+            let root_dacl = windows_dacl(&root, &base);
+            let entry_dacl = windows_dacl(&entry, &base);
+            super::held_directory::record_refused_owner_for_test(&root, None);
+
+            assert_eq!(
+                super::take_ownership_if_refused(&root, &[JOURNAL_FILE_NAME]),
+                Err(CredentialStoreFailure::PermissionHardeningFailed),
+                "{case}"
+            );
+            assert_eq!(windows_dacl(&root, &base), root_dacl, "{case}");
+            assert_eq!(windows_dacl(&entry, &base), entry_dacl, "{case}");
+            std::fs::remove_dir_all(&base).expect("remove isolated repair-qualify directory");
+        }
     }
 }

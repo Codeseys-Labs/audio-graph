@@ -38,7 +38,8 @@ pub(crate) fn try_set_owner_only_file(file: &std::fs::File) -> std::io::Result<(
 /// Apply the current user's protected DACL to a directory through a handle
 /// that was opened with `WRITE_DAC`, without reopening it, which
 /// [`try_set_owner_only_file`] cannot do for a directory. The one owner ACE is
-/// inherited by the directory's existing and future children.
+/// inherited by children created afterwards; existing children are not
+/// changed.
 #[cfg(windows)]
 pub(crate) fn try_set_owner_only_directory_handle(
     directory: &std::fs::File,
@@ -352,15 +353,28 @@ mod windows_owner_only_acl {
 
     /// Applies an owner-only DACL whose one ACE is inherited by files and
     /// subdirectories (`OICI`) through `directory` itself, which must already
-    /// carry `WRITE_DAC`. `ReOpenFile` refuses directory handles. Applying a
-    /// DACL to a directory rewrites the inherited ACEs of its existing
-    /// children, so they keep owner access and lose every other principal.
+    /// carry `WRITE_DAC`. `ReOpenFile` refuses directory handles. The DACL is
+    /// set on the handle's object alone (`SetKernelObjectSecurity`), so the
+    /// ACEs of existing children are left as they are: only the Win32
+    /// `Set*SecurityInfo` functions rewrite those, and they would reach a
+    /// child that is also another file's name. Children created afterwards
+    /// inherit the owner ACE.
     pub(super) fn set_directory_handle_dacl(directory: &std::fs::File) -> std::io::Result<()> {
         use std::os::windows::io::AsRawHandle;
-        let (_descriptor, dacl) =
+        use windows::Win32::Security::SetKernelObjectSecurity;
+        let (descriptor, _dacl) =
             build_owner_only_dacl_with_ace_flags(Path::new("open directory"), "OICI")
                 .map_err(std::io::Error::other)?;
-        apply_protected_dacl(HANDLE(directory.as_raw_handle()), dacl)
+        // SAFETY: the handle stays open and carries `WRITE_DAC`; `descriptor`
+        // owns the security descriptor for the duration of the call.
+        unsafe {
+            SetKernelObjectSecurity(
+                HANDLE(directory.as_raw_handle()),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor.0,
+            )
+        }
+        .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
     }
 
     fn apply_protected_dacl(

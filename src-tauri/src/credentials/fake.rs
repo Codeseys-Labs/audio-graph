@@ -168,6 +168,20 @@ impl FakeCredentialStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .journal = journal;
     }
+
+    /// Leaves a staging record for `operation_id` in `set_id` that no journal
+    /// records, as a lost journal publication would.
+    pub(crate) fn plant_staging(
+        &self,
+        operation_id: CredentialOperationId,
+        set_id: CredentialSetId,
+    ) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .staging
+            .push((operation_id, set_id, Zeroizing::new(b"planted".to_vec())));
+    }
 }
 
 impl FakeCredentialState {
@@ -228,9 +242,14 @@ impl CredentialEntryStore for FakeCredentialStore {
         }))
     }
 
-    /// Models the native repair without guards: every staging record of a
-    /// set is untracked except the one of the journal's pending activation
-    /// and the one of `observed`.
+    /// Models what the native repair removes, not how it finds it. The fake
+    /// has no staging guards, and it lists every staging record of a set,
+    /// which the native store cannot: there, candidates are only the
+    /// operation a guard names and those the journal history records, so a
+    /// staging record neither names stays. Every staging record of a set is
+    /// untracked here except the one of the journal's pending activation and
+    /// the one of `observed`. What the native repair can and cannot find is
+    /// tested against the native store in `native_keyring.rs`.
     fn repair_untracked_records(
         &self,
         observed: Option<&ObservedActivation>,
