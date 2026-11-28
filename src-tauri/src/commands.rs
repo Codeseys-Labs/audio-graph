@@ -12738,11 +12738,15 @@ fn openai_compatible_endpoint_fingerprint(endpoint: &str, model: &str) -> String
 /// fetch the `/models` catalog with the given `default_model` fallback. Reused
 /// by the `asr.api`, `llm.cerebras`, `llm.sambanova` and `llm.api` arms so
 /// their probe behavior stays in lockstep.
+///
+/// The key comes from `store`, the snapshot the readiness refresh loaded, so
+/// the check and the entry's credential presence agree.
 async fn openai_compatible_readiness_arm(
     endpoint: &str,
     default_model: Option<&str>,
+    store: &crate::credentials::CredentialStore,
 ) -> AppResult<ProviderReadinessProbeResult> {
-    let api_key = endpoint_api_key_from_draft_or_store(endpoint, None)?;
+    let api_key = endpoint_api_key_from_store(endpoint, store);
     let model_catalog = fetch_openai_compatible_model_catalog_with_default(
         endpoint,
         api_key.as_deref(),
@@ -12778,7 +12782,8 @@ async fn probe_provider_readiness(
             let crate::settings::AsrProvider::Api { endpoint, .. } = &settings.asr_provider else {
                 return readiness_note(ProviderReadinessNote::NotSelected);
             };
-            openai_compatible_readiness_arm(endpoint, Some(OPENAI_COMPATIBLE_DEFAULT_MODEL)).await
+            openai_compatible_readiness_arm(endpoint, Some(OPENAI_COMPATIBLE_DEFAULT_MODEL), store)
+                .await
         }
         "llm.cerebras" => {
             let endpoint = match &settings.llm_provider {
@@ -12792,6 +12797,7 @@ async fn probe_provider_readiness(
             openai_compatible_readiness_arm(
                 endpoint,
                 Some(crate::provider_registry::CEREBRAS_DEFAULT_MODEL),
+                store,
             )
             .await
         }
@@ -12807,6 +12813,7 @@ async fn probe_provider_readiness(
             openai_compatible_readiness_arm(
                 endpoint,
                 Some(crate::provider_registry::SAMBANOVA_DEFAULT_MODEL),
+                store,
             )
             .await
         }
@@ -12822,7 +12829,8 @@ async fn probe_provider_readiness(
             {
                 return readiness_note(ProviderReadinessNote::NotSelected);
             }
-            openai_compatible_readiness_arm(endpoint, Some(OPENAI_COMPATIBLE_DEFAULT_MODEL)).await
+            openai_compatible_readiness_arm(endpoint, Some(OPENAI_COMPATIBLE_DEFAULT_MODEL), store)
+                .await
         }
         "asr.aws_transcribe" => {
             let crate::settings::AsrProvider::AwsTranscribe {
@@ -20610,7 +20618,10 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let descriptor = crate::provider_registry::descriptor_by_id("llm.api");
-        let store = crate::credentials::CredentialStore::default();
+        // The check sends the key from the store it is given, never the
+        // machine's own credential backend.
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openai_api_key = Some("wombat-key-canary".to_string());
 
         for (status, code) in [
             ("401 Unauthorized", RuntimeErrorCode::CredentialRejected),
@@ -20647,7 +20658,7 @@ mod tests {
             let settings = crate::settings::AppSettings {
                 llm_provider: crate::settings::LlmProvider::Api {
                     endpoint,
-                    api_key: "wombat-key-canary".to_string(),
+                    api_key: String::new(),
                     model: "probe-model".to_string(),
                 },
                 ..Default::default()
