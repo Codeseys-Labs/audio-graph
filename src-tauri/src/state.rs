@@ -69,6 +69,66 @@ pub struct SpeakerInfo {
     pub segment_count: u32,
 }
 
+/// Most chat messages kept in memory. History is cloned whole into every chat
+/// request, so it is capped to bound memory and prompt-build cost; the oldest
+/// messages are dropped first.
+pub const MAX_CHAT_HISTORY: usize = 200;
+
+/// Trim `messages` to the newest [`MAX_CHAT_HISTORY`].
+pub fn cap_chat_messages(messages: &mut Vec<ChatMessage>) {
+    if messages.len() > MAX_CHAT_HISTORY {
+        let drop = messages.len() - MAX_CHAT_HISTORY;
+        messages.drain(0..drop);
+    }
+}
+
+/// The sidebar's chat turns, plus a generation that every [`Self::clear`]
+/// bumps. A chat request reads the generation together with the history it
+/// sends and records its turns through [`Self::append_if_current`], so a
+/// request that finishes after the chat was cleared, or after a session
+/// rotation (which clears it), records nothing and cannot bring a cleared
+/// message back.
+#[derive(Debug, Default)]
+pub struct ChatHistory {
+    messages: Vec<ChatMessage>,
+    generation: u64,
+}
+
+impl ChatHistory {
+    pub fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn clear(&mut self) {
+        self.messages.clear();
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Append `turns`, keeping the newest [`MAX_CHAT_HISTORY`] messages.
+    fn append(&mut self, turns: impl IntoIterator<Item = ChatMessage>) {
+        self.messages.extend(turns);
+        cap_chat_messages(&mut self.messages);
+    }
+
+    /// Append `turns` only if nothing cleared the history since `generation`
+    /// was read. Returns whether they were appended.
+    pub fn append_if_current(
+        &mut self,
+        generation: u64,
+        turns: impl IntoIterator<Item = ChatMessage>,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.append(turns);
+        true
+    }
+}
+
 /// Live projection job thread handles, keyed by `(kind, job_id)`
 /// (audio-graph-9cc1 / ADR-0045 decision 4, drain half).
 ///
@@ -236,7 +296,7 @@ pub struct AppState {
     pub audio_player: crate::playback::AudioPlayer,
 
     /// Chat message history for the sidebar.
-    pub chat_history: Arc<RwLock<Vec<ChatMessage>>>,
+    pub chat_history: Arc<RwLock<ChatHistory>>,
 
     /// Agent/react proposals that are awaiting user approval.
     pub pending_agent_proposals: Arc<Mutex<HashMap<String, crate::events::AgentProposalPayload>>>,
@@ -258,6 +318,12 @@ pub struct AppState {
     /// "no auto-dispatch yet this session". Backs the `min_interval_secs`
     /// gate. Reset to 0 on session rotation.
     pub agent_auto_answer_last_dispatch_ms: Arc<AtomicU64>,
+    /// Set while a live-assist card answer streams or is being persisted.
+    /// The answer gate refuses a new dispatch as `Busy` while it is set, so a
+    /// retry cannot start before the previous attempt's terminal ledger row
+    /// and card write land. Unlike a `stream_registry` entry, cancelling the
+    /// stream does not clear it; the answer task does, once it has finished.
+    pub card_answer_in_flight: Arc<AtomicBool>,
 
     // ── Audio capture infrastructure ────────────────────────────────────
     /// The capture manager (behind Mutex because AudioCaptureManager has &mut self methods).
@@ -935,11 +1001,12 @@ impl AppState {
             llm_executor,
             stream_registry: StreamRegistry::new(),
             audio_player: crate::playback::AudioPlayer::new(),
-            chat_history: Arc::new(RwLock::new(Vec::new())),
+            chat_history: Arc::new(RwLock::new(ChatHistory::default())),
             pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
             decision_shadow,
             agent_auto_answer_session_count: Arc::new(AtomicU64::new(0)),
             agent_auto_answer_last_dispatch_ms: Arc::new(AtomicU64::new(0)),
+            card_answer_in_flight: Arc::new(AtomicBool::new(false)),
             capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),
             pipeline_tx,
             pipeline_rx,

@@ -1157,6 +1157,42 @@ describe("AnswerThread (audio-graph-83cc T4, deliverable c)", () => {
     expect(answerQuestionCard).toHaveBeenCalledWith("failed-q");
   });
 
+  it("a failed draft renders the closed diagnostic's localized copy and its partial answer, never a raw token", () => {
+    resetStore({
+      agentProposals: [
+        proposal({
+          id: "diag-q",
+          kind: "question",
+          title: "Question from Speaker 1",
+          body: questionBody("What is the launch date?"),
+        }),
+      ],
+      answerDrafts: {
+        "diag-q": {
+          status: "failed",
+          text: "Partly answered",
+          requestId: "r1",
+          failure: {
+            kind: "runtime",
+            detail: {
+              code: "provider_unavailable",
+              retryable: true,
+              recovery_action: "retry",
+              context: { operation: "language_model_inference" },
+            },
+          },
+        },
+      },
+    });
+    render(<AgentProposalsPanel />);
+    const row = itemForText("Question from Speaker 1");
+    expect(within(row).getByRole("alert")).toHaveTextContent(
+      "The provider is unavailable.",
+    );
+    expect(within(row).getByText("Partly answered")).toBeInTheDocument();
+    expect(row.textContent).not.toContain("runtime/");
+  });
+
   it("an answered card shows the answer text (in the feed's details disclosure), no added-to-graph note, and no Ask AI button", () => {
     // audio-graph-83cc T5 (deliverable d) update: an answered, terminal
     // (non-Failed) card now resolves to the FEED regardless of whether it
@@ -1273,6 +1309,72 @@ describe("AnswerThread (audio-graph-83cc T4, deliverable c)", () => {
     expect(
       within(row).queryByRole("button", { name: /retry/i }),
     ).not.toBeInTheDocument();
+  });
+
+  it("a failed answer persisted before diagnostics existed renders generic copy, never its legacy finish_reason", () => {
+    resetStore({
+      liveAssistCards: [
+        card({
+          status: "dismissed",
+          proposal: {
+            id: "legacy-failed-q",
+            kind: "question",
+            title: "Question from Speaker 1",
+            body: questionBody("What is the launch date?"),
+          },
+          answer: answer({
+            status: "failed",
+            text: "",
+            finish_reason: "error: runtime/provider_unavailable",
+          }),
+        }),
+      ],
+    });
+    render(<AgentProposalsPanel />);
+    const row = itemForText("Question from Speaker 1");
+    fireEvent.click(within(row).getByRole("button", { name: "Details" }));
+    expect(within(row).getByRole("alert")).toHaveTextContent(
+      "The answer failed.",
+    );
+    expect(row.textContent).not.toContain("runtime/");
+  });
+
+  it("a failed answer with a diagnostic renders its localized copy", () => {
+    resetStore({
+      liveAssistCards: [
+        card({
+          status: "dismissed",
+          proposal: {
+            id: "diag-failed-q",
+            kind: "question",
+            title: "Question from Speaker 1",
+            body: questionBody("What is the launch date?"),
+          },
+          answer: answer({
+            status: "failed",
+            text: "",
+            finish_reason: null,
+            diagnostic: {
+              kind: "runtime",
+              detail: {
+                code: "credential_rejected",
+                retryable: false,
+                recovery_action: "reenter_credential",
+                context: { operation: "language_model_inference" },
+              },
+            },
+          }),
+        }),
+      ],
+    });
+    render(<AgentProposalsPanel />);
+    const row = itemForText("Question from Speaker 1");
+    fireEvent.click(within(row).getByRole("button", { name: "Details" }));
+    const alert = within(row).getByRole("alert");
+    expect(alert).toHaveTextContent(
+      "The provider rejected the credential. Re-enter it in Settings.",
+    );
+    expect(alert).toHaveTextContent("Re-enter the credential in Settings.");
   });
 
   it("a dismissed card's answer is preserved and visible in the feed's details disclosure", () => {

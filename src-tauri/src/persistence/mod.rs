@@ -412,9 +412,11 @@ fn validate_live_assist_card(session_id: &str, card: &LiveAssistCardRecord) -> R
     // citation rule above — a card's answer (once T3 starts writing one) is
     // still bound by ADR-0037 evidence validation.
     if let Some(answer) = &card.answer {
-        if !matches!(answer.status, CardAnswerStatus::Failed) && answer.text.trim().is_empty() {
+        // An answer that was cut short (failed, or cancelled before its first
+        // token) may have no text; a completed answer must.
+        if matches!(answer.status, CardAnswerStatus::Answered) && answer.text.trim().is_empty() {
             return Err(format!(
-                "Live assist card {} answer text is required unless the answer failed",
+                "Live assist card {} answer text is required for an answered card",
                 card.proposal.id
             ));
         }
@@ -4296,6 +4298,7 @@ mod local_memory_repository_tests {
             route_id: "route.openrouter".into(),
             requested_by,
             finish_reason: Some("stop".into()),
+            diagnostic: None,
             total_tokens: Some(64),
             answered_at_ms: 1_700_000_000_200,
         }
@@ -5418,7 +5421,7 @@ mod local_memory_repository_tests {
             .upsert_live_assist_card(session_id, &card)
             .expect_err("a non-Failed answer with empty/whitespace text must be rejected");
         assert!(
-            error.contains("answer text is required unless the answer failed"),
+            error.contains("answer text is required for an answered card"),
             "{error}"
         );
 
@@ -5426,30 +5429,32 @@ mod local_memory_repository_tests {
     }
 
     #[test]
-    fn validate_live_assist_card_permits_a_failed_answer_with_empty_text() {
+    fn validate_live_assist_card_permits_a_failed_or_interrupted_answer_with_empty_text() {
         let dir = unique_tempdir("live-assist-answer-failed-empty-text");
         let repo = FileMemoryRepository::with_data_root(&dir);
         let session_id = "session-answer-failed-empty-text";
 
-        let mut card = sample_live_assist_card(
-            session_id,
-            "card-failed-answer",
-            LiveAssistCardStatus::Pending,
-        );
-        card.answer = Some(sample_card_answer(
-            CardAnswerStatus::Failed,
-            CardOrigin::Transcript,
-        ));
+        for (card_id, status) in [
+            ("card-failed-answer", CardAnswerStatus::Failed),
+            ("card-interrupted-answer", CardAnswerStatus::Interrupted),
+        ] {
+            let mut card =
+                sample_live_assist_card(session_id, card_id, LiveAssistCardStatus::Pending);
+            let mut answer = sample_card_answer(status, CardOrigin::Transcript);
+            answer.text = String::new();
+            card.answer = Some(answer);
 
-        repo.upsert_live_assist_card(session_id, &card)
-            .expect("a Failed answer may carry empty text");
-        let loaded = repo
-            .load_live_assist_cards(session_id)
-            .expect("load failed-answer card");
-        assert_eq!(
-            loaded[0].answer.as_ref().map(|a| a.status),
-            Some(CardAnswerStatus::Failed)
-        );
+            repo.upsert_live_assist_card(session_id, &card)
+                .expect("an answer cut short may carry empty text");
+            let loaded = repo
+                .load_live_assist_cards(session_id)
+                .expect("load the card");
+            let loaded = loaded
+                .iter()
+                .find(|loaded| loaded.proposal.id == card_id)
+                .expect("the card is stored");
+            assert_eq!(loaded.answer.as_ref().map(|a| a.status), Some(status));
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

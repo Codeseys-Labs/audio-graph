@@ -7,7 +7,7 @@ fn main() {
     let stdin = std::io::stdin();
     let saved = std::env::args_os().len() == 1
         && !stdin.is_terminal()
-        && save_typesafe_credential_from_reader(stdin.lock());
+        && save_typesafe_credential_from_reader(stdin.lock()).is_ok();
     println!("{}", if saved { "saved" } else { "missing" });
     if !saved {
         std::process::exit(1);

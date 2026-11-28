@@ -483,7 +483,14 @@ export interface CardAnswer {
   /** ADR-0038: resolved by trusted code, never model- or config-echoed. */
   route_id: string;
   requested_by: CardOrigin;
+  /** Finish reason of an answered or interrupted stream. Records written
+   * before `diagnostic` existed may hold a free-form failure string here;
+   * it is never rendered. */
   finish_reason?: string | null;
+  /** Closed diagnostic of a `"failed"` answer. Untrusted wire data: render
+   * it only through `runtimeDiagnosticPresentation`. Absent on records
+   * written before it existed. */
+  diagnostic?: RuntimeDiagnostic | null;
   /** `null` when the provider omitted usage — never a fabricated zero. */
   total_tokens?: number | null;
   answered_at_ms: number;
@@ -2910,7 +2917,6 @@ export interface LifetimeUsage {
 export type AppErrorPayload =
   | { code: "io"; message: string }
   | { code: "credential_missing"; message: { key: string } }
-  | { code: "credential_file_error"; message: { reason: string } }
   | { code: "aws_credential_expired"; message?: null }
   | { code: "aws_region_invalid"; message: { region: string } }
   | { code: "gemini_rate_limited"; message?: null }
@@ -3018,20 +3024,11 @@ export interface CredentialPresence {
   source: "credentials_yaml" | "missing" | string;
 }
 
-/**
- * Result of `save_credential_cmd`. `"saved"` means the value was written and
- * the readiness epoch + settings cache were refreshed; `"skipped_empty"` means
- * an empty/whitespace value was a no-op (the stored key, if any, is untouched
- * and no readiness caches were invalidated). Mirrors the Rust
- * `SaveCredentialOutcome` enum.
- *
- * Forward-looking plumbing: every current caller pre-guards with `value.trim()`
- * before invoking and ignores the resolved value (the no-op guarantee is
- * enforced on the backend, not by branching on this result). It's typed so a
- * future caller that wants to skip its post-save presence/readiness refresh on
- * a `"skipped_empty"` no-op can do so without re-checking emptiness itself.
- */
-export type SaveCredentialOutcome = "saved" | "skipped_empty";
+/** A committed credential can carry a nonfatal cleanup or refresh diagnostic. */
+export type SaveCredentialOutcome =
+  | "saved"
+  | "skipped_empty"
+  | { saved_with_warning: RuntimeDiagnostic };
 
 // ---------------------------------------------------------------------------
 // Chat types
@@ -3040,6 +3037,17 @@ export type SaveCredentialOutcome = "saved" | "skipped_empty";
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string;
+}
+
+/**
+ * A chat bubble. `failure` marks a failed turn: `content` is then partial
+ * model output (possibly empty). The backend recorded no turn for it, so it
+ * is never sent back to a provider. `turnId` is set only on a reply still
+ * in flight, so its stream updates that bubble and no other.
+ */
+export interface ChatThreadMessage extends ChatMessage {
+  failure?: RuntimeDiagnostic;
+  turnId?: string;
 }
 
 export interface ChatResponse {
@@ -3064,13 +3072,13 @@ export interface ChatTokenDeltaEvent {
 }
 
 /**
- * Streaming-chat terminal payload. Delivered as the `done` frame of the
- * {@link ChatStreamEvent} channel exactly once per request — on success,
- * error, or cancel. `finish_reason`:
+ * Streaming-chat terminal payload for a completed or cancelled stream.
+ * Delivered as the `done` frame of the {@link ChatStreamEvent} channel at
+ * most once per request. `finish_reason`:
  *   - `"stop"` / `"length"` / `"content_filter"` etc. — normal LLM stop.
  *   - `"cancelled"`                                  — user pressed stop.
- *   - `"error: <message>"`                           — stream failed; the
- *     `full_text` is whatever was accumulated before the error.
+ * A failed stream ends with a `failed` frame instead
+ * ({@link ChatStreamFailedEvent}).
  * Stays the internal store-action shape consumed by `finalizeChatStream`.
  */
 export interface ChatTokenDoneEvent {
@@ -3085,17 +3093,29 @@ export interface ChatTokenDoneEvent {
 }
 
 /**
+ * Terminal payload of a failed stream, the `failed` frame of the
+ * {@link ChatStreamEvent} channel. `full_text` is model output produced
+ * before the failure, for display only. `diagnostic` is untrusted wire data:
+ * render it only through `runtimeDiagnosticPresentation`, which fails closed.
+ */
+export interface ChatStreamFailedEvent {
+  request_id: string;
+  full_text: string;
+  diagnostic: unknown;
+}
+
+/**
  * Discriminated wire event for the streaming-chat `tauri::ipc::Channel`
- * (audio-graph-1534). Mirrors the Rust `ChatStreamEvent` enum
+ * (audio-graph-1534). Mirrors the Rust `ChatStreamFrame` enum
  * (`#[serde(tag = "event", content = "data")]`): a single `channel.onmessage`
- * handler in the store routes the `delta` frame into `appendChatTokenDelta`
- * and the `done` frame into `finalizeChatStream`. The `data` shapes are the
- * unchanged {@link ChatTokenDeltaEvent} / {@link ChatTokenDoneEvent} payloads,
- * so only the transport (event → channel) changed, not the store contract.
+ * handler in the store routes the `delta` frame into `appendChatTokenDelta`,
+ * the `done` frame into `finalizeChatStream`, and the `failed` frame into
+ * `finalizeChatStreamFailure`. Every stream ends with one `done` or `failed`.
  */
 export type ChatStreamEvent =
   | { event: "delta"; data: ChatTokenDeltaEvent }
-  | { event: "done"; data: ChatTokenDoneEvent };
+  | { event: "done"; data: ChatTokenDoneEvent }
+  | { event: "failed"; data: ChatStreamFailedEvent };
 
 /** Emitted after provider-reported chat/LLM token usage is persisted. */
 export interface LlmUsageUpdateEvent {
@@ -3463,7 +3483,7 @@ export interface AudioGraphStore {
   clearNotifications: () => void;
 
   // ── Chat ─────────────────────────────────────────────────────────────
-  chatMessages: ChatMessage[];
+  chatMessages: ChatThreadMessage[];
   isChatLoading: boolean;
   rightPanelTab: "transcript" | "chat";
   setRightPanelTab: (tab: "transcript" | "chat") => void;
@@ -3523,20 +3543,36 @@ export interface AudioGraphStore {
 
   /**
    * `request_id` of the streaming chat reply currently being assembled
-   * (plan A3 / ADR-0006). `null` when no stream is in flight; otherwise
-   * the last entry in `chatMessages` is the assistant placeholder being
-   * grown by `appendChatTokenDelta`.
+   * (plan A3 / ADR-0006). `null` when no stream is in flight.
    */
   streamingChatRequestId: string | null;
-  /** Append a token delta to the in-progress assistant message. */
-  appendChatTokenDelta: (event: ChatTokenDeltaEvent) => void;
   /**
-   * Finalize the in-progress assistant message: replace its content with
-   * `full_text` (which is authoritative — handles cases where the
-   * provider streamed token deltas and then revised them on the terminal
-   * chunk), clear `streamingChatRequestId`, and clear `isChatLoading`.
+   * `turnId` of the reply `isChatLoading` waits for, or `null`. Only that
+   * turn's end resets the chat-wide loading state.
    */
-  finalizeChatStream: (event: ChatTokenDoneEvent) => void;
+  chatReplyTurnId: string | null;
+  /**
+   * Append a token delta to the in-progress assistant message with
+   * `turnId`. A delta whose message is gone is dropped.
+   */
+  appendChatTokenDelta: (event: ChatTokenDeltaEvent, turnId: string) => void;
+  /**
+   * Finalize the in-progress assistant message with `turnId`: replace its
+   * content with `full_text` (which is authoritative — handles cases where
+   * the provider streamed token deltas and then revised them on the terminal
+   * chunk) and mark a cancelled reply, clear `streamingChatRequestId`, and
+   * clear `isChatLoading`.
+   */
+  finalizeChatStream: (event: ChatTokenDoneEvent, turnId: string) => void;
+  /**
+   * Mark the in-progress assistant message with `turnId` as a failed turn:
+   * its content becomes the partial `full_text`, and the diagnostic is
+   * normalized so a malformed payload renders the fixed internal copy.
+   */
+  finalizeChatStreamFailure: (
+    event: ChatStreamFailedEvent,
+    turnId: string,
+  ) => void;
 
   // ── Models ────────────────────────────────────────────────────────────
   models: ModelInfo[];
