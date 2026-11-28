@@ -445,6 +445,7 @@ fn run(
             let connection = Builder::address(address).build().await.unwrap();
             let mut messages = MessageStream::from(&connection);
             connection.request_name(SERVICE_NAME).await.unwrap();
+            connection.request_name(GNOME_NAME).await.unwrap();
             ready.send(()).unwrap();
             let mut store = Store::new(initial, behavior, disconnect);
             let mut stopped = pin!(stopped);

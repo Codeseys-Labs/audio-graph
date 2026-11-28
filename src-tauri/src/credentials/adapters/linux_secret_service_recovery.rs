@@ -8,26 +8,17 @@ use super::{
 };
 use crate::crash_handler::{RedactedPanicOp, catch_redacted_panic};
 use crate::credentials::adapters::linux_secret_service_wire::{
-    LockedTarget, WireError, ensure_worker_context, recovery_error, recovery_until,
-    session_address, unix_builder,
+    Address, CompletionStream, LockedTarget, OwnedObjectPath, WireError, block_on,
+    define_recovery_peer, ensure_worker_context, next_completion, recovery_until, session_address,
 };
 use crate::credentials::domain::CredentialStoreFailure as Failure;
+use futures_util::FutureExt;
 use futures_util::future::{Either, select};
-use futures_util::{FutureExt, StreamExt};
-use serde::Serialize;
 use std::future::{Future, poll_fn};
 use std::pin::pin;
 use std::sync::Mutex;
 use std::task::Poll;
 use std::time::{Duration, Instant};
-use zbus::message::Type;
-use zbus::names::OwnedUniqueName;
-use zbus::proxy::{Builder as ProxyBuilder, CacheProperties, MethodFlags};
-use zbus::wire::DynamicDeserialize;
-use zbus::{
-    Address, Connection, DynamicType, MatchRule, MessageStream, OwnedObjectPath, OwnedVariant,
-    Proxy,
-};
 use zruntime::SharedRuntime;
 
 const SERVICE: &str = "org.freedesktop.Secret.Service";
@@ -121,7 +112,7 @@ impl RecoveryBoundary for Boundary {
         let address = self.test.address.clone().map_or_else(session_address, Ok);
         #[cfg(not(test))]
         let address = session_address();
-        zbus::block_on(interact(
+        block_on(interact(
             permission,
             &target,
             address.map_err(closed_wire)?,
@@ -162,72 +153,14 @@ impl RecoveryBoundary for Boundary {
 type WireResult<T> = Result<T, WireError>;
 type UnlockReply = (Vec<OwnedObjectPath>, OwnedObjectPath);
 
-struct Peer<'lease, 'gate> {
-    _permission: &'lease AllowPrompt<'lease, 'gate>,
-    connection: Connection,
-    owner: OwnedUniqueName,
-}
-
-impl<'lease, 'gate> Peer<'lease, 'gate> {
-    // Only the lexical child can own the raw interactive connection, and it
-    // takes the existing sealed grant before it can open one.
-    async fn connect_for_recovery(
-        permission: &'lease AllowPrompt<'lease, 'gate>,
-        target: &LockedTarget,
-        address: Address,
-    ) -> WireResult<Option<Self>> {
-        let connection = unix_builder(address)?
-            .build()
-            .await
-            .map_err(recovery_error)?;
-        let (owner, locked) = target.check_recovery_connection(&connection).await?;
-        Ok(locked.then_some(Self {
-            _permission: permission,
-            connection,
-            owner,
-        }))
-    }
-}
+define_recovery_peer!();
+use interactive_transport::Peer;
 
 impl Peer<'_, '_> {
-    async fn call<B, R>(&self, path: &str, interface: &str, method: &str, body: &B) -> WireResult<R>
-    where
-        B: Serialize + DynamicType,
-        R: for<'de> DynamicDeserialize<'de>,
-    {
-        let proxy: Proxy<'_> = ProxyBuilder::new(&self.connection)
-            .destination(self.owner.as_str())
-            .path(path)
-            .interface(interface)
-            .cache_properties(CacheProperties::No)
-            .build()
-            .await
-            .map_err(recovery_error)?;
-        proxy
-            .call_with_flags(method, MethodFlags::NO_AUTO_START, body)
-            .await
-            .map_err(recovery_error)?
-            .ok_or_else(|| Failure::Internal.into())
-    }
-
-    async fn subscribe(&self, path: &OwnedObjectPath) -> WireResult<MessageStream> {
-        let rule = MatchRule::builder()
-            .msg_type(Type::Signal)
-            .sender(self.owner.as_str())
-            .path(path.as_str())
-            .interface(PROMPT)
-            .member("Completed")
-            .build()
-            .map_err(recovery_error)?;
-        MessageStream::for_match_rule(rule, &self.connection, None)
-            .await
-            .map_err(recovery_error)
-    }
-
     async fn dismiss(
         &self,
         path: &OwnedObjectPath,
-        completions: Option<MessageStream>,
+        completions: Option<CompletionStream>,
     ) -> Option<bool> {
         let end = Instant::now() + DISMISS_GRACE;
         let completions = match completions {
@@ -241,14 +174,29 @@ impl Peer<'_, '_> {
             let _ = recovery_until(end, request).await;
             return None;
         };
-        let settlement = async {
-            let mut request = pin!(request);
-            match select(request.as_mut(), pin!(completed(&mut completions))).await {
-                Either::Left((_, completion)) => completion.await,
-                Either::Right((result, _)) => result,
+        recovery_until(
+            end,
+            dismiss_and_settle(request, next_completion(&mut completions)),
+        )
+        .await
+        .ok()
+    }
+}
+
+async fn dismiss_and_settle(
+    request: impl Future<Output = WireResult<()>>,
+    completion: impl Future<Output = WireResult<bool>>,
+) -> WireResult<bool> {
+    match select(pin!(request), pin!(completion)).await {
+        Either::Left((_, completion)) => completion.await,
+        Either::Right((result, request)) => {
+            // A closed or malformed stream does not settle the prompt.
+            // Keep polling Dismiss through the same bounded deadline.
+            if result.is_err() {
+                let _ = request.await;
             }
-        };
-        recovery_until(end, settlement).await.ok()
+            result
+        }
     }
 }
 
@@ -279,10 +227,7 @@ async fn interact(
         test,
     )
     .await;
-    let _ = recovery_until(Instant::now() + RETIRE_GRACE, async {
-        peer.connection.close().await.map_err(recovery_error)
-    })
-    .await;
+    let _ = recovery_until(Instant::now() + RETIRE_GRACE, peer.retire()).await;
     outcome
 }
 
@@ -295,7 +240,11 @@ async fn unlock(
 ) -> Result<(), RecoveryFailure> {
     let objects = [target.path()];
     let reply: UnlockReply = match wait
-        .run(peer.call(SERVICE_PATH, SERVICE, UNLOCK_METHOD, &(objects.as_slice(),)))
+        .run(async {
+            peer.require_current().await?;
+            peer.call(SERVICE_PATH, SERVICE, UNLOCK_METHOD, &(objects.as_slice(),))
+                .await
+        })
         .await
     {
         Ok(reply) => reply,
@@ -324,7 +273,7 @@ async fn unlock(
 struct PromptGuard<'peer, 'lease, 'gate> {
     peer: &'peer Peer<'lease, 'gate>,
     path: OwnedObjectPath,
-    completions: Option<MessageStream>,
+    completions: Option<CompletionStream>,
 }
 
 impl PromptGuard<'_, '_, '_> {
@@ -338,6 +287,7 @@ impl PromptGuard<'_, '_, '_> {
             let stream = wait.run(self.peer.subscribe(&self.path)).await?;
             let completions = self.completions.insert(stream);
             wait.run(async {
+                self.peer.require_current().await?;
                 self.peer
                     .call::<_, ()>(self.path.as_str(), PROMPT, PROMPT_METHOD, &(window,))
                     .await?;
@@ -351,7 +301,7 @@ impl PromptGuard<'_, '_, '_> {
                         std::future::pending::<()>().await;
                     }
                 }
-                completed(completions).await
+                next_completion(completions).await
             })
             .await
         })
@@ -378,8 +328,9 @@ impl PromptGuard<'_, '_, '_> {
                 }
             }
             Err(()) => {
-                let _ = self.dismiss().await;
-                log::warn!("Secret Service recovery panicked. A dialog may still be open.");
+                if !matches!(self.dismiss().await, Ok(Some(_))) {
+                    log::warn!("Secret Service recovery panicked. A dialog may still be open.");
+                }
                 Err(RecoveryFailure::Uncertain)
             }
         }
@@ -388,7 +339,7 @@ impl PromptGuard<'_, '_, '_> {
     fn queued_completion(&mut self) -> Option<bool> {
         self.completions
             .as_mut()
-            .and_then(|stream| completed(stream).now_or_never()?.ok())
+            .and_then(|stream| next_completion(stream).now_or_never()?.ok())
     }
 
     async fn dismiss(self) -> Result<Option<bool>, ()> {
@@ -415,17 +366,6 @@ async fn catch_interactive<T>(future: impl Future<Output = T>) -> Result<T, ()> 
         }
     })
     .await
-}
-
-async fn completed(completions: &mut MessageStream) -> WireResult<bool> {
-    let signal = completions
-        .next()
-        .await
-        .ok_or(Failure::Unavailable)?
-        .map_err(recovery_error)?;
-    let (dismissed, _): (bool, OwnedVariant) =
-        signal.body().deserialize().map_err(recovery_error)?;
-    Ok(dismissed)
 }
 
 struct Wait<'a> {
@@ -487,5 +427,5 @@ fn closed_wire(WireError(code): WireError) -> RecoveryFailure {
 }
 
 #[cfg(test)]
-#[path = "linux_secret_service_recovery_tests.rs"]
+#[path = "linux_secret_service_recovery/tests.rs"]
 mod tests;

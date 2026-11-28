@@ -2,32 +2,122 @@
 //! and the same non-interactive message policy.
 #![cfg_attr(not(test), allow(dead_code))] // Factory activation is gated by #152.
 
-#[path = "linux_secret_service_crypto.rs"]
 mod crypto;
 
+// Expand the same flagged send in the ordinary and capability-bearing peers.
+// The recovery peer must be defined where the sealed AllowPrompt type is visible.
 #[cfg(target_os = "linux")]
-#[path = "."]
+macro_rules! send_flagged {
+    ($connection:expr, $destination:expr, $path:expr, $interface:expr, $member:expr, $body:expr, $map_error:expr) => {{
+        let proxy: ::zbus::Proxy<'_> = ::zbus::proxy::Builder::new($connection)
+            .destination($destination)
+            .path($path)
+            .interface($interface)
+            .cache_properties(::zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .map_err($map_error)?;
+        proxy
+            .call_with_flags($member, ::zbus::proxy::MethodFlags::NO_AUTO_START, $body)
+            .await
+            .map_err($map_error)?
+            .ok_or_else(|| Failure::Internal.into())
+    }};
+}
+
+#[cfg(target_os = "linux")]
+macro_rules! define_recovery_peer {
+    () => {
+        mod interactive_transport {
+            use super::{Failure, LockedTarget, OwnedObjectPath, WireResult};
+            use $crate::credentials::adapters::native_interaction::explicit_recovery::recovery_facade::AllowPrompt;
+            use $crate::credentials::adapters::linux_secret_service_wire::{
+                Address, CompletionStream, check_recovery_connection, is_unix, map_error, send_flagged, subscribe_completion,
+            };
+            use ::zbus::wire::DynamicDeserialize;
+            use ::zbus::{Connection, DynamicType};
+            use serde::Serialize;
+
+            pub(super) struct Peer<'lease, 'gate> {
+                _permission: &'lease AllowPrompt<'lease, 'gate>,
+                connection: Connection,
+                owner: $crate::credentials::adapters::linux_secret_service_wire::ServiceOwner,
+            }
+
+            impl<'lease, 'gate> Peer<'lease, 'gate> {
+                pub(super) async fn connect_for_recovery(
+                    permission: &'lease AllowPrompt<'lease, 'gate>,
+                    target: &LockedTarget,
+                    address: Address,
+                ) -> WireResult<Option<Self>> {
+                    if !is_unix(&address) {
+                        return Err(Failure::Unavailable.into());
+                    }
+                    let connection = ::zbus::connection::Builder::address(address)
+                        .build()
+                        .await
+                        .map_err(|_| Failure::Unavailable)?;
+                    let (owner, locked) = check_recovery_connection(target, &connection).await?;
+                    Ok(locked.then_some(Self { _permission: permission, connection, owner }))
+                }
+            }
+
+            impl Peer<'_, '_> {
+                pub(super) async fn call<B, R>(
+                    &self,
+                    path: &str,
+                    interface: &str,
+                    member: &str,
+                    body: &B,
+                ) -> WireResult<R>
+                where
+                    B: Serialize + DynamicType,
+                    R: for<'de> DynamicDeserialize<'de>,
+                {
+                    send_flagged!(&self.connection, self.owner.as_str(), path, interface, member, body, map_error)
+                }
+
+                pub(super) async fn require_current(&self) -> WireResult<()> {
+                    self.owner.require_current(&self.connection).await
+                }
+
+                pub(super) async fn subscribe(&self, path: &OwnedObjectPath) -> WireResult<CompletionStream> {
+                    subscribe_completion(&self.connection, &self.owner, path).await
+                }
+
+                pub(super) async fn retire(self) -> WireResult<()> {
+                    self.connection.close().await.map_err(map_error)
+                }
+            }
+        }
+    };
+}
+
+#[cfg(target_os = "linux")]
+pub(super) use {define_recovery_peer, send_flagged};
+
+#[cfg(target_os = "linux")]
 mod linux {
     use super::crypto::{ALGORITHM, CryptoError, Exchange, SessionKey};
     use crate::credentials::domain::CredentialStoreFailure as Failure;
+    use futures_util::StreamExt;
     use serde::Serialize;
     use std::collections::BTreeMap;
     use std::fmt;
     use std::future::Future;
     use std::time::{Duration, Instant};
     use zbus::address::Transport;
-    use zbus::connection::Builder;
+    use zbus::message::Type;
     use zbus::names::OwnedUniqueName;
-    use zbus::proxy::{Builder as ProxyBuilder, CacheProperties, MethodFlags};
     use zbus::wire::DynamicDeserialize;
-    use zbus::{
-        Address, Connection, DynamicType, OwnedObjectPath, OwnedVariant, Proxy, Variant, fdo,
-    };
+    pub(in super::super) use zbus::{Address, OwnedObjectPath, block_on};
+    use zbus::{DynamicType, MatchRule, MessageStream, OwnedGuid, OwnedVariant, Variant, fdo};
     use zeroize::Zeroizing;
 
     const BUS: &str = "org.freedesktop.DBus";
     const BUS_PATH: &str = "/org/freedesktop/DBus";
     const SERVICE: &str = "org.freedesktop.Secret.Service";
+    const GNOME_NAME: &str = "org.gnome.keyring";
     const SERVICE_NAME: &str = "org.freedesktop.secrets";
     const SERVICE_PATH: &str = "/org/freedesktop/secrets";
     const ITEM: &str = "org.freedesktop.Secret.Item";
@@ -93,12 +183,8 @@ mod linux {
         Address::session().map_err(|_| Failure::Unavailable.into())
     }
 
-    pub(in super::super) fn unix_builder(address: Address) -> WireResult<Builder<'static>> {
-        // Reject executable and remote transports on both connection paths.
-        if !matches!(address.transport(), Transport::Unix(_)) {
-            return Err(Failure::Unavailable.into());
-        }
-        Ok(Builder::address(address))
+    pub(in super::super) fn is_unix(address: &Address) -> bool {
+        matches!(address.transport(), Transport::Unix(_))
     }
 
     fn read_at(
@@ -136,7 +222,7 @@ mod linux {
         work: impl AsyncFnOnce(Instant) -> WireResult<T>,
     ) -> WireResult<T> {
         ensure_worker_context()?;
-        zbus::block_on(work(Instant::now() + timeout))
+        block_on(work(Instant::now() + timeout))
     }
 
     pub(in super::super) fn ensure_worker_context() -> WireResult<()> {
@@ -165,75 +251,154 @@ mod linux {
 
     struct Client {
         connection: pinned::Transport,
-        owner: OwnedUniqueName,
         session: Option<OwnedObjectPath>,
     }
 
-    // Keep the ordinary connection opaque even to sibling adapter modules.
-    // They can use the closed routes, but cannot get a raw sender from Client.
+    // Only this module can mint a service pin or obtain the ordinary connection.
     mod pinned {
         use super::*;
-        use futures_util::StreamExt;
-        use zbus::message::Type;
-        use zbus::{MatchRule, MessageStream};
+        use zbus::Connection;
 
-        pub(super) struct Transport(Connection);
+        #[derive(Clone, PartialEq, Eq)]
+        pub(in super::super::super) struct ServiceOwner(OwnedUniqueName);
+
+        impl ServiceOwner {
+            pub(in super::super::super) fn as_str(&self) -> &str {
+                self.0.as_str()
+            }
+
+            pub(super) async fn bind(connection: &Connection) -> WireResult<Self> {
+                let owner = name_owner(connection, SERVICE_NAME)
+                    .await
+                    .map_err(unavailable_if_missing)?;
+                let pinned = Self(owner);
+                pinned.require_current(connection).await?;
+                Ok(pinned)
+            }
+
+            pub(in super::super::super) async fn require_current(
+                &self,
+                connection: &Connection,
+            ) -> WireResult<()> {
+                match name_owner(connection, GNOME_NAME).await {
+                    Ok(owner) if owner == self.0 => {}
+                    Ok(_) | Err(WireError(Failure::Missing)) => {
+                        return Err(Failure::Unsupported.into());
+                    }
+                    Err(error) => return Err(error),
+                }
+                if name_owner(connection, SERVICE_NAME)
+                    .await
+                    .map_err(unavailable_if_missing)?
+                    != self.0
+                {
+                    return Err(Failure::Unsupported.into());
+                }
+                Ok(())
+            }
+        }
+
+        pub(super) struct Transport {
+            connection: Connection,
+            owner: ServiceOwner,
+        }
 
         impl Transport {
-            pub(super) fn new(connection: Connection) -> Self {
-                Self(connection)
+            pub(super) async fn connect(address: Address) -> WireResult<Self> {
+                // Reject executable and remote transports.
+                if !is_unix(&address) {
+                    return Err(Failure::Unavailable.into());
+                }
+                let connection = zbus::connection::Builder::address(address)
+                    .build()
+                    .await
+                    .map_err(|_| Failure::Unavailable)?;
+                Self::bind(connection).await
             }
 
-            pub(super) fn server_guid(&self) -> &zbus::OwnedGuid {
-                self.0.server_guid()
+            pub(super) async fn bind(connection: Connection) -> WireResult<Self> {
+                let owner = ServiceOwner::bind(&connection).await?;
+                Ok(Self { connection, owner })
             }
 
-            pub(super) async fn call<B, R>(
-                &self,
-                owner: &OwnedUniqueName,
-                method: Method<'_>,
-                body: &B,
-            ) -> WireResult<R>
+            pub(super) fn owner(&self) -> &ServiceOwner {
+                &self.owner
+            }
+
+            pub(super) fn server_guid(&self) -> &OwnedGuid {
+                self.connection.server_guid()
+            }
+
+            pub(super) async fn require_current(&self) -> WireResult<()> {
+                self.owner.require_current(&self.connection).await
+            }
+
+            pub(super) async fn call<B, R>(&self, method: Method<'_>, body: &B) -> WireResult<R>
             where
                 B: Serialize + DynamicType,
                 R: for<'de> DynamicDeserialize<'de>,
             {
-                flagged_call(&self.0, Some(owner), method, body).await
+                flagged_call(&self.connection, Some(&self.owner), method, body).await
             }
 
-            pub(super) async fn dismiss(
-                &self,
-                owner: &OwnedUniqueName,
-                path: &OwnedObjectPath,
-            ) -> WireResult<bool> {
-                let rule = MatchRule::builder()
-                    .msg_type(Type::Signal)
-                    .sender(owner.as_str())
-                    .path(path.as_str())
-                    .interface(PROMPT)
-                    .member("Completed")
-                    .build()
-                    .map_err(map_error)?;
-                let mut stream = MessageStream::for_match_rule(rule, &self.0, None)
-                    .await
-                    .map_err(map_error)?;
-                self.call::<_, ()>(owner, Method::Dismiss(path), &())
-                    .await?;
-                let completion = stream
-                    .next()
-                    .await
-                    .ok_or(Failure::Unavailable)?
-                    .map_err(map_error)?;
-                let (dismissed, _): (bool, OwnedVariant) =
-                    completion.body().deserialize().map_err(map_error)?;
-                Ok(dismissed)
+            pub(super) async fn dismiss(&self, path: &OwnedObjectPath) -> WireResult<bool> {
+                let mut stream = subscribe_completion(&self.connection, &self.owner, path).await?;
+                self.call::<_, ()>(Method::Dismiss(path), &()).await?;
+                next_completion(&mut stream).await
             }
 
             #[cfg(test)]
             pub(super) async fn disconnect(&self) {
-                self.0.clone().close().await.unwrap();
+                self.connection.clone().close().await.unwrap();
             }
         }
+    }
+
+    pub(in super::super) use pinned::ServiceOwner;
+
+    // Validate the opaque locked target against a connection owned by the
+    // capability-bearing peer. No caller gets a raw connection back.
+    pub(in super::super) async fn check_recovery_connection(
+        target: &LockedTarget,
+        connection: &zbus::Connection,
+    ) -> WireResult<(ServiceOwner, bool)> {
+        let client = Client::bind(connection.clone()).await?;
+        target.check_recovery_connection(&client).await
+    }
+
+    pub(in super::super) struct CompletionStream(MessageStream);
+
+    pub(in super::super) async fn subscribe_completion(
+        connection: &zbus::Connection,
+        owner: &ServiceOwner,
+        path: &OwnedObjectPath,
+    ) -> WireResult<CompletionStream> {
+        let rule = MatchRule::builder()
+            .msg_type(Type::Signal)
+            .sender(owner.as_str())
+            .path(path.as_str())
+            .interface(PROMPT)
+            .member("Completed")
+            .build()
+            .map_err(map_error)?;
+        MessageStream::for_match_rule(rule, connection, None)
+            .await
+            .map(CompletionStream)
+            .map_err(map_error)
+    }
+
+    pub(in super::super) async fn next_completion(
+        stream: &mut CompletionStream,
+    ) -> WireResult<bool> {
+        let completion = stream
+            .0
+            .next()
+            .await
+            .ok_or(Failure::Unavailable)?
+            .map_err(map_error)?;
+        let (dismissed, _): (bool, OwnedVariant) =
+            completion.body().deserialize().map_err(map_error)?;
+        Ok(dismissed)
     }
 
     #[derive(Clone, Copy)]
@@ -277,40 +442,29 @@ mod linux {
         }
     }
 
-    async fn name_owner(connection: &Connection, name: &str) -> WireResult<OwnedUniqueName> {
+    async fn name_owner(connection: &zbus::Connection, name: &str) -> WireResult<OwnedUniqueName> {
         flagged_call(connection, None, Method::GetNameOwner, &(name,)).await
-    }
-
-    async fn require_gnome_owner(
-        connection: &Connection,
-        pinned: &OwnedUniqueName,
-    ) -> WireResult<()> {
-        match name_owner(connection, "org.gnome.keyring").await {
-            Ok(owner) if owner == *pinned => Ok(()),
-            _ => Err(Failure::Unsupported.into()),
-        }
     }
 
     impl Client {
         async fn connect(address: Address) -> WireResult<Self> {
-            let connection = unix_builder(address)?
-                .build()
-                .await
-                .map_err(|_| Failure::Unavailable)?;
-            Self::bind(connection).await
-        }
-
-        async fn bind(connection: Connection) -> WireResult<Self> {
-            // Pin the provider for the entire operation. A new owner cannot
-            // answer a request intended for the old owner's item or session.
-            let owner = name_owner(&connection, SERVICE_NAME)
-                .await
-                .map_err(unavailable_if_missing)?;
+            let connection = pinned::Transport::connect(address).await?;
             Ok(Self {
-                connection: pinned::Transport::new(connection),
-                owner,
+                connection,
                 session: None,
             })
+        }
+
+        async fn bind(connection: zbus::Connection) -> WireResult<Self> {
+            let connection = pinned::Transport::bind(connection).await?;
+            Ok(Self {
+                connection,
+                session: None,
+            })
+        }
+
+        fn owner(&self) -> &ServiceOwner {
+            self.connection.owner()
         }
 
         async fn call<B, R>(&self, method: Method<'_>, body: &B) -> WireResult<R>
@@ -318,20 +472,28 @@ mod linux {
             B: Serialize + DynamicType,
             R: for<'de> DynamicDeserialize<'de>,
         {
-            self.connection
-                .call(&self.owner, method, body)
-                .await
-                .map_err(|error| {
-                    if method.route().1 == SERVICE {
-                        unavailable_if_missing(error)
-                    } else {
-                        error
-                    }
-                })
+            // Mutations check before recording dispatch. Cleanup still goes to
+            // the original unique owner if either well-known name moved.
+            if !matches!(
+                method,
+                Method::SetSecret(_)
+                    | Method::CreateItem(_)
+                    | Method::DeleteItem(_)
+                    | Method::CloseSession(_)
+            ) {
+                self.connection.require_current().await?;
+            }
+            self.connection.call(method, body).await.map_err(|error| {
+                if method.route().1 == SERVICE {
+                    unavailable_if_missing(error)
+                } else {
+                    error
+                }
+            })
         }
 
         async fn dismiss_mutation_prompt(&self, path: &OwnedObjectPath) -> WireResult<bool> {
-            self.connection.dismiss(&self.owner, path).await
+            self.connection.dismiss(path).await
         }
 
         async fn property(&self, item: &OwnedObjectPath, name: &str) -> WireResult<OwnedVariant> {
@@ -495,8 +657,8 @@ mod linux {
     }
 
     async fn flagged_call<B, R>(
-        connection: &Connection,
-        owner: Option<&OwnedUniqueName>,
+        connection: &zbus::Connection,
+        owner: Option<&ServiceOwner>,
         method: Method<'_>,
         body: &B,
     ) -> WireResult<R>
@@ -510,19 +672,24 @@ mod linux {
         } else {
             owner.ok_or(Failure::Internal)?.as_str()
         };
-        let proxy: Proxy<'_> = ProxyBuilder::new(connection)
-            .destination(destination)
-            .path(path)
-            .interface(interface)
-            .cache_properties(CacheProperties::No)
-            .build()
-            .await
-            .map_err(map_error)?;
-        proxy
-            .call_with_flags(member, MethodFlags::NO_AUTO_START, body)
-            .await
-            .map_err(map_error)?
-            .ok_or_else(|| Failure::Internal.into())
+        let map_call_error = |error| {
+            if matches!(method, Method::GetNameOwner)
+                && matches!(&error, zbus::Error::FDO(error) if matches!(**error, fdo::Error::NameHasNoOwner(_)))
+            {
+                Failure::Missing.into()
+            } else {
+                map_error(error)
+            }
+        };
+        send_flagged!(
+            connection,
+            destination,
+            path,
+            interface,
+            member,
+            body,
+            map_call_error
+        )
     }
 
     fn unavailable_if_missing(error: WireError) -> WireError {
@@ -564,12 +731,9 @@ mod linux {
         .into()
     }
 
-    #[path = "linux_secret_service_mutations.rs"]
     mod mutations;
-    #[path = "linux_secret_service_recovery_target.rs"]
     mod recovery_target;
     #[cfg(test)]
-    #[path = "linux_secret_service_wire_tests.rs"]
     pub(in super::super) mod tests;
     pub(in super::super) use mutations::{MutationOutcome, delete_exact, write_exact};
     pub(in super::super) use recovery_target::{LockedTarget, locked_target};
@@ -584,8 +748,9 @@ pub(super) use linux::tests as scripted_peer;
 #[cfg(target_os = "linux")]
 #[allow(unused_imports)] // The factory remains dormant.
 pub(super) use linux::{
-    LockedTarget, WireError, ensure_worker_context, locked_target, map_error as recovery_error,
-    session_address, unix_builder, until as recovery_until,
+    Address, CompletionStream, LockedTarget, OwnedObjectPath, ServiceOwner, WireError, block_on,
+    check_recovery_connection, ensure_worker_context, is_unix, locked_target, map_error,
+    next_completion, session_address, subscribe_completion, until as recovery_until,
 };
 #[cfg(target_os = "linux")]
 #[allow(unused_imports)] // The factory remains dormant.
