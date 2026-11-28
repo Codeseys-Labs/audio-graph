@@ -225,22 +225,32 @@ impl NativeKeyringCredentialStore {
     /// Re-reads the journal and marker and requires the pair this store was
     /// bound to. Run under the interaction lease and the mutation lock, so no
     /// cooperating process can change the pair between this check and the
-    /// read that follows. An open store treats both halves missing like one
-    /// half missing: either way its authority is gone.
+    /// read that follows. `Ok(None)` is the fresh install: a store opened
+    /// before any authority existed still finds none. A store that was bound
+    /// treats both halves missing like one half missing: either way its
+    /// authority is gone.
     fn require_bound_authority_unlocked(
         &self,
         interaction: &mut NativeInteractionLease<'_>,
-    ) -> Result<Box<AuthorityJournal>, CredentialStoreFailure> {
-        match self.read_authority_state_unlocked(interaction)? {
-            AuthorityPairState::Ready {
-                authority_instance_id,
-                journal,
-            } if self.bound_authority.as_deref() == Some(authority_instance_id.as_str()) => {
-                Ok(journal)
-            }
-            AuthorityPairState::Ready { .. }
-            | AuthorityPairState::Uninitialized
-            | AuthorityPairState::RecoveryRequired => Err(CredentialStoreFailure::CorruptRecord),
+    ) -> Result<Option<Box<AuthorityJournal>>, CredentialStoreFailure> {
+        match (
+            self.read_authority_state_unlocked(interaction)?,
+            self.bound_authority.as_deref(),
+        ) {
+            (
+                AuthorityPairState::Ready {
+                    authority_instance_id,
+                    journal,
+                },
+                Some(bound),
+            ) if bound == authority_instance_id => Ok(Some(journal)),
+            (AuthorityPairState::Uninitialized, None) => Ok(None),
+            (
+                AuthorityPairState::Ready { .. }
+                | AuthorityPairState::Uninitialized
+                | AuthorityPairState::RecoveryRequired,
+                _,
+            ) => Err(CredentialStoreFailure::CorruptRecord),
         }
     }
 
@@ -277,7 +287,14 @@ impl CredentialEntryStore for NativeKeyringCredentialStore {
     ) -> Result<Option<EncodedCredentialRecord>, CredentialStoreFailure> {
         let mut interaction = self.interaction_gate.acquire()?;
         let _mutation_lock = self.journal.acquire_mutation_lock()?;
-        self.require_bound_authority_unlocked(&mut interaction)?;
+        // With no authority there are no credentials, and an entry left
+        // without one is never served.
+        if self
+            .require_bound_authority_unlocked(&mut interaction)?
+            .is_none()
+        {
+            return Ok(None);
+        }
         self.read_record_unlocked(&mut interaction, &EntryLocator::active(set_id))
     }
 
@@ -372,7 +389,8 @@ impl CredentialMutationSession for NativeCredentialMutationSession<'_> {
         self.require_no_pending_readback()?;
         let journal = self
             .store
-            .require_bound_authority_unlocked(&mut self.interaction)?;
+            .require_bound_authority_unlocked(&mut self.interaction)?
+            .ok_or(CredentialStoreFailure::CorruptRecord)?;
         self.authority_instance_id = self.store.bound_authority.clone();
         Ok(*journal)
     }
@@ -2625,6 +2643,37 @@ mod tests {
         assert!(matches!(replacement.read_active(&set_id), Ok(None)));
         assert!(matches!(
             original.read_active(&set_id),
+            Err(CredentialStoreFailure::CorruptRecord)
+        ));
+    }
+
+    /// A store opened before any authority exists reads nothing and never
+    /// touches a record. Once a store it is not bound to initializes an
+    /// authority, it refuses instead.
+    #[test]
+    fn uninitialized_store_reads_none_until_an_unbound_authority_appears() {
+        let keyring = Arc::new(MemoryKeyringBoundary::default());
+        let journal = Arc::new(MemoryJournalBoundary::default());
+        let gate = NativeInteractionGate::isolated_for_test();
+        let fresh = match NativeKeyringCredentialStore::open_with_boundaries_and_gate(
+            keyring.clone(),
+            journal.clone(),
+            gate,
+        )
+        .expect("open absent authority")
+        {
+            NativeCredentialStoreOpen::Uninitialized(store) => store,
+            _ => panic!("expected uninitialized authority"),
+        };
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let native_reads = keyring.reads.load(Ordering::SeqCst);
+        assert!(matches!(fresh.read_active(&set_id), Ok(None)));
+        // Only the authority marker was read; the record never was.
+        assert_eq!(keyring.reads.load(Ordering::SeqCst), native_reads + 1);
+
+        let _initialized = ready_store_with_gate(keyring.clone(), journal.clone(), gate);
+        assert!(matches!(
+            fresh.read_active(&set_id),
             Err(CredentialStoreFailure::CorruptRecord)
         ));
     }
