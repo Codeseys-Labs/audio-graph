@@ -15,13 +15,14 @@ use crossbeam_channel::Receiver;
 use tauri::AppHandle;
 
 use crate::audio::pipeline::ProcessedAudioChunk;
-use crate::events::{AgentProposalPayload, PipelineStatus};
+use crate::events::AgentProposalPayload;
 use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine};
 use crate::settings::LlmProvider;
 use crate::state::{ProjectionJobRegistry, ProjectionRuntimeHandle, TranscriptSegment};
+use crate::status::StatusAuthority;
 
 /// Input/output channels and the cooperative-shutdown flag.
 ///
@@ -68,7 +69,7 @@ pub(crate) struct SpeechShared {
     /// Set at Stop before the registry above is drained. See
     /// `AppState::projection_lane_stopping`.
     pub projection_lane_stopping: Arc<AtomicBool>,
-    pub pipeline_status: Arc<RwLock<PipelineStatus>>,
+    pub pipeline_status: StatusAuthority,
     pub app_handle: AppHandle,
     pub knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
     pub graph_snapshot: Arc<RwLock<GraphSnapshot>>,
@@ -148,6 +149,6 @@ pub(crate) struct ExtractionDeps<'a> {
     pub graph_extractor: &'a Arc<RuleBasedExtractor>,
     pub knowledge_graph: &'a Arc<Mutex<TemporalKnowledgeGraph>>,
     pub graph_snapshot: &'a Arc<RwLock<GraphSnapshot>>,
-    pub pipeline_status: &'a Arc<RwLock<PipelineStatus>>,
+    pub pipeline_status: &'a StatusAuthority,
     pub app_handle: &'a AppHandle,
 }

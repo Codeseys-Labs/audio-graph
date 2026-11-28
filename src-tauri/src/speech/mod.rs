@@ -65,7 +65,7 @@ use crate::audio::pipeline::ProcessedAudioChunk;
 use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
 };
-use crate::events::{self, PipelineStatus, StageStatus};
+use crate::events::{self, StageStatus};
 use crate::graph::entities::{ExtractedEntity, ExtractionResult, GraphDelta, GraphSnapshot};
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::{RelabelScope, TemporalKnowledgeGraph};
@@ -910,68 +910,61 @@ struct AsrReconnectStatus {
 impl AsrReconnectStatus {
     fn reconnecting(
         &mut self,
-        app: &AppHandle,
-        pipeline: &Arc<RwLock<PipelineStatus>>,
+        status: &crate::status::StatusAuthority,
         reason: events::AsrReconnectReason,
         backoff_secs: u64,
     ) {
-        {
-            let mut status = pipeline.write().unwrap_or_else(|e| e.into_inner());
-            match &status.asr {
+        status.publish_if(|status| {
+            let asr = &mut status.stages_mut().asr;
+            match asr {
                 StageStatus::Idle | StageStatus::Error { .. } => {
                     self.previous = None;
-                    return;
+                    return false;
                 }
                 StageStatus::Reconnecting { .. } => {}
-                _ => self.previous = Some(status.asr.clone()),
+                _ => self.previous = Some(asr.clone()),
             }
-            status.asr = StageStatus::Reconnecting {
+            *asr = StageStatus::Reconnecting {
                 reason,
                 retry_delay: RuntimeRetryDelayBucket::from_seconds(backoff_secs),
             };
-        }
-        emit_pipeline_status(app, pipeline);
+            true
+        });
     }
 
-    fn reconnected(
-        &mut self,
-        app: &AppHandle,
-        pipeline: &Arc<RwLock<PipelineStatus>>,
-        asr_count: u64,
-    ) {
+    fn reconnected(&mut self, status: &crate::status::StatusAuthority, asr_count: u64) {
         let Some(mut previous) = self.previous.take() else {
             return;
         };
-        {
-            let mut status = pipeline.write().unwrap_or_else(|e| e.into_inner());
-            if !matches!(status.asr, StageStatus::Reconnecting { .. }) {
-                return;
+        status.publish_if(|status| {
+            let asr = &mut status.stages_mut().asr;
+            if !matches!(asr, StageStatus::Reconnecting { .. }) {
+                return false;
             }
             if let StageStatus::Running { processed_count } = &mut previous {
                 *processed_count = (*processed_count).max(asr_count);
             }
-            status.asr = previous;
-        }
-        emit_pipeline_status(app, pipeline);
+            *asr = previous;
+            true
+        });
     }
 
     fn handle_aws_status(
         &mut self,
-        app: &AppHandle,
-        pipeline: &Arc<RwLock<PipelineStatus>>,
-        status: crate::asr::aws_transcribe::AwsTranscribeStatus,
+        status: &crate::status::StatusAuthority,
+        update: crate::asr::aws_transcribe::AwsTranscribeStatus,
         asr_count: u64,
     ) {
         use crate::asr::aws_transcribe::AwsTranscribeStatus;
-        match status {
+        match update {
             AwsTranscribeStatus::Reconnecting {
                 reason,
                 backoff_secs,
                 ..
             } => {
-                self.reconnecting(app, pipeline, reason, backoff_secs);
+                self.reconnecting(status, reason, backoff_secs);
             }
-            AwsTranscribeStatus::Reconnected => self.reconnected(app, pipeline, asr_count),
+            AwsTranscribeStatus::Reconnected => self.reconnected(status, asr_count),
         }
     }
 }
@@ -987,49 +980,22 @@ fn emit_terminal_streaming_asr_error(
     diagnostic: RuntimeDiagnostic,
 ) {
     ctx.streaming_asr_terminated.store(true, Ordering::Release);
-    set_asr_status_and_emit(
-        &ctx.app_handle,
-        &ctx.pipeline_status,
-        StageStatus::Error { diagnostic },
-    );
+    set_asr_status(&ctx.pipeline_status, StageStatus::Error { diagnostic });
 }
 
-/// Write the ASR stage status, recovering from a poisoned lock the same way
-/// the extraction path does (`mod.rs:679`). **Pure** (no Tauri) — testable.
-///
-/// FA-1: a poisoned `pipeline_status` lock must not silently swallow an error
-/// status — recover the inner guard and write through it so the failure is
-/// still recorded (and then emitted by the caller).
-fn set_asr_status(pipeline_status: &Arc<RwLock<PipelineStatus>>, asr: StageStatus) {
-    let mut status = pipeline_status.write().unwrap_or_else(|e| e.into_inner());
-    status.asr = asr;
+/// Publish the ASR stage status (FA-1). Cloud/streaming providers that go to
+/// `Error`/`Reconnecting` (or back to `Running` on reconnect) must push the
+/// new state to the frontend, else the UI keeps showing the last `Running`
+/// snapshot while the provider is dead. A poisoned status lock is recovered,
+/// so a failure is still recorded and emitted.
+fn set_asr_status(status: &crate::status::StatusAuthority, asr: StageStatus) {
+    status.publish(|status| status.stages_mut().asr = asr);
 }
 
-/// Emit the current pipeline status to the UI. Best-effort — recovers from a
-/// poisoned lock so an error status is never *doubly* lost (FA-1). Mirrors the
-/// read+emit pattern at the end of `process_extraction_and_emit`.
-fn emit_pipeline_status(app_handle: &AppHandle, pipeline_status: &Arc<RwLock<PipelineStatus>>) {
-    let status = pipeline_status.read().unwrap_or_else(|e| e.into_inner());
-    let _ = app_handle.emit(events::PIPELINE_STATUS_EVENT, &*status);
-}
-
-/// Set the ASR stage status **and** emit the updated pipeline status to the UI
-/// (FA-1). Cloud/streaming providers that go to `Error`/`Reconnecting` (or back
-/// to `Running` on reconnect) must push the new state to the frontend, else the
-/// UI keeps showing the last `Running` snapshot while the provider is dead.
-fn set_asr_status_and_emit(
-    app_handle: &AppHandle,
-    pipeline_status: &Arc<RwLock<PipelineStatus>>,
-    asr: StageStatus,
-) {
-    set_asr_status(pipeline_status, asr);
-    emit_pipeline_status(app_handle, pipeline_status);
-}
-
-/// Apply a diarization backend selection's degradation (if any) to the shared
-/// pipeline status and notify the UI, once, at worker startup — mirrors
-/// `set_asr_status_and_emit` above (audio-graph-586b: `mode=provider` must
-/// never be silently overridden by an unannounced Simple-backend fallback).
+/// Apply a diarization backend selection's degradation (if any) to the
+/// status and publish it, once, at worker startup — mirrors `set_asr_status`
+/// above (audio-graph-586b: `mode=provider` must never be silently
+/// overridden by an unannounced Simple-backend fallback).
 ///
 /// No-op when `reason` is `None` (the selected backend matched what `mode`
 /// asked for, or diarization is off) — the caller's existing `Running{0}`
@@ -1041,8 +1007,7 @@ fn set_asr_status_and_emit(
 /// `!matches!(status.diarization, StageStatus::Degraded { .. })` before
 /// overwriting, so this call's honest state persists for the whole session.
 fn apply_diarization_degradation(
-    app_handle: &AppHandle,
-    pipeline_status: &Arc<RwLock<PipelineStatus>>,
+    status: &crate::status::StatusAuthority,
     reason: Option<DiarizationDegradationReason>,
 ) {
     let Some(reason) = reason else {
@@ -1053,14 +1018,12 @@ fn apply_diarization_degradation(
         reason.as_wire_code(),
         reason.diagnostic_text()
     );
-    {
-        let mut status = pipeline_status.write().unwrap_or_else(|e| e.into_inner());
-        status.diarization = StageStatus::Degraded {
+    status.publish(|status| {
+        status.stages_mut().diarization = StageStatus::Degraded {
             reason,
             diagnostic: reason.diagnostic(),
         };
-    }
-    emit_pipeline_status(app_handle, pipeline_status);
+    });
 }
 
 /// Suppress a local-backend degradation reason when the ACTIVE provider is
@@ -2578,20 +2541,16 @@ fn apply_extraction_result_if_current(
         );
     }
 
-    // Update entity_extraction and graph status, then emit pipeline status
-    if let Ok(mut status) = deps.pipeline_status.write() {
-        status.entity_extraction = StageStatus::Running {
+    // Publish the entity_extraction and graph counts.
+    deps.pipeline_status.publish(|status| {
+        let stages = status.stages_mut();
+        stages.entity_extraction = StageStatus::Running {
             processed_count: *extraction_count,
         };
-        status.graph = StageStatus::Running {
+        stages.graph = StageStatus::Running {
             processed_count: *graph_update_count,
         };
-    }
-    if let Ok(status) = deps.pipeline_status.read() {
-        let _ = deps
-            .app_handle
-            .emit(events::PIPELINE_STATUS_EVENT, &*status);
-    }
+    });
     emit_stage_latency(
         deps.app_handle,
         "entity_extraction",
@@ -2681,7 +2640,7 @@ pub(crate) struct TranscriptProcessingContext {
     /// Set at Stop before the registry above is drained. See
     /// `AppState::projection_lane_stopping`.
     pub projection_lane_stopping: Arc<std::sync::atomic::AtomicBool>,
-    pub pipeline_status: Arc<RwLock<PipelineStatus>>,
+    pub pipeline_status: crate::status::StatusAuthority,
     pub app_handle: AppHandle,
     pub llm_engine: Arc<Mutex<Option<LlmEngine>>>,
     pub api_client: Arc<Mutex<Option<ApiClient>>>,
@@ -3136,7 +3095,7 @@ impl TranscriptProcessingContext {
                 .read()
                 .unwrap_or_else(|p| p.into_inner());
             if observe_transcript_receipt(
-                Some((&ctx.app_handle, &ctx.pipeline_status)),
+                Some(&ctx.pipeline_status),
                 &ctx.transcript_ledger,
                 &ctx.projection_schedulers,
                 Some(&ctx.projection_dispatch_context()),
@@ -3214,7 +3173,7 @@ fn transcript_saving_failure(
 
 /// Returns true when the visible storage status changed.
 fn update_transcript_saving_status(
-    status: &mut PipelineStatus,
+    status: &mut events::TranscriptSaving,
     id: u64,
     result: &LiveTranscriptResult,
 ) -> bool {
@@ -3313,7 +3272,7 @@ fn commit_asr_span_revision(
 
 #[cfg(test)]
 fn record_asr_span_revision_event_and_observe_projection(
-    status: Option<(&AppHandle, &RwLock<PipelineStatus>)>,
+    status: Option<&crate::status::StatusAuthority>,
     transcript_ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
     transcript_event_writer: &Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
     projection_schedulers: &Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
@@ -3340,7 +3299,7 @@ fn record_asr_span_revision_event_and_observe_projection(
 
 #[allow(clippy::too_many_arguments)]
 fn observe_transcript_receipt(
-    status: Option<(&AppHandle, &RwLock<PipelineStatus>)>,
+    status: Option<&crate::status::StatusAuthority>,
     transcript_ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
     projection_schedulers: &Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
     projection_dispatch: Option<&ProjectionDispatchContext>,
@@ -3349,19 +3308,20 @@ fn observe_transcript_receipt(
     publication_id: u64,
     receipt: LiveTranscriptResult,
 ) -> bool {
-    let changed = {
+    {
         let ledger = transcript_ledger.lock().unwrap_or_else(|p| p.into_inner());
         if ledger.session_id != expected_session {
             return false;
         }
-        status.and_then(|(app, status)| {
-            let mut status = status.write().unwrap_or_else(|p| p.into_inner());
-            update_transcript_saving_status(&mut status, publication_id, &receipt)
-                .then(|| (app, status.clone()))
-        })
-    };
-    if let Some((app, status)) = changed {
-        let _ = app.emit(events::PIPELINE_STATUS_EVENT, &status);
+        if let Some(status) = status {
+            status.publish_if(|status| {
+                update_transcript_saving_status(
+                    status.transcript_saving_mut(),
+                    publication_id,
+                    &receipt,
+                )
+            });
+        }
     }
     if !report_transcript_commit(receipt) {
         return false;
@@ -4779,30 +4739,31 @@ fn publish_accepted_final(
         ctx.transcript_ledger.clone(),
     );
 
-    // 4. Update pipeline status counts.
-    if let Ok(mut status) = ctx.pipeline_status.write() {
+    // 4. Publish the pipeline status counts.
+    ctx.pipeline_status.publish(|status| {
+        let stages = status.stages_mut();
         // A local promotion advances a healthy count, but provides no evidence
         // that a disconnected or failed provider has recovered.
         if !ctx.streaming_asr_terminated.load(Ordering::Acquire)
-            && !matches!(status.asr, StageStatus::Reconnecting { .. })
-            && (!promoted_interim || matches!(status.asr, StageStatus::Running { .. }))
+            && !matches!(stages.asr, StageStatus::Reconnecting { .. })
+            && (!promoted_interim || matches!(stages.asr, StageStatus::Running { .. }))
         {
-            let processed_count = match status.asr {
+            let processed_count = match stages.asr {
                 StageStatus::Running { processed_count } => processed_count.max(asr_count),
                 _ => asr_count,
             };
-            status.asr = StageStatus::Running { processed_count };
+            stages.asr = StageStatus::Running { processed_count };
         }
         // audio-graph-586b: a `Degraded` diarization status (set once, at
         // worker startup, by `apply_diarization_degradation`) must persist
         // for the whole session — this per-segment count update must never
         // clobber it back to a healthy-looking `Running`.
-        if !matches!(status.diarization, StageStatus::Degraded { .. }) {
-            status.diarization = StageStatus::Running {
+        if !matches!(stages.diarization, StageStatus::Degraded { .. }) {
+            stages.diarization = StageStatus::Running {
                 processed_count: diarization_count,
             };
         }
-    }
+    });
 
     // 5. Knowledge Graph Extraction — fire-and-forget, COALESCED. Consecutive
     // same-speaker segments are batched (see coalesce_submit) to cut redundant
@@ -6345,11 +6306,7 @@ fn handle_moonshine_worker_error(
 ) {
     let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Native);
     log::warn!("Moonshine streaming: {phase} failed diagnostic={diagnostic}");
-    set_asr_status_and_emit(
-        &ctx.app_handle,
-        &ctx.pipeline_status,
-        StageStatus::Error { diagnostic },
-    );
+    set_asr_status(&ctx.pipeline_status, StageStatus::Error { diagnostic });
 }
 
 fn emit_moonshine_revisions(
@@ -6499,11 +6456,7 @@ pub(crate) fn run_moonshine_speech_processor_with_worker<A: MoonshineStreamingAd
     if worker.stop().is_err() {
         let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Native);
         log::warn!("Moonshine streaming: stop failed diagnostic={diagnostic}");
-        set_asr_status_and_emit(
-            &ctx.app_handle,
-            &ctx.pipeline_status,
-            StageStatus::Error { diagnostic },
-        );
+        set_asr_status(&ctx.pipeline_status, StageStatus::Error { diagnostic });
     }
 
     log::info!(
@@ -6546,11 +6499,7 @@ fn run_asr_worker(
                 )
                 .into();
                 log::error!("ASR worker: Whisper model load failed diagnostic={diagnostic}");
-                set_asr_status_and_emit(
-                    &shared.app_handle,
-                    &shared.pipeline_status,
-                    StageStatus::Error { diagnostic },
-                );
+                set_asr_status(&shared.pipeline_status, StageStatus::Error { diagnostic });
                 return;
             }
         };
@@ -6560,11 +6509,7 @@ fn run_asr_worker(
         Err(_) => {
             let diagnostic = internal_transcription_diagnostic(RuntimeTransport::Native);
             log::error!("ASR worker: Whisper state unavailable diagnostic={diagnostic}");
-            set_asr_status_and_emit(
-                &shared.app_handle,
-                &shared.pipeline_status,
-                StageStatus::Error { diagnostic },
-            );
+            set_asr_status(&shared.pipeline_status, StageStatus::Error { diagnostic });
             return;
         }
     };
@@ -6573,11 +6518,7 @@ fn run_asr_worker(
 
     let (diarization_config, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
-    apply_diarization_degradation(
-        &shared.app_handle,
-        &shared.pipeline_status,
-        diarization_degradation,
-    );
+    apply_diarization_degradation(&shared.pipeline_status, diarization_degradation);
 
     // ADR-0017 / B16: when the unbounded clustering backend is selected, spawn
     // its live rolling-window worker fed by the same 16 kHz mono segment audio
@@ -6847,11 +6788,7 @@ pub(crate) fn run_speech_processor_diarization_only(
     // Auto-detect Sortformer / clustering models; falls back to Simple if none.
     let (diarization_config, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
-    apply_diarization_degradation(
-        &shared.app_handle,
-        &shared.pipeline_status,
-        diarization_degradation,
-    );
+    apply_diarization_degradation(&shared.pipeline_status, diarization_degradation);
 
     // ADR-0017 / B16: spawn the live clustering worker when that backend is
     // selected, fed the same 16 kHz mono segment audio used for the placeholder
@@ -6873,13 +6810,10 @@ pub(crate) fn run_speech_processor_diarization_only(
     // clobbering it with the generic Whisper message. FA-1 follow-up: EMIT so
     // every fallback caller leaves the UI's "Running" state instead of looking
     // healthy while no ASR is running.
-    {
-        let mut status = shared
-            .pipeline_status
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        if !matches!(status.asr, StageStatus::Error { .. }) {
-            status.asr = StageStatus::Error {
+    shared.pipeline_status.publish(|status| {
+        let stages = status.stages_mut();
+        if !matches!(stages.asr, StageStatus::Error { .. }) {
+            stages.asr = StageStatus::Error {
                 diagnostic: transcription_diagnostic(
                     RuntimeErrorCode::ProviderUnavailable,
                     false,
@@ -6888,10 +6822,9 @@ pub(crate) fn run_speech_processor_diarization_only(
                 ),
             };
         }
-        status.entity_extraction = StageStatus::Running { processed_count: 0 };
-        status.graph = StageStatus::Running { processed_count: 0 };
-    }
-    emit_pipeline_status(&shared.app_handle, &shared.pipeline_status);
+        stages.entity_extraction = StageStatus::Running { processed_count: 0 };
+        stages.graph = StageStatus::Running { processed_count: 0 };
+    });
 
     log::info!("Speech processor (diarization-only): entering processing loop");
 
@@ -7037,7 +6970,7 @@ pub(crate) fn run_speech_processor_diarization_only(
                         .read()
                         .unwrap_or_else(|p| p.into_inner());
                     if !observe_transcript_receipt(
-                        Some((&shared.app_handle, &shared.pipeline_status)),
+                        Some(&shared.pipeline_status),
                         &shared.transcript_ledger,
                         &shared.projection_schedulers,
                         Some(&projection_dispatch),
@@ -7116,16 +7049,19 @@ pub(crate) fn run_speech_processor_diarization_only(
                         shared.transcript_ledger.clone(),
                     );
 
-                    if let Ok(mut status) = shared.pipeline_status.write() {
+                    shared.pipeline_status.publish_if(|status| {
                         // audio-graph-586b: see the identical guard's comment in
                         // `emit_transcript_and_extract_with_meta` — a `Degraded` set at
                         // worker startup must survive every per-segment count update.
-                        if !matches!(status.diarization, StageStatus::Degraded { .. }) {
-                            status.diarization = StageStatus::Running {
+                        let stages = status.stages_mut();
+                        let healthy = !matches!(stages.diarization, StageStatus::Degraded { .. });
+                        if healthy {
+                            stages.diarization = StageStatus::Running {
                                 processed_count: count,
                             };
                         }
-                    }
+                        healthy
+                    });
 
                     // Knowledge Graph Extraction — fire-and-forget
                     let expected_session_id = active_session_id_snapshot(&shared.active_session_id);
@@ -7222,9 +7158,10 @@ pub(crate) fn run_cloud_asr_speech_processor(
             }
         });
 
-    if let Ok(mut status) = pipeline_status_for_status_update.write() {
-        status.asr = StageStatus::Running { processed_count: 0 };
-    }
+    set_asr_status(
+        &pipeline_status_for_status_update,
+        StageStatus::Running { processed_count: 0 },
+    );
 
     log::info!("Cloud ASR speech processor: entering accumulator loop");
     let mut accumulators: HashMap<String, AudioAccumulator> = HashMap::new();
@@ -7277,11 +7214,7 @@ fn run_cloud_asr_worker(
 ) {
     let (diarization_config, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
-    apply_diarization_degradation(
-        &shared.app_handle,
-        &shared.pipeline_status,
-        diarization_degradation,
-    );
+    apply_diarization_degradation(&shared.pipeline_status, diarization_degradation);
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -7390,11 +7323,7 @@ fn run_cloud_asr_worker(
                 log::warn!("Cloud ASR worker: transcription failed diagnostic={diagnostic}");
                 // FA-1: emit so the UI reflects the error instead of the last
                 // "Running" snapshot.
-                set_asr_status_and_emit(
-                    &ctx.app_handle,
-                    &ctx.pipeline_status,
-                    StageStatus::Error { diagnostic },
-                );
+                set_asr_status(&ctx.pipeline_status, StageStatus::Error { diagnostic });
             }
         }
     }
@@ -7458,11 +7387,7 @@ pub(crate) fn run_deepgram_speech_processor(
             // FA-1: emit so the UI leaves the "Running" state for this dead
             // provider instead of looking healthy. This returns immediately
             // after, so the receiver thread never runs to report it.
-            set_asr_status_and_emit(
-                &shared.app_handle,
-                &shared.pipeline_status,
-                StageStatus::Error { diagnostic },
-            );
+            set_asr_status(&shared.pipeline_status, StageStatus::Error { diagnostic });
             return;
         }
     }
@@ -7504,9 +7429,10 @@ pub(crate) fn run_deepgram_speech_processor(
         }
     };
 
-    if let Ok(mut status) = pipeline_status_for_status_update.write() {
-        status.asr = StageStatus::Running { processed_count: 0 };
-    }
+    set_asr_status(
+        &pipeline_status_for_status_update,
+        StageStatus::Running { processed_count: 0 },
+    );
 
     // Audio sender loop: reads chunks and forwards to Deepgram.
     log::info!("Deepgram streaming: entering audio sender loop");
@@ -8202,7 +8128,6 @@ fn run_deepgram_event_receiver(
     let (_, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
     apply_diarization_degradation(
-        &shared.app_handle,
         &shared.pipeline_status,
         diarization_degradation_for_provider_labeled_session(
             provider_native_diarization_active,
@@ -8767,14 +8692,9 @@ fn run_deepgram_event_receiver(
                 reason,
                 backoff_secs,
                 ..
-            } => reconnect_status.reconnecting(
-                &ctx.app_handle,
-                &ctx.pipeline_status,
-                reason,
-                backoff_secs,
-            ),
+            } => reconnect_status.reconnecting(&ctx.pipeline_status, reason, backoff_secs),
             DeepgramEvent::Reconnected => {
-                reconnect_status.reconnected(&ctx.app_handle, &ctx.pipeline_status, asr_count);
+                reconnect_status.reconnected(&ctx.pipeline_status, asr_count);
             }
         }
     }
@@ -8856,11 +8776,7 @@ pub(crate) fn run_assemblyai_speech_processor(
             // FA-1: emit so the UI leaves the "Running" state for this dead
             // provider instead of looking healthy. This returns immediately
             // after, so the receiver thread never runs to report it.
-            set_asr_status_and_emit(
-                &shared.app_handle,
-                &shared.pipeline_status,
-                StageStatus::Error { diagnostic },
-            );
+            set_asr_status(&shared.pipeline_status, StageStatus::Error { diagnostic });
             return;
         }
     }
@@ -8889,9 +8805,10 @@ pub(crate) fn run_assemblyai_speech_processor(
             }
         });
 
-    if let Ok(mut status) = pipeline_status_for_status_update.write() {
-        status.asr = StageStatus::Running { processed_count: 0 };
-    }
+    set_asr_status(
+        &pipeline_status_for_status_update,
+        StageStatus::Running { processed_count: 0 },
+    );
 
     // Audio sender loop: reads chunks and forwards to AssemblyAI.
     log::info!("AssemblyAI streaming: entering audio sender loop");
@@ -9108,14 +9025,9 @@ fn run_assemblyai_event_receiver(
                 reason,
                 backoff_secs,
                 ..
-            } => reconnect_status.reconnecting(
-                &ctx.app_handle,
-                &ctx.pipeline_status,
-                reason,
-                backoff_secs,
-            ),
+            } => reconnect_status.reconnecting(&ctx.pipeline_status, reason, backoff_secs),
             AssemblyAIEvent::Reconnected => {
-                reconnect_status.reconnected(&ctx.app_handle, &ctx.pipeline_status, asr_count);
+                reconnect_status.reconnected(&ctx.pipeline_status, asr_count);
             }
         }
     }
@@ -9150,11 +9062,7 @@ pub(crate) fn run_soniox_speech_processor(
         }
         Err(e) => {
             let diagnostic = websocket_connect_diagnostic("Soniox", e);
-            set_asr_status_and_emit(
-                &shared.app_handle,
-                &shared.pipeline_status,
-                StageStatus::Error { diagnostic },
-            );
+            set_asr_status(&shared.pipeline_status, StageStatus::Error { diagnostic });
             return;
         }
     }
@@ -9179,9 +9087,10 @@ pub(crate) fn run_soniox_speech_processor(
             }
         });
 
-    if let Ok(mut status) = pipeline_status_for_status_update.write() {
-        status.asr = StageStatus::Running { processed_count: 0 };
-    }
+    set_asr_status(
+        &pipeline_status_for_status_update,
+        StageStatus::Running { processed_count: 0 },
+    );
 
     log::info!("Soniox streaming: entering audio sender loop");
     let mut chunks_sent: u64 = 0;
@@ -9361,14 +9270,9 @@ fn run_soniox_event_receiver(
                 reason,
                 backoff_secs,
                 ..
-            } => reconnect_status.reconnecting(
-                &ctx.app_handle,
-                &ctx.pipeline_status,
-                reason,
-                backoff_secs,
-            ),
+            } => reconnect_status.reconnecting(&ctx.pipeline_status, reason, backoff_secs),
             SonioxEvent::Reconnected => {
-                reconnect_status.reconnected(&ctx.app_handle, &ctx.pipeline_status, asr_count);
+                reconnect_status.reconnected(&ctx.pipeline_status, asr_count);
             }
         }
     }
@@ -9417,11 +9321,7 @@ pub(crate) fn run_openai_realtime_speech_processor(
             // FA-1: emit so the UI leaves the "Running" state for this dead
             // provider instead of looking healthy. This returns immediately
             // after, so the receiver thread never runs to report it.
-            set_asr_status_and_emit(
-                &shared.app_handle,
-                &shared.pipeline_status,
-                StageStatus::Error { diagnostic },
-            );
+            set_asr_status(&shared.pipeline_status, StageStatus::Error { diagnostic });
             return;
         }
     }
@@ -9450,9 +9350,10 @@ pub(crate) fn run_openai_realtime_speech_processor(
             }
         });
 
-    if let Ok(mut status) = pipeline_status_for_status_update.write() {
-        status.asr = StageStatus::Running { processed_count: 0 };
-    }
+    set_asr_status(
+        &pipeline_status_for_status_update,
+        StageStatus::Running { processed_count: 0 },
+    );
 
     // Audio sender loop: reads chunks, forwards to OpenAI, then commits on an
     // utterance-scale cadence to trigger incremental transcription.
@@ -9585,11 +9486,7 @@ fn run_openai_realtime_event_receiver(
 
     let (_, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
-    apply_diarization_degradation(
-        &shared.app_handle,
-        &shared.pipeline_status,
-        diarization_degradation,
-    );
+    apply_diarization_degradation(&shared.pipeline_status, diarization_degradation);
 
     let mut asr_count: u64 = 0;
     let diarization_count: u64 = 0;
@@ -9754,14 +9651,9 @@ fn run_openai_realtime_event_receiver(
                 reason,
                 backoff_secs,
                 ..
-            } => reconnect_status.reconnecting(
-                &ctx.app_handle,
-                &ctx.pipeline_status,
-                reason,
-                backoff_secs,
-            ),
+            } => reconnect_status.reconnecting(&ctx.pipeline_status, reason, backoff_secs),
             OpenAiRealtimeEvent::Reconnected => {
-                reconnect_status.reconnected(&ctx.app_handle, &ctx.pipeline_status, asr_count);
+                reconnect_status.reconnected(&ctx.pipeline_status, asr_count);
             }
         }
     }
@@ -9792,20 +9684,17 @@ pub(crate) fn run_aws_transcribe_speech_processor(
 
     let (_, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
-    apply_diarization_degradation(
-        &shared.app_handle,
-        &shared.pipeline_status,
-        diarization_degradation,
-    );
+    apply_diarization_degradation(&shared.pipeline_status, diarization_degradation);
 
     let mut asr_count: u64 = 0;
     let mut diarization_count: u64 = 0;
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
 
-    if let Ok(mut status) = shared.pipeline_status.write() {
-        status.asr = StageStatus::Running { processed_count: 0 };
-    }
+    set_asr_status(
+        &shared.pipeline_status,
+        StageStatus::Running { processed_count: 0 },
+    );
 
     log::info!("AWS Transcribe speech processor: starting streaming session");
 
@@ -9826,14 +9715,12 @@ pub(crate) fn run_aws_transcribe_speech_processor(
     let ctx_for_partial = ctx.clone();
     let aws_config = aws_config.with_content_egress_policy(provider_content_egress_policy);
 
-    let app_handle_for_status = ctx.app_handle.clone();
     let pipeline_status_for_status = ctx.pipeline_status.clone();
     let asr_count_for_status = Arc::new(AtomicU64::new(0));
     let asr_count_for_transcript = asr_count_for_status.clone();
     let mut reconnect_status = AsrReconnectStatus::default();
     let on_status = move |status| {
         reconnect_status.handle_aws_status(
-            &app_handle_for_status,
             &pipeline_status_for_status,
             status,
             asr_count_for_status.load(Ordering::Relaxed),
@@ -9982,11 +9869,7 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
 
     let (_, diarization_degradation) =
         make_diarization_config(&config.models_dir, config.diarization_mode);
-    apply_diarization_degradation(
-        &shared.app_handle,
-        &shared.pipeline_status,
-        diarization_degradation,
-    );
+    apply_diarization_degradation(&shared.pipeline_status, diarization_degradation);
 
     let mut asr_count: u64 = 0;
     let diarization_count: u64 = 0;
@@ -9998,9 +9881,10 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
     let mut active_sherpa_span: Option<(String, String, String, u64)> = None;
     let mut revision_numbers_by_span: HashMap<String, u64> = HashMap::new();
 
-    if let Ok(mut status) = shared.pipeline_status.write() {
-        status.asr = StageStatus::Running { processed_count: 0 };
-    }
+    set_asr_status(
+        &shared.pipeline_status,
+        StageStatus::Running { processed_count: 0 },
+    );
 
     let ctx = shared_to_transcript_context(
         shared,
@@ -10370,7 +10254,7 @@ mod tests_status {
     use super::{
         AGENT_SIGNAL_MIN_CHARS, AGENT_SIGNAL_MIN_TOKENS, AsrReconnectStatus,
         DiarizationDegradationReason, DiarizationDispatchContext, DiarizationEventSink,
-        ExtractionDeps, PipelineStatus, ProjectionDataMovementSink, ProjectionDispatchContext,
+        ExtractionDeps, ProjectionDataMovementSink, ProjectionDispatchContext,
         ProjectionPatchAttempt, ProjectionPatchGenerator, ProjectionRuntimeEventSink,
         SpeechChannels, SpeechConfig, SpeechShared, StageStatus, agent_proposal_body,
         agent_signal_content_text, agent_signal_grade, apply_extraction_result_if_current,
@@ -11305,7 +11189,7 @@ mod tests_status {
             projection_runtime: app.projection_runtime_handle(),
             projection_job_workers: app.projection_job_workers.clone(),
             projection_lane_stopping: app.projection_lane_stopping.clone(),
-            pipeline_status: app.pipeline_status.clone(),
+            pipeline_status: app.status.clone(),
             app_handle,
             knowledge_graph: app.knowledge_graph.clone(),
             graph_snapshot: app.graph_snapshot.clone(),
@@ -11344,10 +11228,10 @@ mod tests_status {
 
         let emitted = Arc::new(AtomicUsize::new(0));
         let mut listeners = Vec::new();
+        app.status.record();
         for event_name in [
             events::GRAPH_DELTA,
             events::GRAPH_UPDATE,
-            events::PIPELINE_STATUS_EVENT,
             events::PIPELINE_LATENCY,
         ] {
             let emitted = emitted.clone();
@@ -11433,7 +11317,11 @@ mod tests_status {
         assert_eq!(
             emitted.load(Ordering::SeqCst),
             0,
-            "stale extraction must not emit graph, status, or latency events"
+            "stale extraction must not emit graph or latency events"
+        );
+        assert!(
+            app.status.recorded().is_empty(),
+            "stale extraction must not publish status"
         );
 
         for listener in listeners {
@@ -12269,13 +12157,22 @@ mod tests_status {
         use super::{
             PendingPublication, retire_transcript_publications, update_transcript_saving_status,
         };
-        let status = Arc::new(Mutex::new(PipelineStatus::default()));
+        let status = crate::status::StatusAuthority::detached();
+        status.record();
         let observed = status.clone();
         let held = PendingPublication::register(
             "orchard".into(),
             &projection_asr_payload("reed", 1, "leaf", true),
             move |receipt, _, id| {
-                update_transcript_saving_status(&mut observed.lock().unwrap(), id, &receipt)
+                observed
+                    .publish_if(|status| {
+                        update_transcript_saving_status(
+                            status.transcript_saving_mut(),
+                            id,
+                            &receipt,
+                        )
+                    })
+                    .is_some()
             },
         );
         retire_transcript_publications(&held.session, std::slice::from_ref(&held.event));
@@ -12283,10 +12180,11 @@ mod tests_status {
             Err(crate::persistence::canonical_log::TranscriptCommitError::ReplyLost),
             false,
         );
-        let status = status.lock().unwrap();
-        assert!(status.pending_transcript_saves.is_empty());
-        assert!(status.transcript_not_saving.is_none());
         assert!(!changed);
+        assert!(status.recorded().is_empty(), "nothing is published");
+        let saving = status.snapshot().transcript_saving().clone();
+        assert!(saving.pending_transcript_saves.is_empty());
+        assert!(saving.transcript_not_saving.is_none());
     }
 
     fn assemblyai_speaker_revision(
@@ -13236,7 +13134,7 @@ mod tests_status {
         for provider in ["deepgram", "assemblyai", "soniox", "openai_realtime"] {
             let shared = moonshine_shared_for_app(&app, super::shared_test_app_handle());
             let config = moonshine_speech_config(dir.clone());
-            set_asr_status(&app.pipeline_status, StageStatus::Idle);
+            set_asr_status(&app.status, StageStatus::Idle);
             match provider {
                 "deepgram" => super::run_deepgram_event_receiver(
                     events(
@@ -13289,7 +13187,7 @@ mod tests_status {
                 ),
             }
             assert!(
-                matches!(&app.pipeline_status.read().unwrap().asr, StageStatus::Error { diagnostic } if *diagnostic == expected),
+                matches!(&app.status.snapshot().stages().asr, StageStatus::Error { diagnostic } if *diagnostic == expected),
                 "{provider}"
             );
         }
@@ -13361,7 +13259,7 @@ mod tests_status {
         use crate::persistence::canonical_log::{
             CanonicalAppendRejection, TranscriptCommitError as Error, TranscriptReceipt,
         };
-        let mut status = PipelineStatus::default();
+        let mut status = events::TranscriptSaving::default();
         for previous in [None, Some(events::TranscriptSavingFailure::StorageFull)] {
             status.transcript_not_saving = previous;
             for error in [
@@ -13514,10 +13412,7 @@ mod tests_status {
             RuntimeSafeRecoveryAction::Retry,
             RuntimeTransport::Http,
         );
-        set_asr_status(
-            &app.pipeline_status,
-            StageStatus::Running { processed_count: 0 },
-        );
+        set_asr_status(&app.status, StageStatus::Running { processed_count: 0 });
         let (tx, rx) = crossbeam_channel::unbounded();
         for start in 0..2 {
             tx.send(super::AccumulatedSegment {
@@ -13542,7 +13437,7 @@ mod tests_status {
                     return Err(diagnostic.clone());
                 }
                 assert!(matches!(
-                    &app.pipeline_status.read().unwrap().asr,
+                    &app.status.snapshot().stages().asr,
                     StageStatus::Error { diagnostic: actual } if *actual == diagnostic
                 ));
                 Ok(vec![TranscriptSegment {
@@ -13559,7 +13454,7 @@ mod tests_status {
         );
         assert_eq!(calls, 2);
         assert!(matches!(
-            app.pipeline_status.read().unwrap().asr,
+            app.status.snapshot().stages().asr,
             StageStatus::Running { processed_count: 1 }
         ));
         drain_app_writers(&app);
@@ -13568,24 +13463,61 @@ mod tests_status {
     }
 
     #[test]
-    #[cfg_attr(target_os = "macos", ignore = "Tao needs the main thread on macOS")]
     fn stop_during_asr_reconnect_keeps_the_stage_idle() {
-        let app_handle = super::shared_test_app_handle();
-        let pipeline = Arc::new(RwLock::new(crate::events::PipelineStatus::default()));
+        let status = crate::status::StatusAuthority::detached();
+        let asr = || status.snapshot().stages().asr.clone();
         let mut reconnect_status = AsrReconnectStatus::default();
         let reason = events::AsrReconnectReason::ConnectionLost;
-        set_asr_status(&pipeline, StageStatus::Running { processed_count: 7 });
-        reconnect_status.reconnecting(&app_handle, &pipeline, reason, 1);
-        assert!(matches!(
-            pipeline.read().unwrap().asr,
-            StageStatus::Reconnecting { .. }
-        ));
+        set_asr_status(&status, StageStatus::Running { processed_count: 7 });
+        reconnect_status.reconnecting(&status, reason, 1);
+        assert!(matches!(asr(), StageStatus::Reconnecting { .. }));
 
-        set_asr_status(&pipeline, StageStatus::Idle);
-        reconnect_status.reconnecting(&app_handle, &pipeline, reason, 2);
-        assert!(matches!(pipeline.read().unwrap().asr, StageStatus::Idle));
-        reconnect_status.reconnected(&app_handle, &pipeline, 8);
-        assert!(matches!(pipeline.read().unwrap().asr, StageStatus::Idle));
+        set_asr_status(&status, StageStatus::Idle);
+        reconnect_status.reconnecting(&status, reason, 2);
+        assert!(matches!(asr(), StageStatus::Idle));
+        reconnect_status.reconnected(&status, 8);
+        assert!(matches!(asr(), StageStatus::Idle));
+    }
+
+    /// Entering, updating and leaving a reconnect are each one publish, in
+    /// revision order, and a reconnect with nothing to restore publishes
+    /// nothing (#141 with #579).
+    #[test]
+    fn each_asr_reconnect_transition_is_one_publish() {
+        let status = crate::status::StatusAuthority::detached();
+        set_asr_status(&status, StageStatus::Running { processed_count: 7 });
+        status.record();
+        let mut reconnect_status = AsrReconnectStatus::default();
+        let reason = events::AsrReconnectReason::ConnectionLost;
+        reconnect_status.reconnecting(&status, reason, 1);
+        reconnect_status.reconnecting(&status, reason, 30);
+        reconnect_status.reconnected(&status, 9);
+        reconnect_status.reconnected(&status, 9);
+        let recorded = status.recorded();
+        let stages: Vec<StageStatus> = recorded
+            .iter()
+            .map(|snapshot| snapshot.stages().asr.clone())
+            .collect();
+        assert!(
+            matches!(
+                stages.as_slice(),
+                [
+                    StageStatus::Reconnecting { .. },
+                    StageStatus::Reconnecting { .. },
+                    StageStatus::Running { processed_count: 9 }
+                ]
+            ),
+            "{stages:?}"
+        );
+        assert!(
+            recorded
+                .windows(2)
+                .all(|pair| pair[0].revision() < pair[1].revision())
+        );
+        assert_eq!(
+            recorded.last().map(|snapshot| snapshot.revision()),
+            Some(status.snapshot().revision())
+        );
     }
 
     #[test]
@@ -13602,10 +13534,7 @@ mod tests_status {
         let app = AppState::new();
         app.projection_lane_stopping.store(true, Ordering::SeqCst);
         let run = |events: Vec<Event>| {
-            set_asr_status(
-                &app.pipeline_status,
-                StageStatus::Running { processed_count: 0 },
-            );
+            set_asr_status(&app.status, StageStatus::Running { processed_count: 0 });
             let (tx, rx) = crossbeam_channel::unbounded();
             for event in events {
                 tx.send(event).unwrap();
@@ -13619,7 +13548,7 @@ mod tests_status {
                 0,
                 false,
             );
-            app.pipeline_status.read().unwrap().asr.clone()
+            app.status.snapshot().stages().asr.clone()
         };
         let context = RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
             .with_transport(RuntimeTransport::Websocket);
@@ -13792,7 +13721,7 @@ mod tests_status {
             receive: impl FnOnce(crossbeam_channel::Receiver<E>, SpeechShared, SpeechConfig),
         ) -> StageStatus {
             set_asr_status(
-                &app.pipeline_status,
+                &app.status,
                 StageStatus::Running {
                     processed_count: 17,
                 },
@@ -13807,7 +13736,7 @@ mod tests_status {
                 moonshine_shared_for_app(app, super::shared_test_app_handle()),
                 moonshine_speech_config(dir.to_path_buf()),
             );
-            app.pipeline_status.read().unwrap().asr.clone()
+            app.status.snapshot().stages().asr.clone()
         }
 
         let _lock = crate::sessions::TEST_HOME_LOCK
@@ -13895,9 +13824,10 @@ mod tests_status {
             &diagnostic,
         );
 
-        let app_handle = super::shared_test_app_handle();
+        let status = &app.status;
+        let asr = || status.snapshot().stages().asr.clone();
         set_asr_status(
-            &app.pipeline_status,
+            status,
             StageStatus::Running {
                 processed_count: 17,
             },
@@ -13908,43 +13838,31 @@ mod tests_status {
             backoff_secs: 10,
             reason: AsrReconnectReason::SessionRollover,
         };
-        reconnect_status.handle_aws_status(&app_handle, &app.pipeline_status, attempt.clone(), 17);
+        reconnect_status.handle_aws_status(status, attempt.clone(), 17);
         assert!(matches!(
-            app.pipeline_status.read().unwrap().asr,
+            asr(),
             StageStatus::Reconnecting {
                 reason: AsrReconnectReason::SessionRollover,
                 retry_delay: RuntimeRetryDelayBucket::Medium
             }
         ));
-        reconnect_status.handle_aws_status(
-            &app_handle,
-            &app.pipeline_status,
-            AwsTranscribeStatus::Reconnected,
-            19,
-        );
+        reconnect_status.handle_aws_status(status, AwsTranscribeStatus::Reconnected, 19);
         assert!(matches!(
-            app.pipeline_status.read().unwrap().asr,
+            asr(),
             StageStatus::Running {
                 processed_count: 19
             }
         ));
-        reconnect_status.handle_aws_status(&app_handle, &app.pipeline_status, attempt.clone(), 19);
+        reconnect_status.handle_aws_status(status, attempt.clone(), 19);
         set_asr_status(
-            &app.pipeline_status,
+            status,
             StageStatus::Error {
                 diagnostic: diagnostic.clone(),
             },
         );
-        reconnect_status.handle_aws_status(&app_handle, &app.pipeline_status, attempt, 19);
-        reconnect_status.handle_aws_status(
-            &app_handle,
-            &app.pipeline_status,
-            AwsTranscribeStatus::Reconnected,
-            19,
-        );
-        assert!(
-            matches!(&app.pipeline_status.read().unwrap().asr, StageStatus::Error { diagnostic: actual } if actual == &diagnostic)
-        );
+        reconnect_status.handle_aws_status(status, attempt, 19);
+        reconnect_status.handle_aws_status(status, AwsTranscribeStatus::Reconnected, 19);
+        assert!(matches!(asr(), StageStatus::Error { diagnostic: actual } if actual == diagnostic));
 
         drain_app_writers(&app);
         drop(app);
@@ -14150,9 +14068,9 @@ mod tests_status {
                 assert_eq!(segment.id, "moonshine:mic-1:line-final@final");
             }
             {
-                let status = app.pipeline_status.read().unwrap();
+                let status = app.status.snapshot();
                 assert!(matches!(
-                    status.asr,
+                    status.stages().asr,
                     StageStatus::Running { processed_count: 1 }
                 ));
             }
@@ -14273,8 +14191,8 @@ mod tests_status {
                 data_dir.join("models-error"),
             );
 
-            let status = app.pipeline_status.read().unwrap();
-            match &status.asr {
+            let status = app.status.snapshot();
+            match &status.stages().asr {
                 StageStatus::Error { diagnostic } => {
                     assert_eq!(
                         diagnostic,
@@ -14745,7 +14663,10 @@ mod tests_status {
             failed.recv_timeout(Duration::from_secs(60)).unwrap();
             group.publish();
             assert_eq!(
-                app.pipeline_status.read().unwrap().transcript_not_saving,
+                app.status
+                    .snapshot()
+                    .transcript_saving()
+                    .transcript_not_saving,
                 Some(events::TranscriptSavingFailure::ConfirmationDelayed)
             );
             assert!(app.transcript_buffer.read().unwrap().is_empty());
@@ -14780,7 +14701,10 @@ mod tests_status {
                 members as u64
             );
             assert_eq!(
-                app.pipeline_status.read().unwrap().transcript_not_saving,
+                app.status
+                    .snapshot()
+                    .transcript_saving()
+                    .transcript_not_saving,
                 None
             );
             // A delayed provider error or repeated recovery delivery cannot
@@ -14796,7 +14720,10 @@ mod tests_status {
                 },
             );
             assert_eq!(
-                app.pipeline_status.read().unwrap().transcript_not_saving,
+                app.status
+                    .snapshot()
+                    .transcript_saving()
+                    .transcript_not_saving,
                 None
             );
             assert!(turns.received.try_recv().is_err());
@@ -14858,10 +14785,10 @@ mod tests_status {
             receipts.submit(&ctx, row, index, turn);
         };
         let status = || {
-            let status = app.pipeline_status.read().unwrap();
+            let status = app.status.snapshot();
             (
-                status.transcript_not_saving,
-                status.transcript_captions_lost,
+                status.transcript_saving().transcript_not_saving,
+                status.transcript_saving().transcript_captions_lost,
             )
         };
         let captions = || {
@@ -14990,10 +14917,18 @@ mod tests_status {
         failed.recv_timeout(Duration::from_secs(60)).unwrap();
         receipts.publish();
         assert_eq!(
-            app.pipeline_status.read().unwrap().transcript_not_saving,
+            app.status
+                .snapshot()
+                .transcript_saving()
+                .transcript_not_saving,
             Some(events::TranscriptSavingFailure::StorageFull)
         );
-        assert!(app.pipeline_status.read().unwrap().transcript_captions_lost);
+        assert!(
+            app.status
+                .snapshot()
+                .transcript_saving()
+                .transcript_captions_lost
+        );
         assert!(app.transcript_buffer.read().unwrap().is_empty());
         assert_eq!(
             app.transcript_ledger.lock().unwrap().accepted_event_count,
@@ -15016,16 +14951,32 @@ mod tests_status {
             .unwrap()
             .group_counts();
         assert_eq!(
-            app.pipeline_status.read().unwrap().transcript_not_saving,
+            app.status
+                .snapshot()
+                .transcript_saving()
+                .transcript_not_saving,
             Some(events::TranscriptSavingFailure::StorageFull)
         );
-        assert!(app.pipeline_status.read().unwrap().transcript_captions_lost);
+        assert!(
+            app.status
+                .snapshot()
+                .transcript_saving()
+                .transcript_captions_lost
+        );
         receipts.publish();
         assert_eq!(
-            app.pipeline_status.read().unwrap().transcript_not_saving,
+            app.status
+                .snapshot()
+                .transcript_saving()
+                .transcript_not_saving,
             None
         );
-        assert!(app.pipeline_status.read().unwrap().transcript_captions_lost);
+        assert!(
+            app.status
+                .snapshot()
+                .transcript_saving()
+                .transcript_captions_lost
+        );
         let session = app.current_session_id();
         let disk = load_transcript_events(&session).unwrap();
         assert_eq!(disk.len(), 1);
@@ -15102,7 +15053,10 @@ mod tests_status {
                 .any(|record| record.message == "transcript commit refused: WriterAbsent")
         );
         assert_eq!(
-            app.pipeline_status.read().unwrap().transcript_not_saving,
+            app.status
+                .snapshot()
+                .transcript_saving()
+                .transcript_not_saving,
             Some(events::TranscriptSavingFailure::WriterAbsent)
         );
         assert!(app.transcript_buffer.read().unwrap().is_empty());
@@ -19208,54 +19162,54 @@ mod tests_status {
 
     #[test]
     fn set_asr_status_writes_through() {
-        let ps = Arc::new(RwLock::new(PipelineStatus::default()));
+        let status = crate::status::StatusAuthority::detached();
+        status.record();
         let expected = RuntimeDiagnostic::internal(
             RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
                 .with_transport(RuntimeTransport::Native),
         );
         set_asr_status(
-            &ps,
+            &status,
             StageStatus::Error {
                 diagnostic: expected.clone(),
             },
         );
-        let guard = ps.read().unwrap();
-        match &guard.asr {
+        match &status.snapshot().stages().asr {
             StageStatus::Error { diagnostic } => assert_eq!(diagnostic, &expected),
             other => panic!("expected Error, got {other:?}"),
         }
+        assert_eq!(status.recorded().len(), 1, "the write is emitted");
     }
 
     #[test]
     fn set_asr_status_recovers_from_poisoned_lock() {
-        let ps = Arc::new(RwLock::new(PipelineStatus::default()));
+        let status = crate::status::StatusAuthority::detached();
 
-        // Poison the lock by panicking while holding the write guard.
-        let ps_clone = Arc::clone(&ps);
+        // Poison the lock by panicking inside a publish.
+        let poisoner = status.clone();
         let _ = std::thread::spawn(move || {
-            let _g = ps_clone.write().unwrap();
-            panic!("intentional panic to poison the lock");
+            poisoner.publish(|_| panic!("intentional panic to poison the lock"));
         })
         .join();
-        assert!(ps.write().is_err(), "precondition: lock is poisoned");
 
-        // The error status must still be recorded despite the poison — FA-1's
-        // whole point is that a poisoned lock cannot silently lose the failure.
+        // The error status must still be recorded and emitted despite the
+        // poison — FA-1's whole point is that a poisoned lock cannot silently
+        // lose the failure.
+        status.record();
         let expected = RuntimeDiagnostic::internal(
             RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
                 .with_transport(RuntimeTransport::Native),
         );
         set_asr_status(
-            &ps,
+            &status,
             StageStatus::Error {
                 diagnostic: expected.clone(),
             },
         );
-
-        let guard = ps.read().unwrap_or_else(|e| e.into_inner());
-        match &guard.asr {
+        match &status.snapshot().stages().asr {
             StageStatus::Error { diagnostic } => assert_eq!(diagnostic, &expected),
             other => panic!("expected Error after poison recovery, got {other:?}"),
         }
+        assert_eq!(status.recorded().len(), 1);
     }
 }

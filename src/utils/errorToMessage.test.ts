@@ -174,6 +174,20 @@ describe("errorToMessage", () => {
     expect(msg).toContain("24.0");
   });
 
+  it("localizes a capture start failure by its closed reason and fails closed on an unknown one", () => {
+    const failure = (reason: unknown) =>
+      errorToMessage({
+        code: "capture_start_failed",
+        message: { reason, source_index: 0, sources: [] },
+      });
+    expect(failure("permission_denied")).toBe(
+      "Audio capture permission was denied. Allow audio capture for AudioGraph in your system settings, then try again.",
+    );
+    expect(failure("canary-driver-text")).toBe(
+      "The audio system couldn't start capture. Try again, or choose another source.",
+    );
+  });
+
   it("artifactTooLargeDetails narrows an artifact_too_large payload to its fields", () => {
     const details = artifactTooLargeDetails({
       code: "artifact_too_large",

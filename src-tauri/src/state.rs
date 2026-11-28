@@ -18,7 +18,6 @@ use crate::audio::consumer::{
     ProcessedAudioMixingMode, ProcessedAudioSourceFilter,
 };
 use crate::audio::pipeline::{AudioPipelineInput, ProcessedAudioChunk, ProcessedPipelineMessage};
-use crate::events::PipelineStatus;
 use crate::gemini::GeminiLiveClient;
 use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
@@ -249,15 +248,16 @@ pub struct AppState {
     /// Handle to the graph auto-save background thread.
     pub graph_autosave_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 
-    /// Current pipeline status.
-    pub pipeline_status: Arc<RwLock<PipelineStatus>>,
+    /// The one authority for what the window displays: the revisioned
+    /// snapshot, and the truth flags below, which it alone writes (#141).
+    pub status: crate::status::StatusAuthority,
 
-    /// Whether capture is currently active.
+    /// Whether capture is currently active. Written only by `status`.
     pub is_capturing: Arc<RwLock<bool>>,
 
     /// Whether transcribe mode is active (AtomicBool for lock-free flag checks
     /// from the speech processor thread — fixes Bug 2: stop_transcribe now
-    /// actually terminates the speech processor).
+    /// actually terminates the speech processor). Written only by `status`.
     pub is_transcribing: Arc<AtomicBool>,
 
     // ── Knowledge graph infrastructure ──────────────────────────────────
@@ -866,6 +866,9 @@ impl AppState {
             crossbeam_channel::bounded::<ProcessedAudioChunk>(1024);
         let is_transcribing = Arc::new(AtomicBool::new(false));
         let is_gemini_active = Arc::new(RwLock::new(false));
+        let is_capturing = Arc::new(RwLock::new(false));
+        let is_converse_active = Arc::new(RwLock::new(false));
+        let is_openai_realtime_active = Arc::new(RwLock::new(false));
         let processed_audio_consumers = Arc::new(ProcessedAudioConsumerRegistry::new());
         if let Err(e) = processed_audio_consumers.register(ProcessedAudioConsumerRegistration {
             descriptor: ProcessedAudioConsumerDescriptor {
@@ -893,15 +896,24 @@ impl AppState {
         // Spawn transcript writers (best-effort — if base dir is unavailable, None)
         let transcript_writer = TranscriptWriter::spawn(&session_id);
         let transcript_event_writer = TranscriptEventWriter::spawn(&session_id);
-        let pipeline_status = PipelineStatus {
-            transcript_crash_safety_unverified: transcript_event_writer
+        let session_id_handle = Arc::new(RwLock::new(session_id.clone()));
+        let status = crate::status::StatusAuthority::new(crate::status::TruthFlags {
+            is_capturing: is_capturing.clone(),
+            is_transcribing: is_transcribing.clone(),
+            is_gemini_active: is_gemini_active.clone(),
+            is_converse_active: is_converse_active.clone(),
+            is_openai_realtime_active: is_openai_realtime_active.clone(),
+            session_id: session_id_handle.clone(),
+        });
+        status.publish(|status| {
+            let saving = status.transcript_saving_mut();
+            saving.transcript_crash_safety_unverified = transcript_event_writer
                 .as_ref()
-                .is_some_and(TranscriptEventWriter::is_unqualified),
-            transcript_not_saving: transcript_event_writer
+                .is_some_and(TranscriptEventWriter::is_unqualified);
+            saving.transcript_not_saving = transcript_event_writer
                 .is_none()
-                .then_some(crate::events::TranscriptSavingFailure::WriterAbsent),
-            ..Default::default()
-        };
+                .then_some(crate::events::TranscriptSavingFailure::WriterAbsent);
+        });
         let projection_event_writer = ProjectionEventWriter::spawn(&session_id);
         let transcript_ledger = TranscriptLedger::new(session_id.clone());
         let speaker_timeline = SpeakerTimeline::new(session_id.clone());
@@ -942,7 +954,7 @@ impl AppState {
         let decision_shadow = Arc::new(crate::decision::shadow::ShadowRuntime::new(&session_id));
 
         Self {
-            session_id: Arc::new(RwLock::new(session_id)),
+            session_id: session_id_handle,
             transcript_buffer: Arc::new(RwLock::new(VecDeque::with_capacity(500))),
             transcript_writer: Arc::new(Mutex::new(transcript_writer)),
             display_transcript_write_misses: Arc::new(AtomicU64::new(0)),
@@ -957,8 +969,8 @@ impl AppState {
             projection_lane_stopping: Arc::new(AtomicBool::new(false)),
             graph_snapshot: Arc::new(RwLock::new(GraphSnapshot::default())),
             graph_autosave_thread: Arc::new(Mutex::new(None)),
-            pipeline_status: Arc::new(RwLock::new(pipeline_status)),
-            is_capturing: Arc::new(RwLock::new(false)),
+            status,
+            is_capturing,
             is_transcribing,
             knowledge_graph: Arc::new(Mutex::new(TemporalKnowledgeGraph::new())),
             graph_extractor: Arc::new(RuleBasedExtractor::new()),
@@ -991,11 +1003,11 @@ impl AppState {
             gemini_client: Arc::new(Mutex::new(None)),
             gemini_audio_thread: Arc::new(Mutex::new(None)),
             gemini_event_thread: Arc::new(Mutex::new(None)),
-            is_converse_active: Arc::new(RwLock::new(false)),
+            is_converse_active,
             converse_capture_gate: Arc::new(AtomicBool::new(false)),
             converse_thread: Arc::new(Mutex::new(None)),
             converse_audio_thread: Arc::new(Mutex::new(None)),
-            is_openai_realtime_active: Arc::new(RwLock::new(false)),
+            is_openai_realtime_active,
             openai_realtime_client: Arc::new(Mutex::new(None)),
             openai_realtime_capture_gate: Arc::new(AtomicBool::new(false)),
             openai_realtime_audio_thread: Arc::new(Mutex::new(None)),
@@ -1228,16 +1240,7 @@ impl AppState {
             .store(0, Ordering::SeqCst);
         self.agent_auto_answer_last_dispatch_ms
             .store(0, Ordering::SeqCst);
-        {
-            let mut status = match self.pipeline_status.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *status = PipelineStatus {
-                transcript_crash_safety_unverified: new_transcript_event_writer.is_unqualified(),
-                ..PipelineStatus::default()
-            };
-        }
+        let crash_safety_unverified = new_transcript_event_writer.is_unqualified();
 
         // No producer can enter while `session_lifecycle` is held by the
         // command. Remove any residual chunks from the just-stopped session so
@@ -1265,14 +1268,11 @@ impl AppState {
             .replace(new_projection_event_writer);
         // Publish the new ownership epoch last. Readers can observe either the
         // complete old session or the complete new session, never a new id with
-        // old writers/graphs/buffers.
-        {
-            let mut guard = match self.session_id.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *guard = new_session_id.to_string();
-        }
+        // old writers/graphs/buffers. The snapshot enters the new session in
+        // the same step that writes the session id.
+        self.status.publish(|status| {
+            status.begin_session(new_session_id.to_string(), crash_safety_unverified);
+        });
 
         drop(publication);
         if let Some(old) = old_display

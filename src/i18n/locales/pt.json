@@ -2,6 +2,8 @@
   "controlBar": {
     "start": "Iniciar",
     "stop": "Parar",
+    "stopping": "Parando…",
+    "statusUnknown": "Status da gravação desconhecido",
     "recording": "Gravando",
     "settings": "Configurações",
     "sessions": "Sessões",
@@ -1702,6 +1704,34 @@
     "providerDeferred": "{{provider}} não está disponível para novas sessões no MVP atual. Suas configurações salvas permanecem inalteradas.",
     "providerSettingsLoading": "As configurações dos provedores ainda estão carregando. Tente novamente em instantes.",
     "artifactTooLarge": "Este artefato tem {{sizeMb}} MB, acima do limite de {{ceilingMb}} MB.",
+    "captureStop": {
+      "incomplete": "A captura não parou de forma limpa. Pressione Parar novamente; se ela continuar, reinicie o AudioGraph.",
+      "endedIncomplete": "A captura parou, mas parte da limpeza não terminou. Se algo parecer errado, reinicie o AudioGraph."
+    },
+    "captureAttach": {
+      "failed": "O AudioGraph não conseguiu se conectar à captura de áudio. Pressione Iniciar para tentar novamente."
+    },
+    "transcriptionRefused": {
+      "capture_not_running": "Não é possível iniciar a transcrição: a captura não está em andamento.",
+      "capture_lost": "Não é possível iniciar a transcrição: a captura parou enquanto a transcrição iniciava.",
+      "start_failed": "Não foi possível iniciar a transcrição, e nada ficou em execução. Tente novamente."
+    },
+    "captureStart": {
+      "forSource": "{{source}}: {{reason}}",
+      "invalid_source": "Esta fonte de áudio não pode ser capturada. Atualize a lista de fontes e escolha-a novamente.",
+      "permission_denied": "A permissão de captura de áudio foi negada. Permita a captura de áudio para o AudioGraph nas configurações do sistema e tente novamente.",
+      "device_unavailable": "O dispositivo de áudio não está disponível. Conecte-o ou ative-o, atualize a lista de fontes e tente novamente.",
+      "unsupported": "Esta fonte de áudio não suporta captura neste dispositivo.",
+      "backend_unavailable": "O sistema de áudio não conseguiu iniciar a captura. Tente novamente ou escolha outra fonte.",
+      "startup_timeout": "O dispositivo de áudio não respondeu a tempo. Tente novamente ou escolha outra fonte.",
+      "worker_exited": "A captura de áudio parou enquanto iniciava. Tente novamente.",
+      "cancelled": "O início da captura foi cancelado.",
+      "stale_attachment": "Esta janela perdeu a conexão com a captura de áudio. Pressione Iniciar para tentar novamente.",
+      "still_preparing": "A captura ainda está iniciando. Aguarde um momento até que termine.",
+      "already_running": "A captura já está em andamento.",
+      "previous_capture_stopping": "A captura anterior ainda está parando. Tente novamente em instantes.",
+      "previous_capture_reconciling": "A captura anterior terminou inesperadamente e ainda está sendo encerrada. Tente novamente em instantes."
+    },
     "ipcUnavailable": {
       "title": "O backend do aplicativo não está acessível",
       "cause": "O aplicativo não conseguiu acessar seu backend local. Isso pode acontecer enquanto o aplicativo ainda está iniciando — tente novamente em instantes."

@@ -6,6 +6,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import TokenUsagePanel from "./TokenUsagePanel";
 import "../i18n";
 import { useAudioGraphStore } from "../store";
+import { NO_PIPELINE_STATUS } from "../store/captureFacts";
+import { snapshot } from "../test/captureBackend";
 import type {
   GeminiStatusEvent,
   LifetimeUsage,
@@ -155,7 +157,13 @@ describe("TokenUsagePanel", () => {
     (listen as unknown as ReturnType<typeof vi.fn>).mockReset();
     (invoke as unknown as ReturnType<typeof vi.fn>).mockReset();
     window.localStorage.clear();
-    useAudioGraphStore.setState({ isCapturing: false, isTranscribing: false });
+    // Usage updates are fenced by the applied snapshot's session; start each
+    // test before any snapshot is applied.
+    useAudioGraphStore.setState({
+      isCapturing: false,
+      isTranscribing: false,
+      pipelineStatus: NO_PIPELINE_STATUS,
+    });
   });
 
   it("shows empty state in both scopes before any usage arrives", async () => {
@@ -216,6 +224,11 @@ describe("TokenUsagePanel", () => {
   it("adds persisted LLM usage updates to session and lifetime totals", async () => {
     const bus = installListener();
     installInvokeDefaults();
+    // The applied snapshot names the session the usage belongs to: before
+    // any snapshot, usage counts toward the lifetime totals only.
+    useAudioGraphStore.setState({
+      pipelineStatus: snapshot({ session: { id: "test-session", epoch: 0 } }),
+    });
     render(<TokenUsagePanel />);
     await flushEffects();
 
@@ -527,7 +540,12 @@ describe("TokenUsagePanel", () => {
   it("New Session finalizes the current session and re-hydrates from a fresh backend record", async () => {
     installListener();
     const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
+    // The applied snapshot names the old session; the rotation's comes from
+    // the status read after the New Session reply.
+    const current = snapshot({ session: { id: "old-session", epoch: 0 } });
+    const rotated = snapshot({ session: { id: "fresh-session", epoch: 1 } });
     useAudioGraphStore.setState({
+      pipelineStatus: current,
       loadedSessionId: "old-session",
       transcriptSegments: [
         {
@@ -596,6 +614,8 @@ describe("TokenUsagePanel", () => {
         case "new_session_cmd":
           postRotation = true;
           return "fresh-session";
+        case "get_pipeline_status":
+          return postRotation ? rotated : undefined;
         default:
           return undefined;
       }
@@ -628,6 +648,45 @@ describe("TokenUsagePanel", () => {
     expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
     expect(useAudioGraphStore.getState().transcriptSegments).toEqual([]);
     expect(useAudioGraphStore.getState().chatMessages).toEqual([]);
+  });
+
+  it("New Session's reply resets nothing: the view resets once the snapshot shows the rotation", async () => {
+    installListener();
+    installInvokeDefaults();
+    const segment = {
+      id: "live-seg",
+      source_id: "system-default",
+      speaker_id: null,
+      speaker_label: null,
+      text: "still here",
+      start_time: 0,
+      end_time: 1,
+      confidence: 1,
+    };
+    useAudioGraphStore.setState({
+      isCapturing: false,
+      isTranscribing: false,
+      pipelineStatus: snapshot({ session: { id: "old-session", epoch: 0 } }),
+      transcriptSegments: [segment],
+    });
+
+    render(<TokenUsagePanel />);
+    await flushEffects();
+    await userEvent.click(screen.getByRole("button", { name: /new session/i }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("get_pipeline_status"),
+    );
+    expect(useAudioGraphStore.getState().transcriptSegments).toEqual([segment]);
+
+    act(() =>
+      useAudioGraphStore
+        .getState()
+        .setPipelineStatus(
+          snapshot({ session: { id: "fresh-session", epoch: 1 } }),
+        ),
+    );
+    expect(useAudioGraphStore.getState().transcriptSegments).toEqual([]);
+    useAudioGraphStore.setState({ pipelineStatus: NO_PIPELINE_STATUS });
   });
 
   it("disables New Session while capture is live", async () => {

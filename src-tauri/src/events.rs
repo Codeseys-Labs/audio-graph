@@ -109,12 +109,6 @@ pub const CAPTURE_STORAGE_FULL: &str = "capture-storage-full";
 /// omits session ids, file paths, transcript text, and provider payloads.
 pub const PERSISTENCE_QUEUE_BACKPRESSURE: &str = "persistence-queue-backpressure";
 
-/// Event emitted when the backpressure state of a capture source changes —
-/// i.e. the rsac ring buffer has started or stopped dropping buffers because
-/// the consumer (this app's pipeline) isn't keeping up. Edge-triggered: fires
-/// only on transitions (false→true or true→false), not continuously.
-pub const CAPTURE_BACKPRESSURE: &str = "capture-backpressure";
-
 /// Event emitted by the processed-audio dispatcher with per-consumer queue
 /// health and drop counters.
 /// Payload: [`crate::audio::consumer::ProcessedAudioConsumerHealthPayload`].
@@ -218,12 +212,6 @@ pub const PRIVACY_POLICY_BLOCKED: &str = "privacy-policy-blocked";
 /// Rust — so the existing no-source-selected notification still surfaces.
 pub const GLOBAL_SHORTCUT_TOGGLE_CAPTURE: &str = "global-shortcut-toggle-capture";
 
-/// Event emitted when the tray *Stop capture* menu item is clicked
-/// (audio-graph-a156). Single source of truth for the event name — the tray
-/// menu handler in [`crate::tray`] emits this constant directly. Routed through
-/// the store `stopCapture` path (same as the UI Stop button).
-pub const TRAY_STOP_CAPTURE: &str = "tray-stop-capture";
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LlmUsageUpdatePayload {
     pub session_id: String,
@@ -302,9 +290,122 @@ pub enum TranscriptSavingFailure {
     WriteFailed,
 }
 
-/// Overall pipeline status, combining all stages.
+/// Identity of one capture start: the epoch the renderer received from
+/// `capture_attach`, and the renderer's sequence number for the start within
+/// it. Ordered lexicographically, epoch first.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct CaptureId {
+    pub epoch: u64,
+    pub seq: u64,
+}
+
+impl CaptureId {
+    /// The greatest id below this one.
+    pub(crate) fn predecessor(self) -> Self {
+        match (self.epoch, self.seq) {
+            (_, seq) if seq > 0 => Self {
+                seq: seq - 1,
+                ..self
+            },
+            (epoch, _) if epoch > 0 => Self {
+                epoch: epoch - 1,
+                seq: u64::MAX,
+            },
+            _ => self,
+        }
+    }
+}
+
+/// Where the capture the backend holds is (#141). `Pending`: a start is
+/// registered and preparing; `Running`: committed and owning sources;
+/// `Stopping`: being torn down; `Idle`: nothing registered or owned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturePhase {
+    Pending,
+    Running,
+    Stopping,
+    #[default]
+    Idle,
+}
+
+/// The capture the backend holds, or last held when idle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CaptureState {
+    pub id: CaptureId,
+    pub phase: CapturePhase,
+}
+
+/// A running transcription: the capture it belongs to, and its generation
+/// (one per transcription start), so a stop names exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Transcription {
+    pub capture: CaptureId,
+    pub generation: u64,
+}
+
+/// Which realtime modes run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RealtimeModes {
+    pub gemini: bool,
+    pub converse: bool,
+    pub openai_realtime: bool,
+}
+
+/// The live session: its id, and its epoch, which every successful rotation
+/// increments.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionState {
+    pub id: String,
+    pub epoch: u64,
+}
+
+/// A backpressured capture source, named by its capture and its position in
+/// that capture's start, never by its selection string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackpressuredSource {
+    pub capture: CaptureId,
+    pub source_index: usize,
+}
+
+/// The display stages other than capture's.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct PipelineStatus {
+pub struct Stages {
+    pub pipeline: StageStatus,
+    pub asr: StageStatus,
+    pub diarization: StageStatus,
+    pub entity_extraction: StageStatus,
+    pub graph: StageStatus,
+}
+
+impl Stages {
+    /// Every stage set to `stage`.
+    pub fn all(stage: StageStatus) -> Self {
+        Self {
+            pipeline: stage.clone(),
+            asr: stage.clone(),
+            diarization: stage.clone(),
+            entity_extraction: stage.clone(),
+            graph: stage,
+        }
+    }
+}
+
+/// Whether the live transcript is being saved.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TranscriptSaving {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_not_saving: Option<TranscriptSavingFailure>,
     /// At least one caption was refused in this session. Rotation resets the flag.
@@ -317,12 +418,174 @@ pub struct PipelineStatus {
     /// File sync succeeded on storage without a qualified crash-durability tier.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transcript_crash_safety_unverified: bool,
-    pub capture: StageStatus,
-    pub pipeline: StageStatus,
-    pub asr: StageStatus,
-    pub diarization: StageStatus,
-    pub entity_extraction: StageStatus,
-    pub graph: StageStatus,
+}
+
+/// The one snapshot of everything the window displays (#141 decision of
+/// 2026-11-28). The live instance lives behind
+/// [`crate::status::StatusAuthority`], the only way to change it: every
+/// change there bumps `revision`, so the renderer applies a snapshot iff its
+/// revision is higher than the last one it applied, and no emission order
+/// can show a state older than one already shown.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PipelineStatus {
+    revision: u64,
+    capture_state: CaptureState,
+    /// Every start id at or below this can no longer begin, and none is
+    /// pending or running.
+    retired_through: CaptureId,
+    transcription: Option<Transcription>,
+    /// The last transcription generation issued (0 before any): a start
+    /// names the generation it begins, so a late or repeated delivery of it
+    /// starts nothing.
+    transcription_generation: u64,
+    realtime: RealtimeModes,
+    session: SessionState,
+    backpressure: Vec<BackpressuredSource>,
+    #[serde(flatten)]
+    transcript_saving: TranscriptSaving,
+    /// The capture stage's display; written with `capture_state`.
+    capture: StageStatus,
+    #[serde(flatten)]
+    stages: Stages,
+}
+
+impl PipelineStatus {
+    /// The status of a fresh process for session `session_id`.
+    pub fn new(session_id: String) -> Self {
+        Self {
+            session: SessionState {
+                id: session_id,
+                epoch: 0,
+            },
+            ..Self::default()
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn capture_state(&self) -> CaptureState {
+        self.capture_state
+    }
+
+    pub fn retired_through(&self) -> CaptureId {
+        self.retired_through
+    }
+
+    pub fn transcription(&self) -> Option<Transcription> {
+        self.transcription
+    }
+
+    pub fn transcription_generation(&self) -> u64 {
+        self.transcription_generation
+    }
+
+    pub fn realtime(&self) -> RealtimeModes {
+        self.realtime
+    }
+
+    pub fn session(&self) -> &SessionState {
+        &self.session
+    }
+
+    pub fn backpressure(&self) -> &[BackpressuredSource] {
+        &self.backpressure
+    }
+
+    pub fn transcript_saving(&self) -> &TranscriptSaving {
+        &self.transcript_saving
+    }
+
+    pub fn capture(&self) -> &StageStatus {
+        &self.capture
+    }
+
+    pub fn stages(&self) -> &Stages {
+        &self.stages
+    }
+
+    pub(crate) fn bump_revision(&mut self) {
+        self.revision += 1;
+    }
+
+    /// Set what the capture manager holds, and the capture stage with it.
+    pub(crate) fn set_capture(&mut self, state: CaptureState, retired_through: CaptureId) {
+        self.capture_state = state;
+        self.retired_through = self.retired_through.max(retired_through);
+        self.capture = match state.phase {
+            CapturePhase::Running => StageStatus::Running { processed_count: 0 },
+            CapturePhase::Pending | CapturePhase::Stopping | CapturePhase::Idle => {
+                StageStatus::Idle
+            }
+        };
+    }
+
+    /// Begin a transcription of `capture`: a new generation.
+    pub(crate) fn begin_transcription(&mut self, capture: CaptureId) -> Transcription {
+        self.transcription_generation += 1;
+        let transcription = Transcription {
+            capture,
+            generation: self.transcription_generation,
+        };
+        self.transcription = Some(transcription);
+        transcription
+    }
+
+    pub(crate) fn end_transcription(&mut self) {
+        self.transcription = None;
+    }
+
+    pub(crate) fn realtime_mut(&mut self) -> &mut RealtimeModes {
+        &mut self.realtime
+    }
+
+    /// Enter session `id`: the next epoch, with that session's own stage and
+    /// transcript-saving state.
+    pub(crate) fn begin_session(&mut self, id: String, crash_safety_unverified: bool) {
+        self.session = SessionState {
+            id,
+            epoch: self.session.epoch + 1,
+        };
+        self.transcript_saving = TranscriptSaving {
+            transcript_crash_safety_unverified: crash_safety_unverified,
+            ..TranscriptSaving::default()
+        };
+        self.stages = Stages::default();
+    }
+
+    /// Mark source `source_index` of `capture` backpressured or recovered.
+    /// Returns whether that changed anything.
+    pub(crate) fn set_backpressure(
+        &mut self,
+        capture: CaptureId,
+        source_index: usize,
+        backpressured: bool,
+    ) -> bool {
+        let source = BackpressuredSource {
+            capture,
+            source_index,
+        };
+        let present = self.backpressure.contains(&source);
+        match (backpressured, present) {
+            (true, false) => self.backpressure.push(source),
+            (false, true) => self.backpressure.retain(|other| *other != source),
+            _ => return false,
+        }
+        true
+    }
+
+    pub(crate) fn clear_backpressure(&mut self) {
+        self.backpressure.clear();
+    }
+
+    pub(crate) fn transcript_saving_mut(&mut self) -> &mut TranscriptSaving {
+        &mut self.transcript_saving
+    }
+
+    pub(crate) fn stages_mut(&mut self) -> &mut Stages {
+        &mut self.stages
+    }
 }
 
 /// Interim ASR hypothesis from streaming providers.
@@ -931,10 +1194,25 @@ pub struct LiveAssistCardRecord {
     pub decision_provenance: Option<Vec<crate::decision::route::DecisionRecord>>,
 }
 
-/// Payload for capture error events.
+/// The kind of a capture source, as a capture-error event names it: never
+/// the selection string, device name or application name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSourceKind {
+    SystemDefault,
+    Device,
+    Application,
+    ProcessTree,
+    Other,
+}
+
+/// Payload for capture error events: the capture and the failing source's
+/// kind, with a closed message.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CaptureErrorPayload {
-    pub source_id: String,
+    /// The capture the failing source belongs to.
+    pub capture_id: CaptureId,
+    pub source_kind: CaptureSourceKind,
     pub error: String,
     pub recoverable: bool,
 }
@@ -968,16 +1246,6 @@ pub struct PersistenceQueueBackpressurePayload {
     pub queue_capacity: usize,
     /// Cumulative count of dropped events in this process for the writer handle.
     pub dropped_count: u64,
-}
-
-/// Payload for capture-backpressure state-change events.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CaptureBackpressurePayload {
-    pub source_id: String,
-    /// `true` when the ring buffer has started dropping; `false` when recovery
-    /// is detected. The frontend should surface this as a transient warning
-    /// (e.g. a pill badge) rather than a fatal error.
-    pub is_backpressured: bool,
 }
 
 /// Payload for `AWS_ERROR` events (ag#13).
@@ -1037,32 +1305,6 @@ where
     }
 }
 
-/// Heuristic classifier for capture errors into recoverable vs fatal.
-///
-/// Used at capture-error emit sites to populate `CaptureErrorPayload.recoverable`.
-/// Fatal errors indicate the source cannot be used again without user action
-/// (permission, device disconnection). Recoverable errors may succeed on retry.
-pub fn classify_capture_error(err: &str) -> bool {
-    let lower = err.to_lowercase();
-    let fatal_markers = [
-        "permission denied",
-        "not permitted",
-        "unauthorized",
-        "disconnected",
-        "device not found",
-        "no such device",
-        "device removed",
-        "access denied",
-        "not supported",
-        "unsupported",
-    ];
-    if fatal_markers.iter().any(|m| lower.contains(m)) {
-        return false;
-    }
-    // Default to recoverable for unclassified errors — user can retry.
-    true
-}
-
 /// Returns `true` if this I/O error indicates the underlying storage is full
 /// (ENOSPC on Unix, ERROR_DISK_FULL on Windows).
 ///
@@ -1104,6 +1346,69 @@ mod tests {
     }
 
     use super::*;
+
+    /// The snapshot's wire shape is the renderer's contract (#141): every
+    /// field the window displays, flat stage fields, and the revision.
+    #[test]
+    fn a_status_snapshot_states_everything_the_window_displays() {
+        let older = CaptureId { epoch: 2, seq: 9 };
+        let newer = CaptureId { epoch: 3, seq: 0 };
+        assert!(older < newer, "the epoch compares first");
+
+        let mut status = PipelineStatus::new("session-1".to_string());
+        status.bump_revision();
+        status.set_capture(
+            CaptureState {
+                id: newer,
+                phase: CapturePhase::Running,
+            },
+            newer,
+        );
+        let transcription = status.begin_transcription(newer);
+        assert!(status.set_backpressure(newer, 1, true));
+        assert!(!status.set_backpressure(newer, 1, true), "already set");
+        status.realtime_mut().gemini = true;
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "revision": 1,
+                "capture_state": {"id": {"epoch": 3, "seq": 0}, "phase": "running"},
+                "retired_through": {"epoch": 3, "seq": 0},
+                "transcription": {"capture": {"epoch": 3, "seq": 0}, "generation": transcription.generation},
+                "transcription_generation": transcription.generation,
+                "realtime": {"gemini": true, "converse": false, "openai_realtime": false},
+                "session": {"id": "session-1", "epoch": 0},
+                "backpressure": [{"capture": {"epoch": 3, "seq": 0}, "source_index": 1}],
+                "capture": {"type": "Running", "processed_count": 0},
+                "pipeline": {"type": "Idle"},
+                "asr": {"type": "Idle"},
+                "diarization": {"type": "Idle"},
+                "entity_extraction": {"type": "Idle"},
+                "graph": {"type": "Idle"},
+            })
+        );
+
+        // A retired-through watermark never moves back; a rotation keeps the
+        // capture and begins the next session epoch with clean stages.
+        status.set_capture(
+            CaptureState {
+                id: newer,
+                phase: CapturePhase::Idle,
+            },
+            older,
+        );
+        assert_eq!(status.retired_through(), newer);
+        assert!(matches!(status.capture(), StageStatus::Idle));
+        status.begin_session("session-2".to_string(), false);
+        assert_eq!(
+            status.session(),
+            &SessionState {
+                id: "session-2".to_string(),
+                epoch: 1,
+            }
+        );
+    }
 
     fn test_runtime_diagnostic() -> audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic
     {

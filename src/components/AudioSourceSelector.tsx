@@ -28,6 +28,7 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
+import { captureStarting } from "../store/captureFacts";
 import type {
   AudioFormatInfo,
   AudioPermissionStatus,
@@ -256,7 +257,11 @@ export default function AudioSourceSelector() {
     (s) => s.removeSelectedSourceIds,
   );
   const fetchSources = useAudioGraphStore((s) => s.fetchSources);
-  const isCapturing = useAudioGraphStore((s) => s.isCapturing);
+  // A pending start locks the selection exactly as a running capture does:
+  // Stop must name the sources that start resolved.
+  const isCapturing = useAudioGraphStore(
+    (s) => s.isCapturing || captureStarting(s),
+  );
   const processes = useAudioGraphStore((s) => s.processes);
   const searchFilter = useAudioGraphStore((s) => s.searchFilter);
   const setSearchFilter = useAudioGraphStore((s) => s.setSearchFilter);

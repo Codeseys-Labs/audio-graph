@@ -17,6 +17,8 @@ import {
   segment,
 } from "../session/reviewTestUtils";
 import { useAudioGraphStore } from "../store";
+import { NO_PIPELINE_STATUS } from "../store/captureFacts";
+import { captureBackendReply, snapshot } from "../test/captureBackend";
 import type { SessionMetadata } from "../types";
 import { downloadAsFile } from "../utils/download";
 import NowStrip from "./NowStrip";
@@ -45,6 +47,15 @@ vi.mock("../utils/download", async (importOriginal) => ({
 
 const mockedInvoke = vi.mocked(invoke);
 const mockedDownload = vi.mocked(downloadAsFile);
+/** The backend's acknowledgement of the latest `start_capture` call. */
+function acknowledgeStart(): unknown {
+  const call = mockedInvoke.mock.calls
+    .filter(([cmd]) => cmd === "start_capture")
+    .at(-1);
+  if (!call) throw new Error("start_capture was not invoked");
+  // The backend double commits it, so later status reads agree.
+  return captureBackendReply("start_capture", call[1]);
+}
 
 /**
  * Review across Start and Stop (PR #536 review rounds 1 and 2).
@@ -245,6 +256,9 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
     useAudioGraphStore.setState({
       sessions: [],
       isCapturing: false,
+      captureStatus: "idle",
+      startPending: null,
+      pipelineStatus: NO_PIPELINE_STATUS,
       isTranscribing: false,
       selectedSourceIds: [],
       captureStartTime: null,
@@ -354,17 +368,22 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
   it("does not reload history into the Live store when Start is pressed on a hydrated A", async () => {
     mockBackend();
     const startAck = deferred<unknown>();
-    mockedInvoke.mockImplementation(async (cmd: string) => {
+    mockedInvoke.mockImplementation(async (cmd: string, args) => {
       if (cmd === "list_sessions") return [SESSION_A];
       if (cmd === "load_session") return payloadA();
       if (cmd === "start_capture") return startAck.promise;
       if (cmd === "purge_expired_sessions") return [];
-      return null;
+      return captureBackendReply(cmd, args) ?? null;
     });
     useAudioGraphStore.setState({
       sessions: [SESSION_A],
       sessionsLoading: false,
       selectedSourceIds: ["system-default"],
+      // Attached, its idle snapshot applied.
+      captureAttach: "ready",
+      captureEpoch: 1,
+      pipelineStatus: snapshot(),
+      captureUnknown: false,
       isCapturing: false,
       isTranscribing: false,
     });
@@ -405,7 +424,7 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
 
     // Acknowledged: Capture would mount with none of A's data resident.
     await act(async () => {
-      startAck.resolve(null);
+      startAck.resolve(acknowledgeStart());
     });
     await waitFor(() =>
       expect(useAudioGraphStore.getState().isCapturing).toBe(true),
@@ -416,5 +435,60 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
     expect(after.loadedSessionId).toBeNull();
     expect(after.transcriptSegments).toEqual([]);
     expect(after.graphSnapshot.nodes).toEqual([]);
+  });
+
+  it("keeps a row click during an unacknowledged Start from loading history", async () => {
+    mockBackend();
+    const startAck = deferred<unknown>();
+    mockedInvoke.mockImplementation(async (cmd: string, args) => {
+      if (cmd === "list_sessions") return [SESSION_A];
+      if (cmd === "load_session") return payloadA();
+      if (cmd === "start_capture") return startAck.promise;
+      if (cmd === "purge_expired_sessions") return [];
+      return captureBackendReply(cmd, args) ?? null;
+    });
+    useAudioGraphStore.setState({
+      sessions: [SESSION_A],
+      sessionsLoading: false,
+      selectedSourceIds: ["system-default"],
+      // Attached, its idle snapshot applied.
+      captureAttach: "ready",
+      captureEpoch: 1,
+      pipelineStatus: snapshot(),
+      captureUnknown: false,
+      isCapturing: false,
+      isTranscribing: false,
+      loadedSessionId: null,
+    });
+    render(
+      <>
+        <NowStrip />
+        <SessionsBrowser />
+      </>,
+    );
+    const row = await screen.findByTestId("session-select-session-a");
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() =>
+      expect(useAudioGraphStore.getState().startPending).not.toBeNull(),
+    );
+    // Start is pending: choosing a row may open A's own Review pane, but must
+    // not load A into the global store the capture is about to open into.
+    fireEvent.click(row);
+    await act(async () => {});
+    expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
+    expect(useAudioGraphStore.getState().transcriptSegments).toEqual([]);
+
+    await act(async () => {
+      startAck.resolve(acknowledgeStart());
+    });
+    await waitFor(() =>
+      expect(useAudioGraphStore.getState().isCapturing).toBe(true),
+    );
+    await act(async () => {});
+    const after = useAudioGraphStore.getState();
+    expect(after.startPending).toBeNull();
+    expect(after.loadedSessionId).toBeNull();
+    expect(after.transcriptSegments).toEqual([]);
   });
 });

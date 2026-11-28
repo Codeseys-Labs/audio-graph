@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RuntimeDiagnostic } from "../generated/runtimeDiagnostic";
+import { NO_PIPELINE_STATUS } from "../store/captureFacts";
 import type { PipelineStatus } from "../types";
 import { computeCompositeHealth } from "./pipelineHealth";
 
@@ -16,14 +17,7 @@ const diagnostic: RuntimeDiagnostic = {
   },
 };
 
-const idle: PipelineStatus = {
-  capture: { type: "Idle" },
-  pipeline: { type: "Idle" },
-  asr: { type: "Idle" },
-  diarization: { type: "Idle" },
-  entity_extraction: { type: "Idle" },
-  graph: { type: "Idle" },
-};
+const idle: PipelineStatus = NO_PIPELINE_STATUS;
 
 function baseInput() {
   return {

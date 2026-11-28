@@ -308,13 +308,46 @@ describe("AudioGraph desktop shell (embedded WebdriverIO/Tauri E2E)", () => {
     await listSourcesMock.mockReturnValue([MOCK_SOURCE]);
 
     const startMock = await browser.tauri.mock("start_capture");
-    await startMock.mockResolvedValueOnce(null);
+    // A real acknowledgement: a snapshot the store applies by its revision.
+    // A static mock cannot echo the request's capture id, so it acknowledges
+    // an id above any this renderer allocates (ids compare epoch first), at
+    // revisions above any the real backend reaches in this run, so the real
+    // status reads after each reply never outrank it.
+    const acknowledged = { epoch: 1_000_000, seq: 0 };
+    const idleStage = { type: "Idle" };
+    const runningStage = { type: "Running", processed_count: 0 };
+    const snapshotAt = (revision: number, phase: "running" | "idle") => ({
+      revision,
+      capture_state: { id: acknowledged, phase },
+      // Never at or above a capture that runs; the acknowledged one once it
+      // has ended.
+      retired_through:
+        phase === "running" ? { epoch: 0, seq: 0 } : acknowledged,
+      transcription: null,
+      transcription_generation: 0,
+      realtime: { gemini: false, converse: false, openai_realtime: false },
+      session: { id: "e2e-session", epoch: 0 },
+      backpressure: [],
+      capture: phase === "running" ? runningStage : idleStage,
+      pipeline: phase === "running" ? runningStage : idleStage,
+      asr: idleStage,
+      diarization: idleStage,
+      entity_extraction: idleStage,
+      graph: idleStage,
+    });
+    await startMock.mockResolvedValueOnce({
+      outcome: "started",
+      snapshot: snapshotAt(1_000_000_000, "running"),
+    });
     await startMock.mockRejectedValueOnce(
       new Error("e2e-mocked-capture-failure"),
     );
 
     const stopMock = await browser.tauri.mock("stop_capture");
-    await stopMock.mockResolvedValue(null);
+    await stopMock.mockResolvedValue({
+      outcome: "stopped",
+      snapshot: snapshotAt(1_000_000_001, "idle"),
+    });
 
     // `AudioSourceSelector` lives in the always-mounted `<aside>` outside the
     // `workspaceView`-switched `<main>` subtree (App.tsx), so hopping tabs

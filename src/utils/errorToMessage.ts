@@ -11,7 +11,11 @@
  * remaining legacy codes can migrate here without changing callers.
  */
 import i18n from "../i18n";
-import type { AppErrorPayload, NotifyOptions } from "../types";
+import {
+  type AppErrorPayload,
+  CAPTURE_FAILURE_REASONS,
+  type NotifyOptions,
+} from "../types";
 import { runtimeDiagnosticPresentation } from "./runtimeDiagnostic";
 
 /**
@@ -119,10 +123,33 @@ function formatAppError(err: AppErrorPayload): string {
         sizeMb: (err.message.size_bytes / (1024 * 1024)).toFixed(1),
         ceilingMb: (err.message.ceiling_bytes / (1024 * 1024)).toFixed(1),
       });
+    case "capture_start_failed":
+      return captureStartFailureMessage(err.message?.reason);
+    case "capture_stop_failed":
+      // Capture has ended when the snapshot says so: nothing to press again.
+      return i18n.t(
+        err.message?.snapshot?.capture_state?.phase === "idle"
+          ? "errors.captureStop.endedIncomplete"
+          : "errors.captureStop.incomplete",
+      );
+    case "transcription_refused":
+      // Closed reasons: anything else reads as the capture not running.
+      return i18n.t(
+        err.message?.reason === "capture_lost" ||
+          err.message?.reason === "start_failed"
+          ? `errors.transcriptionRefused.${err.message.reason}`
+          : "errors.transcriptionRefused.capture_not_running",
+      );
     case "unknown":
       return err.message;
   }
   return i18n.t("runtimeDiagnostics.runtime.internal");
+}
+
+/** Localized copy for a capture start failure; unknown input fails closed. */
+export function captureStartFailureMessage(reason: unknown): string {
+  const known = CAPTURE_FAILURE_REASONS.find((value) => value === reason);
+  return i18n.t(`errors.captureStart.${known ?? "backend_unavailable"}`);
 }
 
 /** A successful write can carry a typed warning when the credential refresh failed. */

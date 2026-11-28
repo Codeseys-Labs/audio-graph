@@ -20,6 +20,8 @@ import i18n from "../i18n";
 import { useReviewStore } from "../session/reviewStore";
 import { loadedSession, segment } from "../session/reviewTestUtils";
 import { useAudioGraphStore } from "../store";
+import { NO_PIPELINE_STATUS } from "../store/captureFacts";
+import { captureBackendReply } from "../test/captureBackend";
 import { preloadGraphLens } from "../test/lazyChunks";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
 import NowStrip from "./NowStrip";
@@ -162,7 +164,7 @@ function mockBackend(): void {
     if (cmd === "load_session_notes_artifacts_cmd")
       return { notes: null, projection_events: [] };
     if (cmd === "load_session_graph_artifact_cmd") return null;
-    return null;
+    return captureBackendReply(cmd, args) ?? null;
   });
 }
 
@@ -179,6 +181,8 @@ describe("SessionsBrowser: the just-stopped session's resident data", () => {
     useAudioGraphStore.setState({
       sessions: [],
       isCapturing: false,
+      captureStatus: "idle",
+      pipelineStatus: NO_PIPELINE_STATUS,
       isTranscribing: false,
       selectedSourceIds: [],
       captureStartTime: null,
@@ -194,12 +198,19 @@ describe("SessionsBrowser: the just-stopped session's resident data", () => {
       sessions: [],
       sessionsLoading: false,
       isCapturing: true,
+      captureStatus: "running",
+      // B, live: the snapshot names its session, which the Stop routes to.
+      pipelineStatus: {
+        ...NO_PIPELINE_STATUS,
+        revision: 0,
+        capture_state: { id: { epoch: 1, seq: 1 }, phase: "running" },
+        session: { id: "session-b", epoch: 0 },
+      },
       isTranscribing: true,
       selectedSourceIds: ["system-default"],
       captureStartTime: Date.now(),
       loadedSessionId: null,
       transcriptSegments: [segment("b-1", B_TEXT)],
-      getSessionId: vi.fn(async () => "session-b"),
     });
     render(
       <>

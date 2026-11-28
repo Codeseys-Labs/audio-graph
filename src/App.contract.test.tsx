@@ -40,6 +40,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import i18n from "./i18n";
 import { useAudioGraphStore } from "./store";
+import { NO_PIPELINE_STATUS } from "./store/captureFacts";
+import {
+  captureBackendReply,
+  resetCaptureBackend,
+} from "./test/captureBackend";
 import type { AppSettings, AudioSourceInfo, CredentialPresence } from "./types";
 
 // Heavy/lazy or irrelevant-to-this-contract children are stubbed exactly like
@@ -166,6 +171,7 @@ let startCaptureCalls = 0;
 
 function installInvokeMocks() {
   startCaptureCalls = 0;
+  resetCaptureBackend();
   mockedInvoke.mockImplementation(async (cmd: string, args) => {
     switch (cmd) {
       case "load_credential_presence_cmd": {
@@ -185,10 +191,11 @@ function installInvokeMocks() {
         return [];
       case "start_capture":
         startCaptureCalls += 1;
-        if (startCaptureCalls === 1) return null;
+        if (startCaptureCalls === 1) return captureBackendReply(cmd, args);
         throw new Error("e2e-mocked-capture-failure");
+      case "capture_attach":
       case "stop_capture":
-        return null;
+        return captureBackendReply(cmd, args);
       default:
         return undefined;
     }
@@ -217,6 +224,14 @@ function seedChromeStoreDefaults() {
     searchFilter: "",
     sourceRecoveryIntent: null,
     isCapturing: false,
+    captureStatus: "idle",
+    captureUnknown: false,
+    unknownStart: null,
+    unknownStop: false,
+    startPending: null,
+    stopPending: null,
+    stopOperation: null,
+    pipelineStatus: NO_PIPELINE_STATUS,
     isTranscribing: false,
     isGeminiActive: false,
     captureStartTime: null,

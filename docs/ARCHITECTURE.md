@@ -797,15 +797,26 @@ sequenceDiagram
     participant Graph as Knowledge Graph
     participant Audit as Movement Ledger
 
-    UI->>Main: start_capture(source_id)
+    UI->>Main: capture_attach(realm) once per page: epoch e, status snapshot
+    Note over UI,Main: Attach cancels any start an earlier page left pending; a running capture is adopted from the snapshot. A late attach from a superseded page is refused. Start is unavailable until it replies
+    UI->>Main: start_capture(id = (e, seq), sources[])
+    Note over UI,Main: Identity first: a repeat of the live or preparing start reports that start's outcome. Otherwise a start of a superseded epoch is refused stale_attachment, and one at or below either watermark cancelled. Registration publishes (id, pending). retired_through never covers a start that is pending or running
+    Note over UI,Main: stop_capture(id) ends every capture up to id: watermark first and the committed aggregate published stopping at once, then, under the lifecycle lock, its sources joined and its cleanup. A window's stop of everything carries (epoch, seq): its repeat ends what its first delivery did, and one of another attachment or older than the latest is stale and changes nothing. The tray's ends what the backend holds
+    Main->>Main: close a previous start's uncertain CaptureStarted row, if any
     Main->>Pipe: ResetSession barrier
     Pipe->>Disp: ordered processed reset
     Disp-->>Main: outgoing prefix handled
-    Main->>Cap: prepare capture thread
-    Cap->>Cap: rsac build/start/subscribe
-    Cap-->>Main: Ready (audio gated)
-    Main->>Audit: flush/sync first-source CaptureStarted (not ADR-0027 Accepted)
-    Main->>Cap: Commit / release receive loop
+    loop Each requested source, in order
+        Main->>Cap: prepare capture thread
+        Cap->>Cap: rsac build/start/subscribe
+        Cap-->>Main: Ready (audio gated) or closed failure reason
+    end
+    Note over Main,Cap: Any failure or Stop: stop and join every prepared worker; the refusal carries the snapshot after it
+    Main->>Audit: flush/sync CaptureStarted (not ADR-0027 Accepted)
+    Note over Main,Audit: A member that died meanwhile fails the start; its CaptureStarted is closed
+    Main->>Cap: Commit every source / release receive loops
+    Main-->>UI: pipeline-status (revision n, (id, running)), and the reply (started, snapshot), in any order
+    Note over UI: The backend publishes every change as one revisioned PipelineStatus; the renderer applies a snapshot only if its revision is higher, and re-reads the status after every reply, on focus, and every few seconds while capture is in flight
 
     loop Every ~10ms audio buffer
         Cap->>Pipe: TaggedAudioBuffer (48kHz stereo f32)
@@ -890,14 +901,13 @@ Event name constants and payload types are defined in `src-tauri/src/events.rs`.
 | `asr-partial` | `AsrPartialPayload` | Streaming ASR provider produced an interim hypothesis |
 | `graph-update` | `GraphSnapshot` | Knowledge graph changed (full snapshot, throttled to every ~10th update or 30 s) |
 | `graph-delta` | Delta payload | Incremental graph change (every extraction cycle) |
-| `pipeline-status` | `PipelineStatus` | Pipeline stage status change (~2 s throttle) |
+| `pipeline-status` | `PipelineStatus` | Every change to what the window displays, as one revisioned snapshot (capture, transcription, realtime modes, session, backpressured sources, stages) |
 | `pipeline-latency` | `PipelineLatencyPayload` | Per-stage wall-clock duration sample |
 | `agent-status` | `AgentStatusPayload` | Agent/react loop state change (idle / running / error) |
 | `agent-proposal` | `AgentProposalPayload` | Advisory note, question, or graph suggestion awaiting user approval |
 | `speaker-detected` | Speaker info | New speaker identified |
 | `capture-error` | `CaptureErrorPayload` | Capture or processing error (with `recoverable` flag) |
 | `capture-storage-full` | `CaptureStorageFullPayload` | Persistence write failed because storage is full (ENOSPC / `ERROR_DISK_FULL`) |
-| `capture-backpressure` | `CaptureBackpressurePayload` | rsac ring buffer started/stopped dropping (edge-triggered) |
 | `gemini-transcription` | Transcription text | Gemini Live input transcription |
 | `gemini-response` | Model text | Gemini Live model response |
 | `gemini-status` | Connection status | Gemini Live connection state change |

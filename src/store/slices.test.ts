@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { statusFor } from "../test/captureBackend";
 import { THEME_STORAGE_KEY } from "../theme";
 import { useAudioGraphStore } from "./index";
 
@@ -104,36 +105,41 @@ describe("store: speakers slice (addOrUpdateSpeaker upsert)", () => {
   });
 });
 
-describe("store: source backpressure slice", () => {
+describe("store: source backpressure, from the applied snapshot", () => {
   beforeEach(() => {
-    useAudioGraphStore.setState({ backpressuredSources: [] });
+    useAudioGraphStore.setState(useAudioGraphStore.getInitialState(), true);
   });
 
-  it("adds a source when newly backpressured", () => {
-    useAudioGraphStore.getState().setSourceBackpressure("src-1", true);
+  it("lists the shown capture's backpressured sources by capture and position", () => {
+    const shown = { epoch: 1, seq: 2 };
+    useAudioGraphStore.getState().setPipelineStatus(
+      statusFor(shown, "running", {
+        backpressure: [{ capture: shown, source_index: 0 }],
+      }),
+    );
     expect(useAudioGraphStore.getState().backpressuredSources).toEqual([
-      "src-1",
+      "1.2/0",
     ]);
   });
 
-  it("does not duplicate an already-backpressured source", () => {
-    const store = useAudioGraphStore.getState();
-    store.setSourceBackpressure("src-1", true);
-    store.setSourceBackpressure("src-1", true);
-    expect(useAudioGraphStore.getState().backpressuredSources).toEqual([
-      "src-1",
-    ]);
-  });
-
-  it("removes a source when backpressure clears", () => {
-    const store = useAudioGraphStore.getState();
-    store.setSourceBackpressure("src-1", true);
-    store.setSourceBackpressure("src-1", false);
+  it("leaves out another capture's entries", () => {
+    useAudioGraphStore.getState().setPipelineStatus(
+      statusFor({ epoch: 1, seq: 2 }, "running", {
+        backpressure: [{ capture: { epoch: 1, seq: 1 }, source_index: 0 }],
+      }),
+    );
     expect(useAudioGraphStore.getState().backpressuredSources).toEqual([]);
   });
 
-  it("clearing an absent source is a no-op", () => {
-    useAudioGraphStore.getState().setSourceBackpressure("ghost", false);
+  it("clears when a newer snapshot clears it, and ignores an older one", () => {
+    const shown = { epoch: 1, seq: 2 };
+    const backpressured = statusFor(shown, "running", {
+      backpressure: [{ capture: shown, source_index: 0 }],
+    });
+    const cleared = statusFor(shown, "running");
+    useAudioGraphStore.getState().setPipelineStatus(backpressured);
+    useAudioGraphStore.getState().setPipelineStatus(cleared);
+    useAudioGraphStore.getState().setPipelineStatus(backpressured);
     expect(useAudioGraphStore.getState().backpressuredSources).toEqual([]);
   });
 });

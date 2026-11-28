@@ -2,6 +2,8 @@
   "controlBar": {
     "start": "Start",
     "stop": "Stop",
+    "stopping": "Stopping…",
+    "statusUnknown": "Recording status unknown",
     "recording": "Recording",
     "settings": "Settings",
     "sessions": "Sessions",
@@ -1702,6 +1704,34 @@
     "providerDeferred": "{{provider}} is not available for new sessions in the current MVP. Your saved settings are unchanged.",
     "providerSettingsLoading": "Provider settings are still loading. Try again shortly.",
     "artifactTooLarge": "This artifact is {{sizeMb}} MB, over the {{ceilingMb}} MB limit.",
+    "captureStop": {
+      "incomplete": "Capture did not stop cleanly. Press Stop again; if it still runs, restart AudioGraph.",
+      "endedIncomplete": "Capture stopped, but some of its cleanup did not finish. If something looks wrong, restart AudioGraph."
+    },
+    "captureAttach": {
+      "failed": "AudioGraph couldn't connect to audio capture. Press Start to try again."
+    },
+    "transcriptionRefused": {
+      "capture_not_running": "Cannot start transcription: capture is not running.",
+      "capture_lost": "Cannot start transcription: capture stopped while transcription was starting.",
+      "start_failed": "Transcription could not start, and nothing was left running. Try again."
+    },
+    "captureStart": {
+      "forSource": "{{source}}: {{reason}}",
+      "invalid_source": "This audio source can't be captured. Refresh the source list and choose it again.",
+      "permission_denied": "Audio capture permission was denied. Allow audio capture for AudioGraph in your system settings, then try again.",
+      "device_unavailable": "The audio device isn't available. Connect or enable it, refresh the source list, and try again.",
+      "unsupported": "This audio source doesn't support capture on this device.",
+      "backend_unavailable": "The audio system couldn't start capture. Try again, or choose another source.",
+      "startup_timeout": "The audio device didn't respond in time. Try again, or choose another source.",
+      "worker_exited": "Audio capture stopped while it was starting. Try again.",
+      "cancelled": "Capture start was cancelled.",
+      "stale_attachment": "This window lost its connection to audio capture. Press Start to try again.",
+      "still_preparing": "Capture is still starting. Wait a moment for it to finish.",
+      "already_running": "Capture is already running.",
+      "previous_capture_stopping": "The previous capture is still stopping. Try again in a moment.",
+      "previous_capture_reconciling": "The previous capture ended unexpectedly and is still closing. Try again in a moment."
+    },
     "ipcUnavailable": {
       "title": "The desktop backend isn’t reachable",
       "cause": "The app couldn’t reach its local backend. This can happen while the app is still starting up — try again in a moment."

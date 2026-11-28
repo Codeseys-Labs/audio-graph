@@ -74,6 +74,7 @@ pub mod speak_aloud;
 pub mod speech;
 pub mod speech_span_revision;
 pub mod state;
+pub mod status;
 pub mod timeline;
 #[cfg(desktop)]
 pub mod tray;
@@ -129,11 +130,27 @@ struct ShutdownHandles {
     projection_event_writer: Arc<Mutex<Option<crate::persistence::ProjectionEventWriter>>>,
     capture_manager: Arc<Mutex<crate::audio::AudioCaptureManager>>,
     app_settings: Arc<RwLock<crate::settings::AppSettings>>,
-    is_capturing: Arc<RwLock<bool>>,
-    is_transcribing: Arc<AtomicBool>,
-    is_gemini_active: Arc<RwLock<bool>>,
-    is_converse_active: Arc<RwLock<bool>>,
-    is_openai_realtime_active: Arc<RwLock<bool>>,
+    projection_schedulers: Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
+    status: crate::status::StatusAuthority,
+}
+
+impl ShutdownHandles {
+    fn new(state: &AppState) -> Self {
+        Self {
+            session_id: state.session_id.clone(),
+            autosave_stop: state.autosave_stop.clone(),
+            graph_autosave_thread: state.graph_autosave_thread.clone(),
+            knowledge_graph: state.knowledge_graph.clone(),
+            transcript_buffer: state.transcript_buffer.clone(),
+            transcript_writer: state.transcript_writer.clone(),
+            transcript_event_writer: state.transcript_event_writer.clone(),
+            projection_event_writer: state.projection_event_writer.clone(),
+            capture_manager: state.capture_manager.clone(),
+            app_settings: state.app_settings.clone(),
+            projection_schedulers: state.projection_schedulers.clone(),
+            status: state.status.clone(),
+        }
+    }
 }
 
 /// Bounded, best-effort graceful teardown run once from `RunEvent::Exit`.
@@ -153,14 +170,33 @@ struct ShutdownHandles {
 /// Every step is individually timeout-bounded; the function NEVER blocks the
 /// exit indefinitely, even on a wedged disk or network.
 fn stop_captures_and_close_movement(h: &ShutdownHandles) {
-    let stopped_sources = match h.capture_manager.lock() {
-        Ok(mut manager) => manager.stop_all(),
-        Err(poisoned) => poisoned.into_inner().stop_all(),
+    // Capture ends here, so, as on every other end, the projection coverage
+    // check is cancelled first: verification installs and dispatches nothing
+    // from now on.
+    h.projection_schedulers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .cancel_coverage_check();
+    let capture_was_published = h
+        .status
+        .read(|status| status.capture_state().phase == crate::events::CapturePhase::Running);
+    let (stopped_sources, uncertain_start) = {
+        let mut manager = h.capture_manager.lock().unwrap_or_else(|p| p.into_inner());
+        let stopped = manager.stop_all();
+        crate::commands::publish_capture_state(&h.status, &manager, |_| false);
+        (stopped, manager.take_uncertain_capture_start())
     };
-    let capture_was_published = match h.is_capturing.read() {
-        Ok(active) => *active,
-        Err(poisoned) => *poisoned.into_inner(),
+    let privacy_mode = match h.app_settings.read() {
+        Ok(settings) => settings.privacy_mode,
+        Err(poisoned) => poisoned.into_inner().privacy_mode,
     };
+    // A start whose CaptureStarted append reported failure published
+    // nothing, but its row may have landed: close it if it did.
+    if let Some(session_id) = uncertain_start
+        && crate::commands::close_unmatched_capture_start(&session_id, privacy_mode).is_err()
+    {
+        log::error!("Graceful shutdown: failed to resolve an uncertain capture start");
+    }
     if !capture_was_published && stopped_sources.is_empty() {
         return;
     }
@@ -168,10 +204,6 @@ fn stop_captures_and_close_movement(h: &ShutdownHandles) {
     let session_id = match h.session_id.read() {
         Ok(session_id) => session_id.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
-    };
-    let privacy_mode = match h.app_settings.read() {
-        Ok(settings) => settings.privacy_mode,
-        Err(poisoned) => poisoned.into_inner().privacy_mode,
     };
     if let Err(error) = crate::commands::append_capture_lifecycle_movement_for(
         &session_id,
@@ -191,22 +223,12 @@ fn graceful_shutdown(h: &ShutdownHandles) {
     // available so a clean quit never leaves Review evidence permanently open.
     stop_captures_and_close_movement(h);
 
-    // Wind down remaining worker/audio threads by clearing mode-active flags.
-    // `is_transcribing` is an AtomicBool (lock-free flag the speech processor
-    // polls); the rest are RwLock<bool> read by their respective mode loops.
-    h.is_transcribing.store(false, Ordering::SeqCst);
-    for (flag, name) in [
-        (&h.is_capturing, "is_capturing"),
-        (&h.is_gemini_active, "is_gemini_active"),
-        (&h.is_converse_active, "is_converse_active"),
-        (&h.is_openai_realtime_active, "is_openai_realtime_active"),
-    ] {
-        match flag.write() {
-            Ok(mut g) => *g = false,
-            Err(poisoned) => *poisoned.into_inner() = false,
-        }
-        log::debug!("Graceful shutdown: cleared {name}");
-    }
+    // Wind down remaining worker/audio threads: the snapshot that says
+    // nothing runs also clears the mode-active flags their loops poll.
+    h.status.publish(|status| {
+        status.end_transcription();
+        *status.realtime_mut() = crate::events::RealtimeModes::default();
+    });
 
     // 2. Signal the autosave daemon to stop, then join it (bounded) so the
     // final save below is the sole writer for the session graph file.
@@ -432,23 +454,7 @@ pub fn run() {
     // `app_state` is moved into `.manage(...)`. The `RunEvent::Exit` closure is
     // `move`, so it owns these clones. All are cheap `Arc` clones of the shared
     // state (see [`crate::state::AppState`]).
-    let shutdown = ShutdownHandles {
-        session_id: app_state.session_id.clone(),
-        autosave_stop: app_state.autosave_stop.clone(),
-        graph_autosave_thread: app_state.graph_autosave_thread.clone(),
-        knowledge_graph: app_state.knowledge_graph.clone(),
-        transcript_buffer: app_state.transcript_buffer.clone(),
-        transcript_writer: app_state.transcript_writer.clone(),
-        transcript_event_writer: app_state.transcript_event_writer.clone(),
-        projection_event_writer: app_state.projection_event_writer.clone(),
-        capture_manager: app_state.capture_manager.clone(),
-        app_settings: app_state.app_settings.clone(),
-        is_capturing: app_state.is_capturing.clone(),
-        is_transcribing: app_state.is_transcribing.clone(),
-        is_gemini_active: app_state.is_gemini_active.clone(),
-        is_converse_active: app_state.is_converse_active.clone(),
-        is_openai_realtime_active: app_state.is_openai_realtime_active.clone(),
-    };
+    let shutdown = ShutdownHandles::new(&app_state);
 
     let builder = tauri::Builder::default()
         // BUG-3: single-instance guard MUST be the first plugin registered
@@ -531,6 +537,8 @@ pub fn run() {
             // every subsequent `set_log_level` command will persist to.
             let handle = app.handle();
             crate::persistence::register_app_handle(handle.clone());
+            // Every published status snapshot is emitted to the window from now on.
+            app.state::<AppState>().status.set_emitter(handle.clone());
             let loaded_settings = crate::settings::load_settings_with_status(handle);
             let load_status = loaded_settings.status;
             let mut settings = loaded_settings.settings;
@@ -678,6 +686,7 @@ pub(crate) fn app_invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) ->
 {
     tauri::generate_handler![
         commands::list_audio_sources,
+        commands::capture_attach,
         commands::start_capture,
         commands::stop_capture,
         commands::update_tray_capturing,
@@ -836,31 +845,31 @@ mod shutdown_tests {
         let _data_root = DataDirGuard::set(&root);
         let app = AppState::new();
         let session_id = app.current_session_id();
-        app.capture_manager
-            .lock()
-            .unwrap()
-            .insert_synthetic_handle("shutdown-source", false);
-        *app.is_capturing.write().unwrap() = true;
+        {
+            let mut manager = app.capture_manager.lock().unwrap();
+            manager.insert_synthetic_handle("shutdown-source", false);
+            crate::commands::publish_capture_state(&app.status, &manager, |_| false);
+        }
+        let check = crate::persistence::begin_projection_capture(&app);
+        let schedulers = app.projection_schedulers.clone();
+        assert!(
+            schedulers
+                .lock()
+                .unwrap()
+                .owns_coverage_check(&session_id, &check)
+        );
 
-        let handles = ShutdownHandles {
-            session_id: app.session_id.clone(),
-            autosave_stop: app.autosave_stop.clone(),
-            graph_autosave_thread: app.graph_autosave_thread.clone(),
-            knowledge_graph: app.knowledge_graph.clone(),
-            transcript_buffer: app.transcript_buffer.clone(),
-            transcript_writer: app.transcript_writer.clone(),
-            transcript_event_writer: app.transcript_event_writer.clone(),
-            projection_event_writer: app.projection_event_writer.clone(),
-            capture_manager: app.capture_manager.clone(),
-            app_settings: app.app_settings.clone(),
-            is_capturing: app.is_capturing.clone(),
-            is_transcribing: app.is_transcribing.clone(),
-            is_gemini_active: app.is_gemini_active.clone(),
-            is_converse_active: app.is_converse_active.clone(),
-            is_openai_realtime_active: app.is_openai_realtime_active.clone(),
-        };
-
+        let handles = ShutdownHandles::new(&app);
         stop_captures_and_close_movement(&handles);
+
+        // Shutdown ends the capture, so the coverage check is cancelled:
+        // verification installs and dispatches nothing during the quit.
+        assert!(
+            !schedulers
+                .lock()
+                .unwrap()
+                .owns_coverage_check(&session_id, &check)
+        );
 
         assert!(
             app.capture_manager
@@ -895,6 +904,58 @@ mod shutdown_tests {
         ] {
             assert_ne!(writer, Some(false));
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clean_shutdown_closes_a_start_row_whose_append_reported_failure() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "audio-graph-shutdown-uncertain-start-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _data_root = DataDirGuard::set(&root);
+        let app = AppState::new();
+        let session_id = app.current_session_id();
+        // The start's CaptureStarted row landed although its append reported
+        // a failure, so nothing was published and the start is uncertain.
+        crate::commands::append_capture_lifecycle_movement_for(
+            &session_id,
+            crate::settings::PrivacyMode::default(),
+            crate::persistence::DataMovementEventType::CaptureStarted,
+        )
+        .unwrap();
+        app.capture_manager
+            .lock()
+            .unwrap()
+            .mark_capture_start_uncertain(session_id.clone());
+
+        let handles = ShutdownHandles::new(&app);
+        stop_captures_and_close_movement(&handles);
+
+        let kinds: Vec<_> = crate::persistence::load_data_movement_events(&session_id)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                crate::persistence::DataMovementEventType::CaptureStarted,
+                crate::persistence::DataMovementEventType::CaptureStopped,
+            ]
+        );
+        assert!(
+            app.capture_manager
+                .lock()
+                .unwrap()
+                .take_uncertain_capture_start()
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
