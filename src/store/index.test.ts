@@ -3878,6 +3878,7 @@ describe("AudioGraphStore", () => {
     getChannel: () => ChannelLike;
     resolveStart: (id: string) => void;
   } {
+    useAudioGraphStore.setState({ settings: selectableSettings() });
     let channel: ChannelLike | null = null;
     let resolveStart: (id: string) => void = () => {};
     vi.mocked(invoke).mockImplementation(async (cmd, args) => {
@@ -4225,7 +4226,11 @@ describe("AudioGraphStore", () => {
   });
 
   it("renders a diagnostic rejection from the blocking fallback as a failed turn, not text", async () => {
-    useAudioGraphStore.setState({ chatMessages: [], isChatLoading: false });
+    useAudioGraphStore.setState({
+      chatMessages: [],
+      isChatLoading: false,
+      settings: selectableSettings(),
+    });
     vi.mocked(invoke).mockImplementation(async (cmd) => {
       if (cmd === "start_streaming_chat") {
         throw new Error("streaming unsupported by provider");
@@ -4285,6 +4290,7 @@ describe("AudioGraphStore", () => {
   });
 
   it("lets a late blocking reply fill its own bubble without releasing a newer turn", async () => {
+    useAudioGraphStore.setState({ settings: selectableSettings() });
     let resolveFirst: (response: unknown) => void = () => {};
     let starts = 0;
     vi.mocked(invoke).mockImplementation(async (cmd) => {
@@ -4326,6 +4332,7 @@ describe("AudioGraphStore", () => {
   });
 
   it("does not fall back to the blocking command for a send the user cleared", async () => {
+    useAudioGraphStore.setState({ settings: selectableSettings() });
     let rejectStart: (error: unknown) => void = () => {};
     vi.mocked(invoke).mockImplementation(async (cmd) => {
       if (cmd === "start_streaming_chat") {
@@ -4337,6 +4344,11 @@ describe("AudioGraphStore", () => {
     });
 
     const send = useAudioGraphStore.getState().sendChatMessage("private");
+    expect(invoke).toHaveBeenCalledWith(
+      "start_streaming_chat",
+      expect.objectContaining({ message: "private" }),
+    );
+    expect(useAudioGraphStore.getState().isChatLoading).toBe(true);
     await useAudioGraphStore.getState().clearChatHistory();
     rejectStart(new Error("streaming unsupported by provider"));
     await send;
@@ -4360,6 +4372,7 @@ describe("AudioGraphStore", () => {
         context: { operation: "language_model_inference" },
       },
     } as const;
+    useAudioGraphStore.setState({ settings: selectableSettings() });
     vi.mocked(invoke).mockImplementation(async (cmd) => {
       if (cmd === "start_streaming_chat") {
         throw { code: "runtime_diagnostic", diagnostic: CANCELLED_DIAGNOSTIC };
@@ -4380,6 +4393,114 @@ describe("AudioGraphStore", () => {
       failure: CANCELLED_DIAGNOSTIC,
     });
     expect(s.isChatLoading).toBe(false);
+  });
+
+  it("releases the loading state of a turn the user clears", async () => {
+    const reqId = "req-cleared-loading";
+    const { getChannel, resolveStart } = captureStreamChannel();
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    const channel = getChannel();
+    resolveStart(reqId);
+    await sendPromise;
+    expect(useAudioGraphStore.getState().isChatLoading).toBe(true);
+
+    await useAudioGraphStore.getState().clearChatHistory();
+
+    let s = useAudioGraphStore.getState();
+    expect(s.isChatLoading).toBe(false);
+    expect(s.streamingChatRequestId).toBeNull();
+    // The discarded turn's late terminal frame changes nothing.
+    channel.onmessage?.({
+      event: "done",
+      data: { request_id: reqId, full_text: "late", finish_reason: "stop" },
+    });
+    s = useAudioGraphStore.getState();
+    expect(s.chatMessages).toEqual([]);
+    expect(s.isChatLoading).toBe(false);
+  });
+
+  it("keeps an approval that lands after a clear out of the cleared chat", async () => {
+    const proposal = {
+      id: "approve-then-clear",
+      source_segment_id: "seg-1",
+      source_id: "system-default",
+      speaker_label: "Speaker 1",
+      kind: "graph_suggestion" as const,
+      title: "Follow up",
+      body: "Review this for an action item: follow up",
+      confidence: 0.9,
+      created_at_ms: 1,
+    };
+    useAudioGraphStore.setState({ agentProposals: [proposal] });
+    let resolveApproval: (card: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "approve_agent_proposal") {
+        return new Promise((resolve) => {
+          resolveApproval = resolve;
+        });
+      }
+      return undefined;
+    });
+
+    const approval = useAudioGraphStore
+      .getState()
+      .approveAgentProposal(proposal.id);
+    await useAudioGraphStore.getState().clearChatHistory();
+    resolveApproval({
+      session_id: "live",
+      proposal,
+      status: "approved",
+      source_span_ids: ["seg-1"],
+      graph_context_ids: [],
+      outcome: {
+        proposal_id: proposal.id,
+        status: "applied",
+        message: "Approved agent proposal: Follow up",
+      },
+      created_at_ms: 1,
+      updated_at_ms: 2,
+    });
+
+    expect(await approval).not.toBeNull();
+    expect(useAudioGraphStore.getState().chatMessages).toEqual([]);
+  });
+
+  it("keeps a card from another session out of a loaded historical session's queue", () => {
+    const cardFor = (sessionId: string, id: string) => ({
+      session_id: sessionId,
+      proposal: {
+        id,
+        source_segment_id: "seg-1",
+        source_id: "system-default",
+        speaker_label: "Speaker 1",
+        kind: "question" as const,
+        title: "Question from Speaker 1",
+        body: "Consider answering or linking this question: What changed?",
+        confidence: 0.9,
+        created_at_ms: 1,
+      },
+      status: "dismissed" as const,
+      source_span_ids: ["seg-1"],
+      graph_context_ids: [],
+      created_at_ms: 1,
+      updated_at_ms: 2,
+    });
+    useAudioGraphStore.setState({
+      loadedSessionId: "session-b",
+      liveAssistCards: [],
+    });
+
+    useAudioGraphStore
+      .getState()
+      .upsertLiveAssistCard(cardFor("session-a", "live-card"));
+    expect(useAudioGraphStore.getState().liveAssistCards).toEqual([]);
+
+    useAudioGraphStore
+      .getState()
+      .upsertLiveAssistCard(cardFor("session-b", "loaded-card"));
+    expect(
+      useAudioGraphStore.getState().liveAssistCards.map((c) => c.proposal.id),
+    ).toEqual(["loaded-card"]);
   });
 
   // -----------------------------------------------------------------------

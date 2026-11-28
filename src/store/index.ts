@@ -2036,31 +2036,42 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       agentStatus: status,
     })),
   upsertLiveAssistCard: (card: LiveAssistCardRecord) =>
-    set((state) => ({
-      ...exitSamplePreviewState(state.samplePreviewActive),
-      liveAssistCards: upsertLiveAssistCardRecord(
-        state.samplePreviewActive ? [] : state.liveAssistCards,
-        card,
-      ),
-      agentProposals:
-        card.status === "pending"
-          ? upsertAgentProposal(
-              state.samplePreviewActive ? [] : state.agentProposals,
-              card.proposal,
-            )
-          : (state.samplePreviewActive ? [] : state.agentProposals).filter(
-              (proposal) => proposal.id !== card.proposal.id,
-            ),
-      approvingAgentProposalIds:
-        card.status === "pending"
-          ? state.samplePreviewActive
-            ? []
-            : state.approvingAgentProposalIds
-          : (state.samplePreviewActive
+    set((state) => {
+      // While a historical session is loaded, a card from another session (a
+      // live answer finishing meanwhile) stays out of its queue. General
+      // event fencing by session is #142.
+      if (
+        state.loadedSessionId !== null &&
+        card.session_id !== state.loadedSessionId
+      ) {
+        return {};
+      }
+      return {
+        ...exitSamplePreviewState(state.samplePreviewActive),
+        liveAssistCards: upsertLiveAssistCardRecord(
+          state.samplePreviewActive ? [] : state.liveAssistCards,
+          card,
+        ),
+        agentProposals:
+          card.status === "pending"
+            ? upsertAgentProposal(
+                state.samplePreviewActive ? [] : state.agentProposals,
+                card.proposal,
+              )
+            : (state.samplePreviewActive ? [] : state.agentProposals).filter(
+                (proposal) => proposal.id !== card.proposal.id,
+              ),
+        approvingAgentProposalIds:
+          card.status === "pending"
+            ? state.samplePreviewActive
               ? []
               : state.approvingAgentProposalIds
-            ).filter((id) => id !== card.proposal.id),
-    })),
+            : (state.samplePreviewActive
+                ? []
+                : state.approvingAgentProposalIds
+              ).filter((id) => id !== card.proposal.id),
+      };
+    }),
   addAgentProposal: (proposal: AgentProposalEvent) => {
     set((state) => ({
       ...exitSamplePreviewState(state.samplePreviewActive),
@@ -2402,6 +2413,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         proposalId,
       ],
     }));
+    // Counted before awaiting: a clear that lands meanwhile keeps the
+    // approval's summary out of the cleared chat (the backend drops it too).
+    const clearsAtStart = chatClears;
     try {
       const card = await invoke<LiveAssistCardRecord>(
         "approve_agent_proposal",
@@ -2426,7 +2440,10 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         approvingAgentProposalIds: state.approvingAgentProposalIds.filter(
           (id) => id !== proposalId,
         ),
-        chatMessages: [...state.chatMessages, message],
+        chatMessages:
+          chatClears === clearsAtStart
+            ? [...state.chatMessages, message]
+            : state.chatMessages,
         error: null,
       }));
       return result;
@@ -3718,7 +3735,13 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     chatClears += 1;
     try {
       await invoke("clear_chat_history");
-      set({ chatMessages: [], streamingChatRequestId: null });
+      // The discarded turn no longer holds the chat's loading state.
+      set({
+        chatMessages: [],
+        isChatLoading: false,
+        streamingChatRequestId: null,
+        chatReplyTurnId: null,
+      });
     } catch (e) {
       set({ error: errorToMessage(e) });
     }
