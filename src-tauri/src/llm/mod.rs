@@ -16,6 +16,7 @@
 //! extraction still has the local rule-based extractor as its final fallback —
 //! that is a local, non-egress substitution, not a provider hop.
 
+pub(crate) mod admission;
 pub mod api_client;
 pub mod bedrock;
 pub mod engine;

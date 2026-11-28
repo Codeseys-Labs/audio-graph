@@ -472,7 +472,10 @@ struct StoredDecisionRecord {
     latency_ms: u64,
     usage: Usage,
     error_class: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "audio_graph_ipc_contract::model_id::lenient_placement"
+    )]
     model_placement: Option<ModelPlacement>,
 }
 
