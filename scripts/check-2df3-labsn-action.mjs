@@ -588,7 +588,7 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
     invariant(source.includes("expected_durability_tests: 19"), "macOS durability count drift");
     invariant(
         windowsMatrix.includes("expected_cc9a_native_tests: 1") &&
-            windowsMatrix.includes("expected_durability_tests: 17") &&
+            windowsMatrix.includes("expected_durability_tests: 20") &&
             windowsMatrix.includes("expected_crash_harness_tests: 9"),
         "Windows cc9a/canonical/crash matrix row drift",
     );
@@ -947,6 +947,11 @@ function validate(source, canonicalSource = canonicalDurability, manifestSource 
         "cc9a Windows typed refusal proof weakened",
     );
     invariant(
+        /assert_eq!\(\s*durability,\s*CanonicalDurabilityReceipt\s*\{\s*mutation,\s*barrier:\s*CanonicalDurabilityBarrier::FileAndWindowsNtfsParentFlush,?\s*\}\s*\)/.test(windowsTest) &&
+            /assert_eq!\(\s*transaction\.abandon_staged_transition\(\),\s*CanonicalUnlinkOutcome::Unlinked\(CanonicalDurabilityReceipt\s*\{\s*mutation:\s*CanonicalMutation::Unlink,\s*barrier:\s*CanonicalDurabilityBarrier::WindowsNtfsParentFlush,?\s*\}\)\s*\)/.test(windowsTest),
+        "cc9a Windows native file or unlink parent-flush receipt proof weakened",
+    );
+    invariant(
         windowsTest.includes("assert_eq!(after_entries, before_entries)") &&
             windowsTest.includes('assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged")') &&
             windowsTest.includes("COORDINATION_FILE_NAME") &&
@@ -1202,6 +1207,18 @@ const cc9aMutations = [
             ),
         }),
     ],
+    ...["FileAndWindowsNtfsParentFlush", "WindowsNtfsParentFlush"].map((tier) => [
+        `cc9a Windows ${tier} proof weakened`,
+        ({ manifest, ...rest }) => ({
+            ...rest,
+            manifest: mutateRustTest(
+                manifest,
+                "cc9a_native_windows_manifest_requires_qualification_for_install_replacement_and_unlink",
+                `CanonicalDurabilityBarrier::${tier}`,
+                "CanonicalDurabilityBarrier::ParentNamespace",
+            ),
+        }),
+    ]),
     [
         "cc9a Windows entry equality removed",
         ({ manifest, ...rest }) => ({
@@ -1274,7 +1291,7 @@ const cc9aMutations = [
                 `          - os: windows
             runner: windows-2025
             expected_cc9a_native_tests: 1
-            expected_durability_tests: 17
+            expected_durability_tests: 20
             expected_crash_harness_tests: 9`,
                 `          - os: windows
             runner: windows-2025

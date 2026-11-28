@@ -302,8 +302,13 @@ other respects.
 
 ### Windows NTFS amendment (2026-11-27)
 
-Qualified writable fixed local NTFS roots may advance v2, recover canonical
-artifacts and retire Session control entries. Qualification requires persistent
+Volume qualification accepts fixed local NTFS when the volume does not report
+the read-only flag. It does not probe the user's write permissions on every
+directory. Advancing v2, recovering canonical artifacts and retiring control
+entries require a flush-capable handle to the affected parent before namespace
+mutation. Either directory add-file or add-subdirectory access permits the flush
+on local NTFS. With only attribute access, an existing file can still be read or
+appended under its own permissions. Volume qualification also requires persistent
 ACLs, USN journal and open-by-file-ID capabilities, and a volume GUID lookup.
 These are driver-reported capabilities. A RAM-backed NTFS volume reported as
 fixed may qualify.
@@ -312,7 +317,9 @@ Create and replacement return `FileAndWindowsNtfsParentFlush` after the file
 flush, verified name and successful flush of the bound parent directory.
 Replacement also performs a same-volume move. Unlink and already-absent retries
 return `WindowsNtfsParentFlush` after checking absence and flushing the parent.
-A failed required flush yields an indeterminate result. Physical power-loss
+After flushing, the caller reopens the parent by path and verifies its identity
+against the held handle. A failed required flush or parent revalidation yields
+an indeterminate result. Physical power-loss
 evidence remains a release gate under #139.
 
 A read-only alias through a junction or SUBST can name a directory that another

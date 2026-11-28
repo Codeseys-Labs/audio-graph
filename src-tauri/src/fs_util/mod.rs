@@ -441,11 +441,29 @@ mod tests {
         let file = std::fs::File::create_new(named.join("entry")).unwrap();
         std::fs::remove_dir(&named).unwrap();
         link_named_to("decoy");
-        // There is deliberately no entry in the junction target. A pathname
-        // DACL write here must fail; the held file must receive the exact ACL.
+        let decoy_entry = decoy.join("entry");
+        std::fs::write(&decoy_entry, b"decoy").unwrap();
+        let icacls = |args: &[&str]| {
+            let result = std::process::Command::new("icacls.exe")
+                .arg(&decoy_entry)
+                .args(args)
+                .current_dir(&base)
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{result:?}");
+        };
+        // Give the decoy a distinguishable DACL. /save captures the DACL
+        // including its control flags, independent of localized display text.
+        icacls(&["/grant", "*S-1-1-0:R"]);
+        icacls(&["/save", "before.acl"]);
+
         super::try_set_owner_only_file(&file).unwrap();
         assert_current_sid_dacl(&held.join("entry"));
-        assert!(!decoy.join("entry").exists());
+        icacls(&["/save", "after.acl"]);
+        assert_eq!(
+            std::fs::read(base.join("after.acl")).unwrap(),
+            std::fs::read(base.join("before.acl")).unwrap()
+        );
         drop(file);
         std::fs::remove_dir(named).unwrap();
         std::fs::remove_dir_all(base).unwrap();

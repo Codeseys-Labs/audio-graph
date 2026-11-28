@@ -565,19 +565,36 @@ fn open_session_for_content_with_head<T, E>(
             content_reader(floor, None)
         });
     }
-    match SessionArtifactManifestStore::qualified_existing_session(data_root, session_id) {
-        Ok(store) => guarded_session_open_with_head(&store, maximum_supported, content_reader),
-        Err(ManifestStoreError::Qualification(refusal)) => {
-            let store = SessionArtifactManifestStore::after_qualification_refusal(
-                data_root, session_id, refusal,
-            )
-            .map_err(GuardedSessionOpenError::ControlPlaneStore)?;
-            guarded_session_open_with_head(&store, maximum_supported, content_reader)
+    let mut pending = Some(content_reader);
+    let refusal = match SessionArtifactManifestStore::qualified_existing_session(
+        data_root, session_id,
+    ) {
+        Ok(store) => {
+            let result =
+                guarded_session_open_with_head(&store, maximum_supported, |floor, head| {
+                    pending.take().expect("admission calls its reader once")(floor, head)
+                });
+            match result {
+                #[cfg(windows)]
+                Err(GuardedSessionOpenError::ControlPlaneUnreadable(ManifestLoadError::Coordination(
+                    super::canonical_durability::CanonicalCoordinationError::QualificationRefused(refusal)
+                ))) => refusal,
+                other => return other,
+            }
         }
-        // Every other refusal is a refusal. A control plane that exists and
-        // cannot be read under a guard is never admitted as historical v1.
-        Err(error) => Err(GuardedSessionOpenError::ControlPlaneStore(error)),
-    }
+        Err(ManifestStoreError::Qualification(refusal)) => refusal,
+        Err(error) => return Err(GuardedSessionOpenError::ControlPlaneStore(error)),
+    };
+    // A qualification refusal precedes invoking the reader. Retry admission
+    // once with the same floor and the existing read-only coordination policy.
+    let store =
+        SessionArtifactManifestStore::after_qualification_refusal(data_root, session_id, refusal)
+            .map_err(GuardedSessionOpenError::ControlPlaneStore)?;
+    guarded_session_open_with_head(
+        &store,
+        maximum_supported,
+        pending.expect("qualification precedes content"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2876,6 +2893,47 @@ mod guarded_admission_tests {
 
     #[cfg(windows)]
     #[test]
+    fn live_guard_probe_refusal_retries_read_only_admission_once() {
+        use crate::persistence::canonical_durability::{
+            CanonicalDurability, CanonicalFilesystemQualificationError,
+        };
+        let root = root("guard-probe-retry");
+        persist_manifest(&root, SESSION, v1_candidate("guard-retry"));
+        let lock = store_coordination_path(&root, SESSION).unwrap();
+        let inject = || {
+            CanonicalDurability::refuse_next_guard_probe(
+                CanonicalFilesystemQualificationError::IdentityUnavailable,
+            )
+        };
+        let export =
+            || super::open_v1_session_for_export(&root, SESSION, std::convert::identity, Ok);
+        inject();
+        assert!(matches!(
+            export(),
+            Err(GuardedSessionOpenError::ControlPlaneUnreadable(
+                super::ManifestLoadError::Coordination(
+                    crate::persistence::canonical_durability::CanonicalCoordinationError::Missing
+                )
+            ))
+        ));
+        assert!(!lock.exists());
+        write_fixture(&lock, b"");
+        inject();
+        assert_eq!(
+            export()
+                .unwrap()
+                .unwrap()
+                .manifest
+                .unwrap()
+                .transition
+                .idempotency_id,
+            "guard-retry"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn subst_refuses_qualification_and_preserves_v1_export() {
         use std::process::Command;
         struct Mapping(String);
@@ -2951,6 +3009,19 @@ mod guarded_admission_tests {
         else {
             panic!("fixture must refuse namespace qualification");
         };
+        if path != base {
+            use crate::persistence::canonical_durability::{
+                CanonicalCoordinationStage, CanonicalFilesystemQualificationError,
+            };
+            assert!(matches!(
+                refusal,
+                CanonicalFilesystemQualificationError::Io {
+                    stage: CanonicalCoordinationStage::ResolveRoot,
+                    kind: std::io::ErrorKind::InvalidInput,
+                    ..
+                }
+            ));
+        }
         let store =
             SessionArtifactManifestStore::after_qualification_refusal(&path, SESSION, refusal)
                 .unwrap();

@@ -733,7 +733,7 @@ impl ManagedNamespace {
         if is_root && identity_is_available(&self.identity) && identity != self.identity {
             return Err(CanonicalDurabilityRejection::IdentityChanged);
         }
-        let directory = open_parent_directory(platform, &canonical_parent)?;
+        let (directory, flushable) = open_parent_directory(platform, &canonical_parent)?;
         if let Some(directory) = &directory {
             let opened_metadata = directory
                 .metadata()
@@ -749,9 +749,16 @@ impl ManagedNamespace {
             }
         }
         Ok(BoundParent {
+            barrier: ParentDurabilityBarrier {
+                native: directory,
+                flushable,
+                #[cfg(windows)]
+                path: canonical_parent.clone(),
+                #[cfg(test)]
+                algorithm_test: synthetic_algorithm_identity_token(&self.identity).is_some(),
+            },
             canonical_path: canonical_parent,
             identity,
-            barrier: ParentDurabilityBarrier::new(directory, &self.identity),
         })
     }
 }
@@ -764,25 +771,20 @@ struct BoundParent {
 
 struct ParentDurabilityBarrier {
     native: Option<File>,
+    flushable: bool,
+    #[cfg(windows)]
+    path: PathBuf,
     #[cfg(test)]
     algorithm_test: bool,
 }
 
 impl ParentDurabilityBarrier {
-    fn new(native: Option<File>, _namespace_identity: &FilesystemIdentity) -> Self {
-        Self {
-            native,
-            #[cfg(test)]
-            algorithm_test: synthetic_algorithm_identity_token(_namespace_identity).is_some(),
-        }
-    }
-
     fn is_available(&self) -> bool {
         #[cfg(test)]
         if self.algorithm_test {
             return true;
         }
-        self.native.is_some()
+        self.flushable
     }
 
     /// Flush the directory whose identity was validated during parent binding.
@@ -795,7 +797,17 @@ impl ParentDurabilityBarrier {
             .native
             .as_ref()
             .ok_or_else(|| io::Error::other("parent durability barrier unavailable"))?;
-        directory.sync_all()
+        directory.sync_all()?;
+        #[cfg(windows)]
+        {
+            let reopened = windows_ntfs::open_attributes(&self.path)?;
+            if windows_ntfs::identity(&reopened)? != windows_ntfs::identity(directory)? {
+                return Err(io::Error::other(
+                    "parent identity changed across namespace operation",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -803,13 +815,12 @@ impl ParentDurabilityBarrier {
 fn open_parent_directory(
     _platform: CanonicalPlatform,
     path: &Path,
-) -> Result<Option<File>, CanonicalDurabilityRejection> {
-    // Existing-file appends require no namespace flush and may live beneath
-    // a parent where GENERIC_WRITE is denied. Keep an identity handle then;
-    // any operation that needs a flush must still succeed at sync_all().
+) -> Result<(Option<File>, bool), CanonicalDurabilityRejection> {
+    // File-only operations can use the identity handle when both flush-capable
+    // access masks are denied. Namespace callers must check is_available first.
     windows_ntfs::open_directory_for_flush(path)
-        .or_else(|_| windows_ntfs::open_attributes(path))
-        .map(Some)
+        .map(|file| (Some(file), true))
+        .or_else(|_| windows_ntfs::open_attributes(path).map(|file| (Some(file), false)))
         .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))
 }
 
@@ -817,14 +828,14 @@ fn open_parent_directory(
 fn open_parent_directory(
     platform: CanonicalPlatform,
     path: &Path,
-) -> Result<Option<File>, CanonicalDurabilityRejection> {
+) -> Result<(Option<File>, bool), CanonicalDurabilityRejection> {
     // The test policy can exercise Windows refusal on a Unix host without
     // accidentally taking a Unix directory handle first.
     if platform == CanonicalPlatform::Windows {
-        return Ok(None);
+        return Ok((None, false));
     }
     File::open(path)
-        .map(Some)
+        .map(|file| (Some(file), true))
         .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))
 }
 
@@ -964,6 +975,11 @@ impl Default for CanonicalDurability {
     }
 }
 
+#[cfg(all(test, windows))]
+thread_local! {
+    static NEXT_GUARD_PROBE_REFUSAL: std::cell::Cell<Option<CanonicalFilesystemQualificationError>> = const { std::cell::Cell::new(None) };
+}
+
 impl CanonicalDurability {
     pub fn new() -> Self {
         Self::default()
@@ -1050,6 +1066,11 @@ impl CanonicalDurability {
         })
     }
 
+    #[cfg(all(test, windows))]
+    pub(super) fn refuse_next_guard_probe(refusal: CanonicalFilesystemQualificationError) {
+        NEXT_GUARD_PROBE_REFUSAL.set(Some(refusal));
+    }
+
     fn validate_guard_binding(
         &self,
         namespace: &ManagedNamespace,
@@ -1069,6 +1090,10 @@ impl CanonicalDurability {
             || *namespace != binding.namespace
         {
             return Err(CanonicalCoordinationError::QualificationBindingMismatch);
+        }
+        #[cfg(all(test, windows))]
+        if let Some(refusal) = NEXT_GUARD_PROBE_REFUSAL.take() {
+            return Err(CanonicalCoordinationError::QualificationRefused(refusal));
         }
         let filesystem = resolve_live_filesystem(namespace, self.platform)
             .map_err(CanonicalCoordinationError::QualificationRefused)?;
@@ -1481,7 +1506,7 @@ impl CanonicalExclusiveGuard {
         self.unlink_canonical_entry_inner(path, qualification, recovery_key, None)
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", windows)))]
     pub(crate) fn unlink_canonical_entry_with_fault(
         &self,
         path: &Path,
@@ -2110,7 +2135,7 @@ impl CanonicalExclusiveGuard {
     ///
     /// Existing files require write, flush, and file `sync_all`. A first-create
     /// additionally requires matching qualification and the platform's
-    /// namespace barrier (Unix directory sync or NTFS identity readback).
+    /// parent directory flush, including post-flush parent identity verification on NTFS.
     pub fn append(
         &self,
         path: &Path,
@@ -2138,15 +2163,7 @@ impl CanonicalExclusiveGuard {
             Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
         };
 
-        let opened = if namespace_qualified {
-            if !parent.barrier.is_available() {
-                return CanonicalDurabilityOutcome::Rejected(
-                    CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
-                        platform: self.platform,
-                        operation: CanonicalNamespaceOperation::FirstCreate,
-                    },
-                );
-            }
+        let opened = if namespace_qualified && parent.barrier.is_available() {
             self.wait_before_atomic_create();
             match OpenOptions::new()
                 .read(true)
@@ -4036,10 +4053,11 @@ mod windows_ntfs {
     }
 
     pub(super) fn open_directory_for_flush(path: &Path) -> io::Result<File> {
-        open_plain_handle(
-            path,
-            FILE_READ_ATTRIBUTES.0 | windows::Win32::Foundation::GENERIC_WRITE.0,
-        )
+        use windows::Win32::Storage::FileSystem::{FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY};
+        // Either data-write bit permits FlushFileBuffers on local NTFS. The
+        // read-attributes bit is needed for identity checks on the same handle.
+        open_plain_handle(path, FILE_READ_ATTRIBUTES.0 | FILE_ADD_FILE.0)
+            .or_else(|_| open_plain_handle(path, FILE_READ_ATTRIBUTES.0 | FILE_ADD_SUBDIRECTORY.0))
     }
 
     pub(super) fn open_attributes(path: &Path) -> io::Result<File> {
@@ -4173,6 +4191,8 @@ mod windows_ntfs {
             flags & FILE_READ_ONLY_VOLUME != 0,
             has_required_ntfs_features(flags),
         )?;
+        // Probe volume GUID availability on each qualification. The binding
+        // compares the mount and held root volume/file IDs, not this GUID text.
         let mut volume_guid = [0; 64];
         // SAFETY: root is NUL-terminated and the buffer fits a volume GUID path.
         unsafe {
@@ -6685,6 +6705,113 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn ntfs_parent_access_denial_refuses_namespace_mutations_and_allows_file_only_operations() {
+        let root = temp_root("ntfs-flush-denied");
+        fs::create_dir(&root).unwrap();
+        let existing = root.join("existing");
+        fs::write(&existing, b"old").unwrap();
+        let (proof, durability) =
+            CanonicalFilesystemQualification::for_existing_managed_root(&root).unwrap();
+        let guard = durability
+            .try_lock_exclusive_qualified(&root, &proof)
+            .unwrap();
+        // Directory-only deny ACE. The child retains its original file ACL,
+        // including delete permission, and the existing lock remains usable.
+        let acl = std::process::Command::new("icacls.exe")
+            .arg(&root)
+            .args(["/deny", "*S-1-1-0:(WD,AD)"])
+            .output()
+            .unwrap();
+        assert!(acl.status.success(), "{acl:?}");
+        assert_eq!(
+            windows_ntfs::open_directory_for_flush(&root)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(5)
+        );
+        let key = CanonicalRecoveryKey::from_opaque_bytes([30; 16]);
+        let absent = root.join("absent");
+        assert_eq!(
+            guard.append(&absent, b"new", Some(&proof), key),
+            CanonicalDurabilityOutcome::Rejected(
+                CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    operation: CanonicalNamespaceOperation::FirstCreate
+                }
+            )
+        );
+        assert!(!absent.exists());
+        assert_eq!(
+            guard.unlink_canonical_entry(&existing, Some(&proof), key),
+            unlink_namespace_unsupported(CanonicalPlatform::Windows)
+        );
+        assert_eq!(fs::read(&existing).unwrap(), b"old");
+        assert!(matches!(
+            guard.append(&existing, b"+", Some(&proof), key),
+            CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::ExistingAppend,
+                barrier: CanonicalDurabilityBarrier::FileDataAndMetadata
+            })
+        ));
+        drop(guard);
+        let reader = durability.try_lock_shared_qualified(&root, &proof).unwrap();
+        assert_eq!(fs::read(&existing).unwrap(), b"old+");
+        drop(reader);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ntfs_parent_flush_detects_replacement_of_bound_directory() {
+        let root = temp_root("ntfs-parent-swap");
+        let parent = root.join("parent");
+        fs::create_dir_all(&parent).unwrap();
+        let (proof, _) =
+            CanonicalFilesystemQualification::for_existing_managed_root(&parent).unwrap();
+        let bound = proof
+            .namespace
+            .bind_parent(&parent.join("entry"), CanonicalPlatform::Windows)
+            .unwrap();
+        fs::rename(&parent, root.join("original")).unwrap();
+        fs::create_dir(&parent).unwrap();
+        assert_eq!(
+            bound.barrier.sync_all().unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        drop(bound);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ntfs_unlink_parent_flush_failure_requires_absence_reconciliation() {
+        let root = temp_root("ntfs-unlink-parent-fault");
+        fs::create_dir(&root).unwrap();
+        let (proof, durability) =
+            CanonicalFilesystemQualification::for_existing_managed_root(&root).unwrap();
+        let guard = durability
+            .try_lock_exclusive_qualified(&root, &proof)
+            .unwrap();
+        let target = root.join("control");
+        fs::write(&target, b"fixture").unwrap();
+        let key = CanonicalRecoveryKey::from_opaque_bytes([31; 16]);
+        assert!(
+            matches!(guard.unlink_canonical_entry_with_fault(&target, Some(&proof), key, CanonicalDurabilityStage::ParentSync),
+            CanonicalUnlinkOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {stage: CanonicalDurabilityStage::ParentSync, recovery_key, ..}) if recovery_key == key)
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            guard.unlink_canonical_entry(&target, Some(&proof), key),
+            CanonicalUnlinkOutcome::AlreadyAbsent(
+                CanonicalDurabilityBarrier::WindowsNtfsParentFlush
+            )
+        );
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn native_qualification_rejects_a_junction_in_the_root_chain() {
         let base = temp_root("ntfs-junction");
         let real = base.join("real");
@@ -6698,7 +6825,14 @@ mod tests {
             .status;
         assert!(status.success());
         for path in [&junction, &junction.join("child")] {
-            assert!(CanonicalFilesystemQualification::for_existing_managed_root(path).is_err());
+            assert!(matches!(
+                CanonicalFilesystemQualification::for_existing_managed_root(path),
+                Err(CanonicalFilesystemQualificationError::Io {
+                    stage: CanonicalCoordinationStage::ResolveRoot,
+                    kind: io::ErrorKind::InvalidInput,
+                    ..
+                })
+            ));
         }
         assert!(!real.join(COORDINATION_FILE_NAME).exists());
         fs::remove_dir(junction).unwrap();

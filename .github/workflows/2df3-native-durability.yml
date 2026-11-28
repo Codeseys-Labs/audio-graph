@@ -41,7 +41,7 @@ jobs:
           - os: windows
             runner: windows-2025
             expected_cc9a_native_tests: 1
-            expected_durability_tests: 17
+            expected_durability_tests: 20
             expected_crash_harness_tests: 9
     env:
       EVIDENCE_DIR: ${{ github.workspace }}/native-durability-evidence-${{ matrix.os }}
