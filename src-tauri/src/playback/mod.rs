@@ -31,9 +31,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeTransport,
+};
 use audioadapter_buffers::direct::SequentialSlice;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, SampleFormat, StreamConfig, StreamError};
+use cpal::{
+    BufferSize, BuildStreamError, DefaultStreamConfigError, DeviceNameError, PlayStreamError,
+    SampleFormat, StreamConfig, StreamError,
+};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
@@ -43,7 +50,7 @@ use rubato::{
 };
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Public shape of an audio output device, exposed to the frontend so users
 /// can pick one in settings.
@@ -77,28 +84,94 @@ impl Default for PlaybackConfig {
     }
 }
 
-/// Errors returned from playback APIs. These bubble through to Tauri command
-/// results as strings.
-#[derive(Debug, thiserror::Error)]
+/// Closed failures from native audio playback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PlaybackError {
-    #[error("no default output device available on this host")]
+    #[error("no default output device")]
     NoDefaultDevice,
-    #[error("requested device '{0}' not found")]
-    DeviceNotFound(String),
-    #[error("device does not support any streamable format")]
+    #[error("requested output device not found")]
+    DeviceNotFound,
+    #[error("output device is no longer available")]
+    DeviceUnavailable,
+    #[error("output device format is unsupported")]
     NoSupportedFormat,
-    #[error("cpal stream build failed: {0}")]
-    BuildStream(String),
-    #[error("cpal stream play failed: {0}")]
-    PlayStream(String),
+    #[error("invalid playback configuration")]
+    InvalidConfiguration,
+    #[error("playback stream build failed")]
+    BuildStream,
+    #[error("playback stream start failed")]
+    PlayStream,
+    #[error("playback stream failed")]
+    Stream,
+    #[error("playback resampling failed")]
+    Resampler,
     #[error("audio thread is not running")]
     ThreadDead,
 }
 
-impl From<PlaybackError> for String {
-    fn from(value: PlaybackError) -> Self {
-        value.to_string()
+impl PlaybackError {
+    pub fn to_runtime_diagnostic(self, operation: RuntimeOperation) -> RuntimeDiagnostic {
+        let context =
+            RuntimeDiagnosticContext::new(operation).with_transport(RuntimeTransport::Native);
+        match self {
+            Self::NoDefaultDevice | Self::DeviceUnavailable => RuntimeErrorDiagnostic::new(
+                RuntimeErrorCode::ProviderUnavailable,
+                true,
+                RuntimeSafeRecoveryAction::Retry,
+                context,
+            )
+            .into(),
+            Self::DeviceNotFound | Self::NoSupportedFormat | Self::InvalidConfiguration => {
+                RuntimeErrorDiagnostic::invalid_configuration(context).into()
+            }
+            Self::BuildStream
+            | Self::PlayStream
+            | Self::Stream
+            | Self::Resampler
+            | Self::ThreadDead => RuntimeDiagnostic::internal(context),
+        }
     }
+}
+
+impl From<DefaultStreamConfigError> for PlaybackError {
+    fn from(error: DefaultStreamConfigError) -> Self {
+        match error {
+            DefaultStreamConfigError::DeviceNotAvailable => Self::DeviceUnavailable,
+            DefaultStreamConfigError::StreamTypeNotSupported => Self::NoSupportedFormat,
+            _ => Self::BuildStream,
+        }
+    }
+}
+
+impl From<BuildStreamError> for PlaybackError {
+    fn from(error: BuildStreamError) -> Self {
+        match error {
+            BuildStreamError::DeviceNotAvailable => Self::DeviceUnavailable,
+            BuildStreamError::StreamConfigNotSupported => Self::NoSupportedFormat,
+            _ => Self::BuildStream,
+        }
+    }
+}
+
+impl From<PlayStreamError> for PlaybackError {
+    fn from(error: PlayStreamError) -> Self {
+        match error {
+            PlayStreamError::DeviceNotAvailable => Self::DeviceUnavailable,
+            _ => Self::PlayStream,
+        }
+    }
+}
+
+fn log_stream_error(error: StreamError, operation: RuntimeOperation) {
+    let error = match error {
+        StreamError::BufferUnderrun => return,
+        StreamError::DeviceNotAvailable => PlaybackError::DeviceUnavailable,
+        _ => PlaybackError::Stream,
+    };
+    log::warn!(
+        "cpal stream error: {}",
+        error.to_runtime_diagnostic(operation)
+    );
 }
 
 /// Default ring-buffer capacity in samples (mono i16). 192 000 ≈ 4 s of
@@ -114,13 +187,14 @@ enum AudioCommand {
     OpenStream {
         device_name: Option<String>,
         config: PlaybackConfig,
+        operation: RuntimeOperation,
         /// New consumer for the per-stream ring buffer. The corresponding
         /// producer was sent to `AudioPlayer` over the reply channel
         /// before this command was issued.
         consumer: HeapCons<i16>,
         /// One-shot reply so the caller knows whether the open succeeded and
         /// which device sample rate the stream actually requested.
-        reply: crossbeam_channel::Sender<Result<PlaybackOpenInfo, String>>,
+        reply: crossbeam_channel::Sender<Result<PlaybackOpenInfo, PlaybackError>>,
     },
     /// Stop the stream and discard the consumer side. Safe to call when no
     /// stream is open (no-op).
@@ -204,18 +278,28 @@ impl AudioPlayer {
 
     /// Open the host's default output device with the given source config.
     pub fn open_default(&self, config: PlaybackConfig) -> Result<(), PlaybackError> {
-        self.open_inner(None, config)
+        self.open_default_for(config, RuntimeOperation::ProviderRequest)
+    }
+
+    /// Open the default device and associate subsequent diagnostics with its caller.
+    pub(crate) fn open_default_for(
+        &self,
+        config: PlaybackConfig,
+        operation: RuntimeOperation,
+    ) -> Result<(), PlaybackError> {
+        self.open_inner(None, config, operation)
     }
 
     /// Open a specific device by name (as listed by [`list_output_devices`]).
     pub fn open_named(&self, name: String, config: PlaybackConfig) -> Result<(), PlaybackError> {
-        self.open_inner(Some(name), config)
+        self.open_inner(Some(name), config, RuntimeOperation::ProviderRequest)
     }
 
     fn open_inner(
         &self,
         device_name: Option<String>,
         config: PlaybackConfig,
+        operation: RuntimeOperation,
     ) -> Result<(), PlaybackError> {
         validate_playback_config(config)?;
 
@@ -237,23 +321,22 @@ impl AudioPlayer {
             .send(AudioCommand::OpenStream {
                 device_name,
                 config,
+                operation,
                 consumer: cons,
                 reply: reply_tx,
             })
             .map_err(|_| PlaybackError::ThreadDead)?;
-        match reply_rx
+        let info = reply_rx
             .recv_timeout(std::time::Duration::from_millis(2_000))
-            .map_err(|_| PlaybackError::ThreadDead)?
-        {
-            Ok(info) => {
-                let producer =
-                    PlaybackProducer::new(prod, config.source_sample_rate, info.device_sample_rate)
-                        .map_err(PlaybackError::BuildStream)?;
-                *self.producer.lock().unwrap_or_else(|p| p.into_inner()) = Some(producer);
-                Ok(())
-            }
-            Err(message) => Err(PlaybackError::BuildStream(message)),
-        }
+            .map_err(|_| PlaybackError::ThreadDead)??;
+        let producer = PlaybackProducer::new(
+            prod,
+            config.source_sample_rate,
+            info.device_sample_rate,
+            operation,
+        )?;
+        *self.producer.lock().unwrap_or_else(|p| p.into_inner()) = Some(producer);
+        Ok(())
     }
 
     /// Stop the active stream. Stored producer is dropped; subsequent
@@ -354,16 +437,8 @@ impl AudioPlayer {
 }
 
 fn validate_playback_config(config: PlaybackConfig) -> Result<(), PlaybackError> {
-    if config.source_sample_rate == 0 {
-        return Err(PlaybackError::BuildStream(
-            "playback source sample rate must be greater than zero".to_string(),
-        ));
-    }
-    if config.source_channels != 1 {
-        return Err(PlaybackError::BuildStream(format!(
-            "playback currently accepts mono source audio only, got {} channels",
-            config.source_channels
-        )));
+    if config.source_sample_rate == 0 || config.source_channels != 1 {
+        return Err(PlaybackError::InvalidConfiguration);
     }
     Ok(())
 }
@@ -390,11 +465,12 @@ fn audio_thread_main(cmd_rx: Receiver<AudioCommand>, cancel: Arc<AtomicBool>) {
             AudioCommand::OpenStream {
                 device_name,
                 config,
+                operation,
                 consumer,
                 reply,
             } => {
                 drop(active_stream.take());
-                let result = build_stream(device_name, config, consumer, cancel.clone());
+                let result = build_stream(device_name, config, operation, consumer, cancel.clone());
                 match result {
                     Ok(built) => match built.stream.play() {
                         Ok(()) => {
@@ -405,11 +481,11 @@ fn audio_thread_main(cmd_rx: Receiver<AudioCommand>, cancel: Arc<AtomicBool>) {
                             let _ = reply.send(Ok(info));
                         }
                         Err(e) => {
-                            let _ = reply.send(Err(format!("stream.play failed: {e}")));
+                            let _ = reply.send(Err(e.into()));
                         }
                     },
                     Err(e) => {
-                        let _ = reply.send(Err(e.to_string()));
+                        let _ = reply.send(Err(e));
                     }
                 }
             }
@@ -433,6 +509,7 @@ struct BuiltPlaybackStream {
 fn build_stream(
     device_name: Option<String>,
     config: PlaybackConfig,
+    operation: RuntimeOperation,
     consumer: HeapCons<i16>,
     cancel: Arc<AtomicBool>,
 ) -> Result<BuiltPlaybackStream, PlaybackError> {
@@ -441,16 +518,15 @@ fn build_stream(
         None => host
             .default_output_device()
             .ok_or(PlaybackError::NoDefaultDevice)?,
-        Some(name) => host
-            .output_devices()
-            .map_err(|e| PlaybackError::BuildStream(e.to_string()))?
-            .find(|d| d.name().map(|n| n == name).unwrap_or(false))
-            .ok_or(PlaybackError::DeviceNotFound(name))?,
+        Some(name) => find_named_output(
+            host.output_devices()
+                .map_err(|_| PlaybackError::BuildStream)?,
+            &name,
+            |device| device.name(),
+        )?,
     };
 
-    let supported = device
-        .default_output_config()
-        .map_err(|e| PlaybackError::BuildStream(e.to_string()))?;
+    let supported = device.default_output_config()?;
     let sample_format = supported.sample_format();
     let device_channels = supported.channels();
     let device_sample_rate = supported.sample_rate();
@@ -460,11 +536,7 @@ fn build_stream(
         buffer_size: BufferSize::Default,
     };
     let source_channels = config.source_channels.max(1);
-
-    // The consumer is moved into one of the format-specific closures.
-    let err_cb = |e: StreamError| {
-        log::warn!("cpal stream error: {e}");
-    };
+    let err_cb = move |error| log_stream_error(error, operation);
 
     // Three branches because cpal's build_output_stream is sample-format-
     // generic — we have to materialise the right type. Each branch shares
@@ -477,16 +549,14 @@ fn build_stream(
                 source_channels,
                 device_channels,
             };
-            device
-                .build_output_stream(
-                    &stream_config,
-                    move |data: &mut [i16], _info| {
-                        state.fill_i16(data);
-                    },
-                    err_cb,
-                    None,
-                )
-                .map_err(|e| PlaybackError::BuildStream(e.to_string()))?
+            device.build_output_stream(
+                &stream_config,
+                move |data: &mut [i16], _info| {
+                    state.fill_i16(data);
+                },
+                err_cb,
+                None,
+            )?
         }
         SampleFormat::F32 => {
             let mut state = CallbackState {
@@ -495,16 +565,14 @@ fn build_stream(
                 source_channels,
                 device_channels,
             };
-            device
-                .build_output_stream(
-                    &stream_config,
-                    move |data: &mut [f32], _info| {
-                        state.fill_f32(data);
-                    },
-                    err_cb,
-                    None,
-                )
-                .map_err(|e| PlaybackError::BuildStream(e.to_string()))?
+            device.build_output_stream(
+                &stream_config,
+                move |data: &mut [f32], _info| {
+                    state.fill_f32(data);
+                },
+                err_cb,
+                None,
+            )?
         }
         SampleFormat::U16 => {
             let mut state = CallbackState {
@@ -513,22 +581,16 @@ fn build_stream(
                 source_channels,
                 device_channels,
             };
-            device
-                .build_output_stream(
-                    &stream_config,
-                    move |data: &mut [u16], _info| {
-                        state.fill_u16(data);
-                    },
-                    err_cb,
-                    None,
-                )
-                .map_err(|e| PlaybackError::BuildStream(e.to_string()))?
+            device.build_output_stream(
+                &stream_config,
+                move |data: &mut [u16], _info| {
+                    state.fill_u16(data);
+                },
+                err_cb,
+                None,
+            )?
         }
-        other => {
-            return Err(PlaybackError::BuildStream(format!(
-                "unsupported sample format {other:?}"
-            )));
-        }
+        _ => return Err(PlaybackError::NoSupportedFormat),
     };
 
     Ok(BuiltPlaybackStream {
@@ -537,15 +599,31 @@ fn build_stream(
     })
 }
 
+fn find_named_output<D>(
+    mut devices: impl Iterator<Item = D>,
+    requested: &str,
+    name: impl Fn(&D) -> Result<String, DeviceNameError>,
+) -> Result<D, PlaybackError> {
+    devices
+        .find(|device| name(device).is_ok_and(|candidate| candidate == requested))
+        .ok_or(PlaybackError::DeviceNotFound)
+}
+
 struct PlaybackProducer {
     prod: HeapProd<i16>,
     resampler: Option<MonoI16OutputResampler>,
+    operation: RuntimeOperation,
     source_rate: u32,
     device_rate: u32,
 }
 
 impl PlaybackProducer {
-    fn new(prod: HeapProd<i16>, source_rate: u32, output_rate: u32) -> Result<Self, String> {
+    fn new(
+        prod: HeapProd<i16>,
+        source_rate: u32,
+        output_rate: u32,
+        operation: RuntimeOperation,
+    ) -> Result<Self, PlaybackError> {
         let resampler = if source_rate == output_rate {
             None
         } else {
@@ -554,6 +632,7 @@ impl PlaybackProducer {
         Ok(Self {
             prod,
             resampler,
+            operation,
             source_rate,
             device_rate: output_rate,
         })
@@ -568,7 +647,10 @@ impl PlaybackProducer {
             Some(resampler) => {
                 let mut output = Vec::new();
                 if let Err(err) = resampler.process(samples, &mut output) {
-                    log::warn!("playback resampling failed: {err}");
+                    log::warn!(
+                        "playback resampling failed: {}",
+                        err.to_runtime_diagnostic(self.operation)
+                    );
                     resampler.reset();
                     return 0;
                 }
@@ -583,7 +665,10 @@ impl PlaybackProducer {
         };
         let mut output = Vec::new();
         if let Err(err) = resampler.finish(&mut output) {
-            log::warn!("playback resampler flush failed: {err}");
+            log::warn!(
+                "playback resampler flush failed: {}",
+                err.to_runtime_diagnostic(self.operation)
+            );
             resampler.reset();
             return 0;
         }
@@ -620,9 +705,9 @@ struct MonoI16OutputResampler {
 }
 
 impl MonoI16OutputResampler {
-    fn new(source_rate: u32, output_rate: u32) -> Result<Self, String> {
+    fn new(source_rate: u32, output_rate: u32) -> Result<Self, PlaybackError> {
         if source_rate == 0 || output_rate == 0 {
-            return Err("playback resampler sample rates must be greater than zero".to_string());
+            return Err(PlaybackError::Resampler);
         }
 
         let resampler = Self::build_resampler(source_rate, output_rate)?;
@@ -639,7 +724,7 @@ impl MonoI16OutputResampler {
         })
     }
 
-    fn process(&mut self, samples: &[i16], output: &mut Vec<i16>) -> Result<usize, String> {
+    fn process(&mut self, samples: &[i16], output: &mut Vec<i16>) -> Result<usize, PlaybackError> {
         self.source_frames_seen = self.source_frames_seen.saturating_add(samples.len());
         self.input_buffer
             .extend(samples.iter().copied().map(i16_to_unit_f32));
@@ -650,7 +735,7 @@ impl MonoI16OutputResampler {
         Ok(output.len() - before)
     }
 
-    fn finish(&mut self, output: &mut Vec<i16>) -> Result<usize, String> {
+    fn finish(&mut self, output: &mut Vec<i16>) -> Result<usize, PlaybackError> {
         let before = output.len();
         let target = self.expected_output_frames();
         if target == 0 {
@@ -669,7 +754,7 @@ impl MonoI16OutputResampler {
             flushes += 1;
             if flushes > PLAYBACK_RESAMPLER_FLUSH_LIMIT {
                 self.reset();
-                return Err("playback resampler did not flush to expected output length".into());
+                return Err(PlaybackError::Resampler);
             }
         }
 
@@ -690,7 +775,7 @@ impl MonoI16OutputResampler {
         &mut self,
         partial_len: Option<usize>,
         output: &mut Vec<i16>,
-    ) -> Result<(), String> {
+    ) -> Result<(), PlaybackError> {
         let needed = self.resampler.input_frames_next();
         self.scratch_input.clear();
         match partial_len {
@@ -705,11 +790,11 @@ impl MonoI16OutputResampler {
         }
 
         let input_adapter = SequentialSlice::new(&self.scratch_input, 1, needed)
-            .map_err(|e| format!("failed to wrap playback resampler input: {e}"))?;
+            .map_err(|_| PlaybackError::Resampler)?;
         let mut block = vec![0.0_f32; self.resampler.output_frames_next()];
         let output_frames = block.len();
         let mut output_adapter = SequentialSlice::new_mut(&mut block, 1, output_frames)
-            .map_err(|e| format!("failed to wrap playback resampler output: {e}"))?;
+            .map_err(|_| PlaybackError::Resampler)?;
         let indexing = partial_len.map(|valid| Indexing {
             input_offset: 0,
             output_offset: 0,
@@ -718,7 +803,7 @@ impl MonoI16OutputResampler {
         });
         self.resampler
             .process_into_buffer(&input_adapter, &mut output_adapter, indexing.as_ref())
-            .map_err(|e| format!("playback resampler processing failed: {e}"))?;
+            .map_err(|_| PlaybackError::Resampler)?;
 
         self.append_output_block(&block, output);
         Ok(())
@@ -743,7 +828,7 @@ impl MonoI16OutputResampler {
         expected_resampled_frame_count(self.source_frames_seen, self.source_rate, self.output_rate)
     }
 
-    fn build_resampler(source_rate: u32, output_rate: u32) -> Result<Async<f32>, String> {
+    fn build_resampler(source_rate: u32, output_rate: u32) -> Result<Async<f32>, PlaybackError> {
         let params = SincInterpolationParameters {
             sinc_len: 256,
             f_cutoff: 0.95,
@@ -759,7 +844,7 @@ impl MonoI16OutputResampler {
             1,
             FixedAsync::Input,
         )
-        .map_err(|e| format!("failed to create playback resampler: {e}"))
+        .map_err(|_| PlaybackError::Resampler)
     }
 }
 
