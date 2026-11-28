@@ -28,12 +28,20 @@ function fixture(t, {
     bundle = { icon: [pngIcon, macIcon] },
     png = "png fixture",
     icns = iconChunk("icns", iconEntry),
+    manifest = '[package]\nname = "audio-graph"\n[[bin]]\nname = "audio-graph"\npath = "src/main.rs"\n',
+    extraBin = null,
 } = {}) {
     const cwd = mkdtempSync(join(tmpdir(), "audio-graph-release-"));
     t.after(() => rmSync(cwd, { recursive: true, force: true }));
     const tauri = join(cwd, "src-tauri");
     mkdirSync(join(tauri, "icons"), { recursive: true });
     writeFileSync(join(tauri, "tauri.conf.json"), JSON.stringify({ bundle }));
+    writeFileSync(join(tauri, "Cargo.toml"), manifest);
+    if (extraBin !== null) {
+        const path = join(tauri, "src", "bin", extraBin);
+        mkdirSync(join(path, ".."), { recursive: true });
+        writeFileSync(path, "fn main() {}\n");
+    }
     if (png !== null) {
         writeFileSync(join(tauri, pngIcon), png);
     }
@@ -63,6 +71,12 @@ const invalidConfigurations = [
     ["truncated icon chunk", { icns: iconChunk("icns", iconEntry.subarray(0, 8)) }, /ICNS/],
     ["incorrect ICNS length", { icns: iconChunk("icns", iconEntry).subarray(0, 16) }, /ICNS/],
     ["trailing bytes after a valid chunk", { icns: iconChunk("icns", Buffer.concat([iconEntry, Buffer.from([0])])) }, /ICNS/],
+    ["an additional declared binary", { manifest: '[[bin]]\nname = "audio-graph"\n[[bin]]\nname = "fixture-player"\n' }, /binary|\[\[bin\]\]/i],
+    ["an additional quoted binary table", { manifest: '[[bin]]\nname = "audio-graph"\n[["bin"]]\nname = "fixture-player"\n' }, /binary|\[\[bin\]\]/i],
+    ["a missing primary binary", { manifest: '[package]\nname = "audio-graph"\n' }, /binary|\[\[bin\]\]/i],
+    ["a differently named binary", { manifest: '[[bin]]\nname = "fixture-player"\n' }, /binary|\[\[bin\]\]/i],
+    ["an automatically discovered binary", { extraBin: "extra.rs" }, /src.bin|binary/i],
+    ["an automatically discovered directory binary", { extraBin: "extra/main.rs" }, /src.bin|binary/i],
 ];
 
 for (const [name, files, error] of invalidConfigurations) {

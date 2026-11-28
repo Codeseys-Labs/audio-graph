@@ -22,9 +22,9 @@ bench = false
 # tests of its own — the real logic it calls into
 # (`audio_graph::audio::fixture_player`) is a library module and is exercised
 # by the normal `cargo test -p audio-graph --lib` run.
-[[bin]]
+[[example]]
 name = "fixture-player"
-path = "src/bin/fixture_player.rs"
+path = "examples/fixture_player.rs"
 test = false
 bench = false
 
