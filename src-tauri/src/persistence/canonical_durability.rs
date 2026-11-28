@@ -3615,6 +3615,8 @@ fn open_transcript_lock(
             .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))?
     };
     // Bound a stuck peer while allowing ordinary readers and writers to finish.
+    #[cfg(all(test, not(debug_assertions)))]
+    let mut lock_wait = super::projection_profile::LockWait::new(shared);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
         let result = if shared {
@@ -3625,6 +3627,8 @@ fn open_transcript_lock(
         match result {
             Ok(()) => return Ok(file),
             Err(TryLockError::WouldBlock) if wait && std::time::Instant::now() < deadline => {
+                #[cfg(all(test, not(debug_assertions)))]
+                lock_wait.blocked();
                 #[cfg(test)]
                 if let Some(sender) = TRANSCRIPT_WAITER.take() {
                     let _ = sender.send(());

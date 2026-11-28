@@ -2129,20 +2129,28 @@ struct StoredProjectionProvenance {
 
 impl From<StoredProjectionProvenance> for ProjectionProvenance {
     fn from(stored: StoredProjectionProvenance) -> Self {
-        let legacy_remote =
-            crate::llm::route::recorded_as_remote(&stored.provider, stored.route_id.as_deref());
-        Self {
-            model: audio_graph_ipc_contract::model_id::stored_for_place(
-                stored.model,
-                stored.model_placement,
-                legacy_remote,
-            ),
+        let mut provenance = Self {
+            model: stored.model,
             provider: stored.provider,
             prompt_id: stored.prompt_id,
             route_id: stored.route_id,
             model_source: stored.model_source,
             model_placement: stored.model_placement,
-        }
+        };
+        provenance.normalize_stored_model();
+        provenance
+    }
+}
+
+impl ProjectionProvenance {
+    pub(crate) fn normalize_stored_model(&mut self) {
+        let legacy_remote =
+            crate::llm::route::recorded_as_remote(&self.provider, self.route_id.as_deref());
+        self.model = audio_graph_ipc_contract::model_id::stored_for_place(
+            std::mem::take(&mut self.model),
+            self.model_placement,
+            legacy_remote,
+        );
     }
 }
 
