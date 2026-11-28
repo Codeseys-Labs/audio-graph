@@ -1125,15 +1125,12 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
                 if let Err(error) = self.state.mark_imported_keys(&imported_keys) {
                     log::warn!("Credential import bookkeeping deferred: {error}");
                 }
+                for key in imported_keys {
+                    key_sources.insert(key, "imported_file");
+                }
                 for &key in ALLOWED_CREDENTIAL_KEYS {
                     if store.is_present(key)? {
-                        key_sources
-                            .entry(key)
-                            .or_insert(if imported_keys.contains(&key) {
-                                "imported_file"
-                            } else {
-                                "file_fallback"
-                            });
+                        key_sources.entry(key).or_insert("file_fallback");
                     }
                 }
                 // A user who hand-edits credentials.yaml for a key that has
@@ -2087,7 +2084,7 @@ mod tests {
             std::env::temp_dir().join(format!("canary-oak-path-{}.yaml", uuid::Uuid::new_v4()));
         let original = "aws_region: canary-oak-value";
         fs::write(&path, original).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
         let capture = crate::test_log_capture::ThreadLogCapture::start();
         let backend = YamlCredentialBackend::with_path(&path);
         // A privileged Unix runner can read mode 000. Exercise the denial where enforced.
