@@ -540,6 +540,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "atomic-write-file"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84790c55b5704b0d35130bf16a4ce22a8e70eb0ea773522557524d9a4852663d"
+dependencies = [
+ "nix 0.30.1",
+ "rand 0.9.4",
+]
+
+[[package]]
 name = "audio-core"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -550,6 +560,7 @@ name = "audio-graph"
 version = "0.1.0-rc.1"
 dependencies = [
  "async-trait",
+ "atomic-write-file",
  "audio-graph-decision-contract",
  "audio-graph-decision-engine",
  "audio-graph-ipc-contract",
@@ -564,6 +575,7 @@ dependencies = [
  "bytes",
  "bzip2 0.6.1",
  "chrono",
+ "core-foundation 0.10.1",
  "cpal",
  "crossbeam-channel",
  "dirs",
@@ -577,6 +589,7 @@ dependencies = [
  "log",
  "mistralrs",
  "nix 0.31.3",
+ "objc2-foundation",
  "parakeet-rs",
  "percent-encoding",
  "petgraph",
@@ -586,7 +599,10 @@ dependencies = [
  "ringbuf",
  "rsac",
  "rubato 3.0.0",
+ "rustix",
  "schemars 1.2.1",
+ "security-framework",
+ "security-framework-sys",
  "sentry",
  "serde",
  "serde-saphyr 0.0.28",
