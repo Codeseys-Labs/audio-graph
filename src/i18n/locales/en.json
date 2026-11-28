@@ -1665,6 +1665,7 @@
     "handoffDismissLabel": "Dismiss getting-started hint",
     "fallbackTitle": "Let's get you started",
     "fallbackBody": "We couldn't check your saved setup just yet. You can preview a sample session to see how notes and the graph work, try again, or open settings to add a provider.",
+    "credentialSavedCleanupWarning": "Credential saved. An old value in the legacy credential file may override it. Remove the old entry before using this credential.",
     "legacyFileWarning": "Your system keychain is available. AudioGraph could not read the legacy credential file. {{reason}}",
     "unreadableTitle": "We couldn't read your credentials",
     "unreadableBody": "We couldn't read your credential store just now — it may be temporarily unavailable, or a saved credential file may need attention. Retry first in case it's temporary. If you've saved keys before, they may still be recoverable, so open settings to review them before re-entering.",

@@ -636,6 +636,30 @@ describe("AudioGraphStore", () => {
     expect(useAudioGraphStore.getState().error).toBeNull();
   });
 
+  it("warns that an old file entry can override a successful credential rotation", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      saved_with_warning: {
+        kind: "credential",
+        detail: {
+          code: "legacy_cleanup_required",
+          retryable: false,
+          recovery_action: "run_cleanup",
+        },
+      },
+    });
+    await useAudioGraphStore
+      .getState()
+      .saveCredential("openai_api_key", "canary-maple-value");
+    expect(useAudioGraphStore.getState().notifications).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          severity: "warning",
+          message: expect.stringContaining("An old value"),
+        }),
+      ]),
+    );
+  });
+
   it("retains the saved settings and reports a locked credential refresh as a warning", async () => {
     const settings = selectableSettings();
     vi.mocked(invoke).mockImplementation(async (cmd) => {

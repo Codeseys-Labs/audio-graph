@@ -392,7 +392,7 @@ async function saveCredentialIfPresent(
   value: string,
 ): Promise<void> {
   if (!value.trim()) return;
-  await invoke("save_credential_cmd", { key, value });
+  await useAudioGraphStore.getState().saveCredential(key, value);
 }
 
 function credentialPresenceFromEntries(
@@ -2383,7 +2383,7 @@ export function useSettingsController() {
       return;
     }
     try {
-      await invoke("save_credential_cmd", { key, value });
+      await useAudioGraphStore.getState().saveCredential(key, value);
       setCredentialDrafts((prev) => {
         const next = { ...prev };
         delete next[key];

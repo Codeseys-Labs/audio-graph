@@ -1665,6 +1665,7 @@
     "handoffDismissLabel": "Dispensar a dica de primeiros passos",
     "fallbackTitle": "Vamos começar",
     "fallbackBody": "Ainda não conseguimos verificar sua configuração salva. Você pode visualizar uma sessão de exemplo para ver como as notas e o grafo funcionam, tentar novamente ou abrir as configurações para adicionar um provedor.",
+    "credentialSavedCleanupWarning": "Credencial salva. Um valor antigo no arquivo de credenciais legado pode substituí-la. Remova a entrada antiga antes de usar esta credencial.",
     "legacyFileWarning": "O chaveiro do sistema está disponível. O AudioGraph não conseguiu ler o arquivo de credenciais legado. {{reason}}",
     "unreadableTitle": "Não conseguimos ler suas credenciais",
     "unreadableBody": "Não conseguimos ler seu armazenamento de credenciais agora — ele pode estar temporariamente indisponível ou um arquivo de credenciais salvo pode precisar de atenção. Tente novamente primeiro, caso seja temporário. Se você já salvou chaves antes, elas ainda podem ser recuperáveis, então abra as configurações para revisá-las antes de inseri-las novamente.",

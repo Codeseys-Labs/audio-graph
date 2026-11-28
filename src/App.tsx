@@ -968,18 +968,12 @@ function App() {
   const runCredentialProbe = useCallback(async () => {
     setProbeCompleted(false);
     try {
-      const result = await invoke<
-        | CredentialPresence[]
-        | {
-            presence: CredentialPresence[];
-            legacy_file_warning:
-              | import("./generated/runtimeDiagnostic").RuntimeDiagnostic
-              | null;
-          }
-      >("load_credential_presence_cmd", { includeDiagnostics: true });
-      // Older backends return just the rows.
-      const presence = Array.isArray(result) ? result : result.presence;
-      const warning = Array.isArray(result) ? null : result.legacy_file_warning;
+      const { presence, legacy_file_warning: warning } = await invoke<{
+        presence: CredentialPresence[];
+        legacy_file_warning:
+          | import("./generated/runtimeDiagnostic").RuntimeDiagnostic
+          | null;
+      }>("load_credential_presence_cmd", { includeDiagnostics: true });
       const store = useAudioGraphStore.getState();
       const warningId = "legacy-credential-file";
       store.dismissNotification(warningId);

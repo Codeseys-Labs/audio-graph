@@ -205,14 +205,17 @@ function mockStartupProbe(
   modelStatus: ModelStatus = readyModels,
   awsProfiles: readonly string[] = [],
 ) {
-  mockedInvoke.mockImplementation(async (cmd: string) => {
+  mockedInvoke.mockImplementation(async (cmd: string, args) => {
     if (cmd === "load_credential_cmd") {
       throw new Error(
         "load_credential_cmd should not be invoked by frontend tests; use load_credential_presence_cmd and provider readiness instead.",
       );
     }
     if (cmd === "load_credential_presence_cmd") {
-      return credentialPresence(...keys);
+      const presence = credentialPresence(...keys);
+      return args && "includeDiagnostics" in args
+        ? { presence, legacy_file_warning: null }
+        : presence;
     }
     if (cmd === "load_settings_cmd") return settings;
     if (cmd === "get_model_status") return modelStatus;
@@ -492,12 +495,15 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     // pins that the filter is load-bearing, not a no-op: an otherwise
     // fully-configured Deepgram → OpenRouter route must NOT read as
     // configured when the backend reports both keys as absent.
-    mockedInvoke.mockImplementation(async (cmd: string) => {
+    mockedInvoke.mockImplementation(async (cmd: string, args) => {
       if (cmd === "load_credential_presence_cmd") {
-        return [
+        const presence = [
           { key: "deepgram_api_key", present: false, source: "missing" },
           { key: "openrouter_api_key", present: false, source: "missing" },
         ] satisfies CredentialPresence[];
+        return args && "includeDiagnostics" in args
+          ? { presence, legacy_file_warning: null }
+          : presence;
       }
       if (cmd === "load_settings_cmd") return startupSettings();
       if (cmd === "get_model_status") return readyModels;
@@ -1078,14 +1084,20 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
     // Fail on mount, then succeed with a configured Deepgram + OpenRouter route so
     // ExpressSetup stays suppressed and the During panels come back.
     let probeCalls = 0;
-    mockedInvoke.mockImplementation(async (cmd: string) => {
+    mockedInvoke.mockImplementation(async (cmd: string, args) => {
       if (cmd === "load_credential_cmd") {
         throw new Error("plaintext loadback is forbidden");
       }
       if (cmd === "load_credential_presence_cmd") {
         probeCalls += 1;
         if (probeCalls === 1) throw new Error("backend not ready");
-        return credentialPresence("deepgram_api_key", "openrouter_api_key");
+        const presence = credentialPresence(
+          "deepgram_api_key",
+          "openrouter_api_key",
+        );
+        return args && "includeDiagnostics" in args
+          ? { presence, legacy_file_warning: null }
+          : presence;
       }
       if (cmd === "load_settings_cmd") return startupSettings();
       return undefined;

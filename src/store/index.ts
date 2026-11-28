@@ -102,6 +102,7 @@ import type {
   ProcessInfo,
   ProjectionPatch,
   ProviderDescriptor,
+  SaveCredentialOutcome,
   SessionExportBundle,
   SessionMetadata,
   SessionNotesArtifacts,
@@ -3828,7 +3829,24 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
 
   // ── Credentials ───────────────────────────────────────────────────────
   saveCredential: async (key: string, value: string) => {
-    await invoke("save_credential_cmd", { key, value });
+    const outcome = await invoke<SaveCredentialOutcome>("save_credential_cmd", {
+      key,
+      value,
+    });
+    if (outcome && typeof outcome === "object") {
+      const warning = outcome.saved_with_warning;
+      if (
+        warning?.kind === "credential" &&
+        warning.detail.code === "legacy_cleanup_required"
+      ) {
+        get().notify({
+          severity: "warning",
+          message: i18n.t("onboarding.credentialSavedCleanupWarning"),
+        });
+      } else {
+        notifyCredentialWarning(warning, get().notify);
+      }
+    }
   },
   deleteCredential: async (key: string) => {
     const warning = await invoke("delete_credential_cmd", { key });
