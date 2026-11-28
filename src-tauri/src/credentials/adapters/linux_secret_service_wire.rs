@@ -32,6 +32,7 @@ mod linux {
     const SERVICE_PATH: &str = "/org/freedesktop/secrets";
     const ITEM: &str = "org.freedesktop.Secret.Item";
     const COLLECTION: &str = "org.freedesktop.Secret.Collection";
+    const PROMPT: &str = "org.freedesktop.Secret.Prompt";
     const SESSION_INTERFACE: &str = "org.freedesktop.Secret.Session";
     const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
     const DEADLINE: Duration = Duration::from_secs(5);
@@ -88,8 +89,16 @@ mod linux {
         read_alias_at(session_address()?, DEADLINE)
     }
 
-    fn session_address() -> WireResult<Address> {
+    pub(in super::super) fn session_address() -> WireResult<Address> {
         Address::session().map_err(|_| Failure::Unavailable.into())
+    }
+
+    pub(in super::super) fn unix_builder(address: Address) -> WireResult<Builder<'static>> {
+        // Reject executable and remote transports on both connection paths.
+        if !matches!(address.transport(), Transport::Unix(_)) {
+            return Err(Failure::Unavailable.into());
+        }
+        Ok(Builder::address(address))
     }
 
     fn read_at(
@@ -155,19 +164,136 @@ mod linux {
     }
 
     struct Client {
-        connection: Connection,
+        connection: pinned::Transport,
         owner: OwnedUniqueName,
         session: Option<OwnedObjectPath>,
     }
 
+    // Keep the ordinary connection opaque even to sibling adapter modules.
+    // They can use the closed routes, but cannot get a raw sender from Client.
+    mod pinned {
+        use super::*;
+        use futures_util::StreamExt;
+        use zbus::message::Type;
+        use zbus::{MatchRule, MessageStream};
+
+        pub(super) struct Transport(Connection);
+
+        impl Transport {
+            pub(super) fn new(connection: Connection) -> Self {
+                Self(connection)
+            }
+
+            pub(super) fn server_guid(&self) -> &zbus::OwnedGuid {
+                self.0.server_guid()
+            }
+
+            pub(super) async fn call<B, R>(
+                &self,
+                owner: &OwnedUniqueName,
+                method: Method<'_>,
+                body: &B,
+            ) -> WireResult<R>
+            where
+                B: Serialize + DynamicType,
+                R: for<'de> DynamicDeserialize<'de>,
+            {
+                flagged_call(&self.0, Some(owner), method, body).await
+            }
+
+            pub(super) async fn dismiss(
+                &self,
+                owner: &OwnedUniqueName,
+                path: &OwnedObjectPath,
+            ) -> WireResult<bool> {
+                let rule = MatchRule::builder()
+                    .msg_type(Type::Signal)
+                    .sender(owner.as_str())
+                    .path(path.as_str())
+                    .interface(PROMPT)
+                    .member("Completed")
+                    .build()
+                    .map_err(map_error)?;
+                let mut stream = MessageStream::for_match_rule(rule, &self.0, None)
+                    .await
+                    .map_err(map_error)?;
+                self.call::<_, ()>(owner, Method::Dismiss(path), &())
+                    .await?;
+                let completion = stream
+                    .next()
+                    .await
+                    .ok_or(Failure::Unavailable)?
+                    .map_err(map_error)?;
+                let (dismissed, _): (bool, OwnedVariant) =
+                    completion.body().deserialize().map_err(map_error)?;
+                Ok(dismissed)
+            }
+
+            #[cfg(test)]
+            pub(super) async fn disconnect(&self) {
+                self.0.clone().close().await.unwrap();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Method<'a> {
+        GetNameOwner,
+        #[cfg(test)]
+        GetUnixProcessId,
+        #[cfg(test)]
+        LockCollection,
+        ReadAlias,
+        SearchItems,
+        OpenSession,
+        ReadProperty(&'a OwnedObjectPath),
+        GetSecret(&'a OwnedObjectPath),
+        SetSecret(&'a OwnedObjectPath),
+        CreateItem(&'a OwnedObjectPath),
+        DeleteItem(&'a OwnedObjectPath),
+        CloseSession(&'a OwnedObjectPath),
+        Dismiss(&'a OwnedObjectPath),
+    }
+
+    impl Method<'_> {
+        fn route(&self) -> (&str, &str, &str) {
+            match self {
+                Self::GetNameOwner => (BUS_PATH, BUS, "GetNameOwner"),
+                #[cfg(test)]
+                Self::GetUnixProcessId => (BUS_PATH, BUS, "GetConnectionUnixProcessID"),
+                #[cfg(test)]
+                Self::LockCollection => (SERVICE_PATH, SERVICE, "Lock"),
+                Self::ReadAlias => (SERVICE_PATH, SERVICE, "ReadAlias"),
+                Self::SearchItems => (SERVICE_PATH, SERVICE, "SearchItems"),
+                Self::OpenSession => (SERVICE_PATH, SERVICE, "OpenSession"),
+                Self::ReadProperty(path) => (path.as_str(), PROPERTIES, "Get"),
+                Self::GetSecret(path) => (path.as_str(), ITEM, "GetSecret"),
+                Self::SetSecret(path) => (path.as_str(), ITEM, "SetSecret"),
+                Self::CreateItem(path) => (path.as_str(), COLLECTION, "CreateItem"),
+                Self::DeleteItem(path) => (path.as_str(), ITEM, "Delete"),
+                Self::CloseSession(path) => (path.as_str(), SESSION_INTERFACE, "Close"),
+                Self::Dismiss(path) => (path.as_str(), PROMPT, "Dismiss"),
+            }
+        }
+    }
+
+    async fn name_owner(connection: &Connection, name: &str) -> WireResult<OwnedUniqueName> {
+        flagged_call(connection, None, Method::GetNameOwner, &(name,)).await
+    }
+
+    async fn require_gnome_owner(
+        connection: &Connection,
+        pinned: &OwnedUniqueName,
+    ) -> WireResult<()> {
+        match name_owner(connection, "org.gnome.keyring").await {
+            Ok(owner) if owner == *pinned => Ok(()),
+            _ => Err(Failure::Unsupported.into()),
+        }
+    }
+
     impl Client {
         async fn connect(address: Address) -> WireResult<Self> {
-            // Secret Service is a local session-bus protocol. This also prevents
-            // a configured address from selecting an executable transport.
-            if !matches!(address.transport(), Transport::Unix(_)) {
-                return Err(Failure::Unavailable.into());
-            }
-            let connection = Builder::address(address)
+            let connection = unix_builder(address)?
                 .build()
                 .await
                 .map_err(|_| Failure::Unavailable)?;
@@ -177,58 +303,39 @@ mod linux {
         async fn bind(connection: Connection) -> WireResult<Self> {
             // Pin the provider for the entire operation. A new owner cannot
             // answer a request intended for the old owner's item or session.
-            let owner = flagged_call(
-                &connection,
-                BUS,
-                BUS_PATH,
-                BUS,
-                "GetNameOwner",
-                &(SERVICE_NAME,),
-            )
-            .await
-            .map_err(unavailable_if_missing)?;
+            let owner = name_owner(&connection, SERVICE_NAME)
+                .await
+                .map_err(unavailable_if_missing)?;
             Ok(Self {
-                connection,
+                connection: pinned::Transport::new(connection),
                 owner,
                 session: None,
             })
         }
 
-        async fn service_call<B, R>(&self, method: &str, body: &B) -> WireResult<R>
+        async fn call<B, R>(&self, method: Method<'_>, body: &B) -> WireResult<R>
         where
             B: Serialize + DynamicType,
             R: for<'de> DynamicDeserialize<'de>,
         {
-            self.call(SERVICE_PATH, SERVICE, method, body)
+            self.connection
+                .call(&self.owner, method, body)
                 .await
-                .map_err(unavailable_if_missing)
+                .map_err(|error| {
+                    if method.route().1 == SERVICE {
+                        unavailable_if_missing(error)
+                    } else {
+                        error
+                    }
+                })
         }
 
-        async fn call<B, R>(
-            &self,
-            path: &str,
-            interface: &str,
-            method: &str,
-            body: &B,
-        ) -> WireResult<R>
-        where
-            B: Serialize + DynamicType,
-            R: for<'de> DynamicDeserialize<'de>,
-        {
-            flagged_call(
-                &self.connection,
-                self.owner.as_str(),
-                path,
-                interface,
-                method,
-                body,
-            )
-            .await
+        async fn dismiss_mutation_prompt(&self, path: &OwnedObjectPath) -> WireResult<bool> {
+            self.connection.dismiss(&self.owner, path).await
         }
 
         async fn property(&self, item: &OwnedObjectPath, name: &str) -> WireResult<OwnedVariant> {
-            self.call(item.as_str(), PROPERTIES, "Get", &(ITEM, name))
-                .await
+            self.call(Method::ReadProperty(item), &(ITEM, name)).await
         }
 
         async fn attributes(&self, item: &OwnedObjectPath) -> WireResult<Attributes> {
@@ -239,7 +346,7 @@ mod linux {
         }
 
         async fn default_collection(&self) -> WireResult<Option<OwnedObjectPath>> {
-            let alias: OwnedObjectPath = self.service_call("ReadAlias", &("default",)).await?;
+            let alias: OwnedObjectPath = self.call(Method::ReadAlias, &("default",)).await?;
             Ok((alias.as_str() != "/").then_some(alias))
         }
 
@@ -260,7 +367,7 @@ mod linux {
             allow_disappeared: bool,
         ) -> WireResult<Option<(OwnedObjectPath, bool)>> {
             let (unlocked, locked): SearchResults =
-                self.service_call("SearchItems", &(attributes,)).await?;
+                self.call(Method::SearchItems, &(attributes,)).await?;
             let mut candidate = None;
             // SearchItems can return supersets of the requested attributes.
             // Preserve each candidate's search half while checking equality.
@@ -318,7 +425,7 @@ mod linux {
 
         async fn locked(&self, path: &OwnedObjectPath, interface: &str) -> WireResult<bool> {
             let locked: OwnedVariant = self
-                .call(path.as_str(), PROPERTIES, "Get", &(interface, "Locked"))
+                .call(Method::ReadProperty(path), &(interface, "Locked"))
                 .await?;
             bool::try_from(locked).map_err(|_| Failure::CorruptRecord.into())
         }
@@ -327,7 +434,7 @@ mod linux {
             let exchange = Exchange::generate().map_err(map_crypto_error)?;
             let public_key = Variant::from(exchange.public_key().to_vec());
             let (peer_key, session): (OwnedVariant, OwnedObjectPath) = self
-                .service_call("OpenSession", &(ALGORITHM, public_key))
+                .call(Method::OpenSession, &(ALGORITHM, public_key))
                 .await?;
             if session.as_str() == "/" {
                 return Err(Failure::Unsupported.into());
@@ -355,9 +462,8 @@ mod linux {
             key: &SessionKey,
         ) -> WireResult<SecretBytes> {
             let session = self.session_path()?;
-            let (reply_session, iv, encrypted, _content_type): SecretReply = self
-                .call(item.as_str(), ITEM, "GetSecret", &(session,))
-                .await?;
+            let (reply_session, iv, encrypted, _content_type): SecretReply =
+                self.call(Method::GetSecret(item), &(session,)).await?;
             if &reply_session != session {
                 return Err(Failure::CorruptRecord.into());
             }
@@ -374,11 +480,8 @@ mod linux {
             if let Some(session) = self.session.take() {
                 // Preserve the outcome if cleanup fails. Disconnect also retires
                 // the session when the transport is still usable by the peer.
-                let _: WireResult<()> = until(
-                    by,
-                    self.call(session.as_str(), SESSION_INTERFACE, "Close", &()),
-                )
-                .await;
+                let _: WireResult<()> =
+                    until(by, self.call(Method::CloseSession(&session), &())).await;
             }
         }
     }
@@ -393,16 +496,20 @@ mod linux {
 
     async fn flagged_call<B, R>(
         connection: &Connection,
-        destination: &str,
-        path: &str,
-        interface: &str,
-        method: &str,
+        owner: Option<&OwnedUniqueName>,
+        method: Method<'_>,
         body: &B,
     ) -> WireResult<R>
     where
         B: Serialize + DynamicType,
         R: for<'de> DynamicDeserialize<'de>,
     {
+        let (path, interface, member) = method.route();
+        let destination = if interface == BUS {
+            BUS
+        } else {
+            owner.ok_or(Failure::Internal)?.as_str()
+        };
         let proxy: Proxy<'_> = ProxyBuilder::new(connection)
             .destination(destination)
             .path(path)
@@ -412,7 +519,7 @@ mod linux {
             .await
             .map_err(map_error)?;
         proxy
-            .call_with_flags(method, MethodFlags::NO_AUTO_START, body)
+            .call_with_flags(member, MethodFlags::NO_AUTO_START, body)
             .await
             .map_err(map_error)?
             .ok_or_else(|| Failure::Internal.into())
@@ -478,7 +585,7 @@ pub(super) use linux::tests as scripted_peer;
 #[allow(unused_imports)] // The factory remains dormant.
 pub(super) use linux::{
     LockedTarget, WireError, ensure_worker_context, locked_target, map_error as recovery_error,
-    until as recovery_until,
+    session_address, unix_builder, until as recovery_until,
 };
 #[cfg(target_os = "linux")]
 #[allow(unused_imports)] // The factory remains dormant.

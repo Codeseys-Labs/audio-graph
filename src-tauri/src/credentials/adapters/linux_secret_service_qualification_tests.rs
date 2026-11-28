@@ -136,7 +136,7 @@ fn qualify(root: PathBuf) {
             let collection = client.default_collection().await?.ok_or(Failure::Missing)?;
             let objects = vec![collection.clone()];
             let (locked, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) = client
-                .service_call("Lock", &(objects,))
+                .call(Method::LockCollection, &(objects,))
                 .await
                 .expect("daemon accepts the qualification lock request");
             assert!(prompt.as_str() == "/" && locked.contains(&collection));
@@ -206,86 +206,19 @@ fn start_daemon(address: Address) -> WireResult<Daemon> {
                 .map_err(map_error)?;
             let (_, _, owner): (String, String, OwnedUniqueName) =
                 change.body().deserialize().map_err(map_error)?;
-            let pid: u32 = flagged_call(
-                &bus,
-                BUS,
-                BUS_PATH,
-                BUS,
-                "GetConnectionUnixProcessID",
-                &(owner.as_str(),),
-            )
-            .await?;
+            let pid: u32 =
+                flagged_call(&bus, None, Method::GetUnixProcessId, &(owner.as_str(),)).await?;
             assert_eq!(
                 pid,
                 daemon.0.id(),
                 "the opted-in daemon must own the service"
             );
+            require_gnome_owner(&bus, &owner).await?;
             Ok(daemon)
         })
         .await
     })
 }
 
-#[test]
-fn recovery_method_and_gate_source_inventory_is_closed() {
-    let source = std::path::Path::new(file!());
-    let source = if source.is_absolute() {
-        source.to_path_buf()
-    } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(source)
-    };
-    let directory = source.parent().unwrap();
-    let methods = [
-        format!("\"{}\"", ["Un", "lock"].concat()),
-        format!("\"{}\"", ["Pro", "mpt"].concat()),
-    ];
-    let mut found_recovery = false;
-    for entry in fs::read_dir(directory).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        let name = path.file_name().unwrap().to_str().unwrap();
-        if !name.starts_with("linux_secret_service_") || !name.ends_with(".rs") {
-            continue;
-        }
-        let source = fs::read_to_string(&path).unwrap();
-        if name != "linux_secret_service_recovery.rs" {
-            for method in &methods {
-                assert!(
-                    !source.contains(method),
-                    "interactive method outside recovery: {name}"
-                );
-            }
-            continue;
-        }
-        found_recovery = true;
-        for method in &methods {
-            assert_eq!(source.matches(method).count(), 1);
-        }
-        let production_and_test_seam: String =
-            source.chars().filter(|ch| !ch.is_whitespace()).collect();
-        for signature in [
-            "NativeInteractionGate{",
-            "NativeInteractionGate::",
-            "AllowPrompt{",
-            "ForbidPrompt{",
-            "::mint(",
-            ".access",
-            ".stalled",
-            ".lease",
-            "latch_commit_unknown(",
-            "latch_forbid_uncertainty(",
-        ] {
-            assert!(
-                !production_and_test_seam.contains(signature),
-                "recovery uses a sealed gate implementation detail: {signature}"
-            );
-        }
-        assert_eq!(
-            source.matches("NativeInteractionGate").count(),
-            1,
-            "the only gate type use is test injection"
-        );
-        assert!(source.contains("let gate = process_native_interaction_gate();"));
-    }
-    assert!(found_recovery);
-}
+#[path = "linux_secret_service_inventory_tests.rs"]
+mod inventory;

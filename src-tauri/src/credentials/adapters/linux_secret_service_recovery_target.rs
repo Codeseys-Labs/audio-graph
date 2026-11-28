@@ -60,7 +60,10 @@ pub(in super::super::super) fn locked_target_at(
 
 pub(in super::super::super) fn attributes_for(locator: &EntryLocator) -> Attributes {
     Attributes::from([
-        ("xdg:schema".to_owned(), locator.service().to_owned()),
+        (
+            "xdg:schema".to_owned(),
+            "com.codeseys.audiograph.credentials.v2".to_owned(),
+        ),
         ("service".to_owned(), locator.service().to_owned()),
         ("account".to_owned(), locator.account().to_owned()),
     ])
@@ -71,29 +74,17 @@ impl LockedTarget {
         &self.path
     }
 
-    pub(in super::super::super) fn address(&self) -> &Address {
-        &self.address
-    }
-
     /// Inspect a connection opened by the capability-bearing recovery child.
     /// This function cannot produce or hand out a raw connection.
     pub(in super::super::super) async fn check_recovery_connection(
         &self,
         connection: &Connection,
-    ) -> WireResult<(OwnedUniqueName, u32, bool)> {
+    ) -> WireResult<(OwnedUniqueName, bool)> {
         let client = Client::bind(connection.clone()).await?;
         self.check_binding(&client)?;
+        require_gnome_owner(connection, &client.owner).await?;
         let locked = self.current_lock(&client).await?;
-        let pid = flagged_call(
-            connection,
-            BUS,
-            BUS_PATH,
-            BUS,
-            "GetConnectionUnixProcessID",
-            &(client.owner.as_str(),),
-        )
-        .await?;
-        Ok((client.owner, pid, locked))
+        Ok((client.owner, locked))
     }
 
     /// Verification is a distinct five-second transaction. It consumes

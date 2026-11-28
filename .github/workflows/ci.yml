@@ -325,7 +325,13 @@ jobs:
           AUDIOGRAPH_QUALIFY_SECRET_SERVICE: "1"
         run: |
           sudo apt-get install -y --no-install-recommends gnome-keyring
-          cargo test --locked --lib gnome_keyring_headless -- --ignored --nocapture --test-threads=1
+          test_path=credentials::adapters::linux_secret_service_wire::linux::tests::qualification_tests::gnome_keyring_headless
+          listed=$(cargo test --locked --lib "$test_path" -- --ignored --exact --list)
+          if ! grep -Fx "$test_path: test" <<< "$listed"; then
+            echo '::error::The ignored headless GNOME Keyring qualification test was not found.'
+            exit 1
+          fi
+          cargo test --locked --lib "$test_path" -- --ignored --exact --nocapture --test-threads=1
 
   # ── Rust backend + app compile — cloud-only cross-platform smoke ───
   # This matrix is the fast remote confidence path for provider/settings work:
