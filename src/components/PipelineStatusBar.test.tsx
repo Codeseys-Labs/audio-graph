@@ -2,6 +2,7 @@ import { act, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
+import { snapshot } from "../test/captureBackend";
 import type {
   PersistenceQueueBackpressurePayload,
   PipelineLatencyEvent,
@@ -24,16 +25,16 @@ const diagnostic = {
 
 const idle: StageStatus = { type: "Idle" };
 
+/** All stages idle, at a revision above every earlier one. */
 function allIdle(): PipelineStatus {
-  return {
-    capture_id: { epoch: 0, seq: 0 },
+  return snapshot({
     capture: idle,
     pipeline: idle,
     asr: idle,
     diarization: idle,
     entity_extraction: idle,
     graph: idle,
-  };
+  });
 }
 
 function publish(status: PipelineStatus) {

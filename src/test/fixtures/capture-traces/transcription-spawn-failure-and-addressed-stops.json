@@ -1,0 +1,489 @@
+{
+  "name": "transcription-spawn-failure-and-addressed-stops",
+  "deliveries": [
+    {
+      "revision": 3,
+      "capture_state": {
+        "id": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "phase": "running"
+      },
+      "retired_through": {
+        "epoch": 0,
+        "seq": 0
+      },
+      "transcription": {
+        "capture": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "generation": 1
+      },
+      "realtime": {
+        "gemini": false,
+        "converse": false,
+        "openai_realtime": false
+      },
+      "session": {
+        "id": "0ac7bf8a-7b4a-49e3-b33e-d0a78b44fada",
+        "epoch": 0
+      },
+      "backpressure": [],
+      "capture": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "pipeline": {
+        "type": "Idle"
+      },
+      "asr": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "diarization": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "entity_extraction": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "graph": {
+        "type": "Running",
+        "processed_count": 0
+      }
+    },
+    {
+      "revision": 4,
+      "capture_state": {
+        "id": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "phase": "running"
+      },
+      "retired_through": {
+        "epoch": 0,
+        "seq": 0
+      },
+      "transcription": null,
+      "realtime": {
+        "gemini": false,
+        "converse": false,
+        "openai_realtime": false
+      },
+      "session": {
+        "id": "0ac7bf8a-7b4a-49e3-b33e-d0a78b44fada",
+        "epoch": 0
+      },
+      "backpressure": [],
+      "capture": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "pipeline": {
+        "type": "Idle"
+      },
+      "asr": {
+        "type": "Idle"
+      },
+      "diarization": {
+        "type": "Idle"
+      },
+      "entity_extraction": {
+        "type": "Idle"
+      },
+      "graph": {
+        "type": "Idle"
+      }
+    },
+    {
+      "revision": 4,
+      "capture_state": {
+        "id": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "phase": "running"
+      },
+      "retired_through": {
+        "epoch": 0,
+        "seq": 0
+      },
+      "transcription": null,
+      "realtime": {
+        "gemini": false,
+        "converse": false,
+        "openai_realtime": false
+      },
+      "session": {
+        "id": "0ac7bf8a-7b4a-49e3-b33e-d0a78b44fada",
+        "epoch": 0
+      },
+      "backpressure": [],
+      "capture": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "pipeline": {
+        "type": "Idle"
+      },
+      "asr": {
+        "type": "Idle"
+      },
+      "diarization": {
+        "type": "Idle"
+      },
+      "entity_extraction": {
+        "type": "Idle"
+      },
+      "graph": {
+        "type": "Idle"
+      }
+    },
+    {
+      "revision": 5,
+      "capture_state": {
+        "id": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "phase": "running"
+      },
+      "retired_through": {
+        "epoch": 0,
+        "seq": 0
+      },
+      "transcription": {
+        "capture": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "generation": 2
+      },
+      "realtime": {
+        "gemini": false,
+        "converse": false,
+        "openai_realtime": false
+      },
+      "session": {
+        "id": "0ac7bf8a-7b4a-49e3-b33e-d0a78b44fada",
+        "epoch": 0
+      },
+      "backpressure": [],
+      "capture": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "pipeline": {
+        "type": "Idle"
+      },
+      "asr": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "diarization": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "entity_extraction": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "graph": {
+        "type": "Running",
+        "processed_count": 0
+      }
+    },
+    {
+      "revision": 5,
+      "capture_state": {
+        "id": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "phase": "running"
+      },
+      "retired_through": {
+        "epoch": 0,
+        "seq": 0
+      },
+      "transcription": {
+        "capture": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "generation": 2
+      },
+      "realtime": {
+        "gemini": false,
+        "converse": false,
+        "openai_realtime": false
+      },
+      "session": {
+        "id": "0ac7bf8a-7b4a-49e3-b33e-d0a78b44fada",
+        "epoch": 0
+      },
+      "backpressure": [],
+      "capture": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "pipeline": {
+        "type": "Idle"
+      },
+      "asr": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "diarization": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "entity_extraction": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "graph": {
+        "type": "Running",
+        "processed_count": 0
+      }
+    },
+    {
+      "revision": 5,
+      "capture_state": {
+        "id": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "phase": "running"
+      },
+      "retired_through": {
+        "epoch": 0,
+        "seq": 0
+      },
+      "transcription": {
+        "capture": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "generation": 2
+      },
+      "realtime": {
+        "gemini": false,
+        "converse": false,
+        "openai_realtime": false
+      },
+      "session": {
+        "id": "0ac7bf8a-7b4a-49e3-b33e-d0a78b44fada",
+        "epoch": 0
+      },
+      "backpressure": [],
+      "capture": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "pipeline": {
+        "type": "Idle"
+      },
+      "asr": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "diarization": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "entity_extraction": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "graph": {
+        "type": "Running",
+        "processed_count": 0
+      }
+    },
+    {
+      "revision": 6,
+      "capture_state": {
+        "id": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "phase": "running"
+      },
+      "retired_through": {
+        "epoch": 0,
+        "seq": 0
+      },
+      "transcription": null,
+      "realtime": {
+        "gemini": false,
+        "converse": false,
+        "openai_realtime": false
+      },
+      "session": {
+        "id": "0ac7bf8a-7b4a-49e3-b33e-d0a78b44fada",
+        "epoch": 0
+      },
+      "backpressure": [],
+      "capture": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "pipeline": {
+        "type": "Idle"
+      },
+      "asr": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "diarization": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "entity_extraction": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "graph": {
+        "type": "Running",
+        "processed_count": 0
+      }
+    },
+    {
+      "revision": 7,
+      "capture_state": {
+        "id": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "phase": "running"
+      },
+      "retired_through": {
+        "epoch": 0,
+        "seq": 0
+      },
+      "transcription": null,
+      "realtime": {
+        "gemini": false,
+        "converse": false,
+        "openai_realtime": false
+      },
+      "session": {
+        "id": "0ac7bf8a-7b4a-49e3-b33e-d0a78b44fada",
+        "epoch": 0
+      },
+      "backpressure": [],
+      "capture": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "pipeline": {
+        "type": "Idle"
+      },
+      "asr": {
+        "type": "Idle"
+      },
+      "diarization": {
+        "type": "Idle"
+      },
+      "entity_extraction": {
+        "type": "Idle"
+      },
+      "graph": {
+        "type": "Idle"
+      }
+    },
+    {
+      "revision": 7,
+      "capture_state": {
+        "id": {
+          "epoch": 0,
+          "seq": 0
+        },
+        "phase": "running"
+      },
+      "retired_through": {
+        "epoch": 0,
+        "seq": 0
+      },
+      "transcription": null,
+      "realtime": {
+        "gemini": false,
+        "converse": false,
+        "openai_realtime": false
+      },
+      "session": {
+        "id": "0ac7bf8a-7b4a-49e3-b33e-d0a78b44fada",
+        "epoch": 0
+      },
+      "backpressure": [],
+      "capture": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "pipeline": {
+        "type": "Idle"
+      },
+      "asr": {
+        "type": "Idle"
+      },
+      "diarization": {
+        "type": "Idle"
+      },
+      "entity_extraction": {
+        "type": "Idle"
+      },
+      "graph": {
+        "type": "Idle"
+      }
+    }
+  ],
+  "final": {
+    "revision": 7,
+    "capture_state": {
+      "id": {
+        "epoch": 0,
+        "seq": 0
+      },
+      "phase": "running"
+    },
+    "retired_through": {
+      "epoch": 0,
+      "seq": 0
+    },
+    "transcription": null,
+    "realtime": {
+      "gemini": false,
+      "converse": false,
+      "openai_realtime": false
+    },
+    "session": {
+      "id": "0ac7bf8a-7b4a-49e3-b33e-d0a78b44fada",
+      "epoch": 0
+    },
+    "backpressure": [],
+    "capture": {
+      "type": "Running",
+      "processed_count": 0
+    },
+    "pipeline": {
+      "type": "Idle"
+    },
+    "asr": {
+      "type": "Idle"
+    },
+    "diarization": {
+      "type": "Idle"
+    },
+    "entity_extraction": {
+      "type": "Idle"
+    },
+    "graph": {
+      "type": "Idle"
+    }
+  }
+}

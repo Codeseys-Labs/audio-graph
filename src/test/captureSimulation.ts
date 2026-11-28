@@ -161,7 +161,8 @@ export class ModelBackend {
 
   /** A slower thread emits a snapshot it took while capture was running. */
   emitStaleSnapshot(): void {
-    if (this.lastRunning !== null) this.emit("pipeline-status", this.lastRunning);
+    if (this.lastRunning !== null)
+      this.emit("pipeline-status", this.lastRunning);
   }
 
   private reply(outcome: string): CommandOutcome {
@@ -1209,7 +1210,8 @@ export class CaptureSimulation {
         `2: after a status read the window shows ${displayed(view)}, the backend holds ${displayOf(backend)}`,
       );
     }
-    if (view.unknown) failures.push("2: after a status read the state is unknown");
+    if (view.unknown)
+      failures.push("2: after a status read the state is unknown");
     if (this.backend.holdsCapture && !view.stopOffered) {
       failures.push("3: the backend holds a capture and no Stop is offered");
     }
@@ -1257,11 +1259,7 @@ export class CaptureSimulation {
     if (this.backend.holdsCapture) {
       failures.push(`3: a ${kind} Stop left the backend capturing`);
     }
-    if (
-      view.captureStatus !== "idle" ||
-      view.startInFlight ||
-      view.unknown
-    ) {
+    if (view.captureStatus !== "idle" || view.startInFlight || view.unknown) {
       failures.push(
         `3: after a ${kind} Stop the window shows ${view.captureStatus}${view.unknown ? " (unknown)" : ""}`,
       );

@@ -103,7 +103,10 @@ export function startSettledBy(status: PipelineStatus, id: CaptureId): boolean {
  * lost. `null` when there is none.
  */
 export function stopTarget(
-  state: Pick<AudioGraphStore, "pipelineStatus" | "startPending" | "unknownStart">,
+  state: Pick<
+    AudioGraphStore,
+    "pipelineStatus" | "startPending" | "unknownStart"
+  >,
 ): CaptureId | null {
   const { id, phase } = state.pipelineStatus.capture_state;
   let newest = phase === "idle" ? null : id;
@@ -270,7 +273,8 @@ export function isPipelineStatus(value: unknown): value is PipelineStatus {
     typeof realtime === "object" &&
     realtime !== null &&
     REALTIME_MODES.every(
-      (mode) => mode in realtime && typeof Reflect.get(realtime, mode) === "boolean",
+      (mode) =>
+        mode in realtime && typeof Reflect.get(realtime, mode) === "boolean",
     ) &&
     typeof session === "object" &&
     session !== null &&

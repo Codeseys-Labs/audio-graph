@@ -17,8 +17,9 @@ import {
   segment,
 } from "../session/reviewTestUtils";
 import { useAudioGraphStore } from "../store";
-import { captureBackendReply, running } from "../test/captureBackend";
-import type { CaptureId, SessionMetadata } from "../types";
+import { NO_PIPELINE_STATUS } from "../store/captureFacts";
+import { captureBackendReply } from "../test/captureBackend";
+import type { SessionMetadata } from "../types";
 import { downloadAsFile } from "../utils/download";
 import NowStrip from "./NowStrip";
 import SessionsBrowser from "./SessionsBrowser";
@@ -52,8 +53,8 @@ function acknowledgeStart(): unknown {
     .filter(([cmd]) => cmd === "start_capture")
     .at(-1);
   if (!call) throw new Error("start_capture was not invoked");
-  const { id } = call[1] as { id: CaptureId };
-  return { fact: running(id), snapshot: running(id) };
+  // The backend double commits it, so later status reads agree.
+  return captureBackendReply("start_capture", call[1]);
 }
 
 /**
@@ -255,10 +256,9 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
     useAudioGraphStore.setState({
       sessions: [],
       isCapturing: false,
-      captureStarting: false,
-      captureFact: null,
-      captureStartIntent: null,
-      captureStopIntent: null,
+      captureStatus: "idle",
+      startPending: null,
+      pipelineStatus: NO_PIPELINE_STATUS,
       isTranscribing: false,
       selectedSourceIds: [],
       captureStartTime: null,
@@ -464,7 +464,7 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
     await waitFor(() =>
-      expect(useAudioGraphStore.getState().captureStarting).toBe(true),
+      expect(useAudioGraphStore.getState().startPending).not.toBeNull(),
     );
     // Start is pending: choosing a row may open A's own Review pane, but must
     // not load A into the global store the capture is about to open into.
@@ -481,7 +481,7 @@ describe("SessionsBrowser: Review across Start and Stop", () => {
     );
     await act(async () => {});
     const after = useAudioGraphStore.getState();
-    expect(after.captureStarting).toBe(false);
+    expect(after.startPending).toBeNull();
     expect(after.loadedSessionId).toBeNull();
     expect(after.transcriptSegments).toEqual([]);
   });

@@ -20,7 +20,8 @@ import i18n from "../i18n";
 import { useReviewStore } from "../session/reviewStore";
 import { loadedSession, segment } from "../session/reviewTestUtils";
 import { useAudioGraphStore } from "../store";
-import { captureBackendReply, running } from "../test/captureBackend";
+import { NO_PIPELINE_STATUS } from "../store/captureFacts";
+import { captureBackendReply } from "../test/captureBackend";
 import { preloadGraphLens } from "../test/lazyChunks";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
 import NowStrip from "./NowStrip";
@@ -180,8 +181,8 @@ describe("SessionsBrowser: the just-stopped session's resident data", () => {
     useAudioGraphStore.setState({
       sessions: [],
       isCapturing: false,
-      captureFact: null,
-      captureStopIntent: null,
+      captureStatus: "idle",
+      pipelineStatus: NO_PIPELINE_STATUS,
       isTranscribing: false,
       selectedSourceIds: [],
       captureStartTime: null,
@@ -197,7 +198,12 @@ describe("SessionsBrowser: the just-stopped session's resident data", () => {
       sessions: [],
       sessionsLoading: false,
       isCapturing: true,
-      captureFact: running({ epoch: 1, seq: 1 }),
+      captureStatus: "running",
+      pipelineStatus: {
+        ...NO_PIPELINE_STATUS,
+        revision: 0,
+        capture_state: { id: { epoch: 1, seq: 1 }, phase: "running" },
+      },
       isTranscribing: true,
       selectedSourceIds: ["system-default"],
       captureStartTime: Date.now(),

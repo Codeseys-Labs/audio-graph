@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
+import { NO_PIPELINE_STATUS } from "../store/captureFacts";
 import SystemDrawer from "./SystemDrawer";
 
 // `TokenUsagePanel`/`ProjectionRuntimeStatusPanel` each own async
@@ -17,15 +18,7 @@ vi.mock("./ProjectionRuntimeStatusPanel", () => ({
 
 function resetStore() {
   useAudioGraphStore.setState({
-    pipelineStatus: {
-      capture_id: { epoch: 0, seq: 0 },
-      capture: { type: "Idle" },
-      pipeline: { type: "Idle" },
-      asr: { type: "Idle" },
-      diarization: { type: "Idle" },
-      entity_extraction: { type: "Idle" },
-      graph: { type: "Idle" },
-    },
+    pipelineStatus: NO_PIPELINE_STATUS,
     pipelineLatencies: {},
     turnEvents: [],
     latestAudioConsumerHealth: null,

@@ -8,7 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
-import { running } from "../test/captureBackend";
+import { NO_PIPELINE_STATUS } from "../store/captureFacts";
 import type { PendingFinalizingSession, SessionMetadata } from "../types";
 import NowStrip from "./NowStrip";
 import SessionsBrowser, {
@@ -745,7 +745,12 @@ describe("SessionsBrowser component", () => {
     function startLiveCapture(): void {
       useAudioGraphStore.setState({
         isCapturing: true,
-        captureFact: running(LIVE_CAPTURE),
+        captureStatus: "running",
+        pipelineStatus: {
+          ...NO_PIPELINE_STATUS,
+          revision: 0,
+          capture_state: { id: LIVE_CAPTURE, phase: "running" },
+        },
         isTranscribing: true,
         selectedSourceIds: ["system-default"],
         captureStartTime: Date.now(),
@@ -761,7 +766,15 @@ describe("SessionsBrowser component", () => {
 
     afterEach(() => {
       useAudioGraphStore.setState({
-        captureFact: null,
+        captureStatus: "idle",
+        pipelineStatus: NO_PIPELINE_STATUS,
+        // A Stop pressed here may have left its outcome unknown.
+        captureUnknown: false,
+        unknownStart: null,
+        unknownStop: false,
+        startPending: null,
+        stopPending: null,
+        stopOperation: null,
         selectedSourceIds: [],
         captureStartTime: null,
         transcriptSegments: [],
@@ -841,6 +854,7 @@ describe("SessionsBrowser component", () => {
       await waitFor(() =>
         expect(mockedInvoke).toHaveBeenCalledWith("stop_capture", {
           id: LIVE_CAPTURE,
+          operation: null,
         }),
       );
     });
@@ -973,7 +987,10 @@ describe("SessionsBrowser component", () => {
         deleted_at: 1_700_000_000_000,
       }),
     ]);
-    useAudioGraphStore.setState({ isCapturing: true });
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      captureStatus: "running",
+    });
     render(<SessionsBrowser />);
 
     await openRowMenu("Active During Live");
@@ -1004,6 +1021,12 @@ describe("SessionsBrowser component", () => {
 describe("SessionDetail lens tab roving (SHELL-R2)", () => {
   beforeEach(() => {
     mockedInvoke.mockReset();
+    // No live capture holds the store: the lenses open on Notes.
+    useAudioGraphStore.setState({
+      isCapturing: false,
+      captureStatus: "idle",
+      isTranscribing: false,
+    });
     localStorage.clear();
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "list_sessions")

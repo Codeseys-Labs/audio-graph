@@ -41,7 +41,10 @@ import App from "./App";
 import i18n from "./i18n";
 import { useAudioGraphStore } from "./store";
 import { NO_PIPELINE_STATUS } from "./store/captureFacts";
-import { captureBackendReply, resetCaptureBackend } from "./test/captureBackend";
+import {
+  captureBackendReply,
+  resetCaptureBackend,
+} from "./test/captureBackend";
 import type { AppSettings, AudioSourceInfo, CredentialPresence } from "./types";
 
 // Heavy/lazy or irrelevant-to-this-contract children are stubbed exactly like

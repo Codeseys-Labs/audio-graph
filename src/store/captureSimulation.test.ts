@@ -22,6 +22,7 @@ import {
   type RealmNet,
   randomPick,
   runSchedule,
+  SETTLE,
   scriptedPick,
   seededRandom,
 } from "../test/captureSimulation";
@@ -138,14 +139,9 @@ const productionRealm: RealmFactory = async (realm) => {
   };
 };
 
-const STARTUP = [
-  "subscribe",
-  "deliver capture_attach",
-  "reply capture_attach",
-  "deliver get_pipeline_status",
-  "reply get_pipeline_status",
-];
-/** Start A, acknowledged and announced. */
+/** A realm subscribes, attaches and reads the backend's state. */
+const STARTUP = ["subscribe", SETTLE];
+/** Start A, committed, acknowledged and transcribed, and all of it shown. */
 const STARTED = [
   ...STARTUP,
   "press Start",
@@ -154,6 +150,7 @@ const STARTED = [
   "reply start_capture",
   "deliver start_transcribe",
   "reply start_transcribe",
+  SETTLE,
 ];
 
 function budgets(overrides: Partial<Budgets>): Budgets {
@@ -176,6 +173,45 @@ async function scripted(
     failures.push(...result.failures);
   }
   return failures;
+}
+
+/** A simulation stepped by hand: `take` runs the first choice named so. */
+async function manual(limits: Partial<Budgets>) {
+  const sim = new CaptureSimulation(productionRealm, budgets(limits));
+  await sim.loadRealm();
+  const take = async (label: string) => {
+    const choice = sim.choices().find((c) => c.label.startsWith(label));
+    if (!choice) {
+      throw new Error(
+        `${label} is not enabled; enabled: ${sim
+          .choices()
+          .map((c) => c.label)
+          .join(", ")}`,
+      );
+    }
+    await sim.step(choice);
+  };
+  /** The realm subscribes, attaches and reads the backend's state. */
+  const attach = async () => {
+    await take("subscribe");
+    await sim.drain();
+  };
+  /** Start A and transcribe it, and show all of it. */
+  const started = async () => {
+    await attach();
+    for (const label of [
+      "press Start",
+      "deliver start_capture",
+      "commit",
+      "reply start_capture",
+      "deliver start_transcribe",
+      "reply start_transcribe",
+    ]) {
+      await take(label);
+    }
+    await sim.drain();
+  };
+  return { sim, take, attach, started };
 }
 
 const report = process.env.CAPTURE_SIM_REPORT === "1";
@@ -434,18 +470,15 @@ describe("capture snapshot simulation: the round-5 and re-check 4 findings", () 
   });
 
   it("a lost Start reply never hides a live capture", async () => {
-    const failures = await scripted(
-      { starts: 1, drops: 2, lostReplies: 1 },
-      [
-        ...STARTUP,
-        "press Start",
-        "deliver start_capture",
-        "commit",
-        "drop event pipeline-status",
-        "drop event pipeline-status",
-        "lose reply start_capture",
-      ],
-    );
+    const failures = await scripted({ starts: 1, drops: 2, lostReplies: 1 }, [
+      ...STARTUP,
+      "press Start",
+      "deliver start_capture",
+      "commit",
+      "drop event pipeline-status",
+      "drop event pipeline-status",
+      "lose reply start_capture",
+    ]);
     expect(failures).toEqual([]);
   });
 

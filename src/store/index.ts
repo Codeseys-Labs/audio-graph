@@ -190,7 +190,10 @@ function newCaptureToken(): string {
  * is lost or unusable.
  */
 async function attachRealm(realm: string): Promise<number> {
-  useAudioGraphStore.setState({ captureAttach: "attaching", captureRealm: realm });
+  useAudioGraphStore.setState({
+    captureAttach: "attaching",
+    captureRealm: realm,
+  });
   try {
     const attachment = await invoke<unknown>("capture_attach", { realm });
     if (!isCaptureAttachment(attachment)) {
@@ -2996,8 +2999,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     const { id, phase } = status.capture_state;
     const sameCapture = compareCaptureIds(previous.capture_state.id, id) === 0;
     const unknownStart =
-      state.unknownStart !== null &&
-      !startSettledBy(status, state.unknownStart)
+      state.unknownStart !== null && !startSettledBy(status, state.unknownStart)
         ? state.unknownStart
         : null;
     set({
@@ -3380,7 +3382,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
               persistenceQueueBackpressure: {},
               error: null,
               nav: sessionId
-                ? { dest: "sessions" as const, sessionId, lens: "notes" as const }
+                ? {
+                    dest: "sessions" as const,
+                    sessionId,
+                    lens: "notes" as const,
+                  }
                 : current.nav,
               // The 1d92 gap: `sessions.json` may not have this session's
               // finished entry yet. Snapshot enough of the in-memory capture

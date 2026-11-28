@@ -110,7 +110,8 @@ describe("LiveDocument (ticket W5, synthesis audio-graph-a6b5)", () => {
     useAudioGraphStore.setState({
       materializedNotes: null,
       isCapturing: false,
-      captureStarting: false,
+      startPending: null,
+      captureStatus: "idle",
     });
   });
 
@@ -134,7 +135,7 @@ describe("LiveDocument (ticket W5, synthesis audio-graph-a6b5)", () => {
   });
 
   it("offers no sample preview while a capture is starting", () => {
-    useAudioGraphStore.setState({ captureStarting: true });
+    useAudioGraphStore.setState({ startPending: { epoch: 1, seq: 1 } });
     render(<DocumentTileHarness />);
     expect(screen.getByTestId("document-skeleton")).toBeInTheDocument();
     expect(

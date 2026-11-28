@@ -262,7 +262,9 @@ function TokenUsagePanel() {
   // New Session is locked while capture holds the store (the backend refuses
   // a rotation then too).
   const liveCapture = useAudioGraphStore(liveCaptureHoldsStore);
-  const reconcileCapture = useAudioGraphStore((state) => state.reconcileCapture);
+  const reconcileCapture = useAudioGraphStore(
+    (state) => state.reconcileCapture,
+  );
   // The applied snapshot's session epoch; `null` before the first snapshot.
   const sessionEpoch = useAudioGraphStore((state) =>
     state.pipelineStatus.revision < 0
@@ -447,7 +449,11 @@ function TokenUsagePanel() {
   useEffect(() => {
     const previous = seenSessionEpoch.current;
     seenSessionEpoch.current = sessionEpoch;
-    if (previous === null || sessionEpoch === null || sessionEpoch <= previous) {
+    if (
+      previous === null ||
+      sessionEpoch === null ||
+      sessionEpoch <= previous
+    ) {
       return;
     }
     let cancelled = false;

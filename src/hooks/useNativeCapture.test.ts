@@ -31,6 +31,9 @@ describe("useNativeCapture", () => {
 
     useAudioGraphStore.setState({
       isCapturing: false,
+      captureStatus: "idle",
+      captureUnknown: false,
+      startPending: null,
       captureStartTime: null,
       startCaptureAndTranscribe,
       stopCapture,
@@ -68,6 +71,7 @@ describe("useNativeCapture", () => {
   it("global shortcut STOPS capture when already capturing", async () => {
     useAudioGraphStore.setState({
       isCapturing: true,
+      captureStatus: "running",
       captureStartTime: Date.now(),
     });
     renderHook(() => useNativeCapture());

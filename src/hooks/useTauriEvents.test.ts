@@ -13,6 +13,8 @@ import i18n from "../i18n";
 import en from "../i18n/locales/en.json";
 import pt from "../i18n/locales/pt.json";
 import { useAudioGraphStore } from "../store";
+import { NO_PIPELINE_STATUS } from "../store/captureFacts";
+import { snapshot, statusFor } from "../test/captureBackend";
 import type { AwsErrorPayload } from "../types";
 import {
   awsErrorToMessage,
@@ -37,26 +39,17 @@ function resetStore() {
       links: [],
       stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
     },
-    pipelineStatus: {
-      capture_id: { epoch: 0, seq: 0 },
-      capture: { type: "Idle" },
-      pipeline: { type: "Idle" },
-      asr: { type: "Idle" },
-      diarization: { type: "Idle" },
-      entity_extraction: { type: "Idle" },
-      graph: { type: "Idle" },
-    },
+    pipelineStatus: NO_PIPELINE_STATUS,
     pipelineLatencies: {},
-    captureFact: null,
-    captureStartIntent: null,
-    captureStopIntent: null,
-    captureTranscribing: null,
+    captureStatus: "idle",
+    captureUnknown: false,
+    unknownStart: null,
+    unknownStop: false,
+    startPending: null,
     // Attached already: the hook's attach is then a no-op, and these tests
     // cover event routing, not the attachment.
     captureAttach: "ready",
     isCapturing: false,
-    captureStarting: false,
-    captureStopping: false,
     latestAudioConsumerHealth: null,
     asrPartial: null,
     asrSpanRevisions: [],
@@ -108,7 +101,7 @@ describe("useTauriEvents", () => {
   // `expected` list in the "subscribes to all expected events on mount"
   // test. The count is also exercised by the unlisten-cleanup test and
   // the partial-failure test (which drops exactly one).
-  const TOTAL_LISTENERS = 28;
+  const TOTAL_LISTENERS = 27;
   async function waitForAllHandlers() {
     await waitFor(() => {
       expect(handlers.size).toBe(TOTAL_LISTENERS);
@@ -138,7 +131,6 @@ describe("useTauriEvents", () => {
       "pipeline-latency",
       "speaker-detected",
       "capture-error",
-      "capture-backpressure",
       "persistence-queue-backpressure",
       "capture-storage-full",
       "model-download-progress",
@@ -150,7 +142,8 @@ describe("useTauriEvents", () => {
       "aws-error",
       // Streaming chat (plan A3 / ADR-0006) no longer uses events: the
       // chat-token-delta / chat-token-done hot path moved to a per-invocation
-      // ipc::Channel consumed in the store (audio-graph-1534).
+      // ipc::Channel consumed in the store (audio-graph-1534). Capture
+      // backpressure is no event either: it is the snapshot's (#141).
     ];
     for (const name of expected) {
       expect(handlers.has(name)).toBe(true);
@@ -159,88 +152,105 @@ describe("useTauriEvents", () => {
     unmount();
   });
 
+  /** The status reads the hook (and the store) sent. */
+  const reads = () =>
+    vi
+      .mocked(invoke)
+      .mock.calls.filter(([cmd]) => cmd === "get_pipeline_status").length;
+
   it.each([
     false,
     true,
-  ])("restores startup storage status, dropped only behind a newer capture fact (%s)", async (newerEvent) => {
-    const snapshot = {
-      ...useAudioGraphStore.getState().pipelineStatus,
-      transcript_crash_safety_unverified: true,
-    };
-    let finishRead!: (value: typeof snapshot) => void;
-    let readStarted!: () => void;
-    const started = new Promise<void>((resolve) => {
-      readStarted = resolve;
-    });
+  ])("reads the backend's state only once subscribed, applied only when newer than an event that arrived first (%s)", async (newerEvent) => {
+    const read = snapshot({ transcript_crash_safety_unverified: true });
+    let finishRead!: (value: unknown) => void;
+    let subscribedBeforeRead = false;
     vi.mocked(invoke).mockImplementation(async (cmd) => {
       if (cmd !== "get_pipeline_status") return undefined;
-      readStarted();
-      return new Promise<typeof snapshot>((resolve) => {
+      subscribedBeforeRead = handlers.has("pipeline-status");
+      return new Promise((resolve) => {
         finishRead = resolve;
       });
     });
     const { unmount } = renderHook(() => useTauriEvents());
-    await started;
-    // An event stamped with a newer capture fact than the read's.
-    const newer = {
-      ...snapshot,
-      capture_id: {
-        epoch: snapshot.capture_id.epoch + 1,
-        seq: snapshot.capture_id.seq,
-      },
-      transcript_crash_safety_unverified: false,
-    };
+    await vi.waitFor(() => expect(typeof finishRead).toBe("function"));
+    expect(subscribedBeforeRead).toBe(true);
+    const newer = snapshot({ transcript_crash_safety_unverified: false });
     if (newerEvent) {
       act(() =>
         handlers.get("pipeline-status")?.(makeEvent("pipeline-status", newer)),
       );
     }
     await act(async () => {
-      finishRead(snapshot);
+      finishRead(read);
     });
     expect(useAudioGraphStore.getState().pipelineStatus).toEqual(
-      newerEvent ? newer : snapshot,
+      newerEvent ? newer : read,
     );
     unmount();
   });
 
-  it("applies a status read whose capture fact matches an event that arrived first", async () => {
-    // No arrival-order shortcut: a read is dropped only when it is stale.
-    const live = { epoch: 2, seq: 1 };
-    const runningStage = { type: "Running", processed_count: 0 } as const;
-    const idle = { type: "Idle" } as const;
-    const status = (capture: typeof runningStage | typeof idle) => ({
-      ...useAudioGraphStore.getState().pipelineStatus,
-      capture_id: live,
-      capture,
-    });
-    let finishRead!: (value: unknown) => void;
-    vi.mocked(invoke).mockImplementation(async (cmd) =>
-      cmd === "get_pipeline_status"
-        ? new Promise((resolve) => {
-            finishRead = resolve;
-          })
-        : undefined,
-    );
+  it("reads the backend's state again on focus and on a visibility change", async () => {
     const { unmount } = renderHook(() => useTauriEvents());
     await waitForAllHandlers();
-    await vi.waitFor(() => expect(typeof finishRead).toBe("function"));
-    // A slow thread's Running snapshot, then the read that saw it end.
-    act(() =>
-      handlers.get("pipeline-status")?.(
-        makeEvent("pipeline-status", status(runningStage)),
-      ),
-    );
-    expect(useAudioGraphStore.getState().isCapturing).toBe(true);
-    await act(async () => {
-      finishRead(status(idle));
+    await vi.waitFor(() => expect(reads()).toBe(1));
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
     });
-    expect(useAudioGraphStore.getState().isCapturing).toBe(false);
-    expect(useAudioGraphStore.getState().captureFact).toEqual({
-      id: live,
-      phase: "ended",
+    expect(reads()).toBe(2);
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
     });
+    expect(reads()).toBe(3);
     unmount();
+    window.dispatchEvent(new Event("focus"));
+    expect(reads()).toBe(3);
+  });
+
+  it("reads every 3 s only while the shown capture is not idle or its state is unknown, and stops on unmount", async () => {
+    const { unmount } = renderHook(() => useTauriEvents());
+    await waitForAllHandlers();
+    await vi.waitFor(() => expect(reads()).toBe(1));
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      vi.advanceTimersByTime(9_000);
+      expect(reads()).toBe(1);
+      const shown = { epoch: 1, seq: 1 };
+      for (const phase of ["pending", "running", "stopping"] as const) {
+        act(() =>
+          useAudioGraphStore
+            .getState()
+            .setPipelineStatus(statusFor(shown, phase)),
+        );
+        const before = reads();
+        vi.advanceTimersByTime(3_000);
+        expect(reads()).toBe(before + 1);
+      }
+      act(() =>
+        useAudioGraphStore
+          .getState()
+          .setPipelineStatus(statusFor(shown, "idle")),
+      );
+      let before = reads();
+      vi.advanceTimersByTime(9_000);
+      expect(reads()).toBe(before);
+
+      act(() =>
+        useAudioGraphStore.setState({
+          captureUnknown: true,
+          unknownStop: true,
+        }),
+      );
+      before = reads();
+      vi.advanceTimersByTime(3_000);
+      expect(reads()).toBe(before + 1);
+      unmount();
+      before = reads();
+      vi.advanceTimersByTime(9_000);
+      expect(reads()).toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("invokes every registered unlisten on unmount", async () => {
@@ -491,6 +501,17 @@ describe("useTauriEvents", () => {
       session_id: "session-live",
       answer: expect.objectContaining({ status: "answered" }),
     });
+
+    // Fenced by the applied snapshot's session: another session's card is
+    // dropped.
+    useAudioGraphStore.setState({ liveAssistCards: [] });
+    useAudioGraphStore
+      .getState()
+      .setPipelineStatus(
+        snapshot({ session: { id: "session-next", epoch: 1 } }),
+      );
+    handlers.get("agent-card-update")?.(makeEvent("agent-card-update", card));
+    expect(useAudioGraphStore.getState().liveAssistCards).toEqual([]);
   });
 
   it("applies graph-delta payloads to the graph snapshot", async () => {
@@ -611,24 +632,45 @@ describe("useTauriEvents", () => {
     expect(state.sessionProjectionEvents).toEqual([patch]);
     expect(state.materializedNotes).toEqual(notes);
     expect(state.materializedProjectionGraph).toEqual(graph);
+
+    // Another session's materializations are dropped once a snapshot names
+    // the session shown.
+    useAudioGraphStore.setState({
+      materializedNotes: null,
+      materializedProjectionGraph: null,
+    });
+    useAudioGraphStore
+      .getState()
+      .setPipelineStatus(
+        snapshot({ session: { id: "session-next", epoch: 1 } }),
+      );
+    handlers.get("materialized-notes-update")?.(
+      makeEvent("materialized-notes-update", notes),
+    );
+    handlers.get("materialized-graph-update")?.(
+      makeEvent("materialized-graph-update", graph),
+    );
+    expect(useAudioGraphStore.getState().materializedNotes).toBeNull();
+    expect(
+      useAudioGraphStore.getState().materializedProjectionGraph,
+    ).toBeNull();
   });
 
   it("routes pipeline-status and speaker-detected payloads", async () => {
     renderHook(() => useTauriEvents());
     await waitForAllHandlers();
 
-    const running = { type: "Running" } as const;
-    const status = {
-      capture_id: { epoch: 1, seq: 1 },
-      capture: running,
+    const running = { type: "Running", processed_count: 0 } as const;
+    const status = statusFor({ epoch: 1, seq: 1 }, "running", {
       pipeline: running,
       asr: running,
       diarization: running,
       entity_extraction: running,
       graph: running,
-    };
+    });
     handlers.get("pipeline-status")?.(makeEvent("pipeline-status", status));
     expect(useAudioGraphStore.getState().pipelineStatus).toEqual(status);
+    expect(useAudioGraphStore.getState().isCapturing).toBe(true);
 
     const health = {
       consumers: [
@@ -700,27 +742,21 @@ describe("useTauriEvents", () => {
     );
 
     expect(useAudioGraphStore.getState().error).toBe("device disconnected");
-    errSpy.mockRestore();
-  });
 
-  it("tracks capture-backpressure add and clear transitions per source of a capture", async () => {
-    renderHook(() => useTauriEvents());
-    await waitForAllHandlers();
-    const event = (source_index: number, is_backpressured: boolean) =>
-      makeEvent("capture-backpressure", {
+    // An error from a capture older than the one the snapshot shows is stale.
+    useAudioGraphStore.setState({ error: null });
+    useAudioGraphStore
+      .getState()
+      .setPipelineStatus(statusFor({ epoch: 1, seq: 2 }, "running"));
+    handlers.get("capture-error")?.(
+      makeEvent("capture-error", {
         capture_id: { epoch: 1, seq: 1 },
-        source_index,
-        is_backpressured,
-      });
-
-    handlers.get("capture-backpressure")?.(event(1, true));
-    handlers.get("capture-backpressure")?.(event(0, true));
-    handlers.get("capture-backpressure")?.(event(1, true));
-    expect(useAudioGraphStore.getState().backpressuredSources).toHaveLength(2);
-
-    handlers.get("capture-backpressure")?.(event(1, false));
-    handlers.get("capture-backpressure")?.(event(0, false));
-    expect(useAudioGraphStore.getState().backpressuredSources).toEqual([]);
+        source_kind: "device",
+        error: "device disconnected",
+      }),
+    );
+    expect(useAudioGraphStore.getState().error).toBeNull();
+    errSpy.mockRestore();
   });
 
   it("tracks persistence queue backpressure add and clear transitions", async () => {
@@ -805,7 +841,7 @@ describe("useTauriEvents", () => {
     errSpy.mockRestore();
   });
 
-  it("flips isGeminiActive off when gemini-status 'disconnected' fires", async () => {
+  it("leaves the realtime state to the snapshot when gemini-status 'disconnected' fires", async () => {
     renderHook(() => useTauriEvents());
     await waitForAllHandlers();
     expect(useAudioGraphStore.getState().isGeminiActive).toBe(true);
@@ -813,7 +849,10 @@ describe("useTauriEvents", () => {
     handlers.get("gemini-status")?.(
       makeEvent("gemini-status", { type: "disconnected" }),
     );
-    expect(useAudioGraphStore.getState().isGeminiActive).toBe(false);
+    handlers.get("openai-realtime-status")?.(
+      makeEvent("openai-realtime-status", { type: "disconnected" }),
+    );
+    expect(useAudioGraphStore.getState().isGeminiActive).toBe(true);
   });
 
   it("clears a stale error banner when gemini-status 'reconnected' fires (FINDING #56 P2)", async () => {
