@@ -118,6 +118,7 @@ fn is_terminal_reconnect_error(diagnostic: &RuntimeDiagnostic) -> bool {
                 | Code::CredentialExpired
                 | Code::PermissionDenied
                 | Code::InvalidConfiguration
+                | Code::CapacityExhausted
         ),
     }
 }

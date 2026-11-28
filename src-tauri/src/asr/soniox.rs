@@ -65,6 +65,7 @@ pub struct SonioxParsedMessage {
     pub error: Option<RuntimeDiagnostic>,
     pub final_audio_proc_ms: Option<u64>,
     pub total_audio_proc_ms: Option<u64>,
+    accepted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -143,7 +144,7 @@ struct SonioxActiveTurn {
 #[derive(Deserialize)]
 struct SonioxResponse {
     #[serde(default)]
-    tokens: Vec<SonioxToken>,
+    tokens: Option<Vec<SonioxToken>>,
     #[serde(default)]
     finished: bool,
     #[serde(default)]
@@ -170,6 +171,12 @@ impl SonioxResponse {
             Some("unauthenticated") => Code::CredentialRejected,
             Some("temp_api_key_session_expired") => Code::CredentialExpired,
             Some("permission_denied") => Code::PermissionDenied,
+            Some("invalid_request" | "model_not_available") => Code::InvalidConfiguration,
+            Some(
+                "organization_balance_exhausted"
+                | "organization_monthly_budget_exhausted"
+                | "project_monthly_budget_exhausted",
+            ) => Code::CapacityExhausted,
             _ => match self.error_code.as_ref().and_then(Value::as_u64) {
                 Some(400 | 401 | 403) => Code::RequestRejected,
                 Some(408 | 504) => Code::Timeout,
@@ -309,12 +316,20 @@ impl SonioxRealtimeParser {
                 final_audio_proc_ms: None,
                 total_audio_proc_ms: None,
                 error: Some(error),
+                accepted: false,
             });
         }
 
+        // Soniox has no distinct start acknowledgement. A successful
+        // transcription response confirms that the stream was accepted.
+        // https://docs.soniox.com/api-reference/stt/websocket-api#response
+        let accepted = response.tokens.is_some()
+            || response.finished
+            || response.final_audio_proc_ms.is_some()
+            || response.total_audio_proc_ms.is_some();
+        let tokens = response.tokens.as_deref().unwrap_or_default();
         let mut revisions = Vec::new();
-        let transcript_tokens = response
-            .tokens
+        let transcript_tokens = tokens
             .iter()
             .filter(|token| !is_marker_only(&token.text))
             .count();
@@ -325,7 +340,7 @@ impl SonioxRealtimeParser {
         }
 
         let mut updated_active_turn = false;
-        for token in &response.tokens {
+        for token in tokens {
             let (clean_token, closes_turn) = token_without_markers(token);
 
             if let Some(clean_token) = clean_token {
@@ -364,6 +379,7 @@ impl SonioxRealtimeParser {
             error: None,
             final_audio_proc_ms: response.final_audio_proc_ms,
             total_audio_proc_ms: response.total_audio_proc_ms,
+            accepted,
         })
     }
 
@@ -710,6 +726,13 @@ fn emit_disconnected_once(
 }
 
 async fn session_task(ctx: SonioxSessionCtx) {
+    session_task_with_backoff(ctx, Duration::from_secs).await;
+}
+
+async fn session_task_with_backoff(
+    ctx: SonioxSessionCtx,
+    backoff_duration: impl Fn(u64) -> Duration,
+) {
     let mut writer = ctx.writer;
     let mut reader = ctx.reader;
     let mut audio_rx = ctx.audio_rx;
@@ -726,6 +749,7 @@ async fn session_task(ctx: SonioxSessionCtx) {
     // successful reconnect below). See `emit_disconnected_once`.
     let disconnected_emitted = Arc::new(AtomicBool::new(false));
     let mut reconnect_attempts: u32 = 0;
+    let mut last_open_error = None;
     let mut parser = SonioxRealtimeParser::new(config.source_id.clone());
     let write_guard = AsrWsWriteGuard::new("asr.soniox", config.content_egress_policy);
 
@@ -744,6 +768,14 @@ async fn session_task(ctx: SonioxSessionCtx) {
             &pending_chunks,
             &mut parser,
             &write_guard,
+            Some(|| {
+                if reconnect_attempts > 0 {
+                    reconnect_attempts = 0;
+                    connected.store(true, Ordering::SeqCst);
+                    disconnected_emitted.store(false, Ordering::SeqCst);
+                    let _ = event_tx.send(SonioxEvent::Reconnected);
+                }
+            }),
         )
         .await;
 
@@ -781,7 +813,6 @@ async fn session_task(ctx: SonioxSessionCtx) {
                     break;
                 }
 
-                let mut last_open_error = None;
                 let reconnected = loop {
                     let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
                         ReconnectStep::Retry {
@@ -796,6 +827,7 @@ async fn session_task(ctx: SonioxSessionCtx) {
                                 "Soniox session: reconnect budget exhausted after {attempted} attempts"
                             );
                             let message = last_open_error
+                                .take()
                                 .unwrap_or_else(|| websocket_diagnostic(Code::ProviderUnavailable));
                             emit_disconnected_once(&event_tx, &disconnected_emitted);
                             let _ = event_tx.send(SonioxEvent::Error { message });
@@ -811,7 +843,7 @@ async fn session_task(ctx: SonioxSessionCtx) {
                         backoff_secs: backoff,
                     });
 
-                    let sleep = tokio::time::sleep(Duration::from_secs(backoff));
+                    let sleep = tokio::time::sleep(backoff_duration(backoff));
                     tokio::pin!(sleep);
                     loop {
                         tokio::select! {
@@ -851,13 +883,10 @@ async fn session_task(ctx: SonioxSessionCtx) {
                             {
                                 let _ = event_tx.send(SonioxEvent::Revision(revision));
                             }
-                            connected.store(true, Ordering::SeqCst);
-                            // Re-arm the terminal-event guard so a disconnect on
-                            // the fresh session emits exactly once (review n4).
-                            disconnected_emitted.store(false, Ordering::SeqCst);
-                            log::info!("Soniox session: reconnected on attempt {attempt}");
-                            let _ = event_tx.send(SonioxEvent::Reconnected);
-                            reconnect_attempts = 0;
+                            last_open_error = None;
+                            log::info!(
+                                "Soniox session: socket opened on attempt {attempt}; awaiting stream response"
+                            );
                             break true;
                         }
                         Err(diag) => {
@@ -895,6 +924,7 @@ async fn run_io(
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     parser: &mut SonioxRealtimeParser,
     write_guard: &AsrWsWriteGuard,
+    on_accepted: Option<impl FnOnce()>,
 ) -> DisconnectKind {
     run_io_with_keepalive_interval(
         writer,
@@ -906,6 +936,7 @@ async fn run_io(
         parser,
         write_guard,
         Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
+        on_accepted,
     )
     .await
 }
@@ -921,6 +952,7 @@ async fn run_io_with_keepalive_interval(
     parser: &mut SonioxRealtimeParser,
     write_guard: &AsrWsWriteGuard,
     keepalive_interval: Duration,
+    mut on_accepted: Option<impl FnOnce()>,
 ) -> DisconnectKind {
     let mut finishing = false;
     let mut keep_alive = tokio::time::interval(keepalive_interval);
@@ -994,7 +1026,9 @@ async fn run_io_with_keepalive_interval(
 
                 match result {
                     Ok(Message::Text(text)) => {
-                        let finished = match handle_server_message(&text, event_tx, parser) {
+                        let finished = match handle_server_message_with_acceptance(
+                            &text, event_tx, parser, &mut on_accepted,
+                        ) {
                             Ok(finished) => finished,
                             Err(message) => return DisconnectKind::TerminalError(message),
                         };
@@ -1038,10 +1072,20 @@ async fn run_io_with_keepalive_interval(
     }
 }
 
+#[cfg(test)]
 pub(super) fn handle_server_message(
     text: &str,
     tx: &crossbeam_channel::Sender<SonioxEvent>,
     parser: &mut SonioxRealtimeParser,
+) -> Result<bool, RuntimeDiagnostic> {
+    handle_server_message_with_acceptance(text, tx, parser, &mut None::<fn()>)
+}
+
+fn handle_server_message_with_acceptance(
+    text: &str,
+    tx: &crossbeam_channel::Sender<SonioxEvent>,
+    parser: &mut SonioxRealtimeParser,
+    on_accepted: &mut Option<impl FnOnce()>,
 ) -> Result<bool, RuntimeDiagnostic> {
     let parsed = match parser.parse_message(text, current_unix_millis()) {
         Ok(parsed) => parsed,
@@ -1058,6 +1102,12 @@ pub(super) fn handle_server_message(
             return Err(message);
         }
         let _ = tx.send(SonioxEvent::Error { message });
+    }
+
+    if parsed.accepted
+        && let Some(accepted) = on_accepted.take()
+    {
+        accepted();
     }
 
     for revision in parsed.revisions {
@@ -1193,13 +1243,21 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn terminal_auth_frame_ends_session_without_another_reconnect() {
+    async fn terminal_provider_frame_ends_session_without_another_reconnect() {
         use std::sync::atomic::AtomicUsize;
 
         for (wire_type, code) in [
             ("unauthenticated", Code::CredentialRejected),
             ("permission_denied", Code::PermissionDenied),
             ("temp_api_key_session_expired", Code::CredentialExpired),
+            ("invalid_request", Code::InvalidConfiguration),
+            ("model_not_available", Code::InvalidConfiguration),
+            ("organization_balance_exhausted", Code::CapacityExhausted),
+            (
+                "organization_monthly_budget_exhausted",
+                Code::CapacityExhausted,
+            ),
+            ("project_monthly_budget_exhausted", Code::CapacityExhausted),
         ] {
             let (initial_url, initial_server) =
                 ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
@@ -1253,7 +1311,6 @@ mod tests {
                     events.as_slice(),
                     [
                         SonioxEvent::Reconnecting { attempt: 1, .. },
-                        SonioxEvent::Reconnected,
                         SonioxEvent::Disconnected,
                         SonioxEvent::Error { message },
                     ] if *message == websocket_diagnostic(code)
@@ -1510,6 +1567,7 @@ mod tests {
                     "asr.soniox",
                     crate::asr::ProviderContentEgressPolicy::allow(),
                 ),
+                None::<fn()>,
             )
             .await;
             assert_safe(&format!("{disconnect:?}"));
@@ -1853,6 +1911,7 @@ mod tests {
                     &pending_chunks,
                     &mut parser,
                     &write_guard,
+                    None::<fn()>,
                 )
                 .await
             }
@@ -1949,6 +2008,7 @@ mod tests {
                     &pending_chunks,
                     &mut parser,
                     &write_guard,
+                    None::<fn()>,
                 )
                 .await
             }

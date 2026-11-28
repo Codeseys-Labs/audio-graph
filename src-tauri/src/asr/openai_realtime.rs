@@ -1238,25 +1238,23 @@ pub(super) fn handle_server_message(
             });
             ServerMessage::Continue
         }
-        "conversation.item.input_audio_transcription.failed" => {
-            let item_id = parsed.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
-            if !item_id.is_empty() {
+        "conversation.item.input_audio_transcription.failed" | "error" => {
+            if msg_type != "error"
+                && let Some(item_id) = parsed.get("item_id").and_then(Value::as_str)
+            {
                 accumulator.remove(item_id);
             }
-            emit_error(tx, openai_realtime_error_diagnostic(parsed.get("error")));
-            ServerMessage::Continue
-        }
-        "error" => {
             let error = parsed.get("error");
             let message = openai_realtime_error_diagnostic(error);
             if is_terminal_reconnect_error(&message) {
                 return ServerMessage::TerminalError(message);
             }
             emit_error(tx, message);
-            if error
-                .and_then(|error| error.get("code"))
-                .and_then(Value::as_str)
-                == Some("session_expired")
+            if msg_type == "error"
+                && error
+                    .and_then(|error| error.get("code"))
+                    .and_then(Value::as_str)
+                    == Some("session_expired")
             {
                 ServerMessage::SessionExpired
             } else {
@@ -1296,6 +1294,9 @@ fn openai_realtime_error_diagnostic(error: Option<&Value>) -> RuntimeDiagnostic 
         .and_then(Value::as_str);
     websocket_diagnostic(match code {
         Some("rate_limit_exceeded") => Code::RateLimited,
+        // https://developers.openai.com/api/docs/guides/rate-limits
+        Some("insufficient_quota" | "billing_hard_limit_reached") => Code::CapacityExhausted,
+        Some("model_not_found") => Code::InvalidConfiguration,
         // A Realtime session has its own duration limit.
         // https://developers.openai.com/api/docs/guides/realtime-conversations
         Some("session_expired") => Code::Timeout,

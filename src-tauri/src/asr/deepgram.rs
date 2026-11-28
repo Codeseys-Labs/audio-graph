@@ -695,6 +695,7 @@ enum DisconnectKind {
     ProtocolError(RuntimeDiagnostic),
     /// Content-bearing send was blocked by the runtime privacy policy.
     PolicyBlocked(RuntimeDiagnostic),
+    TerminalError(RuntimeDiagnostic),
     /// User called `disconnect()`. No reconnect attempt should be made.
     UserRequested,
     /// Writer task exhausted the audio command stream (caller dropped the
@@ -1242,6 +1243,11 @@ async fn session_task_with_backoff(
                 let _ = event_tx.send(DeepgramEvent::Error { message });
                 break;
             }
+            DisconnectKind::TerminalError(message) => {
+                emit_disconnected_once(&event_tx, &disconnected_emitted);
+                let _ = event_tx.send(DeepgramEvent::Error { message });
+                break;
+            }
             _ => {
                 // Network-ish failure. If the user *also* asked to disconnect
                 // (e.g. they hit stop just as the socket was dying), honour
@@ -1598,7 +1604,9 @@ async fn run_io_with_keepalive_interval(
 
                 match result {
                     Ok(Message::Text(text)) => {
-                        handle_server_message(&text, event_tx);
+                        if let Some(message) = process_server_message(&text, event_tx) {
+                            return DisconnectKind::TerminalError(message);
+                        }
                     }
                     Ok(Message::Close(frame)) => {
                         // If the user was the one asking to close, honour that;
@@ -1638,13 +1646,22 @@ async fn run_io_with_keepalive_interval(
 
 /// Parse a single Deepgram server JSON message and emit appropriate events.
 pub(crate) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEvent>) {
+    if let Some(message) = process_server_message(text, tx) {
+        let _ = tx.send(DeepgramEvent::Error { message });
+    }
+}
+
+fn process_server_message(
+    text: &str,
+    tx: &crossbeam_channel::Sender<DeepgramEvent>,
+) -> Option<RuntimeDiagnostic> {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => {
             let message = websocket_diagnostic(Code::InvalidResponse);
             log::warn!("Deepgram: {message}");
             let _ = tx.send(DeepgramEvent::Error { message });
-            return;
+            return None;
         }
     };
 
@@ -1657,10 +1674,12 @@ pub(crate) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<D
         .unwrap_or("");
 
     if msg_type == "Error" || looks_like_deepgram_error_object(&parsed) {
-        let _ = tx.send(DeepgramEvent::Error {
-            message: deepgram_error_diagnostic(&parsed),
-        });
-        return;
+        let message = deepgram_error_diagnostic(&parsed);
+        if is_terminal_reconnect_error(&message) {
+            return Some(message);
+        }
+        let _ = tx.send(DeepgramEvent::Error { message });
+        return None;
     }
 
     match msg_type {
@@ -1785,7 +1804,7 @@ pub(crate) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<D
                 .or_else(|| parsed.get("lastWordEnd").and_then(|v| v.as_f64()));
             if matches!(last_word_end, Some(value) if value < 0.0) {
                 log::debug!("Deepgram: ignoring UtteranceEnd with last_word_end=-1");
-                return;
+                return None;
             }
             let _ = tx.send(DeepgramEvent::Turn {
                 kind: DeepgramTurnKind::UtteranceEnd,
@@ -1820,6 +1839,7 @@ pub(crate) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<D
             log::debug!("Deepgram: unhandled message type");
         }
     }
+    None
 }
 
 fn looks_like_deepgram_error_object(parsed: &Value) -> bool {
@@ -1838,6 +1858,7 @@ fn deepgram_error_diagnostic(parsed: &Value) -> RuntimeDiagnostic {
         // https://developers.deepgram.com/docs/errors
         Some("INVALID_AUTH") => Code::CredentialRejected,
         Some("INSUFFICIENT_PERMISSIONS") => Code::PermissionDenied,
+        Some("ASR_PAYMENT_REQUIRED") => Code::CapacityExhausted,
         Some("BAD_REQUEST") => Code::RequestRejected,
         Some("CLIENT_MESSAGE_TIMEOUT") => Code::Timeout,
         Some("RATE_LIMIT_EXCEEDED") => Code::RateLimited,

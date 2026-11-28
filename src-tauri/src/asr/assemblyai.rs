@@ -927,6 +927,13 @@ fn emit_session_terminated_once(
 /// reconnect logic. Mirrors the Deepgram `session_task` structure — see
 /// comments there for full design rationale.
 async fn session_task(ctx: AssemblyAISessionCtx) {
+    session_task_with_backoff(ctx, Duration::from_secs).await;
+}
+
+async fn session_task_with_backoff(
+    ctx: AssemblyAISessionCtx,
+    backoff_duration: impl Fn(u64) -> Duration,
+) {
     let mut writer = ctx.writer;
     let mut reader = ctx.reader;
     let mut audio_rx = ctx.audio_rx;
@@ -943,6 +950,7 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
     // successful reconnect below). See `emit_session_terminated_once`.
     let terminated_emitted = Arc::new(AtomicBool::new(false));
     let mut reconnect_attempts: u32 = 0;
+    let mut last_open_error = None;
     let write_guard = AsrWsWriteGuard::new("asr.assemblyai", config.content_egress_policy);
 
     loop {
@@ -959,6 +967,14 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
             &user_disconnected,
             &pending_chunks,
             &write_guard,
+            Some(|| {
+                if reconnect_attempts > 0 {
+                    reconnect_attempts = 0;
+                    connected.store(true, Ordering::SeqCst);
+                    terminated_emitted.store(false, Ordering::SeqCst);
+                    let _ = event_tx.send(AssemblyAIEvent::Reconnected);
+                }
+            }),
         )
         .await;
 
@@ -992,7 +1008,6 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
                     break;
                 }
 
-                let mut last_open_error = None;
                 let reconnected = loop {
                     let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
                         ReconnectStep::Retry {
@@ -1007,6 +1022,7 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
                                 "AssemblyAI session: reconnect budget exhausted after {attempted} attempts"
                             );
                             let message = last_open_error
+                                .take()
                                 .unwrap_or_else(|| websocket_diagnostic(Code::ProviderUnavailable));
                             let _ = event_tx.send(AssemblyAIEvent::Error { message });
                             emit_session_terminated_once(&event_tx, &terminated_emitted);
@@ -1024,7 +1040,7 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
 
                     // Sleep for the backoff window but bail out early on user
                     // cancellation so shutdown doesn't wait up to 10s.
-                    let sleep = tokio::time::sleep(Duration::from_secs(backoff));
+                    let sleep = tokio::time::sleep(backoff_duration(backoff));
                     tokio::pin!(sleep);
                     loop {
                         tokio::select! {
@@ -1055,13 +1071,10 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
                         Ok((new_writer, new_reader)) => {
                             writer = new_writer;
                             reader = new_reader;
-                            connected.store(true, Ordering::SeqCst);
-                            // Re-arm the terminal-event guard so a teardown on the
-                            // fresh session emits exactly once (review n4).
-                            terminated_emitted.store(false, Ordering::SeqCst);
-                            log::info!("AssemblyAI session: reconnected on attempt {attempt}");
-                            let _ = event_tx.send(AssemblyAIEvent::Reconnected);
-                            reconnect_attempts = 0;
+                            last_open_error = None;
+                            log::info!(
+                                "AssemblyAI session: socket opened on attempt {attempt}; awaiting Begin"
+                            );
                             break true;
                         }
                         Err(diag) => {
@@ -1103,6 +1116,7 @@ async fn run_io(
     user_disconnected: &Arc<AtomicBool>,
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     write_guard: &AsrWsWriteGuard,
+    on_begin: Option<impl FnOnce()>,
 ) -> DisconnectKind {
     run_io_with_keepalive_interval(
         writer,
@@ -1113,6 +1127,7 @@ async fn run_io(
         pending_chunks,
         write_guard,
         Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
+        on_begin,
     )
     .await
 }
@@ -1127,6 +1142,7 @@ async fn run_io_with_keepalive_interval(
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
     write_guard: &AsrWsWriteGuard,
     keepalive_interval: Duration,
+    mut on_begin: Option<impl FnOnce()>,
 ) -> DisconnectKind {
     let mut keep_alive = tokio::time::interval(keepalive_interval);
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1203,7 +1219,7 @@ async fn run_io_with_keepalive_interval(
 
                 match result {
                     Ok(Message::Text(text)) => {
-                        handle_server_message(&text, event_tx);
+                        handle_server_message_with_begin(&text, event_tx, &mut on_begin);
                     }
                     Ok(Message::Close(frame)) => {
                         if user_disconnected.load(Ordering::SeqCst) {
@@ -1238,7 +1254,16 @@ async fn run_io_with_keepalive_interval(
 }
 
 /// Parse a single server JSON message and emit appropriate events.
+#[cfg(test)]
 pub(super) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<AssemblyAIEvent>) {
+    handle_server_message_with_begin(text, tx, &mut None::<fn()>);
+}
+
+fn handle_server_message_with_begin(
+    text: &str,
+    tx: &crossbeam_channel::Sender<AssemblyAIEvent>,
+    on_begin: &mut Option<impl FnOnce()>,
+) {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => {
@@ -1262,6 +1287,12 @@ pub(super) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<A
             emit_invalid_response(tx);
             return;
         };
+        // https://www.assemblyai.com/docs/streaming/message-sequence
+        if message_type == AssemblyAiServerMessageType::Begin
+            && let Some(begin) = on_begin.take()
+        {
+            begin();
+        }
         let _ = tx.send(AssemblyAIEvent::ServerMessage {
             frame: AssemblyAiServerMessageFrame::new(payload, message_type),
             received_at_ms: current_unix_millis(),
@@ -1553,6 +1584,7 @@ mod tests {
                     &pending_chunks,
                     &write_guard,
                     keepalive_interval,
+                    None::<fn()>,
                 )
                 .await;
                 let diagnostic = match disconnect {
@@ -1974,6 +2006,7 @@ mod tests {
                     &user_disconnected,
                     &pending_chunks,
                     &write_guard,
+                    None::<fn()>,
                 )
                 .await
             }
@@ -2088,6 +2121,7 @@ mod tests {
                 &pending_chunks,
                 &write_guard,
                 Duration::from_millis(50),
+                None::<fn()>,
             )
             .await
         });
@@ -2193,6 +2227,7 @@ mod tests {
                     &user_disconnected,
                     &pending_chunks,
                     &write_guard,
+                    None::<fn()>,
                 )
                 .await
             }
@@ -2538,6 +2573,10 @@ mod tests {
                     opener_calls.fetch_add(1, Ordering::SeqCst);
                     let (url, _server) = ws_fixture::spawn_server(move |mut websocket| async move {
                         websocket
+                            .send(Message::Text(r#"{"type":"Begin","id":"sample session","expires_at":1800000000}"#.into()))
+                            .await
+                            .expect("send Begin");
+                        websocket
                             .send(Message::Text(
                                 r#"{"type":"Turn","turn_order":1,"end_of_turn":true,"turn_is_formatted":true,"end_of_turn_confidence":0.87,"transcript":"assembly after reconnect","words":[{"text":"assembly","start":0,"end":300,"confidence":0.87}]}"#
                                     .into(),
@@ -2612,6 +2651,12 @@ mod tests {
             "successful reconnect must mark the session connected"
         );
 
+        match recv_event(&event_rx, Duration::from_secs(1)).await {
+            AssemblyAIEvent::ServerMessage { frame, .. } => {
+                assert_eq!(frame.message_type, AssemblyAiServerMessageType::Begin);
+            }
+            other => panic!("expected Begin after Reconnected, got {other:?}"),
+        }
         match recv_event(&event_rx, Duration::from_secs(1)).await {
             AssemblyAIEvent::ServerMessage { frame, .. } => {
                 assert_eq!(frame.message_type, AssemblyAiServerMessageType::Turn);
