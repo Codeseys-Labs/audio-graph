@@ -405,3 +405,26 @@ file and new openers always address the same lock. The digest covers the
 case-folded transcript filename. The separate attempt lease is session-owned
 and holds off a second live writer while an uncertain frame awaits exact
 retry. Readers can still observe the verified prefix of that attempt.
+
+### Recording storage receipts with a session (#139)
+
+The transcript and projection streams each try to record a verified head for
+the first successful barrier observed in each storage class, including an exact
+retry. A witness write failure leaves the canonical receipt intact. The writer
+logs a closed diagnostic and retries the observation on its next commit if
+the head still verifies. If the process exits first, that evidence can be lost.
+Review and export verify the sequence and record hash against the captured log.
+`synced_unqualified` records a successful file synchronization and the applicable
+first-create barrier on unqualified storage. Crash durability there is unverified.
+`qualified` records the successful qualified barrier. Other sequences retain
+unknown provenance.
+
+Until a stream has confirmed weak synchronization, a weak writer records its
+attempt UUID in a companion to the floor-v1 descriptor. Portable recovery evidence
+includes the UUID only when it matches the active descriptor. Recovery that keeps
+a matching member on qualified storage can record a third, bounded observation,
+`recovered_from_unqualified_attempt`. This identifies where that interrupted
+attempt began. The original synchronization outcome remains unknown. A torn or
+empty attempt contributes no observed head. Retirement and recovery attempt
+to remove the companion. A surviving companion can only describe the attempt
+with the matching UUID.

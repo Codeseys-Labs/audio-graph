@@ -187,6 +187,68 @@ contracts with deterministic fixtures (no paid provider calls).
   and projection events) and gated under ADR-0021's storage decision; this ADR
   does not change file layout.
 
+### Projection commit and recovery (#139)
+
+The Notes and Graph lanes share one framed projection log. Each accepted patch
+has a physical sequence and record hash in that log, in addition to its
+lane sequence. Its frame pins the verified transcript head used at admission
+and the speaker head when the patch depends on diarization. Existing unframed
+records remain readable. New patches use the attempt descriptor, verified
+append, synchronization and descriptor retirement from ADR-0041. Qualified
+storage uses its platform barrier. Other writable storage can issue
+`SyncedUnqualified` after synchronization succeeds.
+
+Live writers and projection readers verify the physical head frame at its
+recorded offset before reusing a prefix. An in-place edit to earlier bytes
+that leaves the head frame identical can escape detection until the next full
+verification, an accepted limit because cooperating writers only append
+under the session lock.
+
+The live projection writer retains decoded transcript revisions, event IDs,
+prefix hashes and the latest spans. It retains speaker records once a patch
+needs them. These caches grow with session history and have no fixed memory
+cap. In the Windows release fixture with 10,000 short transcript revisions and
+an empty projection log, loading the source proof grew the process working set
+by about 2.2 KiB per revision. The 568-byte inline record accounts for only
+part of that figure, which includes heap allocations and allocator residency.
+Real sessions vary with the length of their text, IDs and evidence.
+
+Preparing a materialization clones the current Notes and Graph state.
+Installation copies the affected lane and the snapshot writer serializes it.
+These costs grow with materialized content even when source verification
+reads only the previous head frame and newly appended records.
+
+Only a receipt permits the live lane to advance. The resulting cache includes
+the projection frame sequence and record hash. A cache write failure leaves
+a committed patch available for local replay. Opening Notes or Graph checks
+the cache against the verified source and replays accepted patches within the
+artifact byte ceilings. An interrupted read can restart from the log. A cache
+ahead of its source, at a different head, or with different contents at the
+same head is rejected with a closed diagnostic.
+
+Startup resolves transcript attempts before dependent projection attempts.
+It keeps a matching projection member only when its recorded basis heads
+verify. Recovery rewrites the retained prefix and synchronizes it. A missing
+or damaged remainder produces one gap identifying the affected lanes. The
+quarantine retains the suffix for evidence. Review and export can present
+the last verified view with `BehindTranscript` for uncovered transcript
+revisions or `RecomputeRequired` for an unresolved projection gap. Reading
+history performs local replay only. Review shows these notices for the owning
+historical session. A lane that never ran has no coverage to report.
+
+Resuming capture can admit one repair per affected lane through the ordinary
+projection executor under current consent, routing and provider settings.
+Transcription starts with both live lanes marked behind. A background task
+verifies history independently of the Review byte ceiling. Only the same
+session and capture can accept its result. Stop or rotation invalidates it.
+On verification failure the lanes stay behind, the scheduler discards stale
+completion and failure state, and it skips gap repairs for that resume. New
+speech can schedule ordinary work, which still needs a verified source basis
+and a projection receipt before it advances the live lane.
+The accepted repair references the gap it covers. If the job fails, the gap
+remains visible. A previously captured session requires an explicit user
+action before its content can enter a model again.
+
 ### Consequences
 
 - **Positive:** Notes and graph are one deterministic, replayable projection of

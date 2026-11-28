@@ -168,5 +168,4 @@ fn fill_random(bytes: &mut [u8]) -> Result<(), CryptoError> {
 }
 
 #[cfg(test)]
-#[path = "linux_secret_service_crypto_tests.rs"]
 mod tests;

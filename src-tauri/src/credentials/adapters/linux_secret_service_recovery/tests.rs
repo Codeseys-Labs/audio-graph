@@ -5,10 +5,13 @@ use crate::credentials::adapters::linux_secret_service_wire::{
 };
 use crate::credentials::adapters::native_interaction::NativeInteractionGate;
 use crate::test_log_capture;
+use futures_util::StreamExt;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use tokio::sync::oneshot;
 use zbus::connection::Builder;
+use zbus::message::Type;
+use zbus::{Connection, MessageStream};
 
 const BUS: &str = "org.freedesktop.DBus";
 const SERVICE_NAME: &str = "org.freedesktop.secrets";
@@ -36,9 +39,11 @@ enum Behavior {
     IgnoresDeadline,
     WrongWorker,
     Panic,
+    PanicIgnoresDismiss,
     ForgedSender,
     ForgedPath,
     KWallet,
+    OwnerMovesBeforePrompt,
     Stalled,
     CommitUnknown,
 }
@@ -76,14 +81,8 @@ fn run(
             let connection = Builder::address(address.clone()).build().await.unwrap();
             let mut messages = MessageStream::from(&connection);
             connection.request_name(SERVICE_NAME).await.unwrap();
-            let _other_owner = if behavior == Behavior::KWallet {
-                let other = Builder::address(address.clone()).build().await.unwrap();
-                other.request_name("org.gnome.keyring").await.unwrap();
-                Some(other)
-            } else {
-                connection.request_name("org.gnome.keyring").await.unwrap();
-                None
-            };
+            connection.request_name("org.gnome.keyring").await.unwrap();
+            let mut other_owner = None;
             ready.send(()).unwrap();
             let mut retired = false;
             let mut shown = false;
@@ -126,6 +125,12 @@ fn run(
                         } else {
                             PROMPT_PATH
                         };
+                        if behavior == Behavior::OwnerMovesBeforePrompt {
+                            connection.release_name("org.gnome.keyring").await.unwrap();
+                            let other = Builder::address(address.clone()).build().await.unwrap();
+                            other.request_name("org.gnome.keyring").await.unwrap();
+                            other_owner = Some(other);
+                        }
                         connection
                             .reply(
                                 &header,
@@ -214,10 +219,13 @@ fn run(
                     (Some(PROMPT), Some("Dismiss")) => {
                         assert_eq!(path, PROMPT_PATH);
                         assert_eq!(interactive.as_deref(), Some(sender));
-                        assert!(shown);
+                        assert!(shown || behavior == Behavior::OwnerMovesBeforePrompt);
                         if !matches!(
                             behavior,
-                            Behavior::IgnoresDismiss | Behavior::IgnoresDeadline
+                            Behavior::IgnoresDismiss
+                                | Behavior::IgnoresDeadline
+                                | Behavior::PanicIgnoresDismiss
+                                | Behavior::OwnerMovesBeforePrompt
                         ) {
                             unlocked = matches!(
                                 behavior,
@@ -269,6 +277,13 @@ fn run(
                             } else {
                                 script::Scenario::Locked
                             };
+                            if behavior == Behavior::KWallet && call == script::Call::Attributes {
+                                connection.release_name("org.gnome.keyring").await.unwrap();
+                                let other =
+                                    Builder::address(address.clone()).build().await.unwrap();
+                                other.request_name("org.gnome.keyring").await.unwrap();
+                                other_owner = Some(other);
+                            }
                             session.respond(&connection, &message, call, scenario).await;
                         }
                         Event::Ordinary(call)
@@ -280,9 +295,12 @@ fn run(
                 shown,
                 matches!(
                     behavior,
-                    Behavior::IgnoresDismiss | Behavior::IgnoresDeadline
+                    Behavior::IgnoresDismiss
+                        | Behavior::IgnoresDeadline
+                        | Behavior::PanicIgnoresDismiss
                 )
             );
+            drop(other_owner);
             events
         })
     });
@@ -341,7 +359,7 @@ fn run(
                 behavior,
                 Behavior::DeadlineQueuedApproval | Behavior::DeadlineQueuedDismissal
             ),
-            panic_after_prompt: behavior == Behavior::Panic,
+            panic_after_prompt: matches!(behavior, Behavior::Panic | Behavior::PanicIgnoresDismiss),
         },
     )
     .unwrap();
@@ -356,7 +374,10 @@ fn run(
     };
     if !matches!(
         behavior,
-        Behavior::Panic | Behavior::Stalled | Behavior::CommitUnknown
+        Behavior::Panic
+            | Behavior::PanicIgnoresDismiss
+            | Behavior::Stalled
+            | Behavior::CommitUnknown
     ) {
         assert!(
             gate.acquire().is_ok(),
@@ -374,7 +395,15 @@ fn run(
     let rendered = format!("{outcome:?}");
     script::assert_redacted(&rendered);
     assert!(!rendered.contains(WINDOW));
-    script::assert_redacted(&test_log_capture::render(&capture.finish()));
+    let logs = test_log_capture::render(&capture.finish());
+    script::assert_redacted(&logs);
+    assert_eq!(
+        logs.contains("A dialog may still be open."),
+        matches!(
+            behavior,
+            Behavior::IgnoresDismiss | Behavior::IgnoresDeadline | Behavior::PanicIgnoresDismiss
+        )
+    );
     test_log_capture::assert_process_logs_exclude(&[
         script::SECRET,
         script::ATTRIBUTE,
@@ -582,13 +611,22 @@ fn forged_completions_from_other_sender_or_path_cannot_approve() {
 }
 
 #[test]
-fn a_prompt_panic_attempts_dismissal_and_reports_possible_open_dialog() {
-    let (outcome, events) = run(Behavior::Panic, RecoveryScope::Item, None);
-    assert_eq!(outcome, Err(Failure::StalledWorker));
-    assert_eq!(
-        interactive_events(&events),
-        [Event::Unlock, Event::Prompt, Event::Dismiss]
-    );
+fn a_prompt_panic_dismisses_and_only_warns_if_settlement_is_unknown() {
+    for behavior in [Behavior::Panic, Behavior::PanicIgnoresDismiss] {
+        let (outcome, events) = run(behavior, RecoveryScope::Item, None);
+        assert_eq!(outcome, Err(Failure::StalledWorker));
+        assert_eq!(
+            interactive_events(&events),
+            [Event::Unlock, Event::Prompt, Event::Dismiss]
+        );
+    }
+}
+
+#[test]
+fn owner_change_before_prompt_still_dismisses_without_a_dialog_warning() {
+    let (outcome, events) = run(Behavior::OwnerMovesBeforePrompt, RecoveryScope::Item, None);
+    assert_eq!(outcome, Err(Failure::Unsupported));
+    assert_eq!(interactive_events(&events), [Event::Unlock, Event::Dismiss]);
 }
 
 #[test]
@@ -602,4 +640,24 @@ fn kwallet_and_latched_gates_never_dispatch_recovery() {
         assert_eq!(outcome, expected);
         assert!(interactive_events(&events).is_empty());
     }
+}
+
+#[test]
+fn a_failed_completion_stream_does_not_cancel_pending_dismissal() {
+    let sent = std::cell::Cell::new(false);
+    let mut first_poll = true;
+    let request = poll_fn(|cx| {
+        if std::mem::take(&mut first_poll) {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        sent.set(true);
+        Poll::Ready(Ok(()))
+    });
+    let completion = std::future::ready(Err(Failure::Unavailable.into()));
+    assert_eq!(
+        block_on(dismiss_and_settle(request, completion)),
+        Err(WireError(Failure::Unavailable))
+    );
+    assert!(sent.get());
 }
