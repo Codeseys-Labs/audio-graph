@@ -41,8 +41,9 @@
 //! streaming clients (`backoff_for_attempt`).
 
 use super::{
-    BuiltInCredentialSetId, asr_diagnostic, missing_provider_credential, websocket_close,
-    websocket_diagnostic, websocket_error, websocket_upgrade_error, websocket_write_error,
+    BuiltInCredentialSetId, asr_diagnostic, is_terminal_reconnect_error, required_api_key,
+    websocket_close, websocket_diagnostic, websocket_error, websocket_upgrade_error,
+    websocket_write_error,
 };
 use crate::error::AppError;
 use audio_graph_ipc_contract::runtime_diagnostic::{
@@ -295,9 +296,7 @@ impl OpenAiRealtimeClient {
     /// handles audio writing, server message reading, and automatic reconnect
     /// with exponential backoff (re-sending `session.update` on each reconnect).
     pub fn connect(&mut self) -> Result<(), AppError> {
-        if self.config.api_key.trim().is_empty() {
-            return Err(missing_provider_credential(BuiltInCredentialSetId::Openai));
-        }
+        required_api_key(&self.config.api_key, BuiltInCredentialSetId::Openai)?;
 
         // Build a dedicated multi-threaded (1 worker) tokio runtime for the WS.
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -604,6 +603,7 @@ async fn open_ws_url(
     config: &OpenAiRealtimeConfig,
     url_str: &str,
 ) -> Result<(WsWriter, WsReader), RuntimeDiagnostic> {
+    let api_key = required_api_key(&config.api_key, BuiltInCredentialSetId::Openai)?;
     // `IntoClientRequest` fills in the mandatory WebSocket upgrade headers; we
     // only layer `Authorization` on top. NO `OpenAI-Beta` header (GA only).
     let mut request = url_str
@@ -611,7 +611,7 @@ async fn open_ws_url(
         .map_err(|_| websocket_diagnostic(Code::RequestRejected))?;
     request.headers_mut().insert(
         "Authorization",
-        format!("Bearer {}", config.api_key)
+        format!("Bearer {api_key}")
             .parse()
             .map_err(|_| websocket_diagnostic(Code::RequestRejected))?,
     );
@@ -620,7 +620,7 @@ async fn open_ws_url(
     // ordinary connect error instead of hanging the reconnect ladder forever.
     let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
         .await
-        .map_err(|error| websocket_upgrade_error(&error, !config.api_key.trim().is_empty()))?;
+        .map_err(|error| websocket_upgrade_error(&error, true))?;
 
     let (mut writer, reader) = ws_stream.split();
 
@@ -767,6 +767,14 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                 log::warn!("OpenAI Realtime session: disconnected — {disconnect:?}");
                 emit_disconnected_once(&event_tx, &disconnected_emitted);
 
+                if let Err(message) =
+                    required_api_key(&config.api_key, BuiltInCredentialSetId::Openai)
+                {
+                    emit_error(&event_tx, message);
+                    break;
+                }
+
+                let mut last_open_error = None;
                 let reconnected = loop {
                     let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
                         ReconnectStep::Retry {
@@ -780,7 +788,9 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                             log::error!(
                                 "OpenAI Realtime session: reconnect budget exhausted after {attempted} attempts"
                             );
-                            emit_error(&event_tx, websocket_diagnostic(Code::ProviderUnavailable));
+                            let message = last_open_error
+                                .unwrap_or_else(|| websocket_diagnostic(Code::ProviderUnavailable));
+                            emit_error(&event_tx, message);
                             break false;
                         }
                     };
@@ -839,10 +849,12 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                         }
                         Err(diag) => {
                             log::warn!("OpenAI Realtime session: {diag}");
+                            if is_terminal_reconnect_error(&diag) {
+                                emit_error(&event_tx, diag);
+                                break false;
+                            }
+                            last_open_error = Some(diag.clone());
                             emit_error(&event_tx, diag);
-                            // Stay in the reconnect ladder. Do not loop back
-                            // through run_io with the previous closed socket.
-                            continue;
                         }
                     }
                 };
@@ -1250,9 +1262,9 @@ fn openai_realtime_error_diagnostic(error: Option<&Value>) -> RuntimeDiagnostic 
         .and_then(Value::as_str);
     websocket_diagnostic(match code {
         Some("rate_limit_exceeded") => Code::RateLimited,
-        // https://developers.openai.com/api/reference/resources/realtime/server-events#error
-        Some("invalid_api_key") => Code::CredentialRejected,
-        Some("session_expired") => Code::CredentialExpired,
+        // A Realtime session has its own duration limit.
+        // https://developers.openai.com/api/docs/guides/realtime-conversations
+        Some("session_expired") => Code::Timeout,
         Some("invalid_value") => Code::RequestRejected,
         _ => Code::Internal,
     })
@@ -1312,11 +1324,68 @@ fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_stops_on_terminal_upgrade_error() {
+        use super::super::diagnostic_tests::reject_upgrade;
+        use std::sync::atomic::AtomicUsize;
+
+        let (url, initial) = ws_fixture::spawn_server(|mut websocket| async move {
+            websocket.close(None).await.unwrap();
+        })
+        .await;
+        let (writer, reader) = ws_fixture::connect_client(&url).await.split();
+        let (reconnect_url, upgrade_server) = reject_upgrade(401, true).await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&attempts);
+        let opener: ReconnectOpener = Arc::new(move |config| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let url = reconnect_url.clone();
+            Box::pin(async move { open_ws_url(&config, &url).await })
+        });
+
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let task = tokio::spawn(session_task(OpenAiRealtimeSessionCtx {
+            writer,
+            reader,
+            config: test_config(),
+            audio_rx,
+            event_tx,
+            connected: Arc::new(AtomicBool::new(true)),
+            user_disconnected: Arc::new(AtomicBool::new(false)),
+            disconnected_emitted: Arc::new(AtomicBool::new(false)),
+            pending_chunks: Arc::new(AtomicUsize::new(0)),
+            reconnect_opener: Some(opener),
+            run_io_entries: None,
+        }));
+
+        tokio::time::timeout(Duration::from_secs(6), task)
+            .await
+            .expect("reconnect must end on a terminal failure")
+            .unwrap();
+        initial.await.unwrap();
+        upgrade_server.await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    OpenAiRealtimeEvent::Disconnected,
+                    OpenAiRealtimeEvent::Reconnecting { attempt: 1, .. },
+                    OpenAiRealtimeEvent::Error { message: RuntimeDiagnostic::Runtime(error) },
+                ] if error.code == Code::CredentialRejected && !error.retryable
+            ),
+            "unexpected events: {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn upgrade_and_provider_error_outcomes() {
         use super::super::diagnostic_tests::{assert_outcome, reject_upgrade};
         use audio_graph_ipc_contract::runtime_diagnostic::{
-            RuntimeSafeRecoveryAction as Action, RuntimeStatusClass::ClientError,
+            RuntimeSafeRecoveryAction as Action,
+            RuntimeStatusClass::{ClientError, ServerError},
         };
 
         let mut config = test_config();
@@ -1343,6 +1412,21 @@ mod tests {
                 Action::ReviewConfiguration,
                 Some(ClientError),
             ),
+            (408, Code::Timeout, true, Action::Retry, Some(ClientError)),
+            (
+                429,
+                Code::RateLimited,
+                true,
+                Action::RetryAfterDelay,
+                Some(ClientError),
+            ),
+            (
+                503,
+                Code::ProviderUnavailable,
+                true,
+                Action::Retry,
+                Some(ServerError),
+            ),
         ] {
             let (url, server) = reject_upgrade(status, true).await;
             let diagnostic = open_ws_url(&config, &url).await.unwrap_err();
@@ -1351,20 +1435,8 @@ mod tests {
         }
 
         for (wire_code, code, retryable, action, status_class) in [
-            (
-                "invalid_api_key",
-                Code::CredentialRejected,
-                false,
-                Action::ReenterCredential,
-                None,
-            ),
-            (
-                "session_expired",
-                Code::CredentialExpired,
-                false,
-                Action::RefreshCredential,
-                None,
-            ),
+            ("invalid_api_key", Code::Internal, false, Action::None, None),
+            ("session_expired", Code::Timeout, true, Action::Retry, None),
             (
                 "invalid_value",
                 Code::RequestRejected,

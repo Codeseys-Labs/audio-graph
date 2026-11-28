@@ -83,7 +83,18 @@ fn asr_diagnostic(code: RuntimeErrorCode, transport: RuntimeTransport) -> Runtim
     RuntimeErrorDiagnostic::new(code, retryable, recovery, context).into()
 }
 
-fn missing_provider_credential(provider: BuiltInCredentialSetId) -> crate::error::AppError {
+fn required_api_key(
+    api_key: &str,
+    provider: BuiltInCredentialSetId,
+) -> Result<&str, RuntimeDiagnostic> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err(missing_provider_credential(provider));
+    }
+    Ok(api_key)
+}
+
+fn missing_provider_credential(provider: BuiltInCredentialSetId) -> RuntimeDiagnostic {
     CredentialError {
         code: CredentialErrorCode::Missing,
         retryable: false,
@@ -91,6 +102,23 @@ fn missing_provider_credential(provider: BuiltInCredentialSetId) -> crate::error
         set_id: Some(CredentialSetId::BuiltIn(provider)),
     }
     .into()
+}
+
+fn is_terminal_reconnect_error(diagnostic: &RuntimeDiagnostic) -> bool {
+    use RuntimeErrorCode as Code;
+
+    match diagnostic {
+        RuntimeDiagnostic::Credential(error) => error.code == CredentialErrorCode::Missing,
+        // RequestRejected also covers ambiguous statuses such as 400. Keep
+        // the existing reconnect budget for these coarse failures.
+        RuntimeDiagnostic::Runtime(error) => matches!(
+            error.code,
+            Code::CredentialRejected
+                | Code::CredentialExpired
+                | Code::PermissionDenied
+                | Code::InvalidConfiguration
+        ),
+    }
 }
 
 fn websocket_error(error: &tungstenite::Error) -> RuntimeDiagnostic {
@@ -278,12 +306,19 @@ mod diagnostic_tests {
         );
     }
 
+    pub(super) async fn reject_upgrade(
+        status: u16,
+        credential_sent: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        reject_upgrades(vec![(status, Some(wire_prose()))], credential_sent).await
+    }
+
     #[allow(
         clippy::result_large_err,
         reason = "tungstenite's upgrade callback requires an HTTP response as its error"
     )]
-    pub(super) async fn reject_upgrade(
-        status: u16,
+    pub(super) async fn reject_upgrades(
+        responses: Vec<(u16, Option<String>)>,
         credential_sent: bool,
     ) -> (String, tokio::task::JoinHandle<()>) {
         use tungstenite::handshake::server::{Request, Response};
@@ -291,21 +326,28 @@ mod diagnostic_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/asr", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let result =
-                tokio_tungstenite::accept_hdr_async(stream, |request: &Request, _: Response| {
-                    assert_eq!(
-                        request.headers().contains_key("authorization"),
-                        credential_sent
-                    );
-                    Err(tungstenite::http::Response::builder()
-                        .status(status)
-                        .header("x-request-id", REQUEST_ID)
-                        .body(Some(wire_prose()))
-                        .unwrap())
-                })
+            for (status, body) in responses {
+                let (stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                    .await
+                    .expect("timed out waiting for the test upgrade")
+                    .unwrap();
+                let result = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    |request: &Request, _: Response| {
+                        assert_eq!(
+                            request.headers().contains_key("authorization"),
+                            credential_sent
+                        );
+                        Err(tungstenite::http::Response::builder()
+                            .status(status)
+                            .header("x-request-id", REQUEST_ID)
+                            .body(body)
+                            .unwrap())
+                    },
+                )
                 .await;
-            assert!(result.is_err(), "server must reject the upgrade");
+                assert!(result.is_err(), "server must reject the upgrade");
+            }
         });
         (url, server)
     }
@@ -657,8 +699,8 @@ mod diagnostic_tests {
         };
         assert_diagnostic(&message, RuntimeErrorCode::Internal);
         for (wire_code, code) in [
-            ("invalid_api_key", RuntimeErrorCode::CredentialRejected),
-            ("session_expired", RuntimeErrorCode::CredentialExpired),
+            ("invalid_api_key", RuntimeErrorCode::Internal),
+            ("session_expired", RuntimeErrorCode::Timeout),
         ] {
             let payload =
                 json!({"type": "error", "error": {"code": wire_code, "message": wire_prose()}});

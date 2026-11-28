@@ -432,13 +432,11 @@ pub(crate) fn build_aura_url(config: &TtsConfig) -> String {
 /// Open a fresh WebSocket against `url` with `Token <api_key>` auth.
 /// Used both for the initial connect and for reconnect attempts.
 pub(crate) async fn open_ws(url: &str, api_key: &str) -> Result<(WsWriter, WsReader), TtsError> {
-    // For ws:// URLs (test mock server), we still set the Authorization
-    // header but the server is free to ignore it.
-    let credential_sent = !api_key.trim().is_empty();
+    let api_key = api_key.trim();
+    let credential_sent = !api_key.is_empty();
     let host = extract_host(url).unwrap_or_else(|| "api.deepgram.com".to_string());
-    let request = tungstenite::http::Request::builder()
+    let mut request = tungstenite::http::Request::builder()
         .uri(url)
-        .header("Authorization", format!("Token {}", api_key))
         .header(
             "Sec-WebSocket-Key",
             tungstenite::handshake::client::generate_key(),
@@ -449,6 +447,12 @@ pub(crate) async fn open_ws(url: &str, api_key: &str) -> Result<(WsWriter, WsRea
         .header("Host", host)
         .body(())
         .map_err(|_| aura_error(Kind::BadRequest, Code::RequestRejected))?;
+    if credential_sent {
+        let auth = format!("Token {api_key}")
+            .parse()
+            .map_err(|_| aura_error(Kind::BadRequest, Code::RequestRejected))?;
+        request.headers_mut().insert("Authorization", auth);
+    }
 
     // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
     // ordinary transport error (routed through `classify_tungstenite_error`
@@ -462,10 +466,21 @@ pub(crate) async fn open_ws(url: &str, api_key: &str) -> Result<(WsWriter, WsRea
             }
             Ok(ws_stream.split())
         }
-        Err(tungstenite::Error::Http(response)) => Err(TtsError::from_http_status(
-            response.status().as_u16(),
-            credential_sent,
-        )),
+        Err(tungstenite::Error::Http(response)) => {
+            if credential_sent
+                && let Some(diagnostic) = crate::asr::deepgram::deepgram_http_auth_diagnostic(
+                    &response,
+                    RuntimeDiagnosticContext::new(RuntimeOperation::SpeechSynthesis)
+                        .with_transport(RuntimeTransport::Http),
+                )
+            {
+                return Err(TtsError::new(Kind::Auth, diagnostic));
+            }
+            Err(TtsError::from_http_status(
+                response.status().as_u16(),
+                credential_sent,
+            ))
+        }
         Err(e) => Err(classify_tungstenite_error(&e)),
     }
 }
@@ -491,7 +506,6 @@ fn classify_tungstenite_error(error: &tungstenite::Error) -> TtsError {
     use tungstenite::Error;
 
     match error {
-        Error::Http(response) => TtsError::from_http_status(response.status().as_u16(), false),
         Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => {
             aura_error(Kind::Network, Code::Timeout)
         }
@@ -1050,8 +1064,8 @@ mod tests {
         capture_tts_logs();
         let route = "/v1/speak?api_key=query-secret-12345&model=aura-generated-test";
         let url = format!("ws://{addr}{route}");
-        let api_key = "dg-http-test-key";
-        let body = r#"{"error":"provider body text","description":"generated speech text 音声","api_key":"body-secret-12345","request_id":"dg-body-req"}"#;
+        let api_key = "example credential";
+        let body = r#"{"err_code":"INSUFFICIENT_PERMISSIONS","error":"provider body text","description":"generated speech text 音声","api_key":"body-secret-12345","request_id":"dg-body-req"}"#;
         let body_for_server = body.to_string();
 
         let server = tokio::spawn(async move {
@@ -1097,9 +1111,9 @@ mod tests {
         assert_eq!(err.kind(), Kind::Auth);
         assert_eq!(
             err.diagnostic(),
-            TtsError::from_http_status(401, true).diagnostic()
+            TtsError::from_http_status(403, true).diagnostic()
         );
-        assert_eq!(err.to_string(), "runtime/credential_rejected");
+        assert_eq!(err.to_string(), "runtime/permission_denied");
         let event: TtsEvent = err.clone().into();
         let exported = format!(
             "{err} {err:?} {event:?} {} {} {:?}",

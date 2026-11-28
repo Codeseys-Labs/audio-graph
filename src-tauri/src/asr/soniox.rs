@@ -6,8 +6,8 @@
 //! evidence is strong enough to promote Soniox from planned to selectable.
 
 use super::{
-    BuiltInCredentialSetId, asr_diagnostic, missing_provider_credential, websocket_close,
-    websocket_diagnostic, websocket_error, websocket_write_error,
+    BuiltInCredentialSetId, asr_diagnostic, is_terminal_reconnect_error, required_api_key,
+    websocket_close, websocket_diagnostic, websocket_error, websocket_write_error,
 };
 use crate::error::AppError;
 use audio_graph_ipc_contract::runtime_diagnostic::{
@@ -487,9 +487,7 @@ impl SonioxClient {
     }
 
     pub fn connect(&mut self) -> Result<(), AppError> {
-        if self.config.api_key.trim().is_empty() {
-            return Err(missing_provider_credential(BuiltInCredentialSetId::Soniox));
-        }
+        required_api_key(&self.config.api_key, BuiltInCredentialSetId::Soniox)?;
         if self.config.model.trim().is_empty() {
             return Err(websocket_diagnostic(Code::RequestRejected).into());
         }
@@ -638,6 +636,7 @@ async fn open_ws_url(
     config: &SonioxConfig,
     url_str: &str,
 ) -> Result<(AsrWsWriter, AsrWsReader), RuntimeDiagnostic> {
+    required_api_key(&config.api_key, BuiltInCredentialSetId::Soniox)?;
     // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
     // ordinary connect error instead of hanging the reconnect ladder forever.
     // This adapter sends the key in the first config frame, after the upgrade.
@@ -768,6 +767,15 @@ async fn session_task(ctx: SonioxSessionCtx) {
                 }
 
                 log::warn!("Soniox session: disconnected — {disconnect:?}");
+                if let Err(message) =
+                    required_api_key(&config.api_key, BuiltInCredentialSetId::Soniox)
+                {
+                    emit_disconnected_once(&event_tx, &disconnected_emitted);
+                    let _ = event_tx.send(SonioxEvent::Error { message });
+                    break;
+                }
+
+                let mut last_open_error = None;
                 let reconnected = loop {
                     let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
                         ReconnectStep::Retry {
@@ -781,10 +789,10 @@ async fn session_task(ctx: SonioxSessionCtx) {
                             log::error!(
                                 "Soniox session: reconnect budget exhausted after {attempted} attempts"
                             );
-                            let _ = event_tx.send(SonioxEvent::Error {
-                                message: websocket_diagnostic(Code::ProviderUnavailable),
-                            });
+                            let message = last_open_error
+                                .unwrap_or_else(|| websocket_diagnostic(Code::ProviderUnavailable));
                             emit_disconnected_once(&event_tx, &disconnected_emitted);
+                            let _ = event_tx.send(SonioxEvent::Error { message });
                             break false;
                         }
                     };
@@ -848,8 +856,13 @@ async fn session_task(ctx: SonioxSessionCtx) {
                         }
                         Err(diag) => {
                             log::warn!("Soniox session: {diag}");
+                            if is_terminal_reconnect_error(&diag) {
+                                emit_disconnected_once(&event_tx, &disconnected_emitted);
+                                let _ = event_tx.send(SonioxEvent::Error { message: diag });
+                                break false;
+                            }
+                            last_open_error = Some(diag.clone());
                             let _ = event_tx.send(SonioxEvent::Error { message: diag });
-                            continue;
                         }
                     }
                 };
@@ -1049,7 +1062,7 @@ pub(super) fn handle_server_message(
 
 fn soniox_session_config_payload(config: &SonioxConfig) -> Value {
     let mut payload = json!({
-        "api_key": config.api_key,
+        "api_key": config.api_key.trim(),
         "model": config.model,
         "audio_format": "pcm_s16le",
         "sample_rate": 16_000,
@@ -1168,11 +1181,67 @@ fn is_marker_only(text: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_stops_on_terminal_upgrade_error() {
+        use super::super::diagnostic_tests::reject_upgrade;
+        use std::sync::atomic::AtomicUsize;
+
+        let (url, initial) = ws_fixture::spawn_server(|mut websocket| async move {
+            websocket.close(None).await.unwrap();
+        })
+        .await;
+        let (writer, reader) = ws_fixture::connect_client(&url).await.split();
+        let (reconnect_url, upgrade_server) = reject_upgrade(403, false).await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&attempts);
+        let opener: ReconnectOpener = Arc::new(move |config| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let url = reconnect_url.clone();
+            Box::pin(async move { open_ws_url(&config, &url).await })
+        });
+
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let task = tokio::spawn(session_task(SonioxSessionCtx {
+            writer,
+            reader,
+            config: test_config(),
+            audio_rx,
+            event_tx,
+            connected: Arc::new(AtomicBool::new(true)),
+            user_disconnected: Arc::new(AtomicBool::new(false)),
+            pending_chunks: Arc::new(AtomicUsize::new(0)),
+            reconnect_opener: Some(opener),
+            run_io_entries: None,
+        }));
+
+        tokio::time::timeout(Duration::from_secs(6), task)
+            .await
+            .expect("reconnect must end on a terminal failure")
+            .unwrap();
+        initial.await.unwrap();
+        upgrade_server.await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    SonioxEvent::Reconnecting { attempt: 1, .. },
+                    SonioxEvent::Disconnected,
+                    SonioxEvent::Error { message: RuntimeDiagnostic::Runtime(error) },
+                ] if error.code == Code::PermissionDenied && !error.retryable
+            ),
+            "unexpected events: {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn upgrade_and_provider_error_outcomes() {
         use super::super::diagnostic_tests::{assert_outcome, reject_upgrade};
         use audio_graph_ipc_contract::runtime_diagnostic::{
-            RuntimeSafeRecoveryAction as Action, RuntimeStatusClass::ClientError,
+            RuntimeSafeRecoveryAction as Action,
+            RuntimeStatusClass::{ClientError, ServerError},
         };
 
         let mut config = test_config();
@@ -1198,6 +1267,21 @@ mod tests {
                 false,
                 Action::ReviewConfiguration,
                 Some(ClientError),
+            ),
+            (408, Code::Timeout, true, Action::Retry, Some(ClientError)),
+            (
+                429,
+                Code::RateLimited,
+                true,
+                Action::RetryAfterDelay,
+                Some(ClientError),
+            ),
+            (
+                503,
+                Code::ProviderUnavailable,
+                true,
+                Action::Retry,
+                Some(ServerError),
             ),
         ] {
             let (url, server) = reject_upgrade(status, false).await;
