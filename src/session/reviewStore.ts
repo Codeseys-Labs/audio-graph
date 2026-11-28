@@ -327,16 +327,22 @@ export const useReviewStore = create<ReviewState>((set, get) => {
           : state.artifacts,
     }));
 
+    // Async wrappers, so even a synchronous throw from `invoke` is a rejected
+    // read (a failed half), never an exception out of the round.
+    const readSnapshot = async (): Promise<ReviewSnapshot> =>
+      toSnapshot(
+        sessionId,
+        await invoke<unknown>("load_session", { sessionId }),
+      );
+    const readArtifact = async (lens: ArtifactKind): Promise<unknown> => {
+      const source = ARTIFACT_SOURCES[lens];
+      return source.parse(
+        await invoke<unknown>(source.command, source.args(sessionId)),
+      );
+    };
     const [snapshotRes, artifactRes] = await Promise.allSettled([
-      invoke<unknown>("load_session", { sessionId }).then((raw) =>
-        toSnapshot(sessionId, raw),
-      ),
-      kind === null
-        ? Promise.resolve(null)
-        : invoke<unknown>(
-            ARTIFACT_SOURCES[kind].command,
-            ARTIFACT_SOURCES[kind].args(sessionId),
-          ).then((raw) => ARTIFACT_SOURCES[kind].parse(raw)),
+      readSnapshot(),
+      kind === null ? Promise.resolve(null) : readArtifact(kind),
     ]);
     if (isStale()) return;
 
@@ -441,13 +447,23 @@ export const useReviewStore = create<ReviewState>((set, get) => {
       done: Promise.resolve(),
     };
     inFlight = round;
+    const kindUsed = activeKind;
     round.done = (async () => {
-      await executeRound(sessionId, epoch, activeKind);
-      if (inFlight === round) inFlight = null;
+      try {
+        await executeRound(sessionId, epoch, kindUsed);
+      } finally {
+        // Whatever happened (published, dropped as stale, or an unexpected
+        // throw), this round is over: never leave the selection "in flight".
+        if (inFlight === round) inFlight = null;
+      }
+      const sameSelection =
+        get().artifactEpoch === epoch && get().sessionId === sessionId;
+      // One more round when something asked for it while this one ran, or the
+      // open lens changed to one this round did not fetch (a missed request
+      // must never leave a lens loading forever).
       if (
-        round.trailing &&
-        get().artifactEpoch === epoch &&
-        get().sessionId === sessionId
+        sameSelection &&
+        (round.trailing || (activeKind !== null && activeKind !== kindUsed))
       ) {
         await requestRound();
       }

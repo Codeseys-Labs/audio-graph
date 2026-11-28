@@ -341,6 +341,85 @@ describe("reviewStore rounds: snapshot and lens artifact together", () => {
       expect(maxInFlight).toBe(1);
     });
 
+    it("fetches a lens that registered while a round was in flight", async () => {
+      const gate = deferred<unknown>();
+      let loads = 0;
+      backend((cmd, id) => {
+        if (cmd === "load_session") {
+          loads += 1;
+          return loads === 1 ? gate.promise : sessionPayload(id);
+        }
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      const opening = store.select("sess-a", "notes");
+      // Timeline registers while the Notes round is still pending.
+      void store.activateLens("timeline");
+      gate.resolve(sessionPayload("sess-a"));
+      await opening;
+
+      expect(artifacts().timeline.status).toBe("ready");
+      expect(artifacts().timeline.data).toEqual(TIMELINE);
+    });
+
+    it("fetches a lens that registered while the trailing round was already running", async () => {
+      const first = deferred<unknown>();
+      const second = deferred<unknown>();
+      let loads = 0;
+      backend((cmd, id) => {
+        if (cmd === "load_session") {
+          loads += 1;
+          if (loads === 1) return first.promise;
+          if (loads === 2) return second.promise;
+          return sessionPayload(id);
+        }
+        return standard(cmd, id);
+      });
+      const store = useReviewStore.getState();
+      const opening = store.select("sess-a", "notes");
+      void store.refresh(); // queues the trailing round
+      first.resolve(sessionPayload("sess-a"));
+      await vi.waitFor(() => expect(loads).toBe(2)); // trailing round started
+      void store.activateLens("graph"); // too late for it: it picked "notes"
+      second.resolve(sessionPayload("sess-a"));
+      await opening;
+
+      expect(artifacts().graph.status).toBe("ready");
+      expect(artifacts().graph.data).toEqual(GRAPH);
+    });
+
+    it("is not wedged by a synchronous throw from invoke: a later refresh still runs", async () => {
+      mockedInvoke.mockImplementationOnce(() => {
+        throw new Error("bridge down");
+      });
+      await useReviewStore.getState().select("sess-a");
+      expect(useReviewStore.getState().status).toBe("error");
+
+      backend(standard);
+      await useReviewStore.getState().refresh();
+      expect(useReviewStore.getState().status).toBe("ready");
+      expect(useReviewStore.getState().snapshot?.sessionId).toBe("sess-a");
+    });
+
+    it("is not wedged by a round dropped as stale: the next selection and refresh both run", async () => {
+      const gate = deferred<unknown>();
+      backend((cmd, id) =>
+        cmd === "load_session" && id === "sess-a"
+          ? gate.promise
+          : standard(cmd, id),
+      );
+      const store = useReviewStore.getState();
+      const dropped = store.select("sess-a", "notes");
+      store.close(); // epoch bump drops the pending round
+      gate.resolve(sessionPayload("sess-a"));
+      await dropped;
+
+      await store.select("sess-b", "notes");
+      await store.refresh();
+      expect(useReviewStore.getState().snapshot?.sessionId).toBe("sess-b");
+      expect(artifacts().notes.status).toBe("ready");
+    });
+
     it("lets a new selection start its own round while an older selection's is pending", async () => {
       const gate = deferred<unknown>();
       backend((cmd, id) =>
