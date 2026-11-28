@@ -356,6 +356,7 @@ pub struct CredentialSnapshot {
     pub store: CredentialStore,
     pub source: &'static str,
     pub key_sources: BTreeMap<&'static str, &'static str>,
+    pub legacy_file_warning: Option<LegacyCredentialError>,
 }
 
 impl CredentialSnapshot {
@@ -365,6 +366,7 @@ impl CredentialSnapshot {
             store,
             source,
             key_sources,
+            legacy_file_warning: None,
         }
     }
 
@@ -377,6 +379,7 @@ impl CredentialSnapshot {
             store,
             source,
             key_sources,
+            legacy_file_warning: None,
         }
     }
 
@@ -719,6 +722,14 @@ impl YamlCredentialBackend {
         })
     }
 
+    /// Only keychain mode may ignore an unreadable secondary import source.
+    fn load_secondary(&self) -> Result<CredentialStore, LegacyCredentialError> {
+        self.load().inspect_err(|error| {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| log::warn!("Legacy credential file could not be read: {error}"));
+        })
+    }
+
     /// Remove a single key's plaintext entry from `credentials.yaml`, preserving
     /// every other key's entry (a load-modify-save that touches only `key`).
     ///
@@ -736,7 +747,9 @@ impl YamlCredentialBackend {
     /// one, bumping its mtime) just to clear an entry that was never there.
     fn clear_key(&self, key: &str) -> Result<(), LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::LegacyFileWrite, || {
-            let mut store = self.load()?;
+            let Ok(mut store) = self.load_secondary() else {
+                return Ok(());
+            };
             if store.get(key)?.is_none() {
                 return Ok(());
             }
@@ -764,15 +777,7 @@ impl CredentialMigrationStateBackend {
     fn load(&self) -> Result<CredentialMigrationState, LegacyCredentialError> {
         with_redacted_panic_scope(RedactedPanicOp::LegacyStateIo, || {
             let path = self.resolved_path()?;
-            let state: CredentialMigrationState = read_yaml(&path)?;
-            if state
-                .migrated_keys
-                .union(&state.deleted_keys)
-                .any(|key| !is_allowed_key(key))
-            {
-                return Err(LegacyCredentialError(Code::CorruptRecord));
-            }
-            Ok(state)
+            read_yaml(&path)
         })
     }
 
@@ -1002,9 +1007,12 @@ impl<S: KeychainStore> KeychainCredentialBackend<S> {
     ) -> Result<Vec<&'static str>, LegacyCredentialError> {
         let mut imported_keys = Vec::new();
         for (key, value) in missing_credentials_from_yaml(keychain_store, file_store, state) {
-            self.store.set_key(key, &value)?;
+            match self.store.set_key(key, &value) {
+                Ok(()) => imported_keys.push(key),
+                Err(error) => log::warn!("Credential import deferred: {error}"),
+            }
+            // YAML is still a valid source for this read if the native import failed.
             set_field(keychain_store, key, Some(value))?;
-            imported_keys.push(key);
         }
         Ok(imported_keys)
     }
@@ -1096,15 +1104,36 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
                 state.clear_deleted_keys(&mut store)?;
                 let mut key_sources =
                     credential_source_map_from_store(&store, self.keychain.source_label());
-                let file_store = self.yaml.load()?;
-                self.state.mark_present_keys(&store)?;
+                if let Err(error) = self.state.mark_present_keys(&store) {
+                    log::warn!("Credential presence bookkeeping deferred: {error}");
+                }
+                let file_store = match self.yaml.load_secondary() {
+                    Ok(file_store) => file_store,
+                    Err(warning) => {
+                        let mut snapshot = CredentialSnapshot::with_key_sources(
+                            store,
+                            self.keychain.source_label(),
+                            key_sources,
+                        );
+                        snapshot.legacy_file_warning = Some(warning);
+                        return Ok(snapshot);
+                    }
+                };
                 let imported_keys =
                     self.keychain
                         .import_missing_from_yaml(&mut store, &file_store, &state)?;
-                self.state.mark_imported_keys(&imported_keys)?;
-                for key in imported_keys {
-                    if store.is_present(key).unwrap_or(false) {
-                        key_sources.insert(key, "imported_file");
+                if let Err(error) = self.state.mark_imported_keys(&imported_keys) {
+                    log::warn!("Credential import bookkeeping deferred: {error}");
+                }
+                for &key in ALLOWED_CREDENTIAL_KEYS {
+                    if store.is_present(key)? {
+                        key_sources
+                            .entry(key)
+                            .or_insert(if imported_keys.contains(&key) {
+                                "imported_file"
+                            } else {
+                                "file_fallback"
+                            });
                     }
                 }
                 // A user who hand-edits credentials.yaml for a key that has
@@ -1131,9 +1160,6 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
             Err(e) if self.fallback_to_yaml => {
                 log::warn!("OS credential store unavailable; using YAML credential fallback: {e}");
                 let store = self.load_filtered_yaml_fallback()?;
-                if store.present_count() == 0 {
-                    return Err(e);
-                }
                 Ok(CredentialSnapshot::new(store, "file_fallback"))
             }
             Err(e) => Err(e),
@@ -1145,26 +1171,6 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
         let state = self.state.load()?;
         state.clear_tracked_keys(&mut store)?;
         Ok(store)
-    }
-
-    fn get_filtered_yaml_fallback(
-        &self,
-        key: &str,
-        native_error: Option<LegacyCredentialError>,
-    ) -> Result<Option<String>, LegacyCredentialError> {
-        let state = self.state.load()?;
-        if state.is_deleted(key) {
-            return Ok(None);
-        }
-        if !state.is_tracked(key)
-            && let Some(value) = self.yaml.get(key)?
-        {
-            return Ok(Some(value));
-        }
-        match native_error {
-            Some(error) => Err(error),
-            None => Ok(None),
-        }
     }
 
     /// Collect plaintext `credentials.yaml` values that should OVERRIDE the
@@ -1281,30 +1287,28 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
             return self.yaml.get(key);
         }
         match self.keychain.get(key) {
-            Ok(Some(value)) => {
+            Ok(value) => {
                 let state = self.state.load()?;
                 if state.is_deleted(key) {
                     return Ok(None);
                 }
-                // Honor a hand-edited credentials.yaml plaintext value for a
-                // migrated key (BUG 7fc5) so single-key reads match the
-                // snapshot loader's precedence: file override beats keychain.
-                if state.migrated_keys.contains(key)
-                    && let Some(file_value) = self.yaml.get(key)?
+                // An existing native value only takes a file override after migration.
+                // A missing native value only imports an untracked file entry.
+                let migrated = state.migrated_keys.contains(key);
+                let consult_file = matches!((&value, migrated), (Some(_), true) | (None, false));
+                if consult_file
+                    && let Ok(file) = self.yaml.load_secondary()
+                    && let Some(legacy) = file.get(key)?.map(str::trim).filter(|v| !v.is_empty())
                 {
-                    let file_value = file_value.trim();
-                    if !file_value.is_empty() {
-                        return Ok(Some(file_value.to_string()));
-                    }
+                    return Ok(Some(legacy.to_owned()));
                 }
-                Ok(Some(value))
+                Ok(value)
             }
-            Ok(None) => self.get_filtered_yaml_fallback(key, None),
-            Err(e) if self.fallback_to_yaml => {
+            Err(error) if self.fallback_to_yaml => {
                 log::warn!(
-                    "OS credential store unavailable; reading YAML credential fallback: {e}"
+                    "OS credential store unavailable; reading YAML credential fallback: {error}"
                 );
-                self.get_filtered_yaml_fallback(key, Some(e))
+                self.load_filtered_yaml_fallback()?.get_owned(key)
             }
             Err(e) => Err(e),
         }
@@ -1853,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_keychain_with_empty_yaml_fallback_preserves_failure() {
+    fn fallback_distinguishes_missing_empty_and_unreadable_files() {
         let path =
             std::env::temp_dir().join(format!("canary-finch-path-{}.yaml", uuid::Uuid::new_v4()));
         let backend = DefaultCredentialBackend {
@@ -1864,33 +1868,250 @@ mod tests {
             fallback_to_yaml: true,
         };
         let _capture = crate::test_log_capture::ThreadLogCapture::start();
-        assert_closed(
+        for contents in [None, Some(""), Some("{}")] {
+            if let Some(contents) = contents {
+                fs::write(&path, contents).unwrap();
+            }
+            let snapshot = backend.load_with_source().unwrap();
+            assert_eq!(snapshot.source, "file_fallback");
+            assert_eq!(snapshot.store.present_count(), 0);
+            assert_eq!(backend.get("aws_region").unwrap(), None);
+        }
+        fs::write(&path, "canary-finch-prose").unwrap();
+        for error in [
             backend.load().unwrap_err(),
-            Code::StoreUnavailable,
-            &["canary-finch-path"],
-        );
-        assert!(!path.exists());
+            backend.get("aws_region").unwrap_err(),
+        ] {
+            assert_closed(
+                error,
+                Code::CorruptRecord,
+                &["canary-finch-path", "canary-finch-prose"],
+            );
+        }
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn invalid_migration_state_cannot_be_rewritten() {
+    fn unknown_migration_names_survive_updates_but_invalid_state_remains_fatal() {
         let path =
             std::env::temp_dir().join(format!("canary-thrush-path-{}.yaml", uuid::Uuid::new_v4()));
         let backend = CredentialMigrationStateBackend::with_path(&path);
-        let original = "deleted_keys: [canary-thrush-value]";
-        fs::write(&path, original).unwrap();
+        fs::write(&path, "deleted_keys: [canary-thrush-field]").unwrap();
         let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        backend.mark_migrated("aws_region").unwrap();
+        let persisted = backend.load().unwrap();
+        assert!(persisted.is_deleted("canary-thrush-field"));
+        assert!(persisted.migrated_keys.contains("aws_region"));
+        fs::write(&path, "canary-thrush-value").unwrap();
         assert_closed(
             backend.mark_deleted("aws_region").unwrap_err(),
             Code::CorruptRecord,
-            &["canary-thrush-path", "canary-thrush-value"],
+            &[
+                "canary-thrush-path",
+                "canary-thrush-value",
+                "canary-thrush-field",
+            ],
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "canary-thrush-value");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unreadable_secondary_yaml_never_blocks_keychain_reads_or_writes() {
+        let path =
+            std::env::temp_dir().join(format!("canary-pine-path-{}.yaml", uuid::Uuid::new_v4()));
+        let state_path = path.with_extension("state.yaml");
+        let fake = FakeKeychainStore::default();
+        fake.set_initial("aws_region", "canary-pine-old");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake),
+            yaml: YamlCredentialBackend::with_path(&path),
+            state: CredentialMigrationStateBackend::with_path(&state_path),
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+        fs::write(&path, "canary-pine-prose").unwrap();
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        assert_eq!(
+            backend.load().unwrap().aws_region.as_deref(),
+            Some("canary-pine-old")
+        );
+        let warning = backend
+            .load_with_source()
+            .unwrap()
+            .legacy_file_warning
+            .unwrap();
+        assert_closed(
+            warning,
+            Code::CorruptRecord,
+            &["canary-pine-path", "canary-pine-prose"],
+        );
+        backend.set("aws_region", "canary-pine-new").unwrap();
+        assert_eq!(
+            backend.get("aws_region").unwrap().as_deref(),
+            Some("canary-pine-new")
+        );
+        assert_eq!(backend.get("groq_api_key").unwrap(), None);
+        backend.delete("aws_region").unwrap();
+        assert_eq!(backend.get("aws_region").unwrap(), None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "canary-pine-prose");
+        crate::test_log_capture::assert_process_logs_exclude(&[
+            "canary-pine-prose",
+            "canary-pine-path",
+            "canary-pine-new",
+        ]);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(state_path).unwrap();
+    }
+
+    #[test]
+    fn read_remains_usable_when_bookkeeping_or_one_import_fails() {
+        let path =
+            std::env::temp_dir().join(format!("canary-elm-path-{}.yaml", uuid::Uuid::new_v4()));
+        let state_path = path.with_extension("state.yaml");
+        let blocked = state_path.with_extension("yaml.tmp");
+        fs::create_dir(&blocked).unwrap();
+        let fake = FakeKeychainStore {
+            reject_import: Some("aws_session_token"),
+            ..Default::default()
+        };
+        fake.set_initial("openai_api_key", "canary-elm-native");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake.clone()),
+            yaml: YamlCredentialBackend::with_path(&path),
+            state: CredentialMigrationStateBackend::with_path(&state_path),
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+        fs::write(
+            &path,
+            "aws_session_token: canary-elm-token\naws_region: canary-elm-region",
+        )
+        .unwrap();
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let snapshot = backend.load_with_source().unwrap();
+        assert_eq!(snapshot.source_for("openai_api_key"), "os_keychain");
+        assert_eq!(snapshot.source_for("aws_session_token"), "file_fallback");
+        assert_eq!(
+            snapshot.store.aws_session_token.as_deref(),
+            Some("canary-elm-token")
+        );
+        assert_eq!(snapshot.source_for("aws_region"), "imported_file");
+        assert_eq!(
+            fake.value("aws_region").as_deref(),
+            Some("canary-elm-region")
+        );
+        assert!(fake.value("aws_session_token").is_none());
+        let logs = crate::test_log_capture::render(&capture.finish());
+        assert!(logs.contains("credential/payload_too_large"));
+        assert!(logs.contains(
+            "Credential presence bookkeeping deferred: credential/legacy_cleanup_required"
+        ));
+        assert!(logs.contains(
+            "Credential import bookkeeping deferred: credential/legacy_cleanup_required"
+        ));
+        crate::test_log_capture::assert_process_logs_exclude(&[
+            "canary-elm-path",
+            "canary-elm-native",
+            "canary-elm-token",
+            "canary-elm-region",
+        ]);
+        fs::remove_dir(blocked).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn denied_yaml_read_preserves_the_file() {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo},
+            Security::{
+                ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl,
+                PROTECTED_DACL_SECURITY_INFORMATION,
+            },
+            Storage::FileSystem::WRITE_DAC,
+        };
+        let path =
+            std::env::temp_dir().join(format!("canary-birch-path-{}.yaml", uuid::Uuid::new_v4()));
+        let original = "aws_region: canary-birch-value";
+        fs::write(&path, original).unwrap();
+        // Hold the right to restore the ACL before denying subsequent read opens.
+        let file = fs::OpenOptions::new()
+            .access_mode(WRITE_DAC.0)
+            .open(&path)
+            .unwrap();
+        let mut acl = ACL::default();
+        // SAFETY: the empty ACL lives through SetSecurityInfo and the borrowed handle
+        // belongs to our unique temp file. A present, empty DACL denies data access.
+        unsafe {
+            InitializeAcl(&mut acl, std::mem::size_of::<ACL>() as u32, ACL_REVISION).unwrap();
+            SetSecurityInfo(
+                HANDLE(file.as_raw_handle()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&acl),
+                None,
+            )
+            .ok()
+            .unwrap();
+        }
+        let _capture = crate::test_log_capture::ThreadLogCapture::start();
+        let backend = YamlCredentialBackend::with_path(&path);
+        let read = backend.load();
+        let delete = backend.delete("aws_region");
+        harden_permissions(&path).unwrap();
+        drop(file);
+        assert_closed(
+            read.unwrap_err(),
+            Code::AccessDenied,
+            &["canary-birch-path", "canary-birch-value"],
+        );
+        assert_closed(
+            delete.unwrap_err(),
+            Code::AccessDenied,
+            &["canary-birch-path", "canary-birch-value"],
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         fs::remove_file(path).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn denied_yaml_read_preserves_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("canary-oak-path-{}.yaml", uuid::Uuid::new_v4()));
+        let original = "aws_region: canary-oak-value";
+        fs::write(&path, original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let backend = YamlCredentialBackend::with_path(&path);
+        // A privileged Unix runner can read mode 000. Exercise the denial where enforced.
+        if fs::File::open(&path).is_err() {
+            for err in [
+                backend.load().unwrap_err(),
+                backend.delete("aws_region").unwrap_err(),
+            ] {
+                assert_closed(
+                    err,
+                    Code::AccessDenied,
+                    &["canary-oak-path", "canary-oak-value"],
+                );
+            }
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_file(path).unwrap();
+        drop(capture);
+    }
+
     #[derive(Clone, Default)]
     struct FakeKeychainStore {
+        reject_import: Option<&'static str>,
         values: Rc<RefCell<BTreeMap<String, String>>>,
     }
 
@@ -1930,6 +2151,9 @@ mod tests {
         fn set_key(&self, key: &str, value: &str) -> Result<(), LegacyCredentialError> {
             if !is_allowed_key(key) {
                 return Err(LegacyCredentialError(Code::InvalidCredentialSet));
+            }
+            if self.reject_import == Some(key) {
+                return Err(LegacyCredentialError(Code::PayloadTooLarge));
             }
             self.values
                 .borrow_mut()
