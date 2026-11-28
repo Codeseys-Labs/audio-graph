@@ -22,20 +22,22 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
+use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
 use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm::engine::{ChatMessage, LlmChatParams, LlmStreamEvent};
-use crate::llm::http_diag::{diagnostic_path, response_request_id};
+use crate::llm::engine::{
+    ChatMessage, LlmChatParams, LlmStreamEvent, engine_failure, engine_not_loaded,
+};
+use crate::llm::http_diag::{HttpFailure, INFERENCE, diagnostic, same_origin_redirects};
 use crate::llm::openrouter::{
     DEFAULT_APP_TITLE, DEFAULT_HTTP_REFERER, OpenRouterConfig, OpenRouterRoutingPolicy,
 };
 use crate::llm::sse::{SseDecoder, SseEvent, StreamChunk};
 pub use crate::llm::stream_contract::{
-    StreamBackendHandles, StreamChatRequest, StreamContextMetadata, StreamParams,
+    FinishReason, StreamBackendHandles, StreamChatRequest, StreamContextMetadata, StreamParams,
     StreamSourceMetadata, StreamTerminalEvent, StreamTerminalReason, StreamUsage,
 };
 use crate::settings::LlmProvider;
@@ -56,20 +58,25 @@ pub enum TokenDelta {
         finish_reason: Option<String>,
     },
     /// Final terminator on success. `usage` is populated when the provider
-    /// honoured `stream_options.include_usage`. `finish_reason` carries the
-    /// last non-null `choices[0].finish_reason` from the SSE stream — usually
-    /// `"stop"`, sometimes `"length"` (truncated by max_tokens), `"content_filter"`,
-    /// or `"tool_calls"`. Defaults to `"stop"` if the stream ends without
-    /// the provider declaring one (some providers omit it on `[DONE]`).
+    /// honoured `stream_options.include_usage`. `finish_reason` is always a
+    /// [`FinishReason`] token (`"stop"`, `"length"`, `"content_filter"`,
+    /// `"tool_calls"`, `"unknown"`), never the provider's raw value. A turn the
+    /// provider finished with `"error"` is an [`Self::Error`], not a `Done`.
+    /// Defaults to `"stop"` if the stream ends without the provider declaring
+    /// one (some providers omit it on `[DONE]`).
     Done {
         full_text: String,
         usage: Option<StreamUsage>,
         finish_reason: String,
     },
-    /// Stream errored mid-flight (network drop, HTTP non-2xx, malformed
-    /// JSON, etc.). `full_text` is whatever was accumulated before the
-    /// error so the caller can show a partial reply rather than nothing.
-    Error { message: String, full_text: String },
+    /// Stream failed (network drop, HTTP non-2xx, provider fault, engine
+    /// failure). `diagnostic` is the closed, typed failure. `full_text` is
+    /// whatever was accumulated before the failure so the caller can show a
+    /// partial reply rather than nothing.
+    Error {
+        diagnostic: RuntimeDiagnostic,
+        full_text: String,
+    },
     /// Caller invoked the cancel token. The stream task drops the HTTP
     /// connection and emits this as its terminal frame so the consumer
     /// can finalize the chat message with `finish_reason: "cancelled"`.
@@ -85,10 +92,10 @@ impl TokenDelta {
             StreamTerminalReason::Done { finish_reason } => Self::Done {
                 full_text: event.full_text,
                 usage: event.usage,
-                finish_reason,
+                finish_reason: finish_reason.as_str().to_string(),
             },
-            StreamTerminalReason::Error { message } => Self::Error {
-                message,
+            StreamTerminalReason::Diagnostic(diagnostic) => Self::Error {
+                diagnostic,
                 full_text: event.full_text,
             },
             StreamTerminalReason::Cancelled => Self::Cancelled {
@@ -104,11 +111,11 @@ impl TokenDelta {
 /// rather than passing the full `LlmProvider` enum down through the SSE
 /// loop, so the loop itself stays provider-agnostic.
 struct StreamRequest {
-    provider: &'static str,
     url: String,
     headers: Vec<(String, String)>,
     body: serde_json::Value,
-    secrets: Vec<String>,
+    /// Whether the request carries a provider credential.
+    credential_sent: bool,
 }
 
 /// Build an OpenAI-style chat-completion `messages` array from the chat
@@ -154,7 +161,10 @@ fn build_api_request(
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
     let mut headers = Vec::with_capacity(2);
     headers.push(("Content-Type".to_string(), "application/json".to_string()));
-    if !api_key.is_empty() {
+    // A whitespace-only key is no key, as in the blocking client.
+    let api_key = api_key.trim();
+    let credential_sent = !api_key.is_empty();
+    if credential_sent {
         headers.push(("Authorization".to_string(), format!("Bearer {}", api_key)));
     }
     let body = serde_json::json!({
@@ -165,16 +175,11 @@ fn build_api_request(
         "stream": true,
         "stream_options": { "include_usage": true },
     });
-    let secrets = (!api_key.is_empty())
-        .then(|| api_key.to_string())
-        .into_iter()
-        .collect();
     StreamRequest {
-        provider: "api",
         url,
         headers,
         body,
-        secrets,
+        credential_sent,
     }
 }
 
@@ -211,11 +216,10 @@ fn build_openrouter_request(
         body["provider"] = provider;
     }
     StreamRequest {
-        provider: "openrouter",
         url,
         headers,
         body,
-        secrets: vec![config.api_key.clone()],
+        credential_sent: !config.api_key.trim().is_empty(),
     }
 }
 
@@ -245,7 +249,7 @@ fn openrouter_routing_policy_from_backend_handles(
 /// `ConverseStream` adapter and remains deferred.
 fn build_request_for_provider(
     request: &StreamChatRequest,
-) -> Result<Option<StreamRequest>, String> {
+) -> Result<Option<StreamRequest>, RuntimeDiagnostic> {
     check_streaming_http_content_egress(request)?;
 
     let StreamParams {
@@ -308,13 +312,18 @@ fn streaming_http_provider_policy_name(provider: &LlmProvider) -> Option<&'stati
     }
 }
 
-fn check_streaming_http_content_egress(request: &StreamChatRequest) -> Result<(), String> {
+fn check_streaming_http_content_egress(
+    request: &StreamChatRequest,
+) -> Result<(), RuntimeDiagnostic> {
     let Some(provider) = streaming_http_provider_policy_name(&request.provider) else {
         return Ok(());
     };
 
-    request.content_egress_policy.check_prompt(provider)?;
-    request.content_egress_policy.check_json(provider)
+    request
+        .content_egress_policy
+        .check_prompt(provider)
+        .and_then(|()| request.content_egress_policy.check_json(provider))
+        .map_err(|_| diagnostic(Code::PolicyBlocked, INFERENCE))
 }
 
 /// Spawn a background tokio task that streams chat tokens for `provider`
@@ -385,14 +394,19 @@ pub fn stream_chat_with_request(
         {
             // Honor the same content-egress policy gate the SSE path applies
             // before any cloud request leaves the machine.
-            if let Err(message) = request
+            if request
                 .content_egress_policy
                 .check_prompt("llm.aws_bedrock")
                 .and_then(|()| request.content_egress_policy.check_json("llm.aws_bedrock"))
+                .is_err()
             {
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::error(message, String::new(), metadata),
+                    StreamTerminalEvent::failure(
+                        crate::llm::bedrock::policy_blocked(),
+                        String::new(),
+                        metadata,
+                    ),
                 )
                 .await;
                 return;
@@ -417,22 +431,21 @@ pub fn stream_chat_with_request(
         let stream_request = match build_request_for_provider(&request) {
             Ok(Some(r)) => r,
             Ok(None) => {
-                let _ = tx
-                    .send(TokenDelta::from_terminal_event(StreamTerminalEvent::error(
-                        format!(
-                            "Streaming chat not supported for provider {}.",
-                            provider_name(&request.provider)
-                        ),
-                        String::new(),
-                        metadata,
-                    )))
-                    .await;
-                return;
-            }
-            Err(message) => {
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::error(message, String::new(), metadata),
+                    StreamTerminalEvent::failure(
+                        diagnostic(Code::Unsupported, INFERENCE),
+                        String::new(),
+                        metadata,
+                    ),
+                )
+                .await;
+                return;
+            }
+            Err(diagnostic) => {
+                send_terminal(
+                    &tx,
+                    StreamTerminalEvent::failure(diagnostic, String::new(), metadata),
                 )
                 .await;
                 return;
@@ -442,17 +455,6 @@ pub fn stream_chat_with_request(
     });
 
     (rx, cancel)
-}
-
-/// Short string identifier for a provider, used only in error messages.
-fn provider_name(p: &LlmProvider) -> &'static str {
-    match p {
-        LlmProvider::Api { .. } => "Api",
-        LlmProvider::OpenRouter { .. } => "OpenRouter",
-        LlmProvider::LocalLlama => "LocalLlama",
-        LlmProvider::MistralRs { .. } => "MistralRs",
-        LlmProvider::AwsBedrock { .. } => "AwsBedrock",
-    }
 }
 
 async fn send_terminal(tx: &mpsc::Sender<TokenDelta>, event: StreamTerminalEvent) {
@@ -489,35 +491,26 @@ async fn run_local_llama_stream(
     }
 
     let Some(local_llama) = request.backend_handles.local_llama.clone() else {
+        // The caller did not pass the engine handle with the request.
         send_terminal(
             &tx,
-            StreamTerminalEvent::error(
-                "LocalLlama streaming requires StreamBackendHandles.local_llama; pass the explicit loaded local engine handle with StreamChatRequest instead of relying on AppState globals."
-                    .to_string(),
-                String::new(),
-                metadata,
-            ),
+            StreamTerminalEvent::failure(engine_failure(Code::Internal), String::new(), metadata),
         )
         .await;
         return;
     };
 
-    let engine = {
-        match local_llama.lock() {
-            Ok(guard) => guard.as_ref().cloned().ok_or_else(|| {
-                "LocalLlama engine is not loaded; load a local LLM model before starting streaming chat."
-                    .to_string()
-            }),
-            Err(e) => Err(format!("LocalLlama engine lock failed: {}", e)),
-        }
+    let engine = match local_llama.lock() {
+        Ok(guard) => guard.as_ref().cloned().ok_or(engine_not_loaded()),
+        Err(_) => Err(engine_failure(Code::Internal)),
     };
 
     let engine = match engine {
         Ok(engine) => engine,
-        Err(message) => {
+        Err(diagnostic) => {
             send_terminal(
                 &tx,
-                StreamTerminalEvent::error(message, String::new(), metadata),
+                StreamTerminalEvent::failure(diagnostic, String::new(), metadata),
             )
             .await;
             return;
@@ -528,8 +521,8 @@ async fn run_local_llama_stream(
         max_tokens: request.params.max_tokens,
         temperature: request.params.temperature,
     };
-    let (event_tx, mut event_rx) = mpsc::channel(64);
-    if let Err(message) = engine.stream_chat(
+    let (event_tx, event_rx) = mpsc::channel(64);
+    if let Err(diagnostic) = engine.stream_chat(
         request.history,
         request.graph_context,
         local_params,
@@ -538,64 +531,13 @@ async fn run_local_llama_stream(
     ) {
         send_terminal(
             &tx,
-            StreamTerminalEvent::error(message, String::new(), metadata),
+            StreamTerminalEvent::failure(diagnostic, String::new(), metadata),
         )
         .await;
         return;
     }
 
-    while let Some(event) = event_rx.recv().await {
-        match event {
-            LlmStreamEvent::Delta { content } => {
-                if tx
-                    .send(TokenDelta::Delta {
-                        content,
-                        finish_reason: None,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            LlmStreamEvent::Done {
-                full_text,
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-            } => {
-                let usage = local_usage_from_done(prompt_tokens, completion_tokens, total_tokens);
-                send_terminal(
-                    &tx,
-                    StreamTerminalEvent::done(full_text, usage, "stop".to_string(), metadata),
-                )
-                .await;
-                return;
-            }
-            LlmStreamEvent::Cancelled { full_text } => {
-                send_terminal(&tx, StreamTerminalEvent::cancelled(full_text, metadata)).await;
-                return;
-            }
-            LlmStreamEvent::Error { message, full_text } => {
-                send_terminal(
-                    &tx,
-                    StreamTerminalEvent::error(message, full_text, metadata),
-                )
-                .await;
-                return;
-            }
-        }
-    }
-
-    send_terminal(
-        &tx,
-        StreamTerminalEvent::error(
-            "LocalLlama engine stream ended without a terminal frame".to_string(),
-            String::new(),
-            metadata,
-        ),
-    )
-    .await;
+    drain_engine_stream_events(event_rx, &tx, metadata).await;
 }
 
 /// mistral.rs (Candle GGUF) streaming adapter.
@@ -618,14 +560,10 @@ async fn run_mistralrs_stream(
     }
 
     let Some(mistralrs) = request.backend_handles.mistralrs_engine.clone() else {
+        // The caller did not pass the engine handle with the request.
         send_terminal(
             &tx,
-            StreamTerminalEvent::error(
-                "MistralRs streaming requires StreamBackendHandles.mistralrs_engine; pass the explicit loaded mistral.rs engine handle with StreamChatRequest instead of relying on AppState globals."
-                    .to_string(),
-                String::new(),
-                metadata,
-            ),
+            StreamTerminalEvent::failure(engine_failure(Code::Internal), String::new(), metadata),
         )
         .await;
         return;
@@ -652,9 +590,9 @@ async fn run_mistralrs_stream(
     tokio::task::spawn_blocking(move || {
         let guard = match mistralrs.lock() {
             Ok(guard) => guard,
-            Err(e) => {
+            Err(_) => {
                 let _ = engine_tx.blocking_send(LlmStreamEvent::Error {
-                    message: format!("MistralRs engine lock failed: {}", e),
+                    diagnostic: engine_failure(Code::Internal),
                     full_text: String::new(),
                 });
                 return;
@@ -662,14 +600,12 @@ async fn run_mistralrs_stream(
         };
         let Some(engine) = guard.as_ref() else {
             let _ = engine_tx.blocking_send(LlmStreamEvent::Error {
-                message:
-                    "MistralRs engine is not loaded; load a local LLM model before starting streaming chat."
-                        .to_string(),
+                diagnostic: engine_not_loaded(),
                 full_text: String::new(),
             });
             return;
         };
-        if let Err(message) = engine.stream_chat(
+        if let Err(diagnostic) = engine.stream_chat(
             history,
             graph_context,
             mistralrs_params,
@@ -677,7 +613,7 @@ async fn run_mistralrs_stream(
             engine_tx.clone(),
         ) {
             let _ = engine_tx.blocking_send(LlmStreamEvent::Error {
-                message,
+                diagnostic,
                 full_text: String::new(),
             });
         }
@@ -686,34 +622,31 @@ async fn run_mistralrs_stream(
     // clone so the channel closes once the blocking task finishes.
     drop(event_tx);
 
-    drain_engine_stream_events(
-        event_rx,
-        &tx,
-        metadata,
-        "MistralRs engine stream ended without a terminal frame",
-    )
-    .await;
+    drain_engine_stream_events(event_rx, &tx, metadata).await;
 }
 
 /// Drain an engine-owned [`LlmStreamEvent`] channel into [`TokenDelta`] frames.
 ///
-/// Shared by the local-engine adapters (mistral.rs today; the llama path keeps
-/// its own inline copy for now). Each `Delta` forwards one content fragment;
-/// the first `Done` / `Cancelled` / `Error` emits exactly one terminal frame and
-/// returns. If the channel closes with no terminal frame (the engine dropped its
-/// sender mid-stream), `ended_without_terminal` is surfaced as a single terminal
-/// `Error` so the consumer never blocks waiting for a terminator that never
+/// Shared by both local-engine adapters. Each `Delta` forwards one content
+/// fragment; the first `Done` / `Cancelled` / `Error` emits exactly one terminal
+/// frame and returns. If the channel closes with no terminal frame (the engine
+/// dropped its sender mid-stream), a single terminal `internal` failure is
+/// emitted so the consumer never blocks waiting for a terminator that never
 /// arrives. Sending stops early (without a terminal) only if the consumer has
 /// already dropped its receiver — there is then no one to deliver to.
+///
+/// The consumer replaces what it showed with the terminal's text, so a failure
+/// that brings no text of its own carries the fragments already forwarded.
 async fn drain_engine_stream_events(
     mut event_rx: mpsc::Receiver<LlmStreamEvent>,
     tx: &mpsc::Sender<TokenDelta>,
     metadata: StreamContextMetadata,
-    ended_without_terminal: &str,
 ) {
+    let mut forwarded = String::new();
     while let Some(event) = event_rx.recv().await {
         match event {
             LlmStreamEvent::Delta { content } => {
+                forwarded.push_str(&content);
                 if tx
                     .send(TokenDelta::Delta {
                         content,
@@ -727,6 +660,7 @@ async fn drain_engine_stream_events(
             }
             LlmStreamEvent::Done {
                 full_text,
+                finish_reason,
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
@@ -734,7 +668,7 @@ async fn drain_engine_stream_events(
                 let usage = local_usage_from_done(prompt_tokens, completion_tokens, total_tokens);
                 send_terminal(
                     tx,
-                    StreamTerminalEvent::done(full_text, usage, "stop".to_string(), metadata),
+                    StreamTerminalEvent::done(full_text, usage, finish_reason, metadata),
                 )
                 .await;
                 return;
@@ -743,8 +677,20 @@ async fn drain_engine_stream_events(
                 send_terminal(tx, StreamTerminalEvent::cancelled(full_text, metadata)).await;
                 return;
             }
-            LlmStreamEvent::Error { message, full_text } => {
-                send_terminal(tx, StreamTerminalEvent::error(message, full_text, metadata)).await;
+            LlmStreamEvent::Error {
+                diagnostic,
+                full_text,
+            } => {
+                let full_text = if full_text.is_empty() {
+                    forwarded
+                } else {
+                    full_text
+                };
+                send_terminal(
+                    tx,
+                    StreamTerminalEvent::failure(diagnostic, full_text, metadata),
+                )
+                .await;
                 return;
             }
         }
@@ -752,7 +698,7 @@ async fn drain_engine_stream_events(
 
     send_terminal(
         tx,
-        StreamTerminalEvent::error(ended_without_terminal.to_string(), String::new(), metadata),
+        StreamTerminalEvent::failure(engine_failure(Code::Internal), forwarded, metadata),
     )
     .await;
 }
@@ -764,8 +710,9 @@ async fn drain_engine_stream_events(
 /// 3. Push each chunk into [`SseDecoder`]; for every emitted `data:` frame,
 ///    parse it as a [`StreamChunk`] and forward each non-empty
 ///    `choices[0].delta.content` as a [`TokenDelta::Delta`].
-/// 4. Terminate on `data: [DONE]` or `finish_reason` ≠ `null` with
-///    [`TokenDelta::Done`].
+/// 4. Terminate with [`TokenDelta::Done`] on `data: [DONE]`, or when the body
+///    ends after a `finish_reason`. A body that ends with neither marker was
+///    cut off and terminates with [`TokenDelta::Error`].
 ///
 /// All early exits (HTTP non-2xx, network error, malformed JSON, cancel
 /// token tripped) emit exactly one terminal frame, so the consumer side
@@ -778,14 +725,15 @@ async fn run_sse_stream(
 ) {
     let client = match reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
+        .redirect(same_origin_redirects())
         .build()
     {
         Ok(c) => c,
-        Err(e) => {
+        Err(_) => {
             send_terminal(
                 &tx,
-                StreamTerminalEvent::error(
-                    format!("Failed to build HTTP client: {}", e),
+                StreamTerminalEvent::failure(
+                    RuntimeDiagnostic::internal(INFERENCE),
                     String::new(),
                     metadata,
                 ),
@@ -818,34 +766,21 @@ async fn run_sse_stream(
         result = req.send() => match result {
             Ok(r) => r,
             Err(e) => {
-                let message = crate::error::redacted_error_excerpt(
-                    &format!("HTTP request failed: {}", e),
-                    request.secrets.iter().map(String::as_str),
-                    500,
-                );
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::error(message, String::new(), metadata),
+                    StreamTerminalEvent::failure(HttpFailure::request(&e, INFERENCE).diagnostic, String::new(), metadata),
                 ).await;
                 return;
             }
         }
     };
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let request_id = response_request_id(resp.headers());
-        let body = resp.text().await.unwrap_or_default();
+    let status = resp.status();
+    if !status.is_success() {
         send_terminal(
             &tx,
-            StreamTerminalEvent::error(
-                streaming_http_error_message(
-                    request.provider,
-                    &request.url,
-                    status,
-                    &body,
-                    request_id.as_deref(),
-                ),
+            StreamTerminalEvent::failure(
+                HttpFailure::status(status, INFERENCE, request.credential_sent).diagnostic,
                 String::new(),
                 metadata,
             ),
@@ -854,11 +789,10 @@ async fn run_sse_stream(
         return;
     }
 
-    let mut decoder = SseDecoder::new();
+    let mut decoder = SseDecoder::new().with_credential_sent(request.credential_sent);
     let mut full_text = String::new();
     let mut usage: Option<StreamUsage> = None;
-    let mut last_finish_reason: Option<String> = None;
-    let response_request_id = response_request_id(resp.headers());
+    let mut last_finish_reason: Option<FinishReason> = None;
     let mut byte_stream = resp.bytes_stream();
 
     loop {
@@ -874,28 +808,30 @@ async fn run_sse_stream(
             chunk = byte_stream.next() => chunk,
         };
 
-        let bytes: Bytes = match next_chunk {
-            Some(Ok(b)) => b,
+        let ended = match next_chunk {
+            Some(Ok(bytes)) => {
+                decoder.feed(&bytes);
+                false
+            }
             Some(Err(e)) => {
-                // Route the transport read error through the safe helper: a
-                // reqwest stream error Displays the request URL, which can
-                // embed userinfo / query credentials, and any registered
-                // provider secret could otherwise surface verbatim here.
-                let message = crate::error::redacted_error_excerpt(
-                    &format!("Stream read error: {}", e),
-                    request.secrets.iter().map(String::as_str),
-                    500,
-                );
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::error(message, full_text, metadata),
+                    StreamTerminalEvent::failure(
+                        HttpFailure::response(&e, INFERENCE).diagnostic,
+                        full_text,
+                        metadata,
+                    ),
                 )
                 .await;
                 return;
             }
-            None => break, // server closed the connection cleanly
+            // The server closed the connection cleanly. What is still buffered
+            // is its last event, sent without the blank line that ends one.
+            None => {
+                decoder.end_of_input();
+                true
+            }
         };
-        decoder.feed(&bytes);
 
         loop {
             match decoder.next_event() {
@@ -906,24 +842,17 @@ async fn run_sse_stream(
                         StreamTerminalEvent::done(
                             std::mem::take(&mut full_text),
                             usage.take(),
-                            last_finish_reason
-                                .take()
-                                .unwrap_or_else(|| "stop".to_string()),
+                            last_finish_reason.take().unwrap_or(FinishReason::Stop),
                             metadata,
                         ),
                     )
                     .await;
                     return;
                 }
-                Some(SseEvent::Error(message)) => {
-                    let message = crate::error::redacted_error_excerpt(
-                        &message,
-                        request.secrets.iter().map(String::as_str),
-                        500,
-                    );
+                Some(SseEvent::Error(diagnostic)) => {
                     send_terminal(
                         &tx,
-                        StreamTerminalEvent::error(message, full_text, metadata),
+                        StreamTerminalEvent::failure(diagnostic, full_text, metadata),
                     )
                     .await;
                     return;
@@ -942,14 +871,21 @@ async fn run_sse_stream(
                                 usage = Some(u);
                             }
                             for choice in &chunk.choices {
-                                // Capture the last non-null finish_reason — the
-                                // provider sends it on the chunk that ends the
-                                // generation (often the same chunk as the last
-                                // delta content, but sometimes a separate trailer).
-                                if let Some(reason) = choice.finish_reason.as_deref()
-                                    && !reason.is_empty()
+                                // Normalize the provider's value once, here, so
+                                // neither frame can carry it raw. The last
+                                // non-blank one wins: it often rides the final
+                                // delta, sometimes a separate trailer.
+                                let finish_reason = choice
+                                    .finish_reason
+                                    .as_deref()
+                                    .filter(|reason| !reason.trim().is_empty())
+                                    .map(FinishReason::from_provider);
+                                // Except over `error`: a turn the provider
+                                // called failed stays failed whatever follows.
+                                if finish_reason.is_some()
+                                    && last_finish_reason != Some(FinishReason::Error)
                                 {
-                                    last_finish_reason = Some(reason.to_string());
+                                    last_finish_reason = finish_reason;
                                 }
                                 if let Some(content) = choice.delta.content.as_deref()
                                     && !content.is_empty()
@@ -958,7 +894,8 @@ async fn run_sse_stream(
                                     if tx
                                         .send(TokenDelta::Delta {
                                             content: content.to_string(),
-                                            finish_reason: choice.finish_reason.clone(),
+                                            finish_reason: finish_reason
+                                                .map(|reason| reason.as_str().to_string()),
                                         })
                                         .await
                                         .is_err()
@@ -969,86 +906,33 @@ async fn run_sse_stream(
                                 }
                             }
                         }
-                        Err(e) => {
+                        Err(_) => {
                             log::warn!(
-                                "{}",
-                                streaming_parse_error_message(
-                                    request.provider,
-                                    &request.url,
-                                    &e,
-                                    &payload,
-                                    response_request_id.as_deref(),
-                                )
+                                "Ignoring malformed SSE chunk: {}",
+                                diagnostic(Code::InvalidResponse, INFERENCE)
                             );
                         }
                     }
                 }
             }
         }
+        if ended {
+            break;
+        }
     }
 
-    // Stream ended without an explicit `[DONE]` (some providers do this):
-    // emit a Done with whatever we accumulated.
-    send_terminal(
-        &tx,
-        StreamTerminalEvent::done(
+    // The body ended without `[DONE]`. A server that sent a `finish_reason`
+    // and then closed has finished its turn. One that sent neither marker was
+    // cut off: what arrived is a partial reply, not an answer.
+    let terminal = match last_finish_reason {
+        Some(finish_reason) => StreamTerminalEvent::done(full_text, usage, finish_reason, metadata),
+        None => StreamTerminalEvent::failure(
+            diagnostic(Code::InvalidResponse, INFERENCE),
             full_text,
-            usage,
-            last_finish_reason.unwrap_or_else(|| "stop".to_string()),
             metadata,
         ),
-    )
-    .await;
-}
-
-fn streaming_http_error_message(
-    provider: &str,
-    url: &str,
-    status: reqwest::StatusCode,
-    body: &str,
-    request_id: Option<&str>,
-) -> String {
-    format!(
-        "Streaming chat HTTP error: provider={} path={} status={} body_bytes={} body_chars={}{}",
-        provider,
-        diagnostic_path(url),
-        status.as_u16(),
-        body.len(),
-        body.chars().count(),
-        request_id
-            .map(|id| format!(" request_id={id}"))
-            .unwrap_or_default()
-    )
-}
-
-fn streaming_parse_error_message(
-    provider: &str,
-    url: &str,
-    error: &serde_json::Error,
-    payload: &str,
-    request_id: Option<&str>,
-) -> String {
-    format!(
-        "Failed to parse streaming chunk: provider={} path={} class={} detail={} payload_bytes={} payload_chars={}{}",
-        provider,
-        diagnostic_path(url),
-        json_error_class(error),
-        error,
-        payload.len(),
-        payload.chars().count(),
-        request_id
-            .map(|id| format!(" request_id={id}"))
-            .unwrap_or_default()
-    )
-}
-
-fn json_error_class(error: &serde_json::Error) -> &'static str {
-    match error.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "data",
-        serde_json::error::Category::Eof => "eof",
-    }
+    };
+    send_terminal(&tx, terminal).await;
 }
 
 /// In-memory request_id → cancel token registry.
@@ -1170,9 +1054,11 @@ pub enum ChatStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         finish_reason: Option<String>,
     },
-    /// Terminal frame, sent exactly once per stream (normal stop / error /
-    /// cancel), carrying the authoritative `full_text` + optional `usage`.
-    /// Mirrors the legacy `chat-token-done` payload.
+    /// Terminal frame, sent exactly once per stream, carrying the
+    /// authoritative `full_text` + optional `usage`. `finish_reason` is the
+    /// closed [`FinishReason`] token of a completed turn, `"cancelled"` for a
+    /// cancelled one, and `"error: runtime/<code>"` for a failed one. Mirrors
+    /// the legacy `chat-token-done` payload.
     #[serde(rename = "done")]
     Done {
         request_id: String,
@@ -1228,9 +1114,14 @@ mod tests {
         format!("http://{}", addr)
     }
 
-    async fn spawn_http_error_mock(status: u16, status_text: &'static str, body: String) -> String {
+    async fn spawn_http_error_mock(
+        status: u16,
+        status_text: &'static str,
+        body: String,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
+        let (keep_open, closed) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let mut buf = vec![0u8; 4096];
@@ -1250,14 +1141,16 @@ mod tests {
                     "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nX-Request-Id: stream_req_123\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     status,
                     status_text,
-                    body.len(),
+                    body.len() + 1,
                     body,
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
+                // Keep the body incomplete until the test has seen the
+                // terminal frame. Reading the body would block that frame.
+                let _ = closed.await;
             }
         });
-        format!("http://{}", addr)
+        (format!("http://{}", addr), keep_open)
     }
 
     /// Mock that streams the payload byte-by-byte with delays so the cancel
@@ -1370,8 +1263,8 @@ mod tests {
                     );
                     break;
                 }
-                TokenDelta::Error { message, .. } => {
-                    panic!("unexpected error: {message}");
+                TokenDelta::Error { diagnostic, .. } => {
+                    panic!("unexpected error: {diagnostic}");
                 }
                 TokenDelta::Cancelled { .. } => panic!("unexpected cancel"),
             }
@@ -1384,13 +1277,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_chat_http_error_uses_metadata_only_diagnostic() {
+    async fn stream_chat_rejects_non_2xx_without_waiting_for_error_body() {
         let api_key = "sk-stream-chat-secret";
         let prompt_echo = "patient transcript and private graph context";
         let body = format!(
             r#"{{"error":"bad auth {api_key}; {prompt_echo}","authorization":"Bearer bearer-stream-secret-12345","aws":"AKIA1234567890ABCDEF"}}"#
         );
-        let base = spawn_http_error_mock(401, "Unauthorized", body).await;
+        let (base, _keep_open) = spawn_http_error_mock(401, "Unauthorized", body).await;
         let provider = LlmProvider::Api {
             endpoint: base,
             api_key: api_key.to_string(),
@@ -1404,126 +1297,375 @@ mod tests {
             StreamParams::default(),
         ));
 
-        match rx.recv().await.expect("terminal frame") {
-            TokenDelta::Error { message, .. } => {
-                assert!(message.contains("Streaming chat HTTP error"));
-                assert!(message.contains("provider=api"));
-                assert!(message.contains("path=/chat/completions"));
-                assert!(message.contains("status=401"));
-                assert!(message.contains("request_id=stream_req_123"));
-                assert!(
-                    message.contains("body_bytes="),
-                    "error must carry body byte length, got: {message}"
-                );
-                assert!(
-                    message.contains("body_chars="),
-                    "error must carry body char length, got: {message}"
-                );
-                assert!(
-                    !message.contains("bad auth") && !message.contains(prompt_echo),
-                    "streaming error must not echo provider body or prompt context: {message}"
-                );
-                for leaked in [
-                    api_key,
-                    "bearer-stream-secret-12345",
-                    "AKIA1234567890ABCDEF",
-                ] {
-                    assert!(
-                        !message.contains(leaked),
-                        "streaming error leaked {leaked}: {message}"
-                    );
-                }
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("non-2xx must not wait for the body")
+            .expect("terminal frame")
+        {
+            // The request carried a key, so the 401 is about that credential.
+            TokenDelta::Error { diagnostic, .. } => {
+                assert_eq!(diagnostic.to_string(), "runtime/credential_rejected")
             }
             other => panic!("expected HTTP error terminal frame, got {other:?}"),
         }
     }
 
-    /// The streaming HTTP-error diagnostic must be metadata-only: it emits only
-    /// the URL *path* (never the query string or userinfo) plus body byte/char
-    /// counts, so no credential shape — API-key-like, bearer-token-like,
-    /// AWS-access-key-like, or URL userinfo/query credential — can reach the
-    /// UI-visible `TokenDelta::Error`, even when the provider echoes them in the
-    /// response body or they ride in the request URL.
-    #[test]
-    fn streaming_http_error_diagnostic_never_surfaces_any_credential_shape() {
-        let body = concat!(
-            r#"{"error":"echoed provider body; patient transcript","#,
-            r#""api_key":"sk-stream-body-secret-12345","#,
-            r#""authorization":"Bearer bearer-stream-body-secret-12345","#,
-            r#""aws":"AKIA1234567890ABCDEF"}"#,
-        );
-        // Assemble the userinfo at runtime so the source carries no contiguous
-        // scheme://user:pass@host literal (which secret scanners flag as a Basic
-        // Auth String); the runtime URL is byte-identical, so the redaction
-        // assertions below still exercise a real credential-bearing URL.
-        let userinfo = format!("{}:{}", "svc-user", "svc-pass");
-        let url = format!(
-            "https://{userinfo}@provider.example/v1/chat/completions?api_key=stream-url-secret-12345&token=stream-url-token-12345"
-        );
-        let message = streaming_http_error_message(
-            "api",
-            &url,
-            reqwest::StatusCode::UNAUTHORIZED,
-            body,
-            Some("stream_req_xyz"),
-        );
+    #[tokio::test]
+    async fn malformed_chunk_and_provider_error_do_not_leak_content() {
+        use crate::llm::http_diag::canary::assert_absent;
+        use crate::test_log_capture::{ThreadLogCapture, render};
 
-        // Metadata context is preserved.
-        assert!(message.contains("Streaming chat HTTP error"));
-        assert!(message.contains("provider=api"));
-        assert!(message.contains("path=/v1/chat/completions"));
-        assert!(message.contains("status=401"));
-        assert!(message.contains("request_id=stream_req_xyz"));
-        assert!(message.contains(&format!("body_bytes={}", body.len())));
-        assert!(message.contains(&format!("body_chars={}", body.chars().count())));
-
-        // No credential shape, body content, or URL query/userinfo leaks.
-        for leaked in [
-            "sk-stream-body-secret-12345",
-            "bearer-stream-body-secret-12345",
-            "AKIA1234567890ABCDEF",
-            "svc-user:svc-pass",
-            "stream-url-secret-12345",
-            "stream-url-token-12345",
-            "echoed provider body",
-            "patient transcript",
-            "api_key=",
-            "token=",
+        let key = "sse-credential-canary";
+        let prompt = format!("sse-prompt-canary{}", "x".repeat(2048));
+        let malformed = format!(
+            "{{\"choices\":\"sse-malformed-chunk-canary{}\"}}",
+            "y".repeat(3000)
+        );
+        let provider_message = format!("sse-provider-body-canary {key} {prompt}");
+        // A named error event with no code, then an error envelope on a plain
+        // data frame whose code classifies it. Neither message goes anywhere.
+        for (fault, expected) in [
+            (
+                format!("event: error\ndata: {{\"error\":\"{provider_message}\"}}\n\n"),
+                "runtime/internal",
+            ),
+            (
+                format!(
+                    "data: {{\"error\":{{\"code\":\"rate_limit_exceeded\",\
+                     \"message\":\"{provider_message}\"}}}}\n\n"
+                ),
+                "runtime/rate_limited",
+            ),
         ] {
+            let body = format!("data: {malformed}\n\n{fault}");
+            // Exact sizes of the prompt, the malformed chunk, and the whole body.
+            let lengths = [prompt.len(), malformed.len(), body.len()].map(|len| len.to_string());
+            let base = spawn_sse_mock_owned(body).await;
+            let capture = ThreadLogCapture::start();
+            let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
+                LlmProvider::Api {
+                    endpoint: format!("{base}/sse-path-canary?private=sse-query-canary"),
+                    api_key: key.to_owned(),
+                    model: "test-model".to_owned(),
+                },
+                vec![ChatMessage {
+                    role: "user".to_owned(),
+                    content: prompt.clone(),
+                }],
+                String::new(),
+                StreamParams::default(),
+            ));
+            let terminal = rx.recv().await.expect("terminal frame");
+            assert!(rx.recv().await.is_none());
+            let logs = render(&capture.finish());
             assert!(
-                !message.contains(leaked),
-                "streaming HTTP diagnostic leaked {leaked}: {message}"
+                matches!(&terminal, TokenDelta::Error { diagnostic, full_text }
+                    if diagnostic.to_string() == expected && full_text.is_empty()),
+                "{terminal:?}"
+            );
+            // The malformed chunk was logged, by diagnostic token only.
+            assert!(
+                logs.contains("Ignoring malformed SSE chunk: runtime/invalid_response"),
+                "{logs}"
+            );
+            let observed = format!("{terminal:?}\n{logs}");
+            assert_absent(
+                &observed,
+                &[
+                    key,
+                    "sse-prompt-canary",
+                    "sse-malformed-chunk-canary",
+                    "sse-provider-body-canary",
+                    "sse-request-canary",
+                    "sse-path-canary",
+                    "sse-query-canary",
+                ],
+            );
+            assert_absent(&observed, &lengths.each_ref().map(String::as_str));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_finish_reason_never_reaches_a_frame_or_a_log() {
+        use crate::llm::http_diag::canary::assert_absent;
+        use crate::test_log_capture::{ThreadLogCapture, render};
+
+        // A chunk that does not parse, so the stream is known to log. Then a
+        // hostile value shaped like the consumer's own failure marker, a
+        // recognized value, and the hostile value again on the trailer.
+        let base = spawn_sse_mock(concat!(
+            "data: {\"choices\":\"unparsed\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"kept \"},\"finish_reason\":\"error: finish-reason-canary\"}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"reply\"},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error: finish-reason-canary\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let capture = ThreadLogCapture::start();
+        let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
+            LlmProvider::Api {
+                endpoint: base,
+                api_key: String::new(),
+                model: "test-model".to_owned(),
+            },
+            vec![],
+            String::new(),
+            StreamParams::default(),
+        ));
+        let mut frames = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            frames.push(frame);
+        }
+        let logs = render(&capture.finish());
+
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content: first, finish_reason: Some(first_reason) },
+                TokenDelta::Delta { content: second, finish_reason: Some(second_reason) },
+                TokenDelta::Done { full_text, finish_reason, .. },
+            ] if first == "kept " && first_reason == "unknown"
+                && second == "reply" && second_reason == "length"
+                && full_text == "kept reply" && finish_reason == "unknown"),
+            "{frames:?}"
+        );
+        assert!(
+            logs.contains("Ignoring malformed SSE chunk: runtime/invalid_response"),
+            "{logs}"
+        );
+        assert_absent(&format!("{frames:?}"), &["finish-reason-canary", "error:"]);
+        assert_absent(&logs, &["finish-reason-canary"]);
+    }
+
+    /// Each body arrives whole and the connection then closes cleanly, so
+    /// this is the end of the stream and not a transport error.
+    async fn frames_of(body: &'static str) -> Vec<TokenDelta> {
+        let base = spawn_sse_mock(body).await;
+        let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
+            api_provider(base),
+            vec![],
+            String::new(),
+            StreamParams::default(),
+        ));
+        let mut frames = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_with_no_terminal_marker_is_a_failure() {
+        let frames =
+            frames_of("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n").await;
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content, .. },
+                TokenDelta::Error { diagnostic, full_text },
+            ] if content == "partial"
+                && diagnostic.to_string() == "runtime/invalid_response"
+                && full_text == "partial"),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finish_reason_then_end_of_body_is_a_complete_answer() {
+        // Some servers send the final chunk and close without `[DONE]`.
+        let frames = frames_of(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"whole\"},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+        .await;
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content, .. },
+                TokenDelta::Done { full_text, finish_reason, .. },
+            ] if content == "whole" && full_text == "whole" && finish_reason == "stop"),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_final_event_without_its_blank_line_is_still_read() {
+        // The last event carries the only terminal marker, and the server
+        // closes without ending it.
+        let frames = frames_of(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"whole \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}",
+        ))
+        .await;
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content: first, .. },
+                TokenDelta::Delta { content: second, .. },
+                TokenDelta::Done { full_text, finish_reason, .. },
+            ] if first == "whole " && second == "answer"
+                && full_text == "whole answer" && finish_reason == "stop"),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_final_fragment_that_does_not_parse_is_still_a_cut_off_stream() {
+        let frames = frames_of(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lost",
+        ))
+        .await;
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content, .. },
+                TokenDelta::Error { diagnostic, full_text },
+            ] if content == "partial"
+                && diagnostic.to_string() == "runtime/invalid_response"
+                && full_text == "partial"),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_finish_reason_is_not_a_terminal_marker() {
+        let frames = frames_of(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"   \"}]}\n\n",
+        )
+        .await;
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content, finish_reason: None },
+                TokenDelta::Error { diagnostic, full_text },
+            ] if content == "partial"
+                && diagnostic.to_string() == "runtime/invalid_response"
+                && full_text == "partial"),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_reported_error_finish_is_a_failed_stream() {
+        let base = spawn_sse_mock(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
+            api_provider(base),
+            vec![],
+            String::new(),
+            StreamParams::default(),
+        ));
+        let mut frames = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            frames.push(frame);
+        }
+
+        // A `Done` would persist the answer as complete.
+        assert!(
+            matches!(&frames[..], [
+                TokenDelta::Delta { content, .. },
+                TokenDelta::Error { diagnostic, full_text },
+            ] if content == "partial"
+                && diagnostic.to_string() == "runtime/internal"
+                && full_text == "partial"),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_finish_is_not_undone_by_a_later_finish_reason() {
+        // With `[DONE]`, and with the server closing after the last chunk.
+        for body in [
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            ),
+        ] {
+            let frames = frames_of(body).await;
+            assert!(
+                matches!(&frames[..], [
+                    TokenDelta::Delta { content, .. },
+                    TokenDelta::Error { diagnostic, full_text },
+                ] if content == "partial"
+                    && diagnostic.to_string() == "runtime/internal"
+                    && full_text == "partial"),
+                "{frames:?}"
             );
         }
     }
 
-    #[test]
-    fn streaming_parse_error_diagnostic_uses_payload_metadata_only() {
-        let payload =
-            r#"{"choices":[{"delta":{"content":"patient transcript and graph context"}}]"#;
-        let error = serde_json::from_str::<StreamChunk>(payload)
-            .expect_err("fixture must be malformed JSON");
-        let message = streaming_parse_error_message(
-            "api",
-            "https://provider.example/v1/chat/completions",
-            &error,
-            payload,
-            Some("parse_req_123"),
-        );
+    #[tokio::test]
+    async fn an_in_band_401_is_about_the_key_only_when_one_was_sent() {
+        for (api_key, expected) in [
+            ("sk-stream", "runtime/credential_rejected"),
+            ("   ", "runtime/request_rejected"),
+        ] {
+            let base = spawn_sse_mock("data: {\"error\":{\"code\":401}}\n\n").await;
+            let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
+                LlmProvider::Api {
+                    endpoint: base,
+                    api_key: api_key.to_owned(),
+                    model: "test-model".to_owned(),
+                },
+                vec![],
+                String::new(),
+                StreamParams::default(),
+            ));
+            let terminal = rx.recv().await.expect("terminal frame");
+            assert!(
+                matches!(&terminal, TokenDelta::Error { diagnostic, .. }
+                    if diagnostic.to_string() == expected),
+                "key {api_key:?}: {terminal:?}"
+            );
+        }
+    }
 
-        assert!(message.contains("Failed to parse streaming chunk"));
-        assert!(message.contains("provider=api"));
-        assert!(message.contains("path=/v1/chat/completions"));
-        assert!(message.contains("class=eof"));
-        assert!(message.contains("request_id=parse_req_123"));
-        assert!(message.contains(&format!("payload_bytes={}", payload.len())));
-        assert!(message.contains(&format!("payload_chars={}", payload.chars().count())));
+    #[tokio::test]
+    async fn a_cross_origin_redirect_is_not_followed_with_the_prompt() {
+        let (elsewhere, connections, probe) = spawn_connection_probe().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let mut total = String::new();
+                while !total.contains("\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => total.push_str(&String::from_utf8_lossy(&buf[..n])),
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: {elsewhere}/chat/completions\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let (mut rx, _) = stream_chat_with_request(allowed_stream_request(
+            api_provider(base),
+            vec![ChatMessage {
+                role: "user".to_owned(),
+                content: "sensitive question".to_owned(),
+            }],
+            String::new(),
+            StreamParams::default(),
+        ));
+        let terminal = rx.recv().await.expect("terminal frame");
         assert!(
-            !message.contains("patient transcript")
-                && !message.contains("graph context")
-                && !message.contains(payload),
-            "parse diagnostic must not echo malformed SSE payload: {message}"
+            matches!(&terminal, TokenDelta::Error { diagnostic, .. }
+                if diagnostic.to_string() == "runtime/request_rejected"),
+            "{terminal:?}"
         );
+        probe.await.expect("connection probe task should finish");
+        assert_eq!(connections.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1564,19 +1706,12 @@ mod tests {
                 .expect("blocked policy terminal frame should arrive")
                 .expect("terminal frame")
             {
-                TokenDelta::Error { message, full_text } => {
+                TokenDelta::Error {
+                    diagnostic,
+                    full_text,
+                } => {
                     assert!(full_text.is_empty());
-                    assert!(
-                        message.contains(&format!(
-                            "Privacy policy blocked prompt egress to {provider_name}"
-                        )),
-                        "blocked egress error should name provider and prompt class, got: {message}"
-                    );
-                    assert!(
-                        !message.contains("sensitive question")
-                            && !message.contains("sensitive graph context"),
-                        "blocked egress error must not echo prompt content: {message}"
-                    );
+                    assert_eq!(diagnostic.to_string(), "runtime/policy_blocked");
                 }
                 other => panic!("expected blocked policy Error frame, got {other:?}"),
             }
@@ -1629,17 +1764,7 @@ mod tests {
                 Err(err) => err,
                 Ok(_) => panic!("default policy must reject before building a cloud request"),
             };
-            assert!(
-                err.contains(&format!(
-                    "Privacy policy blocked prompt egress to {provider_name}"
-                )),
-                "default egress error should name provider and prompt class, got: {err}"
-            );
-            assert!(err.contains("explicit_policy_required"), "got: {err}");
-            assert!(
-                !err.contains("sensitive question") && !err.contains("sensitive graph context"),
-                "default egress error must not echo prompt content: {err}"
-            );
+            assert_eq!(err, diagnostic(Code::PolicyBlocked, INFERENCE));
         }
     }
 
@@ -1703,11 +1828,8 @@ mod tests {
             stream_chat(provider, vec![], String::new(), StreamParams::default());
         let frame = rx.recv().await.expect("at least one terminal frame");
         match frame {
-            TokenDelta::Error { message, .. } => {
-                assert!(
-                    message.contains("StreamBackendHandles.local_llama"),
-                    "error must name the missing explicit LocalLlama handle, got: {message}"
-                );
+            TokenDelta::Error { diagnostic, .. } => {
+                assert_eq!(diagnostic.to_string(), "runtime/internal")
             }
             other => panic!("expected Error for LocalLlama, got {other:?}"),
         }
@@ -1736,11 +1858,8 @@ mod tests {
         let (mut rx, _cancel) = stream_chat_with_request(request);
         let frame = rx.recv().await.expect("at least one terminal frame");
         match frame {
-            TokenDelta::Error { message, .. } => {
-                assert!(
-                    message.contains("LocalLlama engine is not loaded"),
-                    "error must name the unloaded local engine, got: {message}"
-                );
+            TokenDelta::Error { diagnostic, .. } => {
+                assert_eq!(diagnostic.to_string(), "runtime/provider_unavailable");
             }
             other => panic!("expected Error for unloaded LocalLlama, got {other:?}"),
         }
@@ -1802,7 +1921,9 @@ mod tests {
                     done = Some((full_text, usage, finish_reason));
                     break;
                 }
-                TokenDelta::Error { message, .. } => panic!("unexpected local error: {message}"),
+                TokenDelta::Error { diagnostic, .. } => {
+                    panic!("unexpected local error: {diagnostic}")
+                }
                 TokenDelta::Cancelled { .. } => panic!("unexpected local cancel"),
             }
         }
@@ -1882,8 +2003,8 @@ mod tests {
                     break;
                 }
                 TokenDelta::Done { .. } => panic!("cancelled stream must not finish as done"),
-                TokenDelta::Error { message, .. } => {
-                    panic!("cancelled stream must not error: {message}")
+                TokenDelta::Error { diagnostic, .. } => {
+                    panic!("cancelled stream must not error: {diagnostic}")
                 }
             }
         }
@@ -1906,8 +2027,8 @@ mod tests {
                     break;
                 }
                 TokenDelta::Cancelled { .. } => panic!("second stream should complete"),
-                TokenDelta::Error { message, .. } => {
-                    panic!("second stream should not error: {message}")
+                TokenDelta::Error { diagnostic, .. } => {
+                    panic!("second stream should not error: {diagnostic}")
                 }
             }
         }
@@ -1917,13 +2038,18 @@ mod tests {
     #[cfg(feature = "llm-llama")]
     #[tokio::test]
     async fn local_llama_stream_chat_maps_engine_error_to_terminal_error() {
-        let engine = crate::llm::engine::LlmEngine::test_with_stream_error("local stream failed");
+        let engine = crate::llm::engine::LlmEngine::test_with_stream_error(engine_failure(
+            Code::InvalidResponse,
+        ));
         let request = local_llama_request(Arc::new(Mutex::new(Some(engine))));
 
         let (mut rx, _cancel) = stream_chat_with_request(request);
         match rx.recv().await.expect("error frame") {
-            TokenDelta::Error { message, full_text } => {
-                assert_eq!(message, "local stream failed");
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
+                assert_eq!(diagnostic.to_string(), "runtime/invalid_response");
                 assert!(full_text.is_empty());
             }
             other => panic!("expected local Error frame, got {other:?}"),
@@ -1970,10 +2096,9 @@ mod tests {
         let request = mistralrs_request(StreamBackendHandles::empty());
         let (mut rx, _cancel) = stream_chat_with_request(request);
         match rx.recv().await.expect("at least one terminal frame") {
-            TokenDelta::Error { message, .. } => assert!(
-                message.contains("StreamBackendHandles.mistralrs_engine"),
-                "error must name the missing explicit MistralRs handle, got: {message}"
-            ),
+            TokenDelta::Error { diagnostic, .. } => {
+                assert_eq!(diagnostic.to_string(), "runtime/internal")
+            }
             other => panic!("expected Error for MistralRs, got {other:?}"),
         }
         assert!(
@@ -1995,10 +2120,9 @@ mod tests {
         });
         let (mut rx, _cancel) = stream_chat_with_request(request);
         match rx.recv().await.expect("at least one terminal frame") {
-            TokenDelta::Error { message, .. } => assert!(
-                message.contains("MistralRs engine is not loaded"),
-                "error must name the unloaded MistralRs engine, got: {message}"
-            ),
+            TokenDelta::Error { diagnostic, .. } => {
+                assert_eq!(diagnostic.to_string(), "runtime/provider_unavailable")
+            }
             other => panic!("expected Error for unloaded MistralRs, got {other:?}"),
         }
         assert!(
@@ -2034,7 +2158,8 @@ mod tests {
     }
 
     /// Drain helper: a run of `Delta`s followed by one `Done` maps to a run of
-    /// `TokenDelta::Delta` then exactly one `TokenDelta::Done` with split usage.
+    /// `TokenDelta::Delta` then exactly one `TokenDelta::Done` carrying the
+    /// engine's finish reason and split usage.
     #[tokio::test]
     async fn drain_engine_stream_events_maps_deltas_then_single_done() {
         let (event_tx, event_rx) = mpsc::channel(8);
@@ -2044,7 +2169,7 @@ mod tests {
         });
 
         let drain = tokio::spawn(async move {
-            drain_engine_stream_events(event_rx, &tx, metadata, "ended without terminal").await;
+            drain_engine_stream_events(event_rx, &tx, metadata).await;
         });
 
         event_tx
@@ -2062,6 +2187,7 @@ mod tests {
         event_tx
             .send(LlmStreamEvent::Done {
                 full_text: "mistral".to_string(),
+                finish_reason: FinishReason::Length,
                 prompt_tokens: 9,
                 completion_tokens: 2,
                 total_tokens: 11,
@@ -2076,8 +2202,11 @@ mod tests {
             match frame {
                 TokenDelta::Delta { content, .. } => deltas.push(content),
                 TokenDelta::Done {
-                    full_text, usage, ..
+                    full_text,
+                    usage,
+                    finish_reason,
                 } => {
+                    assert_eq!(finish_reason, "length");
                     done = Some((full_text, usage));
                     break;
                 }
@@ -2109,7 +2238,7 @@ mod tests {
             model_id: "m".to_string(),
         });
         let drain = tokio::spawn(async move {
-            drain_engine_stream_events(event_rx, &tx, metadata, "ended without terminal").await;
+            drain_engine_stream_events(event_rx, &tx, metadata).await;
         });
 
         event_tx
@@ -2144,7 +2273,7 @@ mod tests {
     }
 
     /// Drain helper: an `Error` engine event maps to a single `TokenDelta::Error`
-    /// carrying the message and partial text.
+    /// carrying the closed diagnostic and partial text.
     #[tokio::test]
     async fn drain_engine_stream_events_maps_error() {
         let (event_tx, event_rx) = mpsc::channel(8);
@@ -2153,12 +2282,12 @@ mod tests {
             model_id: "m".to_string(),
         });
         let drain = tokio::spawn(async move {
-            drain_engine_stream_events(event_rx, &tx, metadata, "ended without terminal").await;
+            drain_engine_stream_events(event_rx, &tx, metadata).await;
         });
 
         event_tx
             .send(LlmStreamEvent::Error {
-                message: "mistral stream failed".to_string(),
+                diagnostic: engine_failure(Code::Internal),
                 full_text: "so far".to_string(),
             })
             .await
@@ -2166,8 +2295,11 @@ mod tests {
         drop(event_tx);
 
         match rx.recv().await.expect("error frame") {
-            TokenDelta::Error { message, full_text } => {
-                assert_eq!(message, "mistral stream failed");
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
+                assert_eq!(diagnostic, engine_failure(Code::Internal));
                 assert_eq!(full_text, "so far");
             }
             other => panic!("expected Error terminal, got {other:?}"),
@@ -2177,30 +2309,56 @@ mod tests {
     }
 
     /// Drain helper: a channel that closes with no terminal event surfaces a
-    /// single defensive `Error` so the consumer never blocks forever.
+    /// single defensive `Error` so the consumer never blocks forever. That
+    /// failure, like one the engine reports without text, keeps the fragments
+    /// already forwarded: the consumer replaces what it showed with them.
     #[tokio::test]
-    async fn drain_engine_stream_events_no_terminal_yields_defensive_error() {
-        let (event_tx, event_rx) = mpsc::channel(8);
-        let (tx, mut rx) = mpsc::channel(8);
-        let metadata = StreamContextMetadata::from_provider(&LlmProvider::MistralRs {
-            model_id: "m".to_string(),
-        });
-        let drain = tokio::spawn(async move {
-            drain_engine_stream_events(event_rx, &tx, metadata, "engine dropped its sender").await;
-        });
+    async fn drain_engine_stream_events_keeps_forwarded_text_on_a_textless_failure() {
+        for (forwarded, engine_reports_failure) in [("", false), ("kept", false), ("kept", true)] {
+            let (event_tx, event_rx) = mpsc::channel(8);
+            let (tx, mut rx) = mpsc::channel(8);
+            let metadata = StreamContextMetadata::from_provider(&LlmProvider::MistralRs {
+                model_id: "m".to_string(),
+            });
+            let drain = tokio::spawn(async move {
+                drain_engine_stream_events(event_rx, &tx, metadata).await;
+            });
 
-        // Close the channel immediately with no terminal frame.
-        drop(event_tx);
-
-        match rx.recv().await.expect("defensive error frame") {
-            TokenDelta::Error { message, full_text } => {
-                assert_eq!(message, "engine dropped its sender");
-                assert!(full_text.is_empty());
+            if !forwarded.is_empty() {
+                event_tx
+                    .send(LlmStreamEvent::Delta {
+                        content: forwarded.to_string(),
+                    })
+                    .await
+                    .unwrap();
             }
-            other => panic!("expected defensive Error terminal, got {other:?}"),
+            if engine_reports_failure {
+                event_tx
+                    .send(LlmStreamEvent::Error {
+                        diagnostic: engine_failure(Code::Internal),
+                        full_text: String::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            drop(event_tx);
+
+            let mut frames = Vec::new();
+            while let Some(frame) = rx.recv().await {
+                frames.push(frame);
+            }
+            drain.await.unwrap();
+            assert!(
+                matches!(frames.last(), Some(TokenDelta::Error { diagnostic, full_text })
+                    if *diagnostic == engine_failure(Code::Internal) && full_text == forwarded),
+                "forwarded {forwarded:?}, engine reported {engine_reports_failure}: {frames:?}"
+            );
+            assert_eq!(
+                frames.len(),
+                usize::from(!forwarded.is_empty()) + 1,
+                "exactly one terminal frame"
+            );
         }
-        drain.await.unwrap();
-        assert!(rx.recv().await.is_none(), "exactly one terminal frame");
     }
 
     #[test]
@@ -2377,17 +2535,12 @@ mod tests {
             .expect("blocked Bedrock terminal frame should arrive")
             .expect("terminal frame")
         {
-            TokenDelta::Error { message, full_text } => {
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
                 assert!(full_text.is_empty());
-                assert!(
-                    message.contains("Privacy policy blocked prompt egress to llm.aws_bedrock"),
-                    "blocked Bedrock egress error should name the provider, got: {message}"
-                );
-                assert!(
-                    !message.contains("sensitive question")
-                        && !message.contains("sensitive graph context"),
-                    "blocked egress error must not echo prompt content: {message}"
-                );
+                assert_eq!(diagnostic.to_string(), "runtime/policy_blocked");
             }
             other => panic!("expected blocked-egress Error frame, got {other:?}"),
         }
@@ -2416,7 +2569,7 @@ mod tests {
         match TokenDelta::from_terminal_event(StreamTerminalEvent::done(
             "answer".to_string(),
             usage.clone(),
-            "stop".to_string(),
+            FinishReason::Stop,
             metadata.clone(),
         )) {
             TokenDelta::Done {
@@ -2431,13 +2584,16 @@ mod tests {
             other => panic!("expected Done terminal mapping, got {other:?}"),
         }
 
-        match TokenDelta::from_terminal_event(StreamTerminalEvent::error(
-            "provider failed".to_string(),
+        match TokenDelta::from_terminal_event(StreamTerminalEvent::failure(
+            diagnostic(Code::ProviderUnavailable, INFERENCE),
             "partial".to_string(),
             metadata.clone(),
         )) {
-            TokenDelta::Error { message, full_text } => {
-                assert_eq!(message, "provider failed");
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
+                assert_eq!(diagnostic.to_string(), "runtime/provider_unavailable");
                 assert_eq!(full_text, "partial");
             }
             other => panic!("expected Error terminal mapping, got {other:?}"),
@@ -2742,7 +2898,7 @@ mod tests {
                     done_usage = usage;
                     break;
                 }
-                TokenDelta::Error { message, .. } => panic!("unexpected error: {message}"),
+                TokenDelta::Error { diagnostic, .. } => panic!("unexpected error: {diagnostic}"),
                 TokenDelta::Cancelled { .. } => panic!("unexpected cancel"),
             }
         }
@@ -2778,7 +2934,7 @@ mod tests {
                     }
                 }
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Request-Id: sse-request-canary\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = stream.write_all(header.as_bytes()).await;
@@ -2789,14 +2945,7 @@ mod tests {
         format!("http://{}", addr)
     }
 
-    /// Drives the SSE `SseEvent::Error` arm (streaming.rs `run_sse_stream`,
-    /// the `redacted_error_excerpt` call on the decoder error message) by
-    /// streaming a single frame larger than the decoder's 1 MiB cap so the
-    /// decoder reports an overflow. The frame body embeds an API key, a
-    /// `Bearer` token, an AWS access key, and a `?token=` URL credential; the
-    /// provider's `sk-` api_key is registered as a request secret. The
-    /// terminal `TokenDelta::Error` must be the metadata-only overflow
-    /// diagnostic with none of the injected credentials echoed back.
+    /// An oversized frame may contain provider data but its terminal diagnostic cannot.
     #[tokio::test]
     async fn stream_chat_sse_error_event_redacts_provider_secrets() {
         let api_key = "sk-sse-error-provider-secret-12345";
@@ -2833,11 +2982,9 @@ mod tests {
             .expect("SSE error terminal frame should arrive")
             .expect("terminal frame")
         {
-            TokenDelta::Error { message, .. } => {
-                assert!(
-                    message.contains("SSE frame exceeded"),
-                    "SSE error path must surface the decoder overflow diagnostic, got: {message}"
-                );
+            TokenDelta::Error { diagnostic, .. } => {
+                let message = diagnostic.to_string();
+                assert_eq!(message, "runtime/protocol_error");
                 for leaked in [
                     api_key,
                     "bearer-sse-secret-12345",
@@ -2854,13 +3001,7 @@ mod tests {
         }
     }
 
-    /// Drives the transport-error arm (streaming.rs `run_sse_stream`, the
-    /// `req.send()` failure -> `redacted_error_excerpt` call) by pointing the
-    /// request at an unroutable endpoint whose URL embeds userinfo and a
-    /// `?api_key=` query credential, with the provider `sk-` api_key
-    /// registered as a request secret. reqwest's transport error Displays the
-    /// request URL, so the terminal `TokenDelta::Error` must redact every
-    /// registered/pattern secret before it reaches UI/log surfaces.
+    /// Even a transport error whose source contains the URL only returns a diagnostic token.
     #[tokio::test]
     async fn stream_chat_transport_error_redacts_registered_secrets() {
         let api_key = "sk-transport-provider-secret-12345";
@@ -2888,8 +3029,13 @@ mod tests {
             .expect("transport error terminal frame should arrive")
             .expect("terminal frame")
         {
-            TokenDelta::Error { message, full_text } => {
+            TokenDelta::Error {
+                diagnostic,
+                full_text,
+            } => {
+                let message = diagnostic.to_string();
                 assert!(full_text.is_empty(), "transport error has no partial text");
+                assert_eq!(message, "runtime/network_unreachable");
                 for leaked in [api_key, "svc-user", "transport-query-secret-12345"] {
                     assert!(
                         !message.contains(leaked),
@@ -2905,10 +3051,7 @@ mod tests {
     /// the `byte_stream.next()` -> `Some(Err(e))` branch). The mock declares a
     /// large `Content-Length`, writes a partial SSE delta, then aborts the
     /// connection before satisfying it, forcing reqwest to surface a stream
-    /// read error whose Display includes the request URL. The endpoint embeds
-    /// userinfo + a query credential and the `sk-` api_key is registered, so
-    /// the terminal `TokenDelta::Error` must carry none of them — this guards
-    /// the production fix that routes this path through `redacted_error_excerpt`.
+    /// read error whose native source must not cross the terminal boundary.
     #[tokio::test]
     async fn stream_chat_read_error_redacts_registered_secrets() {
         let api_key = "sk-readerr-provider-secret-12345";
@@ -2929,12 +3072,16 @@ mod tests {
                         break;
                     }
                 }
-                // Promise far more body than we deliver, emit one partial
-                // delta, then drop the socket so the client's body read errors.
+                // Promise far more body than we deliver, emit one delta, then
+                // drop the socket so the client's body read errors. The delta
+                // carries a `finish_reason`, so a clean end of body here would
+                // be a complete answer and only a read error is a failure.
                 let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n";
                 let _ = stream.write_all(header.as_bytes()).await;
                 let _ = stream
-                    .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+                    .write_all(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    )
                     .await;
                 // Abort without flushing the promised Content-Length.
                 drop(stream);
@@ -2966,7 +3113,9 @@ mod tests {
         {
             match frame {
                 TokenDelta::Delta { .. } => continue,
-                TokenDelta::Error { message, .. } => {
+                TokenDelta::Error { diagnostic, .. } => {
+                    let message = diagnostic.to_string();
+                    assert_eq!(message, "runtime/invalid_response");
                     for leaked in [api_key, "svc-user", "readerr-query-secret-12345"] {
                         assert!(
                             !message.contains(leaked),

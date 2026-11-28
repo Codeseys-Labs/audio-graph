@@ -1,97 +1,214 @@
-//! Shared HTTP diagnostic helpers for the OpenRouter / generic-API LLM clients.
-//!
-//! The blocking OpenRouter client (`openrouter.rs`) and the SSE streaming client
-//! (`streaming.rs`) both need to (a) extract a redaction-safe request-id from
-//! response headers for diagnostics and (b) reduce a full request URL to just its
-//! path (never the query string, which can carry credentials/routing metadata).
-//! These were byte-identical copies in both files (review n1); centralizing them
-//! keeps the header allow-list and the sanitizer filter from silently drifting
-//! apart between the two transports.
+//! Classify HTTP failures without retaining a request, headers, body, or source.
 
-/// Reduce a request URL to just its path for diagnostics.
-///
-/// Deliberately drops scheme/host/**query string** — the query can carry API
-/// keys or routing metadata that must never reach a log or UI-visible error.
-/// An unparseable URL yields a fixed non-secret placeholder rather than echoing
-/// the raw (possibly secret-bearing) string back.
-pub(crate) fn diagnostic_path(url: &str) -> String {
-    reqwest::Url::parse(url)
-        .map(|parsed| parsed.path().to_string())
-        .unwrap_or_else(|_| "<unparseable>".to_string())
+use std::fmt;
+
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode as Code, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeSafeRecoveryAction as Action, RuntimeStatusClass, RuntimeTransport,
+};
+use reqwest::StatusCode;
+
+pub(super) const INFERENCE: RuntimeDiagnosticContext =
+    http_context(RuntimeOperation::LanguageModelInference);
+
+pub(super) const fn http_context(operation: RuntimeOperation) -> RuntimeDiagnosticContext {
+    RuntimeDiagnosticContext::new(operation).with_transport(RuntimeTransport::Http)
 }
 
-/// Extract a provider request-id from response headers, sanitized for safe
-/// logging.
+/// reqwest's own default bound on one redirect chain.
+const MAX_REDIRECTS: usize = 10;
+
+/// Follow a redirect only within the origin the request was addressed to.
 ///
-/// Checks the known id headers in priority order, keeps only
-/// `[A-Za-z0-9-_.:]` (dropping anything a header could smuggle that isn't
-/// id-shaped), and caps the length at 128 chars. Returns the first non-empty
-/// match, or `None` when no id header is present.
-pub(crate) fn response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    for name in [
-        "x-request-id",
-        "request-id",
-        "x-openrouter-request-id",
-        "cf-ray",
-    ] {
-        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
-            continue;
-        };
-        let sanitized: String = value
-            .chars()
-            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
-            .take(128)
-            .collect();
-        if !sanitized.is_empty() {
-            return Some(sanitized);
+/// reqwest drops `Authorization` on a cross-origin hop, so a status from there
+/// says nothing about the credential this client sent, and a 307 or 308 would
+/// carry the prompt to a host the egress policy never authorized. Stopping
+/// hands the 3xx back to the caller, which reports a rejected request.
+pub(super) fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|origin| origin.origin() == attempt.url().origin());
+        if !same_origin {
+            attempt.stop()
+        } else if attempt.previous().len() >= MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+pub(super) const fn diagnostic(code: Code, context: RuntimeDiagnosticContext) -> RuntimeDiagnostic {
+    let (retryable, action) = match code {
+        Code::NetworkUnreachable => (true, Action::CheckNetwork),
+        Code::Timeout | Code::InvalidResponse => (true, Action::Retry),
+        Code::RateLimited | Code::CapacityExhausted | Code::ProviderUnavailable => {
+            (true, Action::RetryAfterDelay)
+        }
+        Code::CredentialRejected => (false, Action::ReenterCredential),
+        Code::CredentialExpired => (false, Action::RefreshCredential),
+        Code::ProtocolError
+        | Code::RequestRejected
+        | Code::PermissionDenied
+        | Code::InvalidConfiguration => (false, Action::ReviewConfiguration),
+        Code::Unsupported => (false, Action::ChooseSupportedProvider),
+        Code::PolicyBlocked => (false, Action::ReviewPolicy),
+        Code::Cancelled | Code::Internal => (false, Action::None),
+    };
+    RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::new(
+        code, retryable, action, context,
+    ))
+}
+
+pub(super) const fn with_status(
+    context: RuntimeDiagnosticContext,
+    status: u16,
+) -> RuntimeDiagnosticContext {
+    match status {
+        300..=399 => context.with_status_class(RuntimeStatusClass::Redirect),
+        400..=499 => context.with_status_class(RuntimeStatusClass::ClientError),
+        500..=599 => context.with_status_class(RuntimeStatusClass::ServerError),
+        _ => context,
+    }
+}
+
+/// Private recovery evidence for the projection schema downgrade. Never
+/// rendered or serialized as part of the public diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SchemaRejection {
+    Request,
+    Model,
+}
+
+#[derive(Debug)]
+pub(super) struct HttpFailure {
+    pub(super) diagnostic: RuntimeDiagnostic,
+    pub(super) schema_rejection: Option<SchemaRejection>,
+}
+
+impl HttpFailure {
+    pub(super) const fn new(code: Code, context: RuntimeDiagnosticContext) -> Self {
+        Self {
+            diagnostic: diagnostic(code, context),
+            schema_rejection: None,
         }
     }
-    None
+
+    /// Classified by the contract's shared status mapping. `credential_sent`
+    /// is whether the request carried a provider credential: without one a
+    /// 401 is an ordinary rejection, not a rejected credential.
+    pub(super) fn status(
+        status: StatusCode,
+        context: RuntimeDiagnosticContext,
+        credential_sent: bool,
+    ) -> Self {
+        let diagnostic =
+            RuntimeErrorDiagnostic::from_http_status(status.as_u16(), credential_sent, context);
+        Self {
+            diagnostic: diagnostic.into(),
+            schema_rejection: match status.as_u16() {
+                400 | 422 => Some(SchemaRejection::Request),
+                404 => Some(SchemaRejection::Model),
+                _ => None,
+            },
+        }
+    }
+
+    pub(super) fn request(error: &reqwest::Error, context: RuntimeDiagnosticContext) -> Self {
+        let code = if error.is_timeout() {
+            Code::Timeout
+        } else if error.is_connect() {
+            Code::NetworkUnreachable
+        } else if error.is_builder() {
+            Code::RequestRejected
+        } else if error.is_redirect() {
+            Code::ProtocolError
+        } else {
+            Code::Internal
+        };
+        let mut failure = Self::new(code, context);
+        // A pre-header timeout may already have incurred a remote effect.
+        if code == Code::Timeout {
+            failure.diagnostic =
+                RuntimeErrorDiagnostic::new(code, false, Action::None, context).into();
+        }
+        failure
+    }
+
+    pub(super) fn response(error: &reqwest::Error, context: RuntimeDiagnosticContext) -> Self {
+        Self::new(
+            if error.is_timeout() {
+                Code::Timeout
+            } else {
+                Code::InvalidResponse
+            },
+            context,
+        )
+    }
+}
+
+impl fmt::Display for HttpFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.diagnostic, f)
+    }
+}
+
+impl From<HttpFailure> for String {
+    fn from(error: HttpFailure) -> Self {
+        error.to_string()
+    }
+}
+
+/// Canary check for what crosses a returned error, terminal frame, or log.
+#[cfg(test)]
+pub(super) mod canary {
+    pub(crate) fn assert_absent(output: &str, canaries: &[&str]) {
+        for canary in canaries {
+            assert!(!output.contains(canary), "leaked {canary}: {output}");
+        }
+    }
+}
+
+/// Lets a test fail the next HTTP client builds on its thread, which reqwest
+/// gives no way to provoke.
+#[cfg(test)]
+pub(crate) mod client_build {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAILURES: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn fail_next(count: u32) {
+        FAILURES.set(count);
+    }
+
+    pub(in crate::llm) fn take_failure() -> bool {
+        let pending = FAILURES.get();
+        FAILURES.set(pending.saturating_sub(1));
+        pending > 0
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::header::{HeaderMap, HeaderValue};
 
     #[test]
-    fn diagnostic_path_keeps_path_drops_query() {
-        assert_eq!(
-            diagnostic_path("https://openrouter.ai/api/v1/chat/completions?key=secret"),
-            "/api/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn diagnostic_path_placeholder_on_unparseable() {
-        assert_eq!(diagnostic_path("not a url"), "<unparseable>");
-    }
-
-    #[test]
-    fn response_request_id_prefers_priority_order() {
-        let mut headers = HeaderMap::new();
-        headers.insert("cf-ray", HeaderValue::from_static("ray-999"));
-        headers.insert("x-request-id", HeaderValue::from_static("req-123"));
-        // `x-request-id` outranks `cf-ray`.
-        assert_eq!(response_request_id(&headers), Some("req-123".to_string()));
-    }
-
-    #[test]
-    fn response_request_id_sanitizes_and_caps() {
-        let mut headers = HeaderMap::new();
-        // Spaces / disallowed chars are stripped; only id-shaped chars survive.
-        headers.insert("x-request-id", HeaderValue::from_static("ab cd/e\tf!g"));
-        assert_eq!(response_request_id(&headers), Some("abcdefg".to_string()));
-
-        let long = "a".repeat(300);
-        let mut headers = HeaderMap::new();
-        headers.insert("request-id", HeaderValue::from_str(&long).unwrap());
-        assert_eq!(response_request_id(&headers).map(|s| s.len()), Some(128));
-    }
-
-    #[test]
-    fn response_request_id_none_when_absent() {
-        let headers = HeaderMap::new();
-        assert_eq!(response_request_id(&headers), None);
+    fn a_401_is_a_credential_failure_only_for_a_credential_that_was_sent() {
+        let token = |status: u16, credential_sent| {
+            HttpFailure::status(
+                StatusCode::from_u16(status).unwrap(),
+                INFERENCE,
+                credential_sent,
+            )
+            .to_string()
+        };
+        assert_eq!(token(401, true), "runtime/credential_rejected");
+        assert_eq!(token(401, false), "runtime/request_rejected");
+        assert_eq!(token(403, true), "runtime/permission_denied");
+        assert_eq!(token(429, true), "runtime/rate_limited");
     }
 }

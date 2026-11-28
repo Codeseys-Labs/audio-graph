@@ -33,6 +33,10 @@ use std::num::NonZeroU32;
 #[cfg(feature = "llm-llama")]
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode as Code, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeSafeRecoveryAction as Action, RuntimeTransport,
+};
 #[cfg(feature = "llm-llama")]
 use llama_cpp_2::context::LlamaContext;
 #[cfg(feature = "llm-llama")]
@@ -50,6 +54,54 @@ use llama_cpp_2::sampling::LlamaSampler;
 use tokio_util::sync::CancellationToken;
 
 use crate::graph::entities::ExtractionResult;
+use crate::llm::http_diag::diagnostic;
+use crate::llm::stream_contract::FinishReason;
+
+const NATIVE: RuntimeDiagnosticContext =
+    RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference)
+        .with_transport(RuntimeTransport::Native);
+
+/// Closed diagnostic for an in-process engine. Native error text and model
+/// output stop at the engine boundary; only this category leaves it.
+pub(super) const fn engine_failure(code: Code) -> RuntimeDiagnostic {
+    diagnostic(code, NATIVE)
+}
+
+/// The selected local engine has no usable model; loading one is the fix.
+pub(super) const fn engine_not_loaded() -> RuntimeDiagnostic {
+    RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::new(
+        Code::ProviderUnavailable,
+        false,
+        Action::ReviewConfiguration,
+        NATIVE,
+    ))
+}
+
+/// Run a model load so that a panic inside the binding cannot carry the model
+/// path past this frame. llama-cpp-2 asserts in debug builds that the path
+/// exists and puts the path in the message, and the file can go away after
+/// `engine_loop` looked. Inside the scope the crash hook records the operation
+/// code alone and prints nothing; the payload is dropped here.
+#[cfg(any(test, feature = "llm-llama"))]
+fn load_redacted<T>(load: impl FnOnce() -> Option<T>) -> Result<T, RuntimeDiagnostic> {
+    crate::crash_handler::catch_redacted_panic(
+        crate::crash_handler::RedactedPanicOp::LlmModelLoad,
+        load,
+    )
+    .ok()
+    .flatten()
+    .ok_or_else(engine_not_loaded)
+}
+
+/// Parse a local model's extraction output. A parse failure is classified
+/// here so neither the output nor the parser's quote of it leaves the engine.
+#[cfg(any(test, feature = "llm-llama"))]
+fn parse_extraction(output: &str) -> Result<ExtractionResult, RuntimeDiagnostic> {
+    // The fine-tuned model emits JSON directly, but be defensive: slice out the
+    // outermost { .. } object in case the model wraps it in prose.
+    let json = extract_json_object(output).unwrap_or(output);
+    serde_json::from_str(json).map_err(|_| engine_failure(Code::InvalidResponse))
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -110,6 +162,7 @@ pub enum LlmStreamEvent {
     },
     Done {
         full_text: String,
+        finish_reason: FinishReason,
         prompt_tokens: u32,
         completion_tokens: u32,
         total_tokens: u32,
@@ -118,7 +171,7 @@ pub enum LlmStreamEvent {
         full_text: String,
     },
     Error {
-        message: String,
+        diagnostic: RuntimeDiagnostic,
         full_text: String,
     },
 }
@@ -135,12 +188,12 @@ enum EngineReq {
     Extract {
         text: String,
         speaker: String,
-        reply: SyncSender<Result<ExtractionResult, String>>,
+        reply: SyncSender<Result<ExtractionResult, RuntimeDiagnostic>>,
     },
     Chat {
         messages: Vec<ChatMessage>,
         graph_context: String,
-        reply: SyncSender<Result<ChatOutcome, String>>,
+        reply: SyncSender<Result<ChatOutcome, RuntimeDiagnostic>>,
     },
     StreamChat {
         messages: Vec<ChatMessage>,
@@ -180,19 +233,19 @@ impl LlmEngine {
     /// context, so load failures surface synchronously (as before).
     pub fn new(model_path: &str) -> Result<Self, String> {
         let (tx, rx) = channel::<EngineReq>();
-        let (ready_tx, ready_rx) = sync_channel::<Result<(), String>>(1);
+        let (ready_tx, ready_rx) = sync_channel::<Result<(), RuntimeDiagnostic>>(1);
         let path = model_path.to_string();
 
         std::thread::Builder::new()
             .name("llm-engine".to_string())
             .spawn(move || engine_loop(&path, rx, ready_tx))
-            .map_err(|e| format!("Failed to spawn LLM engine thread: {}", e))?;
+            .map_err(|_| engine_failure(Code::Internal).to_string())?;
 
         // Wait for the actor to report model-load + context-creation status.
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self { tx }),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err("LLM engine thread exited before signaling readiness".to_string()),
+            Ok(Err(diagnostic)) => Err(diagnostic.to_string()),
+            Err(_) => Err(engine_failure(Code::Internal).to_string()),
         }
         // On error the `tx` we hold is dropped here, closing the channel so the
         // (already-exited) thread leaves nothing dangling.
@@ -206,7 +259,11 @@ impl LlmEngine {
     /// Extract entities and relations from text using grammar-constrained
     /// generation. The output is forced to match the JSON schema expected by
     /// [`ExtractionResult`].
-    pub fn extract_entities(&self, text: &str, speaker: &str) -> Result<ExtractionResult, String> {
+    pub fn extract_entities(
+        &self,
+        text: &str,
+        speaker: &str,
+    ) -> Result<ExtractionResult, RuntimeDiagnostic> {
         let (reply, reply_rx) = sync_channel(1);
         self.tx
             .send(EngineReq::Extract {
@@ -214,10 +271,10 @@ impl LlmEngine {
                 speaker: speaker.to_string(),
                 reply,
             })
-            .map_err(|_| "LLM engine thread is not running".to_string())?;
+            .map_err(|_| engine_failure(Code::Internal))?;
         reply_rx
             .recv()
-            .map_err(|_| "LLM engine thread dropped the extraction request".to_string())?
+            .map_err(|_| engine_failure(Code::Internal))?
     }
 
     /// Chat with the LLM, providing graph context in the system prompt.
@@ -229,7 +286,7 @@ impl LlmEngine {
         &self,
         messages: &[ChatMessage],
         graph_context: &str,
-    ) -> Result<ChatOutcome, String> {
+    ) -> Result<ChatOutcome, RuntimeDiagnostic> {
         let (reply, reply_rx) = sync_channel(1);
         self.tx
             .send(EngineReq::Chat {
@@ -237,10 +294,10 @@ impl LlmEngine {
                 graph_context: graph_context.to_string(),
                 reply,
             })
-            .map_err(|_| "LLM engine thread is not running".to_string())?;
+            .map_err(|_| engine_failure(Code::Internal))?;
         reply_rx
             .recv()
-            .map_err(|_| "LLM engine thread dropped the chat request".to_string())?
+            .map_err(|_| engine_failure(Code::Internal))?
     }
 
     /// Start a true token-streaming chat request on the actor thread.
@@ -256,7 +313,7 @@ impl LlmEngine {
         params: LlmChatParams,
         cancel: CancellationToken,
         events: tokio::sync::mpsc::Sender<LlmStreamEvent>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeDiagnostic> {
         self.tx
             .send(EngineReq::StreamChat {
                 messages,
@@ -265,7 +322,7 @@ impl LlmEngine {
                 cancel,
                 events,
             })
-            .map_err(|_| "LLM engine thread is not running".to_string())
+            .map_err(|_| engine_failure(Code::Internal))
     }
 
     #[cfg(test)]
@@ -281,9 +338,7 @@ impl LlmEngine {
                 for req in rx {
                     match req {
                         EngineReq::Extract { reply, .. } => {
-                            let _ = reply.send(Err(
-                                "test LLM engine does not implement extraction".to_string(),
-                            ));
+                            let _ = reply.send(Err(engine_failure(Code::Unsupported)));
                         }
                         EngineReq::Chat { reply, .. } => {
                             let text = pieces.concat();
@@ -323,6 +378,7 @@ impl LlmEngine {
                                 let total_tokens = prompt_tokens.saturating_add(completion_tokens);
                                 let _ = events.blocking_send(LlmStreamEvent::Done {
                                     full_text,
+                                    finish_reason: FinishReason::Stop,
                                     prompt_tokens,
                                     completion_tokens,
                                     total_tokens,
@@ -337,8 +393,7 @@ impl LlmEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_with_stream_error(message: impl Into<String>) -> Self {
-        let message = message.into();
+    pub(crate) fn test_with_stream_error(diagnostic: RuntimeDiagnostic) -> Self {
         let (tx, rx) = channel::<EngineReq>();
         std::thread::Builder::new()
             .name("llm-engine-stream-error-test".to_string())
@@ -346,16 +401,14 @@ impl LlmEngine {
                 for req in rx {
                     match req {
                         EngineReq::Extract { reply, .. } => {
-                            let _ = reply.send(Err(
-                                "test LLM engine does not implement extraction".to_string(),
-                            ));
+                            let _ = reply.send(Err(engine_failure(Code::Unsupported)));
                         }
                         EngineReq::Chat { reply, .. } => {
-                            let _ = reply.send(Err(message.clone()));
+                            let _ = reply.send(Err(diagnostic.clone()));
                         }
                         EngineReq::StreamChat { events, .. } => {
                             let _ = events.blocking_send(LlmStreamEvent::Error {
-                                message: message.clone(),
+                                diagnostic: diagnostic.clone(),
                                 full_text: String::new(),
                             });
                         }
@@ -380,15 +433,16 @@ impl LlmEngine {
 /// sharing it across threads is sound. The init result is cached: a failure is
 /// permanent for the process.
 #[cfg(feature = "llm-llama")]
-fn global_backend() -> Result<&'static LlamaBackend, String> {
-    use std::sync::OnceLock;
-    static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
-    BACKEND
-        .get_or_init(|| {
-            LlamaBackend::init().map_err(|e| format!("Failed to init llama backend: {}", e))
-        })
-        .as_ref()
-        .map_err(|e| e.clone())
+fn global_backend() -> Result<&'static LlamaBackend, RuntimeDiagnostic> {
+    use std::sync::LazyLock;
+    // llama.cpp logs to stderr by default, and a failed load prints the model
+    // path there before Rust sees the error. Discard its log before any load.
+    static BACKEND: LazyLock<Option<LlamaBackend>> = LazyLock::new(|| {
+        let mut backend = LlamaBackend::init().ok()?;
+        backend.void_logs();
+        Some(backend)
+    });
+    BACKEND.as_ref().ok_or(engine_failure(Code::Internal))
 }
 
 /// Actor thread entry point: owns the model and one persistent `LlamaContext`
@@ -399,7 +453,11 @@ fn global_backend() -> Result<&'static LlamaBackend, String> {
 /// borrows the model + the `'static` backend) drops first — satisfying the
 /// borrow checker for the `!Send` context held across the loop.
 #[cfg(feature = "llm-llama")]
-fn engine_loop(model_path: &str, rx: Receiver<EngineReq>, ready: SyncSender<Result<(), String>>) {
+fn engine_loop(
+    model_path: &str,
+    rx: Receiver<EngineReq>,
+    ready: SyncSender<Result<(), RuntimeDiagnostic>>,
+) {
     let backend = match global_backend() {
         Ok(b) => b,
         Err(e) => {
@@ -408,11 +466,20 @@ fn engine_loop(model_path: &str, rx: Receiver<EngineReq>, ready: SyncSender<Resu
         }
     };
 
-    let model = match LlamaModel::load_from_file(backend, model_path, &LlamaModelParams::default())
-    {
+    // The binding's debug assertion on a missing path would name the path. A
+    // missing file is an ordinary load failure; `load_redacted` covers the file
+    // going away after this check.
+    if !std::path::Path::new(model_path).is_file() {
+        let _ = ready.send(Err(engine_not_loaded()));
+        return;
+    }
+
+    let model = match load_redacted(|| {
+        LlamaModel::load_from_file(backend, model_path, &LlamaModelParams::default()).ok()
+    }) {
         Ok(m) => m,
-        Err(e) => {
-            let _ = ready.send(Err(format!("Failed to load model '{}': {}", model_path, e)));
+        Err(diagnostic) => {
+            let _ = ready.send(Err(diagnostic));
             return;
         }
     };
@@ -420,16 +487,13 @@ fn engine_loop(model_path: &str, rx: Receiver<EngineReq>, ready: SyncSender<Resu
     let ctx_params = LlamaContextParams::default().with_n_ctx(Some(NonZeroU32::new(2048).unwrap()));
     let mut ctx = match model.new_context(backend, ctx_params) {
         Ok(c) => c,
-        Err(e) => {
-            let _ = ready.send(Err(format!("Failed to create context: {}", e)));
+        Err(_) => {
+            let _ = ready.send(Err(engine_failure(Code::Internal)));
             return;
         }
     };
 
-    log::info!(
-        "LLM model loaded from: {} (persistent-context actor)",
-        model_path
-    );
+    log::info!("LLM model loaded (persistent-context actor)");
     if ready.send(Ok(())).is_err() {
         return; // Caller gave up; nothing to serve.
     }
@@ -492,7 +556,7 @@ fn do_extract(
     ctx: &mut LlamaContext,
     text: &str,
     speaker: &str,
-) -> Result<ExtractionResult, String> {
+) -> Result<ExtractionResult, RuntimeDiagnostic> {
     // ADR-0008 follow-up #1: use the shared conversation ontology as the single
     // source of truth for the extraction vocabulary/schema (kills the prompt
     // drift that came from a hard-coded type list here). The LFM2-specific
@@ -529,17 +593,12 @@ fn do_extract(
         .trim()
         .to_string();
 
-    // The fine-tuned model emits JSON directly, but be defensive: slice out the
-    // outermost { .. } object in case the model wraps it in prose.
-    let json = extract_json_object(&output).unwrap_or(output.as_str());
-
-    serde_json::from_str(json)
-        .map_err(|e| format!("Failed to parse extraction JSON: {} — raw: {}", e, output))
+    parse_extraction(&output)
 }
 
 /// Return the substring spanning the first `{` to the last `}` (inclusive), or
 /// `None` if no balanced-looking object is present.
-#[cfg(feature = "llm-llama")]
+#[cfg(any(test, feature = "llm-llama"))]
 fn extract_json_object(s: &str) -> Option<&str> {
     let start = s.find('{')?;
     let end = s.rfind('}')?;
@@ -557,7 +616,7 @@ fn do_chat(
     ctx: &mut LlamaContext,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<ChatOutcome, String> {
+) -> Result<ChatOutcome, RuntimeDiagnostic> {
     let generation = build_chat_generation(messages, graph_context, LlmChatParams::default());
     let outcome = run_inference(
         model,
@@ -597,6 +656,7 @@ fn do_stream_chat(
         Ok(InferenceRun::Done(outcome)) => {
             let _ = events.blocking_send(LlmStreamEvent::Done {
                 full_text: outcome.text,
+                finish_reason: outcome.finish_reason,
                 prompt_tokens: outcome.prompt_tokens,
                 completion_tokens: outcome.completion_tokens,
                 total_tokens: outcome.total_tokens,
@@ -605,9 +665,9 @@ fn do_stream_chat(
         Ok(InferenceRun::Cancelled { full_text }) => {
             let _ = events.blocking_send(LlmStreamEvent::Cancelled { full_text });
         }
-        Err(message) => {
+        Err(diagnostic) => {
             let _ = events.blocking_send(LlmStreamEvent::Error {
-                message,
+                diagnostic,
                 full_text: String::new(),
             });
         }
@@ -676,6 +736,7 @@ fn build_chat_generation(
 #[cfg(feature = "llm-llama")]
 struct InferenceOutcome {
     text: String,
+    finish_reason: FinishReason,
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
@@ -704,7 +765,7 @@ fn run_inference(
     prompt: &str,
     max_tokens: u32,
     mut sampler: LlamaSampler,
-) -> Result<InferenceOutcome, String> {
+) -> Result<InferenceOutcome, RuntimeDiagnostic> {
     match run_inference_inner(
         model,
         ctx,
@@ -712,12 +773,11 @@ fn run_inference(
         max_tokens,
         &mut sampler,
         None,
-        None::<&mut dyn FnMut(&str) -> Result<(), String>>,
+        None::<&mut dyn FnMut(&str) -> Result<(), RuntimeDiagnostic>>,
     )? {
         InferenceRun::Done(outcome) => Ok(outcome),
-        InferenceRun::Cancelled { .. } => {
-            Err("Inference was cancelled without a cancellation token".to_string())
-        }
+        // Unreachable without a cancellation token; fail closed if it happens.
+        InferenceRun::Cancelled { .. } => Err(engine_failure(Code::Internal)),
     }
 }
 
@@ -730,7 +790,7 @@ fn run_streaming_inference(
     mut sampler: LlamaSampler,
     cancel: &CancellationToken,
     events: &tokio::sync::mpsc::Sender<LlmStreamEvent>,
-) -> Result<InferenceRun, String> {
+) -> Result<InferenceRun, RuntimeDiagnostic> {
     let mut emit_piece = |piece: &str| {
         if piece.is_empty() {
             return Ok(());
@@ -739,7 +799,8 @@ fn run_streaming_inference(
             .blocking_send(LlmStreamEvent::Delta {
                 content: piece.to_string(),
             })
-            .map_err(|_| "LocalLlama stream receiver dropped".to_string())
+            // The consumer left; nobody is listening for this terminal.
+            .map_err(|_| engine_failure(Code::Cancelled))
     };
 
     run_inference_inner(
@@ -762,8 +823,8 @@ fn run_inference_inner(
     max_tokens: u32,
     sampler: &mut LlamaSampler,
     cancel: Option<&CancellationToken>,
-    mut on_piece: Option<&mut dyn FnMut(&str) -> Result<(), String>>,
-) -> Result<InferenceRun, String> {
+    mut on_piece: Option<&mut dyn FnMut(&str) -> Result<(), RuntimeDiagnostic>>,
+) -> Result<InferenceRun, RuntimeDiagnostic> {
     // Reset the persistent context to an empty-KV state (== fresh context).
     ctx.clear_kv_cache();
 
@@ -775,18 +836,18 @@ fn run_inference_inner(
 
     let tokens = model
         .str_to_token(prompt, AddBos::Always)
-        .map_err(|e| format!("Tokenization failed: {}", e))?;
+        .map_err(|_| engine_failure(Code::Internal))?;
 
     let mut batch = LlamaBatch::new(2048, 1);
     for (i, token) in tokens.iter().enumerate() {
         let is_last = i == tokens.len() - 1;
         batch
             .add(*token, i as i32, &[0], is_last)
-            .map_err(|e| format!("Failed to add token to batch: {}", e))?;
+            .map_err(|_| engine_failure(Code::Internal))?;
     }
 
     ctx.decode(&mut batch)
-        .map_err(|e| format!("Failed to decode prompt: {}", e))?;
+        .map_err(|_| engine_failure(Code::Internal))?;
 
     if cancel.is_some_and(|token| token.is_cancelled()) {
         return Ok(InferenceRun::Cancelled {
@@ -808,6 +869,8 @@ fn run_inference_inner(
     // the OpenAI-style `total_tokens` the streaming path reports.
     let mut completion_tokens: u32 = 0;
 
+    // Leaving the loop any way but the stop token means the budget ran out.
+    let mut finish_reason = FinishReason::Length;
     for i in 0..max_tokens as i32 {
         if cancel.is_some_and(|token| token.is_cancelled()) {
             return Ok(InferenceRun::Cancelled { full_text: output });
@@ -819,12 +882,13 @@ fn run_inference_inner(
         sampler.accept(new_token);
 
         if model.is_eog_token(new_token) {
+            finish_reason = FinishReason::Stop;
             break;
         }
 
         let piece = model
             .token_to_piece(new_token, &mut decoder, false, None)
-            .map_err(|e| format!("Token decode failed: {}", e))?;
+            .map_err(|_| engine_failure(Code::Internal))?;
         output.push_str(&piece);
         completion_tokens += 1;
 
@@ -839,15 +903,16 @@ fn run_inference_inner(
         batch.clear();
         batch
             .add(new_token, prompt_len + i, &[0], true)
-            .map_err(|e| format!("Failed to add token: {}", e))?;
+            .map_err(|_| engine_failure(Code::Internal))?;
 
         ctx.decode(&mut batch)
-            .map_err(|e| format!("Decode failed: {}", e))?;
+            .map_err(|_| engine_failure(Code::Internal))?;
     }
 
     let total_tokens = (prompt_len as u32).saturating_add(completion_tokens);
     Ok(InferenceRun::Done(InferenceOutcome {
         text: output,
+        finish_reason,
         prompt_tokens: prompt_len as u32,
         completion_tokens,
         total_tokens,
@@ -950,12 +1015,31 @@ mod model_backed_tests {
              — proves the persistent context's KV cache is reset per call"
         );
     }
+
+    /// Needs no model: a path with no file, then a file that is not a GGUF.
+    /// llama.cpp's own log would print the second path to stderr, which no
+    /// Rust-side capture can observe, so it is voided before any load.
+    #[test]
+    fn a_failed_load_returns_only_the_closed_token() {
+        let missing = std::env::temp_dir().join("marmot-missing-model.gguf");
+        let invalid =
+            std::env::temp_dir().join(format!("marmot-invalid-model-{}.gguf", std::process::id()));
+        std::fs::write(&invalid, b"not a gguf").expect("write the invalid model file");
+
+        for path in [&missing, &invalid] {
+            let error = LlmEngine::new(&path.to_string_lossy())
+                .err()
+                .expect("the model cannot load");
+            assert_eq!(error, "runtime/provider_unavailable");
+        }
+        let _ = std::fs::remove_file(&invalid);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Stub when local llama is not compiled in (cloud-only build).
 // Keeps the type + API so the Arc<Mutex<Option<LlmEngine>>> plumbing and all
-// call sites compile unchanged; every operation reports "not in this build".
+// call sites compile unchanged; every operation reports `unsupported`.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(feature = "llm-llama"))]
@@ -978,15 +1062,15 @@ impl LlmEngine {
         &self,
         _text: &str,
         _speaker: &str,
-    ) -> Result<ExtractionResult, String> {
-        Err(LLAMA_UNAVAILABLE.to_string())
+    ) -> Result<ExtractionResult, RuntimeDiagnostic> {
+        Err(engine_failure(Code::Unsupported))
     }
     pub fn chat(
         &self,
         _messages: &[ChatMessage],
         _graph_context: &str,
-    ) -> Result<ChatOutcome, String> {
-        Err(LLAMA_UNAVAILABLE.to_string())
+    ) -> Result<ChatOutcome, RuntimeDiagnostic> {
+        Err(engine_failure(Code::Unsupported))
     }
     pub fn stream_chat(
         &self,
@@ -995,7 +1079,95 @@ impl LlmEngine {
         _params: LlmChatParams,
         _cancel: CancellationToken,
         _events: tokio::sync::mpsc::Sender<LlmStreamEvent>,
-    ) -> Result<(), String> {
-        Err(LLAMA_UNAVAILABLE.to_string())
+    ) -> Result<(), RuntimeDiagnostic> {
+        Err(engine_failure(Code::Unsupported))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_extraction_output_never_leaves_the_engine() {
+        use crate::test_log_capture::{ThreadLogCapture, render};
+
+        let capture = ThreadLogCapture::start();
+        let output = r#"engine-output-canary {"entities": engine-value-canary"#;
+        let error = parse_extraction(output).expect_err("malformed extraction output");
+        assert_eq!(error.to_string(), "runtime/invalid_response");
+        // Parsing logs nothing today; the capture is for the day something does.
+        let observed = format!("{error:?}\n{}", render(&capture.finish()));
+        assert!(!observed.contains("canary"), "{observed}");
+    }
+
+    #[test]
+    fn extraction_output_wrapped_in_prose_still_parses() {
+        let result = parse_extraction(r#"Sure: {"entities":[],"relations":[]} Done."#)
+            .expect("the JSON object inside the prose");
+        assert!(result.entities.is_empty() && result.relations.is_empty());
+    }
+
+    const LOAD_PANIC_CHILD: &str = "AUDIOGRAPH_TEST_LLM_LOAD_PANIC";
+    const MODEL_PATH_CANARY: &str = "marmot-private-model-dir";
+
+    #[test]
+    #[ignore = "invoked in isolation by a_load_panic_reaches_no_error_log_or_crash_report"]
+    fn load_panic_child() {
+        use crate::test_log_capture::{ThreadLogCapture, render};
+
+        if std::env::var_os(LOAD_PANIC_CHILD).is_none() {
+            return;
+        }
+        crate::crash_handler::install();
+        let capture = ThreadLogCapture::start();
+        // What llama-cpp-2's debug assertion says when the file is gone.
+        let result = load_redacted::<()>(|| {
+            panic!("\"/home/{MODEL_PATH_CANARY}/model.gguf\" does not exist")
+        });
+        let logs = render(&capture.finish());
+
+        assert_eq!(result, Err(engine_not_loaded()));
+        let observed = format!("{result:?}\n{logs}");
+        assert!(!observed.contains(MODEL_PATH_CANARY), "{observed}");
+    }
+
+    #[test]
+    fn a_load_panic_reaches_no_error_log_or_crash_report() {
+        let root =
+            std::env::temp_dir().join(format!("audiograph-llm-load-{}", uuid::Uuid::new_v4()));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "llm::engine::tests::load_panic_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(crate::user_data::DATA_DIR_ENV, &root)
+            .env(LOAD_PANIC_CHILD, "1")
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child status {}", output.status);
+        let reports: Vec<_> = std::fs::read_dir(root.join("crashes"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        std::fs::remove_dir_all(root).unwrap();
+
+        // The hook ran, and recorded the operation and nothing else.
+        assert_eq!(
+            reports,
+            ["AudioGraph crash report\n\nPayload:\n[redacted panic payload: llm.model_load]\n"]
+        );
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !printed.contains(MODEL_PATH_CANARY),
+            "model path in child output"
+        );
     }
 }

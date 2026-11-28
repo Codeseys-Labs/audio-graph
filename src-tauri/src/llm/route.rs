@@ -615,21 +615,20 @@ impl TerminalStatus {
 
 /// Normalize a provider `finish_reason` into a [`TerminalStatus`].
 ///
-/// Trim + ASCII-lowercase first, mirroring `bedrock::map_stop_reason`.
+/// Trim + ASCII-lowercase first, as `FinishReason::from_provider` does.
 ///
 /// Two mappings deserve a note because the code cannot show why:
 /// - `tool_calls` / `function_call` are `Failed`, not `Completed`: no request in
 ///   this repository sends tools, so a tool call is not a usable completion.
 /// - Any **unrecognized** non-empty token is `Completed`, matching the absent
-///   case below and `bedrock::map_stop_reason`'s fallback to `"stop"` for
-///   exactly the same reason: "so the stream still terminates cleanly rather
-///   than surfacing a raw SDK token" — this function claims to mirror that
-///   fallback, so it must not invert it. A vendor-specific *success* token this
-///   table has not enumerated yet (Together AI's `"eos"`, a future SDK
-///   addition) is not evidence of an unusable completion; ADR-0038's own rule is
-///   that "the runtime validator must remain the sole admission authority," so
-///   an unrecognized token defers to the validator instead of discarding a
-///   perfectly valid patch before the JSON is even parsed.
+///   case below. The streaming side reports such a token as `unknown` and
+///   still completes the turn, so this function must not invert that. A
+///   vendor-specific *success* token this table has not enumerated yet
+///   (Together AI's `"eos"`, a future SDK addition) is not evidence of an
+///   unusable completion; ADR-0038's own rule is that "the runtime validator
+///   must remain the sole admission authority," so an unrecognized token
+///   defers to the validator instead of discarding a perfectly valid patch
+///   before the JSON is even parsed.
 ///
 /// Residual limitation, stated rather than papered over: an absent, null, or
 /// unrecognized `finish_reason` maps to `Completed`, because many
@@ -1443,8 +1442,7 @@ mod tests {
         // An UNRECOGNIZED non-empty token — a vendor-specific success marker
         // this table has not enumerated (Together AI's "eos"), or a future SDK
         // addition — is not evidence of an unusable completion: it defers to
-        // the runtime validator instead, mirroring `bedrock::map_stop_reason`'s
-        // fallback to a clean stop for the same reason.
+        // the runtime validator instead, as a stream completes on `unknown`.
         for reason in ["COMPLETE", "eos", "wat"] {
             assert_eq!(
                 terminal_status_from_finish_reason(Some(reason)),
