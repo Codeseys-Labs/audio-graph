@@ -3091,37 +3091,8 @@ fn dispatch_projection_decision(
             }
             spawn_projection_job(dispatch, job);
         }
-        // ADR-0045 decision 3 (audio-graph-bf5d): a same-basis `Current`
-        // failure under budget armed exactly one deferred retry
-        // (`deferred_retry_at_ms`). Spawn the single one-shot clock thread
-        // that fires it even if no further final ASR revision ever arrives
-        // — mirrors the stopping check above, at the analogous point (before
-        // any thread exists), so a lane already stopping never gets a
-        // pointless clock armed for it. `None` means this same failure
-        // exhausted the budget: nothing to arm.
-        //
-        // audio-graph-1609 fold-in: discarding this spawn leaves
-        // `deferred_retry_at_ms` armed with no clock thread ever registered
-        // to fire it (the bf5d orphaned-deferral gap) — `abandon_discarded_deferred_retry`
-        // clears it so the next same-basis observation retries immediately
-        // instead of silently degrading to event-driven-only with no active
-        // signal that it did.
-        //
-        // audio-graph-fa56 known gap (disclosed, not fixed here): this
-        // branch is reachable WHILE `drain_projection_job_workers` is still
-        // joining the projection job thread that hit this failure — a job
-        // still in flight when Stop begins can finish and fail during the
-        // drain. When that happens, `abandon_discarded_deferred_retry`
-        // clears `deferred_retry_at_ms` back to `None` before
-        // `stop_capture_impl`'s post-drain `log_abandoned_deferred_retries_
-        // after_stop` (commands.rs) ever reads it, so this failure is
-        // invisible to that WARN and to the diagnostics snapshot it
-        // persists — the only signal is the `log::debug!` immediately below.
-        // This is the exact same user-facing gap the WARN exists to surface
-        // (a failed apply near Stop whose retry never runs); closing it
-        // needs a signal emitted from THIS discard site (e.g. promoting
-        // this log line, or a sibling one, to `log::warn!`), which is out
-        // of scope for audio-graph-fa56's detection-at-Stop primitive.
+        // Disarm a clock discarded during stop and retain its deadline for
+        // the post-drain diagnostic snapshot.
         ProjectionSchedulerDecision::FailedCurrent {
             failed_job_id,
             kind,
@@ -3131,7 +3102,7 @@ fn dispatch_projection_decision(
                 log::debug!(
                     "projection_lane_stopping set; not arming deferred retry clock for failed_job_id={failed_job_id} kind={kind:?}"
                 );
-                abandon_discarded_deferred_retry(&dispatch, &kind, deferred_retry_at_ms);
+                abandon_discarded_deferred_retry(&dispatch, &kind, &failed_job_id, deferred_retry_at_ms);
                 return;
             }
             spawn_deferred_lane_observation(dispatch, kind, failed_job_id, deferred_retry_at_ms);
@@ -3181,13 +3152,14 @@ fn abandon_discarded_projection_job(dispatch: &ProjectionDispatchContext, job: &
 fn abandon_discarded_deferred_retry(
     dispatch: &ProjectionDispatchContext,
     kind: &ProjectionKind,
+    failed_job_id: &str,
     deferred_retry_at_ms: u64,
 ) {
     let mut schedulers = dispatch
         .projection_schedulers
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    schedulers.abandon_deferred_retry(kind, deferred_retry_at_ms);
+    schedulers.abandon_deferred_retry(kind, failed_job_id, deferred_retry_at_ms);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3260,6 +3232,14 @@ fn spawn_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob)
     // only fires once). This one-shot channel makes registration
     // happens-before any work the job can do, closing that race.
     let (registered_tx, registered_rx) = std::sync::mpsc::channel::<()>();
+    // Serialize admission with the drain's registry take, even when the
+    // dispatching worker times out between the first fence check and spawn.
+    let mut guard = registry.lock().unwrap_or_else(|p| p.into_inner());
+    if dispatch.projection_lane_stopping.load(Ordering::SeqCst) {
+        drop(guard);
+        abandon_discarded_projection_job(&dispatch, &job);
+        return;
+    }
     match std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
@@ -3270,15 +3250,11 @@ fn spawn_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob)
             // Register the live handle instead of discarding it (previously
             // `Ok(_) => {}`), so `stop_capture_impl` can drain and join it at
             // Stop instead of leaving it running unbounded in the background.
-            {
-                let mut guard = registry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.push((job_kind, job_id, handle));
-            }
+            guard.push((job_kind, job_id, handle));
             let _ = registered_tx.send(());
         }
         Err(error) => {
+            drop(guard);
             log::error!(
                 "Failed to spawn projection job thread job_id={} error={}",
                 job_id,
@@ -3344,6 +3320,12 @@ fn spawn_deferred_lane_observation(
     let thread_registry_id = registry_id.clone();
     let thread_registry = registry.clone();
     let (registered_tx, registered_rx) = std::sync::mpsc::channel::<()>();
+    let mut guard = registry.lock().unwrap_or_else(|p| p.into_inner());
+    if stopping.load(Ordering::SeqCst) {
+        drop(guard);
+        abandon_discarded_deferred_retry(&dispatch, &kind, &failed_job_id, deferred_retry_at_ms);
+        return;
+    }
     match std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
@@ -3380,12 +3362,7 @@ fn spawn_deferred_lane_observation(
             trigger_deferred_projection_retry(&dispatch, &failed_job_id);
         }) {
         Ok(handle) => {
-            {
-                let mut guard = registry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.push((kind, registry_id, handle));
-            }
+            guard.push((kind, registry_id, handle));
             let _ = registered_tx.send(());
         }
         Err(error) => {
@@ -3827,37 +3804,14 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
             // `ProjectionPatch::basis_currency_at_apply`'s doc comment).
             let mut emitted_patch = patch.clone();
             let apply_started_ms = current_unix_millis();
-            // Check ownership, then release the scheduler before validation or
-            // disk I/O. Historical Review is read-only and cannot reset live
-            // schedulers; the only production reset is session rotation,
-            // which changes the runtime session id and is rejected by the
-            // materializer. Holding this lock through save would stall final
-            // ASR ingestion on slow storage, while taking scheduler -> ledger
-            // here would invert ASR's ledger -> scheduler lock order.
-            let owns_job = {
-                let schedulers = match dispatch.projection_schedulers.lock() {
-                    Ok(schedulers) => schedulers,
-                    Err(poisoned) => {
-                        log::warn!("Projection scheduler lock poisoned before apply; recovering");
-                        poisoned.into_inner()
-                    }
-                };
-                schedulers.owns_in_flight(&job.kind, &job.id, &job.session_id)
-            };
-            if !owns_job {
-                log::debug!(
-                    "Discarding patch before apply for superseded projection job_id={} session_id={}",
-                    job.id,
-                    job.session_id
-                );
+            let Some(apply_result) = dispatch.projection_runtime.apply_projection_job_patch(
+                &dispatch.projection_schedulers,
+                &job,
+                patch,
+            ) else {
                 finish_projection_scheduler_job(dispatch, &job, ProjectionJobCompletion::Completed);
                 return;
-            }
-            let apply_result = dispatch.projection_runtime.apply_runtime_projection_patch(
-                &job.session_id,
-                &job.basis,
-                patch,
-            );
+            };
             match apply_result {
                 Ok(result) => {
                     record_projection_apply_result(
@@ -4075,14 +4029,11 @@ fn finish_projection_scheduler_job(
     job: &ProjectionJob,
     completion: ProjectionJobCompletion,
 ) {
-    let ledger = match dispatch.transcript_ledger.lock() {
-        Ok(ledger) => ledger.clone(),
-        Err(poisoned) => {
-            log::warn!("Transcript ledger lock poisoned during projection completion; recovering");
-            poisoned.into_inner().clone()
-        }
-    };
     let decision = {
+        let ledger = dispatch
+            .transcript_ledger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let mut schedulers = match dispatch.projection_schedulers.lock() {
             Ok(schedulers) => schedulers,
             Err(poisoned) => {
