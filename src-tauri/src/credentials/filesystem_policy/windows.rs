@@ -267,10 +267,10 @@ mod native {
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_INFO,
-        FILE_READ_ATTRIBUTES, FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdInfo, FileRemoteProtocolInfo,
-        FileStandardInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-        GetVolumeInformationByHandleW, OPEN_EXISTING, VOLUME_NAME_GUID,
+        FILE_INFO_BY_HANDLE_CLASS, FILE_READ_ATTRIBUTES, FILE_REMOTE_PROTOCOL_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+        FileIdInfo, FileRemoteProtocolInfo, FileStandardInfo, GetFileInformationByHandleEx,
+        GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, OPEN_EXISTING, VOLUME_NAME_GUID,
     };
     use windows::Win32::System::IO::DeviceIoControl;
     use windows::Win32::System::Ioctl::{IOCTL_STORAGE_GET_HOTPLUG_INFO, STORAGE_HOTPLUG_INFO};
@@ -325,11 +325,13 @@ mod native {
             &self,
             path: &Path,
         ) -> Result<WindowsHeldDirectory, DetectorFault> {
-            let path: Vec<u16> = path
-                .as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
+            let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
+            // An embedded NUL would make CreateFileW address a prefix of the
+            // requested directory instead of failing.
+            if path.contains(&0) {
+                return Err(DetectorFault::TargetUnavailable);
+            }
+            path.push(0);
             let share =
                 FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
             // SAFETY: `path` is NUL-terminated and lives through the call. The
@@ -363,17 +365,34 @@ mod native {
         }
     }
 
-    fn file_information<T: Default>(
-        handle: HANDLE,
-        class: windows::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS,
-    ) -> Result<T, ApiFault> {
+    /// Pairs each handle-information class with the exact output layout that
+    /// `GetFileInformationByHandleEx` writes for it.
+    ///
+    /// # Safety
+    ///
+    /// `CLASS` must be the information class whose output buffer is `Self`.
+    unsafe trait FileInformation: Default {
+        const CLASS: FILE_INFO_BY_HANDLE_CLASS;
+    }
+
+    // SAFETY: `FileStandardInfo` writes exactly one `FILE_STANDARD_INFO`.
+    unsafe impl FileInformation for FILE_STANDARD_INFO {
+        const CLASS: FILE_INFO_BY_HANDLE_CLASS = FileStandardInfo;
+    }
+
+    // SAFETY: `FileIdInfo` writes exactly one `FILE_ID_INFO`.
+    unsafe impl FileInformation for FILE_ID_INFO {
+        const CLASS: FILE_INFO_BY_HANDLE_CLASS = FileIdInfo;
+    }
+
+    fn file_information<T: FileInformation>(handle: HANDLE) -> Result<T, ApiFault> {
         let mut value = T::default();
-        // SAFETY: `value` is a writable `T` with the exact byte size passed to
-        // the API, and remains alive until the synchronous call returns.
+        // SAFETY: `T::CLASS` writes exactly a `T`; `value` is writable for the
+        // byte size passed and remains alive until the synchronous call returns.
         unsafe {
             GetFileInformationByHandleEx(
                 handle,
-                class,
+                T::CLASS,
                 std::ptr::addr_of_mut!(value).cast::<c_void>(),
                 size_of::<T>() as u32,
             )
@@ -388,7 +407,7 @@ mod native {
         type HeldVolume = WindowsHeldVolume;
 
         fn is_directory(&self, target: &Self::HeldDirectory) -> Result<bool, ApiFault> {
-            let info: FILE_STANDARD_INFO = file_information(target.handle.0, FileStandardInfo)?;
+            let info: FILE_STANDARD_INFO = file_information(target.handle.0)?;
             Ok(info.Directory)
         }
 
@@ -396,7 +415,7 @@ mod native {
             &self,
             target: &Self::HeldDirectory,
         ) -> Result<Self::DirectoryIdentity, ApiFault> {
-            let info: FILE_ID_INFO = file_information(target.handle.0, FileIdInfo)?;
+            let info: FILE_ID_INFO = file_information(target.handle.0)?;
             Ok(DirectoryIdentity {
                 volume_serial: info.VolumeSerialNumber,
                 file_id: info.FileId.Identifier,
@@ -558,6 +577,18 @@ mod native {
             FILE_V2_SUPPORTED_PROFILES, FilesystemStatus, FilesystemStatusCode,
             JOURNAL_SUPPORTED_PROFILES, PersistenceTarget, evaluate_filesystem,
         };
+
+        #[test]
+        fn embedded_nul_cannot_open_a_directory_prefix() {
+            // Without the guard, CreateFileW would open the existing prefix.
+            let mut path = std::env::temp_dir().into_os_string();
+            path.push("\0unreachable-suffix");
+            let detector = WindowsFilesystemDetector::new(PlatformRelease::new(10, 0, 0));
+            assert!(matches!(
+                detector.open_target(std::path::Path::new(&path)),
+                Err(DetectorFault::TargetUnavailable)
+            ));
+        }
 
         #[test]
         #[ignore = "requires native Windows and AUDIO_GRAPH_WINDOWS_FILESYSTEM_SMOKE_DIR"]

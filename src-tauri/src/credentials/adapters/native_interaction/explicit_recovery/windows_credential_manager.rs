@@ -156,9 +156,11 @@ mod tests {
     use crate::credentials::domain::CredentialStoreFailure;
 
     const RAW_SOURCE: &str = "credentials/adapters/windows_credential_manager_ffi.rs";
-    // The reviewed Security.framework raw core may declare `extern` symbols,
-    // but never a WinCred link or identifier.
     const MACOS_RAW_SOURCE: &str = "credentials/adapters/macos_keychain_ffi.rs";
+    // The one `extern` block the reviewed Security.framework raw core may
+    // declare, for the status symbol its `-sys` crate does not bind. Any other
+    // `extern` in that file, and any WinCred link anywhere, stays a violation.
+    const MACOS_PERMITTED_EXTERN: &str = "unsafe extern \"C\" {\n    fn SecKeychainGetStatus(keychain: SecKeychainRef, keychain_status: *mut u32) -> OSStatus;\n}";
     const POLICY_SOURCE: &str =
         "credentials/adapters/native_interaction/explicit_recovery/windows_credential_manager.rs";
 
@@ -374,6 +376,10 @@ mod tests {
             })
     }
 
+    fn normalized_tokens(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     fn source_violations(crate_src: &std::path::Path) -> std::io::Result<Vec<SourceViolation>> {
         let raw_source = std::path::Path::new(RAW_SOURCE);
         let macos_raw_source = std::path::Path::new(MACOS_RAW_SOURCE);
@@ -397,13 +403,19 @@ mod tests {
                 .chars()
                 .filter(|character| !character.is_whitespace())
                 .collect();
-            let has_extern = production
+            let extern_scan = if relative == macos_raw_source {
+                normalized_tokens(&production).replacen(
+                    &normalized_tokens(&masked_rust_code(MACOS_PERMITTED_EXTERN)),
+                    " ",
+                    1,
+                )
+            } else {
+                production.clone()
+            };
+            let has_extern = extern_scan
                 .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
                 .any(|identifier| identifier == "extern");
-            let extern_permitted = relative == macos_raw_source;
-            if relative != raw_source
-                && ((has_extern && !extern_permitted) || compact.contains("windows::core::link"))
-            {
+            if relative != raw_source && (has_extern || compact.contains("windows::core::link")) {
                 record_violation(&mut violations, relative, "ffi_declaration");
             }
             for identifier in production
@@ -748,6 +760,46 @@ mod tests {
                 .iter()
                 .any(|violation| violation.identifier == "RawCredentialStore")
         );
+    }
+
+    #[test]
+    fn macos_raw_core_may_declare_only_its_one_reviewed_extern_block() {
+        let fixture = std::env::temp_dir().join(format!(
+            "audio-graph-macos-extern-inventory-{}",
+            uuid::Uuid::new_v4().hyphenated()
+        ));
+        let scan = |case: &str, source: &str| {
+            let crate_src = fixture.join(case).join("src");
+            let adapters = crate_src.join("credentials/adapters");
+            std::fs::create_dir_all(&adapters).expect("create macOS raw-core fixture");
+            std::fs::write(adapters.join("macos_keychain_ffi.rs"), source)
+                .expect("write macOS raw-core fixture");
+            source_violations(&crate_src).expect("scan macOS raw-core fixture")
+        };
+
+        let exact = scan("exact", MACOS_PERMITTED_EXTERN);
+        let extra = scan(
+            "extra",
+            &format!("{MACOS_PERMITTED_EXTERN}\nunsafe extern \"C\" {{ fn SecKeychainLock(); }}"),
+        );
+        let doubled = scan(
+            "doubled",
+            &format!("{MACOS_PERMITTED_EXTERN}\n{MACOS_PERMITTED_EXTERN}"),
+        );
+        let renamed = scan(
+            "renamed",
+            &MACOS_PERMITTED_EXTERN.replace("SecKeychainGetStatus", "SecKeychainLock"),
+        );
+        std::fs::remove_dir_all(&fixture).expect("remove macOS raw-core fixture");
+
+        assert!(exact.is_empty(), "{exact:?}");
+        for violations in [extra, doubled, renamed] {
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.identifier == "ffi_declaration")
+            );
+        }
     }
 
     #[test]

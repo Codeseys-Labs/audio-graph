@@ -338,8 +338,7 @@ mod explicit_recovery {
             CancellationToken, CredentialStoreFailure, NativeInteractionGate, RecoveryBoundary,
             RecoveryOutcome, RecoveryTarget, ensure_forbid_prompt, latch_forbid_uncertainty,
         };
-        use crate::crash_handler::{RedactedPanicOp, with_redacted_panic_scope};
-        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use crate::crash_handler::{RedactedPanicOp, catch_redacted_panic};
 
         pub(super) struct AllowPrompt<'lease, 'gate> {
             lease: &'lease NativeInteractionLease<'gate>,
@@ -373,10 +372,8 @@ mod explicit_recovery {
                 }
                 let recovery = {
                     let prompt = AllowPrompt { lease: &lease };
-                    match with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
-                        catch_unwind(AssertUnwindSafe(|| {
-                            self.boundary.recover(&prompt, target, cancellation)
-                        }))
+                    match catch_redacted_panic(RedactedPanicOp::CredentialBoundary, || {
+                        self.boundary.recover(&prompt, target, cancellation)
                     }) {
                         Ok(result) => result,
                         Err(_) => {
@@ -396,10 +393,8 @@ mod explicit_recovery {
 
                 ensure_forbid_prompt(lease.forbid_prompt())?;
                 let verification =
-                    match with_redacted_panic_scope(RedactedPanicOp::CredentialBoundary, || {
-                        catch_unwind(AssertUnwindSafe(|| {
-                            self.boundary.verify(lease.forbid_prompt(), target)
-                        }))
+                    match catch_redacted_panic(RedactedPanicOp::CredentialBoundary, || {
+                        self.boundary.verify(lease.forbid_prompt(), target)
                     }) {
                         Ok(result) => result,
                         Err(_) => return Err(latch_forbid_uncertainty(lease.forbid_prompt())),
@@ -501,6 +496,9 @@ mod explicit_recovery {
             Closed(CredentialStoreFailure),
             Uncertain,
             Panic,
+            /// Runs a test-chosen panic, such as one whose payload destructor
+            /// panics too.
+            PanicWith(fn() -> !),
         }
 
         struct ScriptedRecoveryBoundary {
@@ -524,6 +522,7 @@ mod explicit_recovery {
                     RecoveryStep::Closed(failure) => Err(RecoveryFailure::Closed(failure)),
                     RecoveryStep::Uncertain => Err(RecoveryFailure::Uncertain),
                     RecoveryStep::Panic => panic!("scripted recovery panic canary"),
+                    RecoveryStep::PanicWith(trigger) => trigger(),
                 }
             }
         }
@@ -2654,6 +2653,50 @@ pub(super) struct NativeInteractionLease<'gate> {
             panic_gate.acquire(),
             Err(CredentialStoreFailure::StalledWorker)
         ));
+    }
+
+    #[test]
+    #[ignore = "invoked in isolation by recovery_panics_are_redacted_at_hook_time"]
+    fn recovery_panic_child() {
+        use crate::credentials::adapters::panic_hook_canary;
+
+        if panic_hook_canary::child_canary().is_none() {
+            return;
+        }
+        crate::crash_handler::install();
+        for panic in [
+            panic_hook_canary::panic_with_canary as fn() -> !,
+            panic_hook_canary::panic_with_destructor_canary,
+        ] {
+            for (recover, verify) in [
+                (RecoveryStep::PanicWith(panic), RecoveryStep::Success),
+                (RecoveryStep::Success, RecoveryStep::PanicWith(panic)),
+            ] {
+                let facade = scripted_facade(
+                    NativeInteractionGate::isolated_for_test(),
+                    Arc::new(Mutex::new(Vec::new())),
+                    recover,
+                    verify,
+                );
+                assert_eq!(
+                    facade.diagnose_or_unlock(
+                        RecoveryTarget::CredentialStore,
+                        &CancellationToken::new()
+                    ),
+                    Err(CredentialStoreFailure::StalledWorker)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_panics_are_redacted_at_hook_time() {
+        let codes = crate::credentials::adapters::panic_hook_canary::redacted_report_codes(
+            "credentials::adapters::native_interaction::tests::recovery_panic_child",
+        );
+        // Recover and verify lanes, each with a string payload (one report)
+        // and with a payload whose destructor panics (two reports).
+        assert_eq!(codes, vec!["credential.boundary".to_owned(); 6]);
     }
 
     fn wait_until_gate_has_queued_waiter(gate: &NativeInteractionGate) {

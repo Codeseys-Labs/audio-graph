@@ -145,9 +145,11 @@ nix = { version = "0.31.3", features = ["fs"] }
 # Dormant credential-v2 macOS boundary: checked Security.framework Keychain
 # calls plus held-descriptor filesystem inspection. Every version below is the
 # one already resolved in the lock (via keyring/native-tls/rsac), so these add
-# direct edges only, no new packages.
+# direct edges only, no new packages. The Keychain calls need none of
+# security-framework's default TLS features (ALPN, session tickets), so this
+# edge does not request them; native-tls and keyring still enable them.
 core-foundation = "=0.10.1"
-security-framework = "=3.7.0"
+security-framework = { version = "=3.7.0", default-features = false }
 security-framework-sys = "=2.17.0"
 rustix = { version = "=1.1.4", features = ["fs"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [

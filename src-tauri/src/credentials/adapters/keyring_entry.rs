@@ -1,18 +1,11 @@
 use super::native_interaction::{
     ForbidPrompt, MutationInvocation, NativeInteractionLease, ensure_forbid_prompt,
 };
-use crate::crash_handler::{RedactedPanicOp, with_redacted_panic_scope};
+use crate::crash_handler::{RedactedPanicOp, catch_redacted_panic};
 use crate::credentials::domain::CredentialStoreFailure;
 use audio_graph_ipc_contract::credential_contract::{CredentialOperationId, CredentialSetId};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use zeroize::{Zeroize, Zeroizing};
-
-/// The crash hook observes the closed operation code before the unwind reaches
-/// `catch_unwind`, so a platform panic payload never reaches a report.
-fn catch_native_unwind<T>(op: RedactedPanicOp, call: impl FnOnce() -> T) -> std::thread::Result<T> {
-    with_redacted_panic_scope(op, || catch_unwind(AssertUnwindSafe(call)))
-}
 
 const CREDENTIAL_SERVICE: &str = "com.codeseys.audiograph.credentials";
 const WINDOWS_TARGET_PREFIX: &str = "Codeseys.AudioGraph.Credentials/";
@@ -103,7 +96,7 @@ impl KeyringEntryAdapter {
     ) -> Result<Option<Zeroizing<Vec<u8>>>, CredentialStoreFailure> {
         let (prompt, invocation) = lease.mutation_capabilities();
         ensure_forbid_prompt(prompt)?;
-        let result = catch_native_unwind(RedactedPanicOp::KeychainRead, || {
+        let result = catch_redacted_panic(RedactedPanicOp::KeychainRead, || {
             self.boundary.get_secret(prompt, locator)
         });
         match result {
@@ -126,7 +119,7 @@ impl KeyringEntryAdapter {
     ) -> Result<(), CredentialStoreFailure> {
         let (prompt, invocation) = lease.mutation_capabilities();
         invocation.prepare()?;
-        match catch_native_unwind(RedactedPanicOp::KeychainWrite, || {
+        match catch_redacted_panic(RedactedPanicOp::KeychainWrite, || {
             self.boundary
                 .set_secret(prompt, invocation, locator, secret)
         }) {
@@ -148,7 +141,7 @@ impl KeyringEntryAdapter {
     ) -> Result<(), CredentialStoreFailure> {
         let (prompt, invocation) = lease.mutation_capabilities();
         invocation.prepare()?;
-        let result = match catch_native_unwind(RedactedPanicOp::KeychainWrite, || {
+        let result = match catch_redacted_panic(RedactedPanicOp::KeychainWrite, || {
             self.boundary
                 .set_secret(prompt, invocation, locator, secret)
         }) {
@@ -173,7 +166,7 @@ impl KeyringEntryAdapter {
     ) -> Result<(), CredentialStoreFailure> {
         let (prompt, invocation) = lease.mutation_capabilities();
         invocation.prepare()?;
-        let deleted = catch_native_unwind(RedactedPanicOp::KeychainDelete, || {
+        let deleted = catch_redacted_panic(RedactedPanicOp::KeychainDelete, || {
             self.boundary.delete_credential(prompt, invocation, locator)
         });
         match deleted {
@@ -187,7 +180,7 @@ impl KeyringEntryAdapter {
             Ok(Err(failure)) => return Err(failure),
         }
 
-        let readback = catch_native_unwind(RedactedPanicOp::KeychainRead, || {
+        let readback = catch_redacted_panic(RedactedPanicOp::KeychainRead, || {
             self.boundary.get_secret(prompt, locator)
         });
         match readback {
@@ -210,10 +203,10 @@ mod tests {
     use crate::credentials::adapters::native_interaction::{
         ForbidPrompt, MutationInvocation, NativeInteractionGate,
     };
+    use crate::credentials::adapters::panic_hook_canary;
     use crate::credentials::domain::CredentialStoreFailure;
     use audio_graph_ipc_contract::credential_contract::{BuiltInCredentialSetId, CredentialSetId};
     use std::collections::HashMap;
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -488,9 +481,13 @@ mod tests {
         }
     }
 
-    /// Every boundary method panics with a private canary after the mutation
-    /// cut, so each adapter lane reaches the crash hook exactly once.
-    struct CanaryPanicBoundary(String);
+    /// Every boundary method panics after the mutation cut with the chosen
+    /// canary. A `delete_succeeds` boundary deletes cleanly instead, so the
+    /// absence readback is the lane that panics.
+    struct CanaryPanicBoundary {
+        panic: fn() -> !,
+        delete_succeeds: bool,
+    }
 
     impl KeyringBoundary for CanaryPanicBoundary {
         fn get_secret(
@@ -498,7 +495,7 @@ mod tests {
             _prompt: &ForbidPrompt<'_>,
             _locator: &EntryLocator,
         ) -> Result<Vec<u8>, CredentialStoreFailure> {
-            panic!("{}", self.0)
+            (self.panic)()
         }
 
         fn set_secret(
@@ -509,7 +506,7 @@ mod tests {
             _secret: &[u8],
         ) -> Result<(), CredentialStoreFailure> {
             invocation.mark_started();
-            panic!("{}", self.0)
+            (self.panic)()
         }
 
         fn delete_credential(
@@ -519,7 +516,10 @@ mod tests {
             _locator: &EntryLocator,
         ) -> Result<(), CredentialStoreFailure> {
             invocation.mark_started();
-            panic!("{}", self.0)
+            if self.delete_succeeds {
+                return Ok(());
+            }
+            (self.panic)()
         }
     }
 
@@ -799,89 +799,70 @@ mod tests {
         ));
     }
 
-    const NATIVE_PANIC_CANARY_ENV: &str = "AUDIOGRAPH_TEST_NATIVE_BOUNDARY_PANIC_CANARY";
-
     #[test]
     #[ignore = "invoked in isolation by native_boundary_panics_are_redacted_at_hook_time"]
     fn native_boundary_panic_child() {
-        let Ok(canary) = std::env::var(NATIVE_PANIC_CANARY_ENV) else {
+        if panic_hook_canary::child_canary().is_none() {
             return;
-        };
+        }
         crate::crash_handler::install();
-        let adapter = KeyringEntryAdapter::new(Arc::new(CanaryPanicBoundary(canary)));
         let locator = EntryLocator::authority();
+        let adapter = |panic, delete_succeeds| {
+            KeyringEntryAdapter::new(Arc::new(CanaryPanicBoundary {
+                panic,
+                delete_succeeds,
+            }))
+        };
+        let lease = || {
+            NativeInteractionGate::isolated_for_test()
+                .acquire()
+                .expect("isolated interaction lease")
+        };
 
-        let mut lease = NativeInteractionGate::isolated_for_test()
-            .acquire()
-            .expect("read lease");
-        assert!(matches!(
-            adapter.read(&mut lease, &locator),
-            Err(CredentialStoreFailure::StalledWorker)
-        ));
-        let mut lease = NativeInteractionGate::isolated_for_test()
-            .acquire()
-            .expect("write lease");
-        assert_eq!(
-            adapter.write(&mut lease, &locator, b"opaque-record"),
-            Err(CredentialStoreFailure::CommitUnknown)
-        );
-        let mut lease = NativeInteractionGate::isolated_for_test()
-            .acquire()
-            .expect("authority write lease");
-        assert_eq!(
-            adapter.write_authority(&mut lease, &locator, b"opaque-marker"),
-            Err(CredentialStoreFailure::CommitUnknown)
-        );
-        let mut lease = NativeInteractionGate::isolated_for_test()
-            .acquire()
-            .expect("delete lease");
-        assert_eq!(
-            adapter.delete_and_verify_absent(&mut lease, &locator),
-            Err(CredentialStoreFailure::CommitUnknown)
-        );
+        for panic in [
+            panic_hook_canary::panic_with_canary as fn() -> !,
+            panic_hook_canary::panic_with_destructor_canary,
+        ] {
+            let panicking = adapter(panic, false);
+            assert_eq!(
+                panicking.read(&mut lease(), &locator),
+                Err(CredentialStoreFailure::StalledWorker)
+            );
+            assert_eq!(
+                panicking.write(&mut lease(), &locator, b"opaque-record"),
+                Err(CredentialStoreFailure::CommitUnknown)
+            );
+            assert_eq!(
+                panicking.write_authority(&mut lease(), &locator, b"opaque-marker"),
+                Err(CredentialStoreFailure::CommitUnknown)
+            );
+            assert_eq!(
+                panicking.delete_and_verify_absent(&mut lease(), &locator),
+                Err(CredentialStoreFailure::CommitUnknown)
+            );
+            assert_eq!(
+                adapter(panic, true).delete_and_verify_absent(&mut lease(), &locator),
+                Err(CredentialStoreFailure::CommitUnknown)
+            );
+        }
     }
 
     #[test]
     fn native_boundary_panics_are_redacted_at_hook_time() {
-        let nonce = uuid::Uuid::new_v4();
-        let root = std::env::temp_dir().join(format!("audiograph-native-boundary-panic-{nonce}"));
-        let canary = format!("private native payload {nonce}");
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "credentials::adapters::keyring_entry::tests::native_boundary_panic_child",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env(crate::user_data::DATA_DIR_ENV, &root)
-            .env(NATIVE_PANIC_CANARY_ENV, &canary)
-            .output()
-            .expect("run native boundary panic child");
-        let reports = read_reports(&root.join("crashes"));
-        let _ = std::fs::remove_dir_all(&root);
-        let mut reports = reports.expect("child crash reports");
-        reports.sort();
-
-        assert!(output.status.success(), "child status {}", output.status);
-        assert!(!String::from_utf8_lossy(&output.stdout).contains(&canary));
-        assert!(!String::from_utf8_lossy(&output.stderr).contains(&canary));
-        let report = |code: &str| {
-            format!("AudioGraph crash report\n\nPayload:\n[redacted panic payload: {code}]\n")
-        };
-        assert_eq!(
-            reports,
-            [
-                report("credential.keychain_delete"),
-                report("credential.keychain_read"),
-                report("credential.keychain_write"),
-                report("credential.keychain_write"),
-            ]
+        let codes = panic_hook_canary::redacted_report_codes(
+            "credentials::adapters::keyring_entry::tests::native_boundary_panic_child",
         );
-    }
-
-    fn read_reports(directory: &Path) -> std::io::Result<Vec<String>> {
-        std::fs::read_dir(directory)?
-            .map(|entry| std::fs::read_to_string(entry?.path()))
-            .collect()
+        // A string payload reports once per lane. A payload whose destructor
+        // panics reports twice: the boundary panic and the destructor panic,
+        // both inside the lane's scope.
+        let expected: Vec<String> = [
+            ("credential.keychain_delete", 3),
+            ("credential.keychain_read", 6),
+            ("credential.keychain_write", 6),
+        ]
+        .into_iter()
+        .flat_map(|(code, count)| std::iter::repeat_n(code.to_owned(), count))
+        .collect();
+        assert_eq!(codes, expected);
     }
 }

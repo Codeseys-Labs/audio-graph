@@ -61,6 +61,34 @@ pub fn with_redacted_panic_scope<R>(op: RedactedPanicOp, f: impl FnOnce() -> R) 
     f()
 }
 
+/// Content-free evidence that a redacted operation panicked. The opaque
+/// payload never leaves [`catch_redacted_panic`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedactedPanic;
+
+/// Catch a panic from `f` and dispose of its payload inside `op`'s redaction
+/// scope. A payload's destructor may itself panic, so the drop is caught too.
+/// That secondary payload is forgotten, because dropping it could panic again
+/// and returning it would carry it past the scope.
+pub fn catch_redacted_panic<R>(
+    op: RedactedPanicOp,
+    f: impl FnOnce() -> R,
+) -> Result<R, RedactedPanic> {
+    with_redacted_panic_scope(op, || {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(value) => Ok(value),
+            Err(payload) => {
+                if let Err(secondary) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+                {
+                    std::mem::forget(secondary);
+                }
+                Err(RedactedPanic)
+            }
+        }
+    })
+}
+
 /// Install the global panic hook. Safe to call multiple times, though only the
 /// first call has a useful effect — subsequent calls will still chain to the
 /// previous hook (which is itself our hook + the default hook).
@@ -300,6 +328,37 @@ mod tests {
             assert_eq!(ACTIVE_OP.get(), Some(LegacyFileRead));
         });
         assert_eq!(ACTIVE_OP.get(), None);
+    }
+
+    #[test]
+    fn catch_redacted_panic_drops_a_panicking_payload_inside_the_scope() {
+        use std::sync::{Arc, Mutex};
+
+        struct PanickingPayload(Arc<Mutex<Option<Option<RedactedPanicOp>>>>);
+        impl Drop for PanickingPayload {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = Some(ACTIVE_OP.get());
+                panic!("non-secret payload destructor test unwind");
+            }
+        }
+
+        let observed = Arc::new(Mutex::new(None));
+        let payload = PanickingPayload(Arc::clone(&observed));
+        let result: Result<(), RedactedPanic> =
+            catch_redacted_panic(RedactedPanicOp::KeychainRead, move || {
+                std::panic::panic_any(payload)
+            });
+
+        assert_eq!(result, Err(RedactedPanic));
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(Some(RedactedPanicOp::KeychainRead))
+        );
+        assert_eq!(ACTIVE_OP.get(), None);
+        assert_eq!(
+            catch_redacted_panic(RedactedPanicOp::KeychainWrite, || 7),
+            Ok(7)
+        );
     }
 
     const CHILD_NONCE: &str = "AUDIOGRAPH_TEST_CRASH_NONCE";

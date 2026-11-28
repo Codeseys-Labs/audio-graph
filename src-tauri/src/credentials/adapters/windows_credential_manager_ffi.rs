@@ -59,7 +59,8 @@ enum NativeCredentialPersistence {
 }
 
 #[cfg(any(test, target_os = "windows"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 struct NativeWriteRequestFields {
     flags: u32,
     credential_type: NativeCredentialType,
@@ -705,37 +706,53 @@ pub(super) mod test_support {
         allocation.observation.frees.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn observed_native_buffer(
+    fn observed_native_allocation(
         bytes: Vec<u8>,
-    ) -> (NativeCredentialBuffer, Arc<NativeBufferObservation>) {
-        let length = bytes.len();
-        observed_native_buffer_parts(bytes, length, true)
-    }
-
-    fn observed_native_buffer_parts(
-        bytes: Vec<u8>,
-        length: usize,
-        has_blob: bool,
-    ) -> (NativeCredentialBuffer, Arc<NativeBufferObservation>) {
+    ) -> (Box<ObservedNativeAllocation>, Arc<NativeBufferObservation>) {
         let observation = Arc::new(NativeBufferObservation::default());
-        let mut allocation = Box::new(ObservedNativeAllocation {
+        let allocation = Box::new(ObservedNativeAllocation {
             bytes,
             observation: observation.clone(),
         });
-        let blob = has_blob
-            .then(|| NonNull::new(allocation.bytes.as_mut_ptr()))
-            .flatten();
+        (allocation, observation)
+    }
+
+    fn native_buffer_guard(
+        allocation: Box<ObservedNativeAllocation>,
+        blob: Option<NonNull<u8>>,
+        length: usize,
+    ) -> NativeCredentialBuffer {
         let allocation = NonNull::new(Box::into_raw(allocation).cast::<c_void>())
             .expect("boxed test native allocation");
-        let guard = unsafe {
+        // SAFETY: callers pass either the allocation's own byte buffer with its
+        // exact length, or no blob at all; the free function matches the Box.
+        unsafe {
             NativeCredentialBuffer::from_raw_parts(
                 allocation,
                 blob,
                 length,
                 free_observed_native_allocation,
             )
-        };
-        (guard, observation)
+        }
+    }
+
+    /// A present blob whose reported length is always the vector's own length.
+    fn observed_native_buffer(
+        bytes: Vec<u8>,
+    ) -> (NativeCredentialBuffer, Arc<NativeBufferObservation>) {
+        let (mut allocation, observation) = observed_native_allocation(bytes);
+        let length = allocation.bytes.len();
+        let blob = NonNull::new(allocation.bytes.as_mut_ptr());
+        (native_buffer_guard(allocation, blob, length), observation)
+    }
+
+    /// A null blob that reports `length` bytes. The allocation holds untouched
+    /// nonzero sentinel bytes that no slice is ever built over.
+    fn observed_null_blob_buffer(
+        length: usize,
+    ) -> (NativeCredentialBuffer, Arc<NativeBufferObservation>) {
+        let (allocation, observation) = observed_native_allocation(vec![0xa5; length]);
+        (native_buffer_guard(allocation, None, length), observation)
     }
 
     impl RawCredentialStore for FailingMutationStore {
@@ -1080,52 +1097,89 @@ pub(super) mod test_support {
 
     #[test]
     fn native_null_blob_edges_return_closed_results_and_free_once() {
-        let (empty, empty_observed) = observed_native_buffer_parts(Vec::new(), 0, false);
+        let (empty, empty_observed) = observed_null_blob_buffer(0);
         assert_eq!(empty.copy_secret().expect("zero-length null blob").len(), 0);
         drop(empty);
         assert_eq!(empty_observed.snapshot().1, 1);
 
-        let (invalid, invalid_observed) = observed_native_buffer_parts(vec![0xa5; 16], 16, false);
+        let (invalid, invalid_observed) = observed_null_blob_buffer(16);
         assert_eq!(invalid.copy_secret(), Err(ReadFailure::Internal));
         drop(invalid);
         assert_eq!(invalid_observed.snapshot(), (0, 1));
     }
 
-    /// Deletes the isolated test target on success and on unwind, so a failed
-    /// assertion never leaves a record in the user's Credential Manager.
+    /// Deletes the isolated test target if the test unwinds after creating it.
+    /// It is armed only once the target was confirmed absent, so a pre-existing
+    /// entry is never touched; the success path deletes explicitly and disarms.
     #[cfg(target_os = "windows")]
-    struct IsolatedTargetCleanup(String);
+    struct IsolatedTargetCleanup<'target> {
+        target: &'target str,
+        armed: bool,
+    }
 
     #[cfg(target_os = "windows")]
-    impl Drop for IsolatedTargetCleanup {
+    impl Drop for IsolatedTargetCleanup<'_> {
         fn drop(&mut self) {
-            if let Ok(target) = prepare_target(&self.0) {
-                let _ = super::NativeWinCredStore::new().delete(target);
+            if !self.armed {
+                return;
+            }
+            let cleaned = prepare_target(self.target).is_ok_and(|target| {
+                matches!(
+                    super::NativeWinCredStore::new().delete(target),
+                    Ok(()) | Err(DeleteFailure::Missing)
+                )
+            });
+            if !cleaned {
+                eprintln!(
+                    "cleanup of a Codeseys.AudioGraph.Test/credential-v2/ WinCred test target failed"
+                );
             }
         }
     }
 
+    /// Reads the persisted type and persistence of the isolated record. The
+    /// native allocation is owned by the production buffer owner, so its blob
+    /// is scrubbed before `CredFree`. Failure is a closed `None`.
     #[cfg(target_os = "windows")]
-    fn native_record_shape(target: &str) -> (u32, u32) {
+    fn native_record_shape(target: &str) -> Option<(u32, u32)> {
         use windows::Win32::Security::Credentials::{
             CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
         };
         use windows::core::PCWSTR;
 
+        unsafe fn free_credential(allocation: NonNull<c_void>) {
+            unsafe { CredFree(allocation.as_ptr()) };
+        }
+
         let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
         let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
-        unsafe {
+        let read = unsafe {
             CredReadW(
                 PCWSTR(wide.as_ptr()),
                 CRED_TYPE_GENERIC,
                 None,
                 &mut credential,
             )
+        };
+        if read.is_err() {
+            return None;
         }
-        .expect("read isolated test record shape");
-        let shape = unsafe { ((*credential).Type.0, (*credential).Persist.0) };
-        unsafe { CredFree(credential.cast()) };
-        shape
+        let credential = NonNull::new(credential)?;
+        // SAFETY: CredReadW succeeded, so `credential` points to one
+        // CREDENTIALW that stays valid until its owner below frees it.
+        let native = unsafe { credential.as_ref() };
+        let shape = (native.Type.0, native.Persist.0);
+        // SAFETY: the allocation came from CredReadW, its blob pointer and size
+        // describe that allocation's bytes, and CredFree is its deallocator.
+        let _owner = unsafe {
+            NativeCredentialBuffer::from_raw_parts(
+                credential.cast(),
+                NonNull::new(native.CredentialBlob),
+                native.CredentialBlobSize as usize,
+                free_credential,
+            )
+        };
+        Some(shape)
     }
 
     /// Touches the real Credential Manager, but only one fresh target outside
@@ -1144,21 +1198,31 @@ pub(super) mod test_support {
             uuid::Uuid::new_v4().hyphenated()
         );
         assert!(!target.starts_with("Codeseys.AudioGraph.Credentials/"));
-        let _cleanup = IsolatedTargetCleanup(target.clone());
         let store = super::NativeWinCredStore::new();
         let prepared = || prepare_target(&target).expect("isolated test target");
 
-        assert_eq!(store.read(prepared()).err(), Some(ReadFailure::Missing));
+        assert_eq!(
+            store.read(prepared()).err(),
+            Some(ReadFailure::Missing),
+            "isolated test target must not pre-exist"
+        );
+        let mut cleanup = IsolatedTargetCleanup {
+            target: &target,
+            armed: true,
+        };
 
         let first = vec![0xa5; super::MAX_CREDENTIAL_BLOB_BYTES];
         store
             .write(prepare_write(&target, &first).expect("bounded test payload"))
             .expect("write isolated test record");
         let readback = store.read(prepared()).expect("read isolated test record");
-        assert_eq!(readback.as_slice(), first.as_slice());
+        assert!(
+            readback.as_slice() == first.as_slice(),
+            "exact readback of the isolated test record"
+        );
         assert_eq!(
             native_record_shape(&target),
-            (CRED_TYPE_GENERIC.0, CRED_PERSIST_LOCAL_MACHINE.0)
+            Some((CRED_TYPE_GENERIC.0, CRED_PERSIST_LOCAL_MACHINE.0))
         );
 
         let second = [0x00, 0x80, 0xff];
@@ -1166,11 +1230,15 @@ pub(super) mod test_support {
             .write(prepare_write(&target, &second).expect("binary test payload"))
             .expect("replace isolated test record");
         let replaced = store.read(prepared()).expect("read replaced test record");
-        assert_eq!(replaced.as_slice(), second.as_slice());
+        assert!(
+            replaced.as_slice() == second.as_slice(),
+            "exact readback of the replaced test record"
+        );
 
         store
             .delete(prepared())
             .expect("delete isolated test record");
+        cleanup.armed = false;
         assert_eq!(store.read(prepared()).err(), Some(ReadFailure::Missing));
         assert_eq!(store.delete(prepared()), Err(DeleteFailure::Missing));
     }

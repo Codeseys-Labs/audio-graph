@@ -1,4 +1,5 @@
 use super::{AllowPrompt, RecoveryBoundary, RecoveryFailure, RecoveryOutcome, RecoveryTarget};
+use crate::crash_handler::{RedactedPanicOp, catch_redacted_panic};
 use crate::credentials::adapters::keyring_entry::{EntryLocator, KeyringBoundary};
 #[cfg(target_os = "macos")]
 use crate::credentials::adapters::macos_keychain_ffi::{
@@ -10,7 +11,6 @@ use crate::credentials::adapters::native_interaction::{
     latch_forbid_uncertainty,
 };
 use crate::credentials::domain::CredentialStoreFailure;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use zeroize::Zeroizing;
 
 trait MacKeychainApi: Send + Sync {
@@ -142,9 +142,11 @@ impl<Api: MacKeychainApi + ?Sized> ExactInteractionRestore<'_, '_, '_, Api> {
     }
 
     fn restore(&mut self) -> Result<(), ()> {
-        let restored = catch_unwind(AssertUnwindSafe(|| {
+        // Restoration also runs from `Drop` during an unwind, so a panicking
+        // payload must be disposed of here rather than escape and abort.
+        let restored = catch_redacted_panic(RedactedPanicOp::CredentialBoundary, || {
             self.api.set_interaction_allowed(self.prior)
-        }));
+        });
         self.armed = false;
         if matches!(restored, Ok(Ok(()))) {
             Ok(())
