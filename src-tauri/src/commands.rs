@@ -3805,8 +3805,6 @@ fn stream_backend_handles_from_state(
 ) -> crate::llm::streaming::StreamBackendHandles {
     crate::llm::streaming::StreamBackendHandles::new(
         state.llm_engine.clone(),
-        state.api_client.clone(),
-        state.openrouter_client.clone(),
         state.mistralrs_engine.clone(),
     )
 }
@@ -3868,7 +3866,7 @@ fn stream_params_from_settings(
 
 /// Spawn the streaming-chat task for `request_id`.
 ///
-/// Drives `crate::llm::streaming::stream_chat` to completion, sending one
+/// Drives `crate::llm::streaming::stream_chat_with_request` to completion, sending one
 /// [`crate::llm::streaming::ChatStreamEvent::Delta`] per
 /// [`crate::llm::streaming::TokenDelta::Delta`] and exactly one terminal
 /// `Done` (completed or cancelled) or `Failed` frame over the per-invocation

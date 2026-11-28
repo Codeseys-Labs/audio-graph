@@ -1132,9 +1132,7 @@ pub enum ChatStreamEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::openrouter::{
-        OpenRouterClient, OpenRouterDataCollectionPolicy, OpenRouterRoutingPolicy,
-    };
+    use crate::llm::openrouter::{OpenRouterDataCollectionPolicy, OpenRouterRoutingPolicy};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2520,7 +2518,7 @@ mod tests {
         })
         .with_context_id("graph-context:session-1");
 
-        assert!(request.backend_handles.has_handle_for(&provider));
+        assert!(request.backend_handles.mistralrs_engine.is_some());
         assert_eq!(request.metadata.backend.provider, "MistralRs");
         assert_eq!(
             request.metadata.backend.model.as_deref(),
@@ -2908,29 +2906,9 @@ mod tests {
         }
     }
 
-    /// The shared client cache as a settings sync leaves it for `routing_policy`.
-    fn synced_openrouter_cache(
-        base_url: &str,
-        routing_policy: Option<OpenRouterRoutingPolicy>,
-    ) -> Arc<Mutex<Option<OpenRouterClient>>> {
-        let config = OpenRouterConfig {
-            routing_policy,
-            base_url: base_url.to_string(),
-            ..OpenRouterConfig::with_defaults(
-                "sk-or".to_string(),
-                "anthropic/claude-sonnet-4.5".to_string(),
-            )
-        };
-        Arc::new(Mutex::new(Some(
-            OpenRouterClient::new(config)
-                .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow()),
-        )))
-    }
-
     fn openrouter_request(
         provider: LlmProvider,
         routing_policy: Option<OpenRouterRoutingPolicy>,
-        cache: Option<Arc<Mutex<Option<OpenRouterClient>>>>,
     ) -> StreamChatRequest {
         StreamChatRequest::new(
             provider,
@@ -2940,10 +2918,6 @@ mod tests {
             StreamParams::default(),
         )
         .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
-        .with_backend_handles(StreamBackendHandles {
-            openrouter_client: cache,
-            ..StreamBackendHandles::empty()
-        })
     }
 
     #[test]
@@ -2957,35 +2931,19 @@ mod tests {
                 .get("provider")
                 .cloned()
         };
-        let other_policy = OpenRouterRoutingPolicy {
-            only: vec!["other-provider".to_string()],
-            ..OpenRouterRoutingPolicy::default()
-        };
 
-        // Whatever the shared cache holds by the time the body is built: no
-        // handle, an emptied slot, or a client synced from other settings.
-        for cache in [
-            None,
-            Some(Arc::new(Mutex::new(None))),
-            Some(synced_openrouter_cache(
-                base_url,
-                Some(other_policy.clone()),
-            )),
-        ] {
-            let restricted = openrouter_request(
-                openrouter_provider(base_url, None),
-                Some(restricted_routing()),
-                cache.clone(),
-            );
-            assert_eq!(
-                provider_object(&restricted),
-                Some(serde_json::json!({ "data_collection": "deny", "zdr": true }))
-            );
+        let restricted = openrouter_request(
+            openrouter_provider(base_url, None),
+            Some(restricted_routing()),
+        );
+        assert_eq!(
+            provider_object(&restricted),
+            Some(serde_json::json!({ "data_collection": "deny", "zdr": true }))
+        );
 
-            // A request admitted with no policy does not pick one up either.
-            let unrestricted = openrouter_request(openrouter_provider(base_url, None), None, cache);
-            assert_eq!(provider_object(&unrestricted), None);
-        }
+        // A request admitted with no policy has none to send.
+        let unrestricted = openrouter_request(openrouter_provider(base_url, None), None);
+        assert_eq!(provider_object(&unrestricted), None);
 
         // The rich policy still precedes the legacy provider order.
         let rich = openrouter_request(
@@ -2996,7 +2954,6 @@ mod tests {
                 allow_fallbacks: Some(false),
                 ..OpenRouterRoutingPolicy::default()
             }),
-            None,
         );
         assert_eq!(
             provider_object(&rich),
@@ -3008,55 +2965,35 @@ mod tests {
         );
     }
 
-    /// The body is built on the stream task, after admission. A settings save
-    /// that lands in between empties the shared OpenRouter slot, and the
-    /// request still goes to the endpoint it was admitted for.
-    #[test]
-    fn a_settings_save_after_admission_cannot_strip_the_routing_restrictions() {
-        // Built here: a blocking client cannot be constructed inside a runtime.
-        let cache =
-            synced_openrouter_cache("https://openrouter.ai/api/v1", Some(restricted_routing()));
+    /// The routing policy a request was admitted with is what reaches the
+    /// endpoint. A stream request holds no handle to the shared client slots,
+    /// so there is nothing here for a settings save to change; the three
+    /// callers' tests in `commands.rs` run a save in that window.
+    #[tokio::test]
+    async fn an_openrouter_stream_sends_the_routing_policy_it_was_admitted_with() {
+        let (base_url, request_body) = spawn_capturing_sse_mock(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let (mut rx, _cancel) = stream_chat_with_request(openrouter_request(
+            openrouter_provider(&base_url, None),
+            Some(restricted_routing()),
+        ));
 
-        // Current-thread, so the stream task runs on this thread and the
-        // thread-local hook reaches it.
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build a current-thread runtime")
-            .block_on(async {
-                let (base_url, request_body) = spawn_capturing_sse_mock(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
-                     data: [DONE]\n\n",
-                )
-                .await;
-                let request = openrouter_request(
-                    openrouter_provider(&base_url, None),
-                    Some(restricted_routing()),
-                    Some(cache.clone()),
-                );
-
-                let saved = cache.clone();
-                before_next_request_build(move || *saved.lock().unwrap() = None);
-                let (mut rx, _cancel) = stream_chat_with_request(request);
-
-                let mut frames = Vec::new();
-                while let Some(frame) = rx.recv().await {
-                    frames.push(frame);
-                }
-                assert!(
-                    matches!(frames.last(), Some(TokenDelta::Done { .. })),
-                    "{frames:?}"
-                );
-                assert!(
-                    cache.lock().unwrap().is_none(),
-                    "the save must have emptied the shared OpenRouter slot"
-                );
-                let body = request_body.await.expect("the mock received the request");
-                assert_eq!(
-                    body["provider"],
-                    serde_json::json!({ "data_collection": "deny", "zdr": true })
-                );
-            });
+        let mut frames = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            frames.push(frame);
+        }
+        assert!(
+            matches!(frames.last(), Some(TokenDelta::Done { .. })),
+            "{frames:?}"
+        );
+        let body = request_body.await.expect("the mock received the request");
+        assert_eq!(
+            body["provider"],
+            serde_json::json!({ "data_collection": "deny", "zdr": true })
+        );
     }
 
     /// AUD-STR1 P3: a real `usage` block earlier in the stream must NOT be

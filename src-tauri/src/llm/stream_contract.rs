@@ -14,10 +14,9 @@ use audio_graph_ipc_contract::runtime_diagnostic::{
 use serde::{Deserialize, Serialize};
 
 use crate::asr::ProviderContentEgressPolicy;
-use crate::llm::api_client::ApiClient;
 use crate::llm::engine::{ChatMessage, LlmEngine};
 use crate::llm::mistralrs_engine::MistralRsEngine;
-use crate::llm::openrouter::{OpenRouterClient, OpenRouterRoutingPolicy};
+use crate::llm::openrouter::OpenRouterRoutingPolicy;
 use crate::settings::LlmProvider;
 
 /// Token-usage block reported by any streaming chat provider.
@@ -60,16 +59,14 @@ impl Default for StreamParams {
 
 /// Explicit backend handles available to streaming provider adapters.
 ///
-/// A stream adapter receives this bundle from its caller when it needs
-/// runtime engines or clients. Adapters must not recover these handles from
-/// process globals. A handle is something to run on, never a source of
-/// request settings: the caches behind them follow the live settings, so the
-/// endpoint, key, model and routing policy come from the request alone.
+/// A stream adapter receives this bundle from its caller when it needs a
+/// loaded engine. Adapters must not recover these handles from process
+/// globals. There is no handle for an HTTP provider: its endpoint, key, model
+/// and routing policy are request settings and come from the request alone,
+/// never from a client cache that follows the live settings.
 #[derive(Clone, Default)]
 pub struct StreamBackendHandles {
     pub local_llama: Option<Arc<Mutex<Option<LlmEngine>>>>,
-    pub api_client: Option<Arc<Mutex<Option<ApiClient>>>>,
-    pub openrouter_client: Option<Arc<Mutex<Option<OpenRouterClient>>>>,
     pub mistralrs_engine: Option<Arc<Mutex<Option<MistralRsEngine>>>>,
 }
 
@@ -80,25 +77,11 @@ impl StreamBackendHandles {
 
     pub fn new(
         local_llama: Arc<Mutex<Option<LlmEngine>>>,
-        api_client: Arc<Mutex<Option<ApiClient>>>,
-        openrouter_client: Arc<Mutex<Option<OpenRouterClient>>>,
         mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
     ) -> Self {
         Self {
             local_llama: Some(local_llama),
-            api_client: Some(api_client),
-            openrouter_client: Some(openrouter_client),
             mistralrs_engine: Some(mistralrs_engine),
-        }
-    }
-
-    pub fn has_handle_for(&self, provider: &LlmProvider) -> bool {
-        match provider {
-            LlmProvider::LocalLlama => self.local_llama.is_some(),
-            LlmProvider::Api { .. } => self.api_client.is_some(),
-            LlmProvider::OpenRouter { .. } => self.openrouter_client.is_some(),
-            LlmProvider::MistralRs { .. } => self.mistralrs_engine.is_some(),
-            LlmProvider::AwsBedrock { .. } => false,
         }
     }
 }
@@ -107,8 +90,6 @@ impl fmt::Debug for StreamBackendHandles {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StreamBackendHandles")
             .field("local_llama", &self.local_llama.is_some())
-            .field("api_client", &self.api_client.is_some())
-            .field("openrouter_client", &self.openrouter_client.is_some())
             .field("mistralrs_engine", &self.mistralrs_engine.is_some())
             .finish()
     }
