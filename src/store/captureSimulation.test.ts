@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { renderHook } from "@testing-library/react";
+import { cleanup, renderHook } from "@testing-library/react";
 import {
   afterAll,
+  afterEach,
   beforeAll,
   beforeEach,
   describe,
@@ -280,11 +281,31 @@ beforeAll(() => {
   };
 });
 
-afterAll(() => {
+/**
+ * Let React's scheduler run the work the store's updates queued. They
+ * happen outside act, so renders of the mounted realms are scheduled on
+ * setImmediate turns that the simulation's promise-only steps never yield
+ * to. Unflushed, that work runs after this file's environment is torn down.
+ */
+async function flushScheduledReactWork(): Promise<void> {
+  for (let turn = 0; turn < 20; turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+afterEach(async () => {
+  // Unmount every realm this test mounted (its hooks clear their reconcile
+  // intervals), then flush what React still holds for them.
+  cleanup();
+  await flushScheduledReactWork();
+});
+
+afterAll(async () => {
   intervals?.set.mockRestore();
   intervals?.clear.mockRestore();
   intervals = null;
   vi.useRealTimers();
+  await flushScheduledReactWork();
   Reflect.set(globalThis, "IS_REACT_ACT_ENVIRONMENT", actEnvironment);
   if (report) process.stdout.write(`${explored.join("\n")}\n`);
 });
