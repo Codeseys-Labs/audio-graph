@@ -366,6 +366,18 @@ mod native {
         handle: OwnedHandle,
     }
 
+    impl WindowsHeldDirectory {
+        /// Inspects the directory behind `handle`, an already held handle,
+        /// so the observation is bound to that object rather than to a path
+        /// resolved again. The handle is closed when the target drops.
+        pub(crate) fn from_held_handle(handle: std::fs::File) -> Self {
+            use std::os::windows::io::IntoRawHandle;
+            Self {
+                handle: OwnedHandle(HANDLE(handle.into_raw_handle())),
+            }
+        }
+    }
+
     struct WindowsHeldVolume {
         handle: OwnedHandle,
         drive_root: Vec<u16>,

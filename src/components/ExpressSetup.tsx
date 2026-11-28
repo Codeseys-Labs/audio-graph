@@ -43,6 +43,10 @@ import {
   notifyCredentialWarning,
 } from "../utils/errorToMessage";
 import IconButton from "./IconButton";
+import {
+  providerReadinessMessage,
+  providerSetupBlockerMessage,
+} from "./ProviderReadinessPanel";
 import { PROVIDER_DESCRIPTORS } from "./providerRegistryHelpers";
 import {
   deriveProviderSetupModeCards,
@@ -832,8 +836,8 @@ function ExpressSetup({
                         {provider.model ? `: ${provider.model}` : ""} -{" "}
                         {readinessLabel(provider.readinessStatus, t)} -{" "}
                         {credentialSummary(provider, t)}
-                        {provider.readinessMessage
-                          ? ` - ${provider.readinessMessage}`
+                        {provider.readiness
+                          ? ` - ${providerReadinessMessage(provider.readiness, t)}`
                           : ""}
                       </li>
                     ))}
@@ -850,7 +854,7 @@ function ExpressSetup({
                             blocker.key ?? blocker.model ?? blocker.message
                           }`}
                         >
-                          {blocker.message}
+                          {providerSetupBlockerMessage(blocker, t)}
                         </li>
                       ))}
                     </ul>

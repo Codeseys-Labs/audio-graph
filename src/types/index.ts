@@ -1590,9 +1590,10 @@ export type ProviderRuntimeReadinessStatus =
 
 export interface ProviderRuntimeReadiness {
   status: ProviderRuntimeReadinessStatus;
-  message: string;
+  /** Build feature the runtime needs (static build value). */
   required_feature?: string | null;
   runtime_version?: string | null;
+  /** Registry model id the status concerns (static registry value). */
   model_id?: string | null;
 }
 
@@ -1637,10 +1638,53 @@ export interface EffectiveSttFidelity {
   degradations: SttFidelityDegradation[];
 }
 
+/**
+ * What a readiness entry says, as a closed code the UI localizes (mirrors Rust
+ * `ProviderReadinessNote`). A failure is `failed`; its cause is the entry's
+ * `diagnostic`. Never render backend prose: switch on `kind`.
+ */
+export type ProviderReadinessNote =
+  /** Credentials are saved and an automatic check can run. */
+  | { kind: "ready_to_check" }
+  /** Registry credential slot names that are not saved, e.g. `deepgram_api_key`. */
+  | { kind: "missing_credentials"; keys: string[] }
+  /** AWS profile mode with an empty profile name. */
+  | { kind: "aws_profile_required" }
+  /** Gemini Vertex AI without a project id or location. */
+  | { kind: "vertex_project_required" }
+  /** Gemini Vertex AI is not probed automatically. */
+  | { kind: "vertex_not_probed" }
+  /** The provider has no automatic health probe. */
+  | { kind: "no_automatic_probe" }
+  /** Local-file provider, checked by the model manager. */
+  | { kind: "local_models_managed" }
+  /** Local model files summary, by registry model id. */
+  | {
+      kind: "local_models";
+      ready: number;
+      total: number;
+      missing: string[];
+      invalid: string[];
+      /** The provider runtime is planned, not selectable yet. */
+      planned: boolean;
+    }
+  /** The probe ran for a provider that is not the selected one. */
+  | { kind: "not_selected" }
+  /** The readiness check was cancelled. */
+  | { kind: "cancelled" }
+  /** A check for this provider is already running. */
+  | { kind: "check_in_progress" }
+  /** A check ran recently; retry after `retry_after_secs` seconds. */
+  | { kind: "check_rate_limited"; retry_after_secs: number }
+  /** The probe passed; the entry's `model_count` (when set) is the catalog size. */
+  | { kind: "verified" }
+  /** `status` is `error`; the entry's `diagnostic` says why. */
+  | { kind: "failed" };
+
 export interface ProviderReadiness {
   provider_id: string;
   status: ProviderReadinessStatus;
-  message: string;
+  note: ProviderReadinessNote;
   automatic_probe_available?: boolean;
   checked_at?: number | null;
   stale: boolean;
@@ -1653,9 +1697,9 @@ export interface ProviderReadiness {
   openrouter_models?: OpenRouterModel[];
   runtime?: ProviderRuntimeReadiness | null;
   /**
-   * Typed cause of an `error` status, when the probe produced one. Present it
-   * through `runtimeDiagnosticPresentation`; `message` is then only the closed
-   * `runtime/<code>` token.
+   * Typed cause of an `error` status; present exactly when `status` is
+   * `error` (and `note.kind` is `failed`). Present it through
+   * `runtimeDiagnosticPresentation`.
    */
   diagnostic?: RuntimeDiagnostic;
   effective_stt_fidelity?: EffectiveSttFidelity;

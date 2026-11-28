@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use audio_graph_ipc_contract::runtime_diagnostic::{
     RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
-    RuntimeOperation, RuntimeSafeRecoveryAction,
+    RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeTransport,
 };
 use tauri::{Emitter, Manager, State};
 use tokio_util::sync::CancellationToken;
@@ -485,16 +485,59 @@ pub enum ProviderRuntimeReadinessStatus {
     Healthy,
 }
 
+/// A local runtime check, in closed fields only: the status, and the build
+/// feature, runtime version and registry model id it concerns.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProviderRuntimeReadiness {
     pub status: ProviderRuntimeReadinessStatus,
-    pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required_feature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+}
+
+/// What a readiness entry says, as a closed code the UI localizes. A failure
+/// is [`Self::Failed`], and its cause is the entry's `diagnostic`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderReadinessNote {
+    /// Credentials are saved and an automatic check can run.
+    ReadyToCheck,
+    /// Registry credential slots that are not saved.
+    MissingCredentials { keys: Vec<String> },
+    /// AWS profile mode with no profile name.
+    AwsProfileRequired,
+    /// Gemini Vertex AI without a project id or location.
+    VertexProjectRequired,
+    /// Gemini Vertex AI is not probed automatically.
+    VertexNotProbed,
+    /// The provider has no automatic health probe.
+    NoAutomaticProbe,
+    /// A local-file provider, checked by the model manager.
+    LocalModelsManaged,
+    /// The local model files for this provider, by registry model id.
+    LocalModels {
+        ready: usize,
+        total: usize,
+        missing: Vec<String>,
+        invalid: Vec<String>,
+        planned: bool,
+    },
+    /// The probe ran for a provider that is not the selected one.
+    NotSelected,
+    /// The check was cancelled.
+    Cancelled,
+    /// A check for this provider is already running.
+    CheckInProgress,
+    /// A check ran recently; another may start after this many seconds.
+    CheckRateLimited { retry_after_secs: u64 },
+    /// The probe passed. `model_count`, when set, is the catalog size.
+    #[default]
+    Verified,
+    /// The check failed; the entry's `diagnostic` says why.
+    Failed,
 }
 
 /// Origin of a value-free readiness capability. These names deliberately
@@ -556,7 +599,7 @@ pub struct EffectiveSttFidelity {
 
 #[derive(Debug, Clone, Default)]
 struct ProviderReadinessProbeResult {
-    message: String,
+    note: ProviderReadinessNote,
     model_count: Option<usize>,
     model_catalog: Vec<ProviderModelCatalogItem>,
     voice_catalog: Vec<ProviderModelCatalogItem>,
@@ -568,7 +611,7 @@ struct ProviderReadinessProbeResult {
 pub struct ProviderReadiness {
     pub provider_id: String,
     pub status: ProviderReadinessStatus,
-    pub message: String,
+    pub note: ProviderReadinessNote,
     pub automatic_probe_available: bool,
     pub checked_at: Option<u64>,
     pub stale: bool,
@@ -11932,10 +11975,9 @@ struct LocalModelReadinessSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 enum LocalRuntimeProbeOutcome {
-    LoadFailed {
-        message: String,
-        model_id: Option<String>,
-    },
+    /// The runtime could not load the model. Why is not carried: the native
+    /// error names files on this machine.
+    LoadFailed { model_id: Option<String> },
     Healthy {
         runtime_version: String,
         model_id: String,
@@ -11971,16 +12013,10 @@ fn local_model_readiness_summary(
                             // the `len() > 0` check and be reported ready, only
                             // to fail at runtime model load. For models with a
                             // published minimum size, enforce that floor here so
-                            // a truncated file is classified invalid with a
-                            // clear reason instead.
+                            // a truncated file is classified invalid instead.
                             match crate::models::min_model_size_bytes(model.model_id) {
                                 Some(min_bytes) if metadata.len() < min_bytes => {
-                                    summary.invalid.push(format!(
-                                        "{} too small ({} bytes; expected at least {} bytes)",
-                                        model.model_id,
-                                        metadata.len(),
-                                        min_bytes
-                                    ));
+                                    summary.invalid.push(model.model_id.to_string());
                                 }
                                 _ => {
                                     summary.ready += 1;
@@ -11999,34 +12035,29 @@ fn local_model_readiness_summary(
                     continue;
                 }
 
-                let mut missing_files = Vec::new();
-                let mut invalid_files = Vec::new();
+                // A model with any required file missing is missing; one
+                // with a present but empty or non-file component is invalid.
+                // Only the registry model id is kept: the UI localizes it.
+                let mut any_missing = false;
+                let mut any_invalid = false;
                 for required in model.required_files {
                     let required_path = model_dir.join(required);
                     match std::fs::metadata(&required_path) {
                         Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
-                        Ok(_) => invalid_files.push((*required).to_string()),
-                        Err(_) => missing_files.push((*required).to_string()),
+                        Ok(_) => any_invalid = true,
+                        Err(_) => any_missing = true,
                     }
                 }
 
-                if missing_files.is_empty() && invalid_files.is_empty() {
+                if !any_missing && !any_invalid {
                     summary.ready += 1;
                     summary.ready_model_ids.push(model.model_id.to_string());
                 } else {
-                    if !missing_files.is_empty() {
-                        summary.missing.push(format!(
-                            "{} missing {}",
-                            model.model_id,
-                            missing_files.join(", ")
-                        ));
+                    if any_missing {
+                        summary.missing.push(model.model_id.to_string());
                     }
-                    if !invalid_files.is_empty() {
-                        summary.invalid.push(format!(
-                            "{} invalid {}",
-                            model.model_id,
-                            invalid_files.join(", ")
-                        ));
+                    if any_invalid {
+                        summary.invalid.push(model.model_id.to_string());
                     }
                 }
             }
@@ -12036,34 +12067,17 @@ fn local_model_readiness_summary(
     Some(summary)
 }
 
-fn local_model_readiness_message(
+fn local_model_readiness_note(
     descriptor: &crate::provider_registry::ProviderDescriptor,
-    models_dir: &std::path::Path,
-) -> Option<String> {
-    let summary = local_model_readiness_summary(descriptor, models_dir)?;
-    let mut message = if summary.ready == 0 {
-        format!(
-            "No local model files are ready yet. Download one of {} model option(s).",
-            summary.total
-        )
-    } else {
-        format!(
-            "Local model files ready: {}/{} model option(s).",
-            summary.ready, summary.total
-        )
-    };
-
-    if !summary.missing.is_empty() {
-        message.push_str(&format!(" Missing: {}.", summary.missing.join("; ")));
+    summary: LocalModelReadinessSummary,
+) -> ProviderReadinessNote {
+    ProviderReadinessNote::LocalModels {
+        ready: summary.ready,
+        total: summary.total,
+        missing: summary.missing,
+        invalid: summary.invalid,
+        planned: descriptor.status == crate::provider_registry::ProviderStatus::Planned,
     }
-    if !summary.invalid.is_empty() {
-        message.push_str(&format!(" Invalid: {}.", summary.invalid.join("; ")));
-    }
-    if descriptor.status == crate::provider_registry::ProviderStatus::Planned {
-        message.push_str(" Provider runtime remains planned and is not selectable yet.");
-    }
-
-    Some(message)
 }
 
 fn moonshine_runtime_readiness_from_state(
@@ -12074,9 +12088,6 @@ fn moonshine_runtime_readiness_from_state(
     if !feature_compiled {
         return ProviderRuntimeReadiness {
             status: ProviderRuntimeReadinessStatus::FeatureMissing,
-            message:
-                "Moonshine runtime feature is not compiled; build with asr-moonshine after cross-platform proof."
-                    .to_string(),
             required_feature: Some("asr-moonshine".to_string()),
             runtime_version: None,
             model_id: None,
@@ -12086,9 +12097,6 @@ fn moonshine_runtime_readiness_from_state(
     if ready_models == 0 {
         return ProviderRuntimeReadiness {
             status: ProviderRuntimeReadinessStatus::ModelMissing,
-            message:
-                "Moonshine runtime probe is skipped until one complete model directory is present."
-                    .to_string(),
             required_feature: None,
             runtime_version: None,
             model_id: None,
@@ -12096,30 +12104,23 @@ fn moonshine_runtime_readiness_from_state(
     }
 
     match probe {
-        Some(LocalRuntimeProbeOutcome::LoadFailed { message, model_id }) => {
-            ProviderRuntimeReadiness {
-                status: ProviderRuntimeReadinessStatus::LoadFailed,
-                message,
-                required_feature: None,
-                runtime_version: None,
-                model_id,
-            }
-        }
+        Some(LocalRuntimeProbeOutcome::LoadFailed { model_id }) => ProviderRuntimeReadiness {
+            status: ProviderRuntimeReadinessStatus::LoadFailed,
+            required_feature: None,
+            runtime_version: None,
+            model_id,
+        },
         Some(LocalRuntimeProbeOutcome::Healthy {
             runtime_version,
             model_id,
         }) => ProviderRuntimeReadiness {
             status: ProviderRuntimeReadinessStatus::Healthy,
-            message: format!("Moonshine runtime loaded {model_id} successfully."),
             required_feature: None,
             runtime_version: Some(runtime_version),
             model_id: Some(model_id),
         },
         None => ProviderRuntimeReadiness {
             status: ProviderRuntimeReadinessStatus::RuntimeUnavailable,
-            message:
-                "Moonshine native runtime adapter is not wired yet; provider remains planned and unselectable."
-                    .to_string(),
             required_feature: None,
             runtime_version: None,
             model_id: None,
@@ -12184,9 +12185,6 @@ fn diarization_clustering_runtime_readiness_from_state(
     if !feature_compiled {
         return ProviderRuntimeReadiness {
             status: ProviderRuntimeReadinessStatus::FeatureMissing,
-            message:
-                "Clustering diarization runtime feature is not compiled; build with diarization-clustering after cross-platform proof."
-                    .to_string(),
             required_feature: Some("diarization-clustering".to_string()),
             runtime_version: None,
             model_id: None,
@@ -12196,9 +12194,6 @@ fn diarization_clustering_runtime_readiness_from_state(
     if required_models == 0 || ready_models < required_models {
         return ProviderRuntimeReadiness {
             status: ProviderRuntimeReadinessStatus::ModelMissing,
-            message:
-                "Clustering diarization runtime probe is skipped until the pyannote segmentation and TitaNet embedding models are present."
-                    .to_string(),
             required_feature: None,
             runtime_version: None,
             model_id: None,
@@ -12206,29 +12201,23 @@ fn diarization_clustering_runtime_readiness_from_state(
     }
 
     match probe {
-        Some(LocalRuntimeProbeOutcome::LoadFailed { message, model_id }) => {
-            ProviderRuntimeReadiness {
-                status: ProviderRuntimeReadinessStatus::LoadFailed,
-                message,
-                required_feature: None,
-                runtime_version: None,
-                model_id,
-            }
-        }
+        Some(LocalRuntimeProbeOutcome::LoadFailed { model_id }) => ProviderRuntimeReadiness {
+            status: ProviderRuntimeReadinessStatus::LoadFailed,
+            required_feature: None,
+            runtime_version: None,
+            model_id,
+        },
         Some(LocalRuntimeProbeOutcome::Healthy {
             runtime_version,
             model_id,
         }) => ProviderRuntimeReadiness {
             status: ProviderRuntimeReadinessStatus::Healthy,
-            message: format!("Clustering diarization runtime loaded {model_id} successfully."),
             required_feature: None,
             runtime_version: Some(runtime_version),
             model_id: Some(model_id),
         },
         None => ProviderRuntimeReadiness {
             status: ProviderRuntimeReadinessStatus::RuntimeUnavailable,
-            message: "Clustering diarization runtime probe is not available in this build path."
-                .to_string(),
             required_feature: None,
             runtime_version: None,
             model_id: None,
@@ -12301,7 +12290,6 @@ fn local_runtime_probe_outcome(
                 ));
                 let MoonshineNativeProbeResult {
                     status,
-                    message,
                     runtime_version,
                     ..
                 } = probe;
@@ -12316,7 +12304,6 @@ fn local_runtime_probe_outcome(
                     | MoonshineNativeProbeStatus::ModelMissing
                     | MoonshineNativeProbeStatus::ModelInvalid => {
                         Some(LocalRuntimeProbeOutcome::LoadFailed {
-                            message,
                             model_id: Some(model_id.clone()),
                         })
                     }
@@ -12337,12 +12324,13 @@ fn local_runtime_probe_outcome(
                 let embedding_model = models_dir.join(crate::models::DIAR_EMB_TITANET_FILENAME);
                 let model_id = diarization_clustering_runtime_model_id();
 
-                if let Err(message) = diarization_clustering_runtime_file_preflight(
+                if diarization_clustering_runtime_file_preflight(
                     &segmentation_model,
                     &embedding_model,
-                ) {
+                )
+                .is_err()
+                {
                     return Some(LocalRuntimeProbeOutcome::LoadFailed {
-                        message,
                         model_id: Some(model_id),
                     });
                 }
@@ -12359,11 +12347,7 @@ fn local_runtime_probe_outcome(
                         ),
                         model_id,
                     }),
-                    Err(error) => Some(LocalRuntimeProbeOutcome::LoadFailed {
-                        message: format!(
-                            "Clustering diarization runtime load failed for {}: {error}",
-                            segmentation_model.display()
-                        ),
+                    Err(_) => Some(LocalRuntimeProbeOutcome::LoadFailed {
                         model_id: Some(model_id),
                     }),
                 }
@@ -12376,15 +12360,6 @@ fn local_runtime_probe_outcome(
         }
         _ => None,
     }
-}
-
-fn apply_local_model_readiness(
-    descriptor: &crate::provider_registry::ProviderDescriptor,
-    app: &tauri::AppHandle,
-    readiness: ProviderReadiness,
-) -> ProviderReadiness {
-    let models_dir = crate::models::get_models_dir(app);
-    apply_local_model_readiness_from_dir(descriptor, &models_dir, readiness)
 }
 
 fn apply_local_model_readiness_from_dir(
@@ -12414,11 +12389,9 @@ where
     ) -> Option<LocalRuntimeProbeOutcome>,
 {
     if let Some(summary) = local_model_readiness_summary(descriptor, models_dir) {
-        if let Some(message) = local_model_readiness_message(descriptor, models_dir) {
-            readiness.message = message;
-        }
         readiness.runtime =
             local_runtime_readiness_with_probe(descriptor, &summary, models_dir, runtime_probe);
+        readiness.note = local_model_readiness_note(descriptor, summary);
     }
     readiness
 }
@@ -12514,29 +12487,25 @@ fn missing_required_credentials(
         .collect()
 }
 
-fn provider_config_readiness_message(
+/// What a provider's settings still lack before its readiness can be
+/// checked, if anything.
+fn provider_config_readiness_note(
     descriptor: &crate::provider_registry::ProviderDescriptor,
     settings: &crate::settings::AppSettings,
-) -> Option<String> {
+) -> Option<ProviderReadinessNote> {
     match descriptor.id {
         "asr.aws_transcribe" => match &settings.asr_provider {
             crate::settings::AsrProvider::AwsTranscribe {
-                credential_source:
-                    crate::settings::AwsCredentialSource::Profile { name },
+                credential_source: crate::settings::AwsCredentialSource::Profile { name },
                 ..
-            } if name.trim().is_empty() => Some(
-                "AWS profile name must be configured before readiness can be checked".to_string(),
-            ),
+            } if name.trim().is_empty() => Some(ProviderReadinessNote::AwsProfileRequired),
             _ => None,
         },
         "llm.aws_bedrock" => match &settings.llm_provider {
             crate::settings::LlmProvider::AwsBedrock {
-                credential_source:
-                    crate::settings::AwsCredentialSource::Profile { name },
+                credential_source: crate::settings::AwsCredentialSource::Profile { name },
                 ..
-            } if name.trim().is_empty() => Some(
-                "AWS profile name must be configured before readiness can be checked".to_string(),
-            ),
+            } if name.trim().is_empty() => Some(ProviderReadinessNote::AwsProfileRequired),
             _ => None,
         },
         "realtime_agent.gemini_live" => match &settings.gemini.auth {
@@ -12545,10 +12514,7 @@ fn provider_config_readiness_message(
                 location,
                 ..
             } if project_id.trim().is_empty() || location.trim().is_empty() => {
-                Some(
-                    "Vertex AI project ID and location must be configured before readiness can be checked"
-                        .to_string(),
-                )
+                Some(ProviderReadinessNote::VertexProjectRequired)
             }
             _ => None,
         },
@@ -12575,10 +12541,10 @@ fn automatic_probe_available_from_decision(
     descriptor: &crate::provider_registry::ProviderDescriptor,
     settings: &crate::settings::AppSettings,
     missing: &[String],
-    config_message: Option<&str>,
+    config_note: Option<&ProviderReadinessNote>,
 ) -> bool {
     missing.is_empty()
-        && config_message.is_none()
+        && config_note.is_none()
         && provider_has_automatic_health_probe(descriptor, settings)
 }
 
@@ -12588,13 +12554,8 @@ fn provider_automatic_probe_available(
     store: &crate::credentials::CredentialStore,
 ) -> bool {
     let missing = missing_required_credentials(descriptor, settings, store);
-    let config_message = provider_config_readiness_message(descriptor, settings);
-    automatic_probe_available_from_decision(
-        descriptor,
-        settings,
-        &missing,
-        config_message.as_deref(),
-    )
+    let config_note = provider_config_readiness_note(descriptor, settings);
+    automatic_probe_available_from_decision(descriptor, settings, &missing, config_note.as_ref())
 }
 
 fn native_realtime_readiness_requested(
@@ -12815,6 +12776,46 @@ fn store_provider_readiness(cache_key: String, readiness: &ProviderReadiness) {
         .insert(cache_key, readiness.clone());
 }
 
+/// Read the credential epoch, then the store it covers. A save writes the store
+/// before it bumps the epoch, so in this order a save landing between the two
+/// reads can only pair a newer store with an older epoch: a result is never
+/// keyed under an epoch newer than the credential it checked.
+fn readiness_credential_snapshot<E>(
+    load: impl FnOnce() -> Result<crate::credentials::CredentialStore, E>,
+) -> Result<(u64, crate::credentials::CredentialStore), E> {
+    let epoch = PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst);
+    Ok((epoch, load()?))
+}
+
+/// Cache a result only if no save or delete landed while it was being
+/// checked; a result from before a key change is returned but not kept.
+fn store_provider_readiness_for_epoch(
+    cache_key: String,
+    readiness: &ProviderReadiness,
+    started_epoch: u64,
+) -> bool {
+    if PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst) != started_epoch {
+        return false;
+    }
+    store_provider_readiness(cache_key, readiness);
+    true
+}
+
+/// A save or delete that landed while the refresh ran may have replaced the
+/// key these results were checked with: they are returned as stale, so no
+/// surface shows them as the current key's verdict.
+fn mark_stale_if_epoch_moved(readiness: &mut [ProviderReadiness], started_epoch: u64) {
+    if PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst) == started_epoch {
+        return;
+    }
+    for entry in readiness
+        .iter_mut()
+        .filter(|entry| entry.checked_at.is_some())
+    {
+        entry.stale = true;
+    }
+}
+
 fn begin_provider_readiness_refresh(
     cache_key: &str,
     now: u64,
@@ -12885,45 +12886,41 @@ fn base_provider_readiness(
     let voice_catalog = fixed_voice_catalog_for_descriptor(descriptor);
     let language_catalog = fixed_language_catalog_for_descriptor(descriptor);
     let missing = missing_required_credentials(descriptor, settings, store);
-    let config_message = provider_config_readiness_message(descriptor, settings);
+    let config_note = provider_config_readiness_note(descriptor, settings);
     let automatic_probe_available = automatic_probe_available_from_decision(
         descriptor,
         settings,
         &missing,
-        config_message.as_deref(),
+        config_note.as_ref(),
     );
     let status = if missing.is_empty() {
         ProviderReadinessStatus::Unchecked
     } else {
         ProviderReadinessStatus::MissingCredentials
     };
-    let message = if missing.is_empty() {
-        if let Some(message) = config_message {
-            message
-        } else if automatic_probe_available {
-            "Ready to check with saved credentials".to_string()
-        } else if descriptor.id == "realtime_agent.gemini_live"
-            && matches!(
-                settings.gemini.auth,
-                crate::settings::GeminiAuthMode::VertexAI { .. }
-            )
-        {
-            "Vertex AI readiness is not probed automatically yet".to_string()
-        } else if descriptor.model_catalog
-            == crate::provider_registry::ModelCatalogPolicy::LocalFiles
-        {
-            "Local model readiness is checked by the model manager".to_string()
-        } else {
-            "No automatic health probe is available for this provider yet".to_string()
-        }
+    let note = if !missing.is_empty() {
+        ProviderReadinessNote::MissingCredentials { keys: missing }
+    } else if let Some(note) = config_note {
+        note
+    } else if automatic_probe_available {
+        ProviderReadinessNote::ReadyToCheck
+    } else if descriptor.id == "realtime_agent.gemini_live"
+        && matches!(
+            settings.gemini.auth,
+            crate::settings::GeminiAuthMode::VertexAI { .. }
+        )
+    {
+        ProviderReadinessNote::VertexNotProbed
+    } else if descriptor.model_catalog == crate::provider_registry::ModelCatalogPolicy::LocalFiles {
+        ProviderReadinessNote::LocalModelsManaged
     } else {
-        format!("Missing saved credential(s): {}", missing.join(", "))
+        ProviderReadinessNote::NoAutomaticProbe
     };
 
     ProviderReadiness {
         provider_id: descriptor.id.to_string(),
         status,
-        message,
+        note,
         automatic_probe_available,
         checked_at: None,
         stale: false,
@@ -12945,11 +12942,11 @@ fn deferred_provider_readiness(
     settings: &crate::settings::AppSettings,
     store: &crate::credentials::CredentialStore,
     credential_epoch: u64,
-    message: String,
+    note: ProviderReadinessNote,
 ) -> ProviderReadiness {
     let mut readiness = base_provider_readiness(descriptor, settings, store, credential_epoch);
     if readiness.status == ProviderReadinessStatus::Unchecked {
-        readiness.message = message;
+        readiness.note = note;
     }
     readiness
 }
@@ -12966,7 +12963,7 @@ fn cancelled_provider_readiness(
     ProviderReadiness {
         provider_id: descriptor.id.to_string(),
         status: ProviderReadinessStatus::Unchecked,
-        message: "Provider readiness check cancelled".to_string(),
+        note: ProviderReadinessNote::Cancelled,
         automatic_probe_available: provider_automatic_probe_available(descriptor, settings, store),
         checked_at: None,
         stale: false,
@@ -13003,7 +13000,7 @@ fn should_probe_provider(
     if !missing_required_credentials(descriptor, settings, store).is_empty() {
         return false;
     }
-    if provider_config_readiness_message(descriptor, settings).is_some() {
+    if provider_config_readiness_note(descriptor, settings).is_some() {
         return false;
     }
     matches!(
@@ -13012,6 +13009,7 @@ fn should_probe_provider(
             | "asr.assemblyai"
             | "asr.soniox"
             | "llm.cerebras"
+            | "llm.sambanova"
             | "llm.openrouter"
             | "tts.deepgram_aura"
             | "realtime_agent.gemini_live"
@@ -13030,29 +13028,27 @@ fn openai_compatible_endpoint_fingerprint(endpoint: &str, model: &str) -> String
     format!("endpoint={}|model={}", endpoint.trim(), model.trim())
 }
 
-/// Shared OpenAI-compatible readiness probe: resolve the endpoint API key, fetch
-/// the `/models` catalog with the given `default_model` fallback, and build the
-/// success result with a caller-supplied message. Reused by the `asr.api`,
-/// `llm.cerebras`, and `llm.api` arms so their probe behavior stays in lockstep.
+/// Shared OpenAI-compatible readiness probe: resolve the endpoint API key and
+/// fetch the `/models` catalog with the given `default_model` fallback. Reused
+/// by the `asr.api`, `llm.cerebras`, `llm.sambanova` and `llm.api` arms so
+/// their probe behavior stays in lockstep.
 ///
-/// `message` receives `(endpoint, model_count)` so each arm keeps its own
-/// human-readable wording (e.g. the Cerebras arm's "API key is valid" copy).
+/// The key comes from `store`, the snapshot the readiness refresh loaded, so
+/// the check and the entry's credential presence agree.
 async fn openai_compatible_readiness_arm(
     endpoint: &str,
     default_model: Option<&str>,
-    message: impl FnOnce(&str, usize) -> String,
+    store: &crate::credentials::CredentialStore,
 ) -> AppResult<ProviderReadinessProbeResult> {
-    let api_key = endpoint_api_key_from_draft_or_store(endpoint, None)?;
+    let api_key = endpoint_api_key_from_store(endpoint, store);
     let model_catalog = fetch_openai_compatible_model_catalog_with_default(
         endpoint,
         api_key.as_deref(),
         default_model,
     )
     .await?;
-    let model_count = model_catalog.len();
     Ok(ProviderReadinessProbeResult {
-        message: message(endpoint, model_count),
-        model_count: Some(model_count),
+        model_count: Some(model_catalog.len()),
         model_catalog,
         ..ProviderReadinessProbeResult::default()
     })
@@ -13062,8 +13058,12 @@ async fn openai_compatible_readiness_arm(
 /// (i.e. the generic, non-Cerebras OpenAI-compatible arms).
 const OPENAI_COMPATIBLE_DEFAULT_MODEL: &str = "whisper-1";
 
-fn connected_openai_compatible_message(endpoint: &str, model_count: usize) -> String {
-    format!("Connected to {endpoint} ({model_count} OpenAI-compatible models)")
+/// A probe result that says only `note`.
+fn readiness_note(note: ProviderReadinessNote) -> AppResult<ProviderReadinessProbeResult> {
+    Ok(ProviderReadinessProbeResult {
+        note,
+        ..ProviderReadinessProbeResult::default()
+    })
 }
 
 async fn probe_provider_readiness(
@@ -13074,17 +13074,10 @@ async fn probe_provider_readiness(
     match descriptor.id {
         "asr.api" => {
             let crate::settings::AsrProvider::Api { endpoint, .. } = &settings.asr_provider else {
-                return Ok(ProviderReadinessProbeResult {
-                    message: "Provider is not selected".to_string(),
-                    ..ProviderReadinessProbeResult::default()
-                });
+                return readiness_note(ProviderReadinessNote::NotSelected);
             };
-            openai_compatible_readiness_arm(
-                endpoint,
-                Some(OPENAI_COMPATIBLE_DEFAULT_MODEL),
-                connected_openai_compatible_message,
-            )
-            .await
+            openai_compatible_readiness_arm(endpoint, Some(OPENAI_COMPATIBLE_DEFAULT_MODEL), store)
+                .await
         }
         "llm.cerebras" => {
             let endpoint = match &settings.llm_provider {
@@ -13098,9 +13091,7 @@ async fn probe_provider_readiness(
             openai_compatible_readiness_arm(
                 endpoint,
                 Some(crate::provider_registry::CEREBRAS_DEFAULT_MODEL),
-                |_endpoint, model_count| {
-                    format!("Cerebras API key is valid ({model_count} models)")
-                },
+                store,
             )
             .await
         }
@@ -13116,9 +13107,7 @@ async fn probe_provider_readiness(
             openai_compatible_readiness_arm(
                 endpoint,
                 Some(crate::provider_registry::SAMBANOVA_DEFAULT_MODEL),
-                |_endpoint, model_count| {
-                    format!("SambaNova API key is valid ({model_count} models)")
-                },
+                store,
             )
             .await
         }
@@ -13127,25 +13116,15 @@ async fn probe_provider_readiness(
             // exclude them here so the generic OpenAI-compatible probe never
             // double-claims them.
             let crate::settings::LlmProvider::Api { endpoint, .. } = &settings.llm_provider else {
-                return Ok(ProviderReadinessProbeResult {
-                    message: "Provider is not selected".to_string(),
-                    ..ProviderReadinessProbeResult::default()
-                });
+                return readiness_note(ProviderReadinessNote::NotSelected);
             };
             if crate::settings::is_cerebras_endpoint(endpoint)
                 || crate::settings::is_sambanova_endpoint(endpoint)
             {
-                return Ok(ProviderReadinessProbeResult {
-                    message: "Provider is not selected".to_string(),
-                    ..ProviderReadinessProbeResult::default()
-                });
+                return readiness_note(ProviderReadinessNote::NotSelected);
             }
-            openai_compatible_readiness_arm(
-                endpoint,
-                Some(OPENAI_COMPATIBLE_DEFAULT_MODEL),
-                connected_openai_compatible_message,
-            )
-            .await
+            openai_compatible_readiness_arm(endpoint, Some(OPENAI_COMPATIBLE_DEFAULT_MODEL), store)
+                .await
         }
         "asr.aws_transcribe" => {
             let crate::settings::AsrProvider::AwsTranscribe {
@@ -13154,28 +13133,16 @@ async fn probe_provider_readiness(
                 ..
             } = &settings.asr_provider
             else {
-                return Ok(ProviderReadinessProbeResult {
-                    message: "Provider is not selected".to_string(),
-                    ..ProviderReadinessProbeResult::default()
-                });
+                return readiness_note(ProviderReadinessNote::NotSelected);
             };
-            let message =
-                test_aws_credentials(region.clone(), credential_source.clone(), None, None).await?;
-            Ok(ProviderReadinessProbeResult {
-                message,
-                ..ProviderReadinessProbeResult::default()
-            })
+            probe_aws_credentials(region, credential_source.clone(), None, None).await?;
+            readiness_note(ProviderReadinessNote::Verified)
         }
         "asr.deepgram" => {
             let api_key = deepgram_api_key_from_store(store)?;
             let model_catalog = fetch_deepgram_stt_model_catalog(&api_key).await?;
-            let model_count = model_catalog.len();
             Ok(ProviderReadinessProbeResult {
-                message: format!(
-                    "Deepgram API key is valid ({} streaming STT models)",
-                    model_count
-                ),
-                model_count: Some(model_count),
+                model_count: Some(model_catalog.len()),
                 model_catalog,
                 ..ProviderReadinessProbeResult::default()
             })
@@ -13183,30 +13150,19 @@ async fn probe_provider_readiness(
         "asr.soniox" => {
             let api_key = soniox_api_key_from_store(store)?;
             let model_catalog = fetch_soniox_realtime_model_catalog(&api_key).await?;
-            let model_count = model_catalog.len();
             Ok(ProviderReadinessProbeResult {
-                message: format!(
-                    "Soniox API key is valid ({} real-time STT models)",
-                    model_count
-                ),
-                model_count: Some(model_count),
+                model_count: Some(model_catalog.len()),
                 model_catalog,
                 ..ProviderReadinessProbeResult::default()
             })
         }
         "tts.deepgram_aura" => {
-            let message = test_tts_connection_cmd("deepgram_aura".to_string(), None).await?;
-            Ok(ProviderReadinessProbeResult {
-                message,
-                ..ProviderReadinessProbeResult::default()
-            })
+            test_tts_connection_cmd("deepgram_aura".to_string(), None).await?;
+            readiness_note(ProviderReadinessNote::Verified)
         }
         "asr.assemblyai" => {
-            let message = test_assemblyai_connection(None).await?;
-            Ok(ProviderReadinessProbeResult {
-                message,
-                ..ProviderReadinessProbeResult::default()
-            })
+            test_assemblyai_connection(None).await?;
+            readiness_note(ProviderReadinessNote::Verified)
         }
         "llm.openrouter" => {
             let api_key = openrouter_api_key_from_store(store)?;
@@ -13218,9 +13174,7 @@ async fn probe_provider_readiness(
             };
             openrouter::test_connection(&api_key, &base_url).await?;
             let models = openrouter::list_models(&api_key, &base_url).await?;
-            let message = format!("OpenRouter API key is valid ({} models)", models.len());
             Ok(ProviderReadinessProbeResult {
-                message,
                 model_count: Some(models.len()),
                 openrouter_models: models,
                 ..ProviderReadinessProbeResult::default()
@@ -13233,35 +13187,73 @@ async fn probe_provider_readiness(
                 ..
             } = &settings.llm_provider
             else {
-                return Ok(ProviderReadinessProbeResult {
-                    message: "Provider is not selected".to_string(),
-                    ..ProviderReadinessProbeResult::default()
-                });
+                return readiness_note(ProviderReadinessNote::NotSelected);
             };
-            let message =
-                test_aws_credentials(region.clone(), credential_source.clone(), None, None).await?;
-            Ok(ProviderReadinessProbeResult {
-                message,
-                ..ProviderReadinessProbeResult::default()
-            })
+            probe_aws_credentials(region, credential_source.clone(), None, None).await?;
+            readiness_note(ProviderReadinessNote::Verified)
         }
         "realtime_agent.gemini_live" => match &settings.gemini.auth {
             crate::settings::GeminiAuthMode::ApiKey { .. } => {
-                let message = test_gemini_api_key(None).await?;
-                Ok(ProviderReadinessProbeResult {
-                    message,
-                    ..ProviderReadinessProbeResult::default()
-                })
+                test_gemini_api_key(None).await?;
+                readiness_note(ProviderReadinessNote::Verified)
             }
-            crate::settings::GeminiAuthMode::VertexAI { .. } => Ok(ProviderReadinessProbeResult {
-                message: "Vertex AI readiness is not probed automatically yet".to_string(),
-                ..ProviderReadinessProbeResult::default()
-            }),
+            crate::settings::GeminiAuthMode::VertexAI { .. } => {
+                readiness_note(ProviderReadinessNote::VertexNotProbed)
+            }
         },
-        _ => Ok(ProviderReadinessProbeResult {
-            message: "No automatic health probe is available for this provider yet".to_string(),
-            ..ProviderReadinessProbeResult::default()
-        }),
+        _ => readiness_note(ProviderReadinessNote::NoAutomaticProbe),
+    }
+}
+
+/// The closed cause of a failed readiness check.
+///
+/// A typed failure is kept as it is. A legacy error variant is mapped by
+/// its kind alone; its text, which can name an endpoint, a region or a
+/// provider's words, is never read. Anything unrecognized is `internal`.
+fn readiness_failure_diagnostic(error: &AppError) -> RuntimeDiagnostic {
+    let context = RuntimeDiagnosticContext::new(RuntimeOperation::ProviderReadiness);
+    let runtime = |code, retryable, action| {
+        RuntimeDiagnostic::from(RuntimeErrorDiagnostic::new(
+            code, retryable, action, context,
+        ))
+    };
+    match error {
+        AppError::RuntimeDiagnostic(diagnostic) => diagnostic.clone(),
+        AppError::CredentialMissing { .. } => crate::credentials::LegacyCredentialError(
+            audio_graph_ipc_contract::credential_contract::CredentialErrorCode::Missing,
+        )
+        .into(),
+        AppError::AwsCredentialExpired => {
+            RuntimeErrorDiagnostic::credential_expired(context).into()
+        }
+        AppError::AwsRegionInvalid { .. } => {
+            RuntimeErrorDiagnostic::invalid_configuration(context).into()
+        }
+        AppError::NetworkTimeout { .. } => runtime(
+            RuntimeErrorCode::Timeout,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+        ),
+        AppError::GeminiRateLimited => runtime(
+            RuntimeErrorCode::RateLimited,
+            true,
+            RuntimeSafeRecoveryAction::RetryAfterDelay,
+        ),
+        AppError::ProviderUnavailable { .. } | AppError::ProviderDeferred { .. } => runtime(
+            RuntimeErrorCode::Unsupported,
+            false,
+            RuntimeSafeRecoveryAction::ChooseSupportedProvider,
+        ),
+        AppError::PrivacyPolicyBlocked { .. } => runtime(
+            RuntimeErrorCode::PolicyBlocked,
+            false,
+            RuntimeSafeRecoveryAction::ReviewPolicy,
+        ),
+        AppError::Io(_)
+        | AppError::ModelNotFound { .. }
+        | AppError::SessionInvalid { .. }
+        | AppError::ArtifactTooLarge { .. }
+        | AppError::Unknown(_) => RuntimeDiagnostic::internal(context),
     }
 }
 
@@ -13312,7 +13304,7 @@ async fn refresh_provider_readiness(
             ProviderReadiness {
                 provider_id: descriptor.id.to_string(),
                 status: ProviderReadinessStatus::Ready,
-                message: probe.message,
+                note: probe.note,
                 automatic_probe_available,
                 checked_at: Some(checked_at),
                 stale: false,
@@ -13334,14 +13326,10 @@ async fn refresh_provider_readiness(
             let model_catalog = fixed_model_catalog_for_descriptor(descriptor);
             let voice_catalog = fixed_voice_catalog_for_descriptor(descriptor);
             let language_catalog = fixed_language_catalog_for_descriptor(descriptor);
-            let diagnostic = match &error {
-                AppError::RuntimeDiagnostic(diagnostic) => Some(diagnostic.clone()),
-                _ => None,
-            };
             ProviderReadiness {
                 provider_id: descriptor.id.to_string(),
                 status: ProviderReadinessStatus::Error,
-                message: error.to_string(),
+                note: ProviderReadinessNote::Failed,
                 automatic_probe_available,
                 checked_at: Some(checked_at),
                 stale: false,
@@ -13353,7 +13341,7 @@ async fn refresh_provider_readiness(
                 language_catalog,
                 openrouter_models: vec![],
                 runtime: None,
-                diagnostic,
+                diagnostic: Some(readiness_failure_diagnostic(&error)),
                 effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
             }
         }
@@ -13364,10 +13352,7 @@ async fn refresh_provider_readiness(
             ProviderReadiness {
                 provider_id: descriptor.id.to_string(),
                 status: ProviderReadinessStatus::Error,
-                message: format!(
-                    "Health check timed out after {}s",
-                    PROVIDER_READINESS_TIMEOUT_SECS
-                ),
+                note: ProviderReadinessNote::Failed,
                 automatic_probe_available,
                 checked_at: Some(checked_at),
                 stale: false,
@@ -13379,7 +13364,15 @@ async fn refresh_provider_readiness(
                 language_catalog,
                 openrouter_models: vec![],
                 runtime: None,
-                diagnostic: None,
+                diagnostic: Some(
+                    RuntimeErrorDiagnostic::new(
+                        RuntimeErrorCode::Timeout,
+                        true,
+                        RuntimeSafeRecoveryAction::Retry,
+                        RuntimeDiagnosticContext::new(RuntimeOperation::ProviderReadiness),
+                    )
+                    .into(),
+                ),
                 effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
             }
         }
@@ -13403,21 +13396,65 @@ pub async fn get_provider_readiness_cmd(
     request_id: Option<String>,
 ) -> AppResult<Vec<ProviderReadiness>> {
     let settings = crate::settings::load_settings(&app);
-    let store = crate::credentials::try_load_credentials()?;
+    let models_dir = crate::models::get_models_dir(&app);
+    provider_readiness_impl(
+        settings,
+        &models_dir,
+        crate::credentials::try_load_credentials,
+        ProviderReadinessQuery {
+            refresh: refresh.unwrap_or(false),
+            force: force.unwrap_or(false),
+            conversation_mode,
+            converse_engine,
+            provider_ids,
+            request_id,
+        },
+    )
+    .await
+}
+
+/// What a caller asks of [`get_provider_readiness_cmd`].
+#[derive(Debug, Default)]
+struct ProviderReadinessQuery {
+    refresh: bool,
+    force: bool,
+    conversation_mode: Option<String>,
+    converse_engine: Option<String>,
+    provider_ids: Option<Vec<String>>,
+    request_id: Option<String>,
+}
+
+/// Testable core of [`get_provider_readiness_cmd`]: everything after the app
+/// handle has given the saved settings and the models directory.
+async fn provider_readiness_impl<E>(
+    settings: crate::settings::AppSettings,
+    models_dir: &std::path::Path,
+    load_credentials: impl FnOnce() -> Result<crate::credentials::CredentialStore, E>,
+    query: ProviderReadinessQuery,
+) -> AppResult<Vec<ProviderReadiness>>
+where
+    AppError: From<E>,
+{
+    let ProviderReadinessQuery {
+        refresh,
+        force,
+        conversation_mode,
+        converse_engine,
+        provider_ids,
+        request_id,
+    } = query;
+    let (credential_epoch, store) = readiness_credential_snapshot(load_credentials)?;
     let request = register_provider_readiness_request(request_id)?;
     let (_request_guard, cancel) = match &request {
         Some((guard, token)) => (Some(guard), Some(token)),
         None => (None, None),
     };
-    let credential_epoch = PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst);
     let native_realtime_active = native_realtime_readiness_requested(
         conversation_mode.as_deref(),
         converse_engine.as_deref(),
     );
     let active_ids =
         requested_provider_ids(&settings, native_realtime_active, provider_ids.as_deref());
-    let refresh = refresh.unwrap_or(false);
-    let force = force.unwrap_or(false);
     let now = unix_millis();
     let mut readiness = Vec::with_capacity(crate::provider_registry::provider_registry().len());
 
@@ -13456,7 +13493,7 @@ pub async fn get_provider_readiness_cmd(
                         &settings,
                         &store,
                         credential_epoch,
-                        "Health check already in progress".to_string(),
+                        ProviderReadinessNote::CheckInProgress,
                     )
                 }),
                 ProviderReadinessRefreshAdmission::RateLimited { retry_after_ms } => cached
@@ -13466,10 +13503,9 @@ pub async fn get_provider_readiness_cmd(
                             &settings,
                             &store,
                             credential_epoch,
-                            format!(
-                                "Health check was started recently; retry in {}s",
-                                retry_after_ms.div_ceil(1000)
-                            ),
+                            ProviderReadinessNote::CheckRateLimited {
+                                retry_after_secs: retry_after_ms.div_ceil(1000),
+                            },
                         )
                     }),
             }
@@ -13477,14 +13513,15 @@ pub async fn get_provider_readiness_cmd(
             base_provider_readiness(descriptor, &settings, &store, credential_epoch)
         };
 
-        let value = apply_local_model_readiness(descriptor, &app, value);
+        let value = apply_local_model_readiness_from_dir(descriptor, models_dir, value);
 
         if value.checked_at.is_some() {
-            store_provider_readiness(cache_key, &value);
+            store_provider_readiness_for_epoch(cache_key, &value, credential_epoch);
         }
         readiness.push(value);
     }
 
+    mark_stale_if_epoch_moved(&mut readiness, credential_epoch);
     Ok(readiness)
 }
 
@@ -13575,11 +13612,7 @@ pub async fn test_cloud_asr_connection(
     let api_key = endpoint_api_key_from_draft_or_store(&endpoint, api_key)?;
     let model_catalog =
         fetch_openai_compatible_model_catalog(&endpoint, api_key.as_deref()).await?;
-    Ok(format!(
-        "Connected to {} ({} models)",
-        endpoint,
-        model_catalog.len()
-    ))
+    Ok(format!("Connected ({} models)", model_catalog.len()))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -13625,12 +13658,8 @@ fn parse_openai_compatible_model_catalog_with_default(
     body: &str,
     default_model: Option<&str>,
 ) -> AppResult<Vec<ProviderModelCatalogItem>> {
-    let response: OpenAiCompatibleModelsResponse = serde_json::from_str(body).map_err(|e| {
-        AppError::Unknown(format!(
-            "Failed to parse OpenAI-compatible model catalog: {}",
-            e
-        ))
-    })?;
+    let response: OpenAiCompatibleModelsResponse =
+        serde_json::from_str(body).map_err(|_| provider_check_invalid_response())?;
     Ok(openai_compatible_model_catalog_from_response_with_default(
         response,
         default_model,
@@ -13707,10 +13736,7 @@ async fn fetch_openai_compatible_model_catalog_with_default(
     default_model: Option<&str>,
 ) -> AppResult<Vec<ProviderModelCatalogItem>> {
     let url = format!("{}/models", endpoint.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let client = provider_check_client()?;
     let mut req = client.get(&url);
     if let Some(api_key) = api_key {
         req = req.bearer_auth(api_key);
@@ -13718,33 +13744,96 @@ async fn fetch_openai_compatible_model_catalog_with_default(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(AppError::Unknown(cloud_asr_connection_error_message(
-            status, &body, api_key,
-        )));
-    }
+        .map_err(|error| provider_check_request_error(&error))?;
+    // A loopback endpoint can be probed with no key, and then a 401 is not a
+    // rejected credential.
+    provider_check_status(resp.status(), api_key.is_some())?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|error| provider_check_response_error(&error))?;
     parse_openai_compatible_model_catalog_with_default(&body, default_model)
 }
 
-fn cloud_asr_connection_error_message(
-    status: reqwest::StatusCode,
-    body: &str,
-    api_key: Option<&str>,
-) -> String {
-    let body = crate::error::redacted_error_excerpt(body, api_key, 200);
-    let detail = format!("HTTP {}: {}", status, body);
-    // Codex P2 (PR #92): this shared arm also probes localhost/loopback
-    // OpenAI-compatible endpoints with NO saved key — a 401 from such a probe
-    // is not a rejected credential, so the marker only applies when a key was
-    // actually sent. The per-provider helpers always send one.
-    if api_key.is_some() {
-        crate::error::classify_credential_rejected_message(status, detail)
-    } else {
-        detail
+/// The context of a readiness or connection check.
+fn provider_check_context() -> RuntimeDiagnosticContext {
+    RuntimeDiagnosticContext::new(RuntimeOperation::ProviderReadiness)
+        .with_transport(RuntimeTransport::Http)
+}
+
+/// The HTTP client a readiness or connection check sends through. Its build
+/// error is OS or TLS prose, so only the fact of it is kept.
+///
+/// Redirects stay on the configured origin: reqwest drops `Authorization` on a
+/// cross-origin hop, so a 401 from there would say nothing about the saved key.
+/// The stopped 3xx is classified as a rejected request.
+fn provider_check_client() -> AppResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(crate::llm::http_diag::same_origin_redirects())
+        .build()
+        .map_err(|_| RuntimeDiagnostic::internal(provider_check_context()).into())
+}
+
+/// A check's response status, classified by the status and whether a
+/// credential was sent. The body of a failed response is never read.
+fn provider_check_status(status: reqwest::StatusCode, credential_sent: bool) -> AppResult<()> {
+    if status.is_success() {
+        return Ok(());
     }
+    Err(RuntimeErrorDiagnostic::from_http_status(
+        status.as_u16(),
+        credential_sent,
+        provider_check_context(),
+    )
+    .into())
+}
+
+/// A check request that got no response, classified by kind; the error's
+/// text names the URL and is not kept.
+fn provider_check_request_error(error: &reqwest::Error) -> AppError {
+    let (code, retryable, action) = if error.is_timeout() {
+        (
+            RuntimeErrorCode::Timeout,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+        )
+    } else if error.is_connect() {
+        (
+            RuntimeErrorCode::NetworkUnreachable,
+            true,
+            RuntimeSafeRecoveryAction::CheckNetwork,
+        )
+    } else if error.is_redirect() {
+        (
+            RuntimeErrorCode::RequestRejected,
+            false,
+            RuntimeSafeRecoveryAction::ReviewConfiguration,
+        )
+    } else {
+        return RuntimeDiagnostic::internal(provider_check_context()).into();
+    };
+    RuntimeErrorDiagnostic::new(code, retryable, action, provider_check_context()).into()
+}
+
+/// A successful check response whose body could not be read.
+fn provider_check_response_error(error: &reqwest::Error) -> AppError {
+    if error.is_timeout() {
+        provider_check_request_error(error)
+    } else {
+        provider_check_invalid_response()
+    }
+}
+
+/// A successful check response whose body is not what the provider documents.
+fn provider_check_invalid_response() -> AppError {
+    RuntimeErrorDiagnostic::new(
+        RuntimeErrorCode::InvalidResponse,
+        true,
+        RuntimeSafeRecoveryAction::Retry,
+        provider_check_context(),
+    )
+    .into()
 }
 
 fn endpoint_api_key_from_draft_or_store(
@@ -13792,8 +13881,7 @@ pub async fn test_openai_compatible_llm_connection_cmd(
     let model_catalog =
         fetch_openai_compatible_model_catalog(&endpoint, api_key.as_deref()).await?;
     Ok(format!(
-        "Connected to {} ({} OpenAI-compatible models)",
-        endpoint.trim(),
+        "Connected ({} OpenAI-compatible models)",
         model_catalog.len()
     ))
 }
@@ -13898,32 +13986,15 @@ fn deepgram_stt_model_catalog_from_response(
 }
 
 fn parse_deepgram_stt_model_catalog(body: &str) -> AppResult<Vec<ProviderModelCatalogItem>> {
-    let response: DeepgramModelsResponse = serde_json::from_str(body)
-        .map_err(|e| AppError::Unknown(format!("Failed to parse Deepgram model catalog: {}", e)))?;
+    let response: DeepgramModelsResponse =
+        serde_json::from_str(body).map_err(|_| provider_check_invalid_response())?;
     Ok(deepgram_stt_model_catalog_from_response(response))
-}
-
-fn deepgram_connection_error_message(
-    status: reqwest::StatusCode,
-    body: &str,
-    api_key: Option<&str>,
-) -> String {
-    let body = crate::error::redacted_error_excerpt(body, api_key, 200);
-    let detail = if body.is_empty() {
-        format!("Deepgram returned HTTP {}", status)
-    } else {
-        format!("Deepgram returned HTTP {}: {}", status, body)
-    };
-    crate::error::classify_credential_rejected_message(status, detail)
 }
 
 async fn fetch_deepgram_stt_model_catalog(
     api_key: &str,
 ) -> AppResult<Vec<ProviderModelCatalogItem>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let client = provider_check_client()?;
     let resp = client
         // Use /v1/models (works with `usage` scope — the scope most keys
         // have for transcription). /v1/projects requires the `manage` scope
@@ -13932,17 +14003,12 @@ async fn fetch_deepgram_stt_model_catalog(
         .header("Authorization", format!("Token {}", api_key))
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(AppError::Unknown(deepgram_connection_error_message(
-            status,
-            &body,
-            Some(api_key),
-        )));
-    }
-
+        .map_err(|error| provider_check_request_error(&error))?;
+    provider_check_status(resp.status(), true)?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|error| provider_check_response_error(&error))?;
     parse_deepgram_stt_model_catalog(&body)
 }
 
@@ -14005,48 +14071,26 @@ fn soniox_realtime_model_catalog_from_response(
 }
 
 fn parse_soniox_realtime_model_catalog(body: &str) -> AppResult<Vec<ProviderModelCatalogItem>> {
-    let response: SonioxModelsResponse = serde_json::from_str(body)
-        .map_err(|e| AppError::Unknown(format!("Failed to parse Soniox model catalog: {}", e)))?;
+    let response: SonioxModelsResponse =
+        serde_json::from_str(body).map_err(|_| provider_check_invalid_response())?;
     Ok(soniox_realtime_model_catalog_from_response(response))
-}
-
-fn soniox_connection_error_message(
-    status: reqwest::StatusCode,
-    body: &str,
-    api_key: Option<&str>,
-) -> String {
-    let body = crate::error::redacted_error_excerpt(body, api_key, 200);
-    let detail = if body.is_empty() {
-        format!("Soniox returned HTTP {}", status)
-    } else {
-        format!("Soniox returned HTTP {}: {}", status, body)
-    };
-    crate::error::classify_credential_rejected_message(status, detail)
 }
 
 async fn fetch_soniox_realtime_model_catalog(
     api_key: &str,
 ) -> AppResult<Vec<ProviderModelCatalogItem>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let client = provider_check_client()?;
     let resp = client
         .get("https://api.soniox.com/v1/models")
         .bearer_auth(api_key)
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(AppError::Unknown(soniox_connection_error_message(
-            status,
-            &body,
-            Some(api_key),
-        )));
-    }
-
+        .map_err(|error| provider_check_request_error(&error))?;
+    provider_check_status(resp.status(), true)?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|error| provider_check_response_error(&error))?;
     parse_soniox_realtime_model_catalog(&body)
 }
 
@@ -14172,32 +14216,15 @@ pub async fn list_sambanova_models_cmd(
 #[tauri::command]
 pub async fn test_assemblyai_connection(api_key: Option<String>) -> AppResult<String> {
     let api_key = assemblyai_api_key_from_draft_or_store(api_key)?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let client = provider_check_client()?;
     let resp = client
         .get("https://api.assemblyai.com/v2/transcript?limit=1")
         .header("Authorization", &api_key)
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(AppError::Unknown(assemblyai_connection_error_message(
-            status,
-        )));
-    }
+        .map_err(|error| provider_check_request_error(&error))?;
+    provider_check_status(resp.status(), true)?;
     Ok("AssemblyAI account key is valid via REST; v3 streaming socket smoke not run".to_string())
-}
-
-/// Build the `test_assemblyai_connection` error message. Extracted (mirrors
-/// `deepgram_connection_error_message` / `soniox_connection_error_message`)
-/// so the 401-credential-rejected classification (audio-graph-57cc) is
-/// unit-testable without a live/mocked HTTP round trip.
-fn assemblyai_connection_error_message(status: reqwest::StatusCode) -> String {
-    let detail = format!("AssemblyAI returned HTTP {}", status);
-    crate::error::classify_credential_rejected_message(status, detail)
 }
 
 fn deepgram_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<String> {
@@ -14263,32 +14290,15 @@ fn assemblyai_api_key_from_store(store: &crate::credentials::CredentialStore) ->
 #[tauri::command]
 pub async fn test_gemini_api_key(api_key: Option<String>) -> AppResult<String> {
     let api_key = gemini_api_key_from_draft_or_store(api_key)?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let client = provider_check_client()?;
     let resp = client
         .get("https://generativelanguage.googleapis.com/v1beta/models")
         .header("x-goog-api-key", api_key.trim())
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(AppError::Unknown(gemini_api_key_connection_error_message(
-            status,
-        )));
-    }
+        .map_err(|error| provider_check_request_error(&error))?;
+    provider_check_status(resp.status(), true)?;
     Ok("Gemini API key is valid".to_string())
-}
-
-/// Build the `test_gemini_api_key` error message. Extracted (mirrors
-/// `assemblyai_connection_error_message` above) so the 401-credential-rejected
-/// classification (audio-graph-57cc) is unit-testable without a live/mocked
-/// HTTP round trip.
-fn gemini_api_key_connection_error_message(status: reqwest::StatusCode) -> String {
-    let detail = format!("Gemini API returned HTTP {}", status);
-    crate::error::classify_credential_rejected_message(status, detail)
 }
 
 fn gemini_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<String> {
@@ -14312,7 +14322,8 @@ fn gemini_api_key_from_store(store: &crate::credentials::CredentialStore) -> App
 /// Test AWS credentials via STS GetCallerIdentity (works for any AWS API access).
 ///
 /// Shared between AWS Transcribe and AWS Bedrock settings — both providers
-/// pull from the same backend credential store.
+/// pull from the same backend credential store. The caller's identity is not
+/// returned: an ARN names the account.
 #[tauri::command]
 pub async fn test_aws_credentials(
     region: String,
@@ -14320,37 +14331,156 @@ pub async fn test_aws_credentials(
     secret_access_key: Option<String>,
     session_token: Option<String>,
 ) -> AppResult<String> {
-    let region_trimmed = region.trim();
-    if region_trimmed.is_empty() {
-        return Err(AppError::AwsRegionInvalid {
-            region: region_trimmed.to_string(),
-        });
-    }
-    if !region_trimmed.contains('-') {
-        return Err(AppError::AwsRegionInvalid {
-            region: region_trimmed.to_string(),
-        });
-    }
-    let region = region_trimmed.to_string();
+    probe_aws_credentials(&region, credential_source, secret_access_key, session_token).await?;
+    Ok("AWS credentials are valid".to_string())
+}
 
+/// Ask STS who the credentials belong to, and keep only whether it answered.
+async fn probe_aws_credentials(
+    region: &str,
+    credential_source: crate::settings::AwsCredentialSource,
+    secret_access_key: Option<String>,
+    session_token: Option<String>,
+) -> AppResult<()> {
+    let region = region.trim();
+    // The closed cause only: the form already holds what the user typed.
+    if region.is_empty() || !region.contains('-') {
+        return Err(
+            RuntimeErrorDiagnostic::invalid_configuration(RuntimeDiagnosticContext::new(
+                RuntimeOperation::ProviderReadiness,
+            ))
+            .into(),
+        );
+    }
     let sdk_config = crate::aws_util::build_aws_sdk_config_with_draft_credentials(
-        &region,
+        region,
         credential_source,
         secret_access_key,
         session_token,
     )
     .await?;
-    let sts = aws_sdk_sts::Client::new(&sdk_config);
-    let identity = sts
+    sts_caller_identity_check(&sdk_config).await
+}
+
+/// One `GetCallerIdentity` call under `sdk_config`, as a closed cause.
+async fn sts_caller_identity_check(sdk_config: &aws_config::SdkConfig) -> AppResult<()> {
+    aws_sdk_sts::Client::new(sdk_config)
         .get_caller_identity()
         .send()
         .await
-        .map_err(|e| format!("AWS auth failed: {}", e))?;
-    Ok(format!(
-        "Authenticated as {} (account: {})",
-        identity.arn().unwrap_or("unknown"),
-        identity.account().unwrap_or("unknown")
-    ))
+        .map(|_identity| ())
+        .map_err(|error| {
+            let status = error
+                .raw_response()
+                .map(|response| response.status().as_u16());
+            sts_failure_diagnostic(&error, status).into()
+        })
+}
+
+fn aws_check_context() -> RuntimeDiagnosticContext {
+    RuntimeDiagnosticContext::new(RuntimeOperation::ProviderReadiness)
+        .with_transport(RuntimeTransport::Sdk)
+}
+
+/// Classify an STS failure from the SDK's error kind and the service's
+/// error code. Neither the SDK's text nor the service message (which names
+/// the caller's ARN and account) is read; a code outside the allowlist is
+/// `internal`. `status` is the HTTP status of the response, when there was one.
+fn sts_failure_diagnostic<R>(
+    error: &aws_sdk_sts::error::SdkError<
+        aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError,
+        R,
+    >,
+    status: Option<u16>,
+) -> RuntimeDiagnostic {
+    use aws_sdk_sts::error::{ProvideErrorMetadata, SdkError};
+    let runtime = |code, retryable, action| {
+        RuntimeErrorDiagnostic::new(code, retryable, action, aws_check_context()).into()
+    };
+    // A redirect the HTTP layer did not follow: STS never answers with one,
+    // so it says nothing about the credential. Like the other checks, it is
+    // a rejected request.
+    if let Some(status @ 300..=399) = status
+        && matches!(
+            error,
+            SdkError::ServiceError(_) | SdkError::ResponseError(_)
+        )
+    {
+        return RuntimeErrorDiagnostic::from_http_status(status, false, aws_check_context()).into();
+    }
+    match error {
+        SdkError::ServiceError(service) => sts_service_code_diagnostic(service.err().code()),
+        SdkError::TimeoutError(_) => runtime(
+            RuntimeErrorCode::Timeout,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+        ),
+        SdkError::DispatchFailure(dispatch) if dispatch.is_timeout() => runtime(
+            RuntimeErrorCode::Timeout,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+        ),
+        SdkError::DispatchFailure(dispatch) if dispatch.is_io() => runtime(
+            RuntimeErrorCode::NetworkUnreachable,
+            true,
+            RuntimeSafeRecoveryAction::CheckNetwork,
+        ),
+        SdkError::ResponseError(_) => runtime(
+            RuntimeErrorCode::InvalidResponse,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+        ),
+        _ => RuntimeDiagnostic::internal(aws_check_context()),
+    }
+}
+
+/// STS error codes, by exact match, as the query protocol reports them.
+fn sts_service_code_diagnostic(code: Option<&str>) -> RuntimeDiagnostic {
+    let context = aws_check_context().with_status_class(
+        audio_graph_ipc_contract::runtime_diagnostic::RuntimeStatusClass::ClientError,
+    );
+    match code {
+        // An access key AWS does not know, or a secret that does not sign it.
+        Some("InvalidClientTokenId" | "SignatureDoesNotMatch" | "IncompleteSignature") => {
+            RuntimeErrorDiagnostic::credential_rejected(context).into()
+        }
+        Some("ExpiredToken" | "ExpiredTokenException") => {
+            RuntimeErrorDiagnostic::credential_expired(context).into()
+        }
+        // The request's timestamp was outside the window STS accepts, usually
+        // the machine's clock; the credential is not at fault. AWS STS common
+        // errors: "Generate a new request with a current timestamp and try again."
+        Some("RequestExpired") => RuntimeErrorDiagnostic::new(
+            RuntimeErrorCode::RequestRejected,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+            context,
+        )
+        .into(),
+        Some("AccessDenied" | "AccessDeniedException") => {
+            RuntimeErrorDiagnostic::permission_denied(context).into()
+        }
+        Some("RegionDisabledException") => {
+            RuntimeErrorDiagnostic::invalid_configuration(context).into()
+        }
+        Some("Throttling" | "ThrottlingException") => RuntimeErrorDiagnostic::new(
+            RuntimeErrorCode::RateLimited,
+            true,
+            RuntimeSafeRecoveryAction::RetryAfterDelay,
+            context,
+        )
+        .into(),
+        Some("ServiceUnavailable" | "InternalFailure") => RuntimeErrorDiagnostic::new(
+            RuntimeErrorCode::ProviderUnavailable,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+            aws_check_context().with_status_class(
+                audio_graph_ipc_contract::runtime_diagnostic::RuntimeStatusClass::ServerError,
+            ),
+        )
+        .into(),
+        _ => RuntimeDiagnostic::internal(aws_check_context()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -21463,7 +21593,8 @@ mod tests {
         assert_eq!(readiness.status, ProviderReadinessStatus::Unchecked);
         assert!(readiness.automatic_probe_available);
         assert_eq!(readiness.checked_at, None);
-        assert_eq!(readiness.message, "Provider readiness check cancelled");
+        assert_eq!(readiness.note, ProviderReadinessNote::Cancelled);
+        assert_eq!(readiness.diagnostic, None);
         let serialized = serde_json::to_string(&readiness).expect("serialize readiness");
         assert!(!serialized.contains("sk-secret-cancel"));
     }
@@ -21526,6 +21657,560 @@ mod tests {
             for canary in ["readiness-key-canary", "readiness-body-canary"] {
                 assert!(!serialized.contains(canary), "{canary} in readiness");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_readiness_carries_the_typed_cause_of_an_openai_compatible_refusal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let descriptor = crate::provider_registry::descriptor_by_id("llm.api");
+        // The check sends the key from the store it is given, never the
+        // machine's own credential backend.
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openai_api_key = Some("wombat-key-canary".to_string());
+
+        for (status, code) in [
+            ("401 Unauthorized", RuntimeErrorCode::CredentialRejected),
+            ("403 Forbidden", RuntimeErrorCode::PermissionDenied),
+            ("429 Too Many Requests", RuntimeErrorCode::RateLimited),
+            (
+                "503 Service Unavailable",
+                RuntimeErrorCode::ProviderUnavailable,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock");
+            let endpoint = format!("http://{}/v1", listener.local_addr().expect("addr"));
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let body = r#"{"error":"wombat-body-canary arn:aws:iam::wombat"}"#;
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+            let settings = crate::settings::AppSettings {
+                llm_provider: crate::settings::LlmProvider::Api {
+                    endpoint,
+                    api_key: String::new(),
+                    model: "probe-model".to_string(),
+                },
+                ..Default::default()
+            };
+
+            let readiness =
+                refresh_provider_readiness(descriptor, &settings, &store, 1, None).await;
+
+            assert_eq!(readiness.status, ProviderReadinessStatus::Error, "{status}");
+            assert_eq!(readiness.note, ProviderReadinessNote::Failed);
+            let Some(RuntimeDiagnostic::Runtime(detail)) = &readiness.diagnostic else {
+                panic!("no typed cause for {status}");
+            };
+            assert_eq!(detail.code, code, "{status}");
+            let serialized = serde_json::to_string(&readiness).expect("serialize readiness");
+            for canary in ["wombat-key-canary", "wombat-body-canary", "wombat"] {
+                assert!(!serialized.contains(canary), "{canary} in readiness");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_readiness_probe_does_not_follow_a_redirect_off_the_configured_origin() {
+        // reqwest would drop the key on the cross-origin hop, so this 401
+        // would wrongly read as a rejected key if the probe followed it.
+        let unauthenticated =
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openai_api_key = Some("redirect-key-canary".to_string());
+        store.openrouter_api_key = Some("redirect-key-canary".to_string());
+
+        for provider_id in ["llm.api", "llm.openrouter"] {
+            let (elsewhere, contacted) =
+                spawn_contact_recording_http_mock(unauthenticated.to_string()).await;
+            let configured = spawn_raw_http_mock(format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {elsewhere}/models\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+            let llm_provider = match provider_id {
+                "llm.api" => crate::settings::LlmProvider::Api {
+                    endpoint: format!("{configured}/v1"),
+                    api_key: String::new(),
+                    model: "probe-model".to_string(),
+                },
+                _ => crate::settings::LlmProvider::OpenRouter {
+                    model: String::new(),
+                    base_url: configured,
+                    provider_order: None,
+                    include_usage_in_stream: true,
+                    api_key: String::new(),
+                },
+            };
+            let settings = crate::settings::AppSettings {
+                llm_provider,
+                ..Default::default()
+            };
+
+            let readiness = refresh_provider_readiness(
+                crate::provider_registry::descriptor_by_id(provider_id),
+                &settings,
+                &store,
+                1,
+                None,
+            )
+            .await;
+
+            assert_eq!(
+                readiness.status,
+                ProviderReadinessStatus::Error,
+                "{provider_id}"
+            );
+            let Some(RuntimeDiagnostic::Runtime(detail)) = &readiness.diagnostic else {
+                panic!("{provider_id}: no typed cause");
+            };
+            assert_eq!(
+                detail.code,
+                RuntimeErrorCode::RequestRejected,
+                "{provider_id}"
+            );
+            assert!(
+                !contacted.load(Ordering::SeqCst),
+                "{provider_id} followed the redirect off its origin"
+            );
+        }
+    }
+
+    #[test]
+    fn a_save_during_a_readiness_refresh_never_caches_the_old_key_under_the_new_epoch() {
+        let _lock = CREDENTIAL_EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let descriptor = crate::provider_registry::descriptor_by_id("llm.openrouter");
+        let settings = crate::settings::AppSettings::default();
+        let active: HashSet<&'static str> = ["llm.openrouter"].into_iter().collect();
+        let key_store = |key: &str| {
+            let mut store = crate::credentials::CredentialStore::default();
+            store.openrouter_api_key = Some(key.to_string());
+            store
+        };
+        let checked = |store: &crate::credentials::CredentialStore, epoch| ProviderReadiness {
+            checked_at: Some(unix_millis()),
+            ..base_provider_readiness(descriptor, &settings, store, epoch)
+        };
+        let current_key =
+            |epoch| provider_readiness_cache_key(descriptor, &settings, epoch, &active);
+
+        // A save lands between the two reads: the store is read with key A,
+        // then the save writes key B and bumps the epoch.
+        let (started, store) = readiness_credential_snapshot(|| {
+            let store = key_store("key-a");
+            bump_provider_credential_epoch();
+            Ok::<_, ()>(store)
+        })
+        .expect("snapshot");
+        let now_epoch = PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst);
+        assert_ne!(started, now_epoch, "key A is never paired with B's epoch");
+        assert!(!store_provider_readiness_for_epoch(
+            current_key(started),
+            &checked(&store, started),
+            started,
+        ));
+        assert!(cached_provider_readiness(&current_key(now_epoch), unix_millis()).is_none());
+
+        // A save lands while the probe runs: its result is returned, not kept.
+        let (started, store) =
+            readiness_credential_snapshot(|| Ok::<_, ()>(key_store("key-b"))).expect("snapshot");
+        let result = checked(&store, started);
+        bump_provider_credential_epoch();
+        let now_epoch = PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst);
+        assert!(!store_provider_readiness_for_epoch(
+            current_key(started),
+            &result,
+            started
+        ));
+        assert!(cached_provider_readiness(&current_key(started), unix_millis()).is_none());
+        assert!(cached_provider_readiness(&current_key(now_epoch), unix_millis()).is_none());
+        // Nor is it returned as the new key's current verdict.
+        let mut returned = vec![result];
+        mark_stale_if_epoch_moved(&mut returned, started);
+        assert!(returned[0].stale, "a result from before the save is stale");
+
+        // With no save in between, the result is cached under its own epoch.
+        let (started, store) =
+            readiness_credential_snapshot(|| Ok::<_, ()>(key_store("key-c"))).expect("snapshot");
+        assert!(store_provider_readiness_for_epoch(
+            current_key(started),
+            &checked(&store, started),
+            started,
+        ));
+        assert!(cached_provider_readiness(&current_key(started), unix_millis()).is_some());
+        let mut returned = vec![checked(&store, started)];
+        mark_stale_if_epoch_moved(&mut returned, started);
+        assert!(!returned[0].stale, "an undisturbed result stays current");
+    }
+
+    #[test]
+    fn the_readiness_command_returns_a_verdict_stale_when_a_save_lands_during_its_check() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _lock = CREDENTIAL_EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let models_dir = unique_tempdir("readiness-command-epoch");
+        let key_a = || {
+            let mut store = crate::credentials::CredentialStore::default();
+            store.openai_api_key = Some("key-a".to_string());
+            Ok::<_, AppError>(store)
+        };
+        let query = |refresh| ProviderReadinessQuery {
+            refresh,
+            force: true,
+            provider_ids: Some(vec!["llm.api".to_string()]),
+            ..Default::default()
+        };
+        let entry_of = |readiness: Vec<ProviderReadiness>| {
+            readiness
+                .into_iter()
+                .find(|entry| entry.provider_id == "llm.api")
+                .expect("an llm.api entry")
+        };
+
+        for save_lands in [true, false] {
+            let (checked, later) = runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind mock");
+                let endpoint = format!("http://{}/v1", listener.local_addr().expect("addr"));
+                tokio::spawn(async move {
+                    if let Ok((mut stream, _)) = listener.accept().await {
+                        let mut request = vec![0u8; 4096];
+                        let _ = stream.read(&mut request).await;
+                        // Key B is saved while the check of key A is in flight.
+                        if save_lands {
+                            bump_provider_credential_epoch();
+                        }
+                        let body = r#"{"data":[{"id":"probe-model"}]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    }
+                });
+                let settings = crate::settings::AppSettings {
+                    llm_provider: crate::settings::LlmProvider::Api {
+                        endpoint,
+                        api_key: String::new(),
+                        model: "probe-model".to_string(),
+                    },
+                    ..Default::default()
+                };
+                let checked =
+                    provider_readiness_impl(settings.clone(), &models_dir, key_a, query(true))
+                        .await
+                        .expect("readiness");
+                // A later call that does not refresh shows what was kept.
+                let later = provider_readiness_impl(settings, &models_dir, key_a, query(false))
+                    .await
+                    .expect("readiness");
+                (entry_of(checked), entry_of(later))
+            });
+
+            // Key A passed either way; the verdict is current only if no save landed.
+            assert_eq!(
+                checked.status,
+                ProviderReadinessStatus::Ready,
+                "{checked:?}"
+            );
+            assert_eq!(checked.stale, save_lands, "{checked:?}");
+            // And it is kept for later calls only then.
+            assert_eq!(later.checked_at.is_some(), !save_lands, "{later:?}");
+        }
+        let _ = std::fs::remove_dir_all(&models_dir);
+    }
+
+    #[tokio::test]
+    async fn readiness_entries_and_notes_serialize_exactly_their_closed_fields() {
+        fn keys(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+            value
+                .as_object()
+                .expect("an object")
+                .keys()
+                .cloned()
+                .collect()
+        }
+        fn set(names: &[&str]) -> std::collections::BTreeSet<String> {
+            names.iter().map(|name| name.to_string()).collect()
+        }
+
+        let notes = [
+            (ProviderReadinessNote::ReadyToCheck, set(&["kind"])),
+            (
+                ProviderReadinessNote::MissingCredentials {
+                    keys: vec!["openai_api_key".to_string()],
+                },
+                set(&["kind", "keys"]),
+            ),
+            (ProviderReadinessNote::AwsProfileRequired, set(&["kind"])),
+            (ProviderReadinessNote::VertexProjectRequired, set(&["kind"])),
+            (ProviderReadinessNote::VertexNotProbed, set(&["kind"])),
+            (ProviderReadinessNote::NoAutomaticProbe, set(&["kind"])),
+            (ProviderReadinessNote::LocalModelsManaged, set(&["kind"])),
+            (
+                ProviderReadinessNote::LocalModels {
+                    ready: 1,
+                    total: 2,
+                    missing: vec!["model-a".to_string()],
+                    invalid: Vec::new(),
+                    planned: false,
+                },
+                set(&["kind", "ready", "total", "missing", "invalid", "planned"]),
+            ),
+            (ProviderReadinessNote::NotSelected, set(&["kind"])),
+            (ProviderReadinessNote::Cancelled, set(&["kind"])),
+            (ProviderReadinessNote::CheckInProgress, set(&["kind"])),
+            (
+                ProviderReadinessNote::CheckRateLimited {
+                    retry_after_secs: 3,
+                },
+                set(&["kind", "retry_after_secs"]),
+            ),
+            (ProviderReadinessNote::Verified, set(&["kind"])),
+            (ProviderReadinessNote::Failed, set(&["kind"])),
+        ];
+        for (note, expected) in notes {
+            let value = serde_json::to_value(&note).expect("serialize note");
+            assert_eq!(keys(&value), expected, "{note:?}");
+        }
+
+        // A real failed entry: only its closed fields, and a closed credential row.
+        let endpoint = spawn_raw_http_mock(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        )
+        .await;
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openai_api_key = Some("keyset-key-canary".to_string());
+        let settings = crate::settings::AppSettings {
+            llm_provider: crate::settings::LlmProvider::Api {
+                endpoint: format!("{endpoint}/v1"),
+                api_key: String::new(),
+                model: "probe-model".to_string(),
+            },
+            ..Default::default()
+        };
+        let readiness = refresh_provider_readiness(
+            crate::provider_registry::descriptor_by_id("llm.api"),
+            &settings,
+            &store,
+            1,
+            None,
+        )
+        .await;
+        let value = serde_json::to_value(&readiness).expect("serialize readiness");
+        assert_eq!(
+            keys(&value),
+            set(&[
+                "provider_id",
+                "status",
+                "note",
+                "automatic_probe_available",
+                "checked_at",
+                "stale",
+                "credential_epoch",
+                "credentials",
+                "diagnostic",
+            ]),
+            "{value}"
+        );
+        for credential in value["credentials"].as_array().expect("credential rows") {
+            assert_eq!(keys(credential), set(&["key", "present"]), "{credential}");
+        }
+    }
+
+    #[test]
+    fn an_sts_failure_is_classified_by_kind_and_code_without_its_text() {
+        use aws_sdk_sts::error::{ConnectorError, ErrorMetadata, SdkError};
+        use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
+        type StsError = SdkError<GetCallerIdentityError, ()>;
+
+        // The service message names the caller; the classifier must not keep it.
+        let service = |code: &str| -> StsError {
+            SdkError::service_error(
+                GetCallerIdentityError::generic(
+                    ErrorMetadata::builder()
+                        .code(code)
+                        .message("arn:aws:iam::111122223333:user/numbat-canary")
+                        .build(),
+                ),
+                (),
+            )
+        };
+        let cases: Vec<(StsError, RuntimeErrorCode)> = vec![
+            (
+                service("InvalidClientTokenId"),
+                RuntimeErrorCode::CredentialRejected,
+            ),
+            (
+                service("SignatureDoesNotMatch"),
+                RuntimeErrorCode::CredentialRejected,
+            ),
+            (service("ExpiredToken"), RuntimeErrorCode::CredentialExpired),
+            (
+                service("ExpiredTokenException"),
+                RuntimeErrorCode::CredentialExpired,
+            ),
+            // A clock outside STS's window, not an expired credential.
+            (service("RequestExpired"), RuntimeErrorCode::RequestRejected),
+            (
+                service("IncompleteSignature"),
+                RuntimeErrorCode::CredentialRejected,
+            ),
+            (service("AccessDenied"), RuntimeErrorCode::PermissionDenied),
+            (
+                service("RegionDisabledException"),
+                RuntimeErrorCode::InvalidConfiguration,
+            ),
+            (service("Throttling"), RuntimeErrorCode::RateLimited),
+            (
+                service("ServiceUnavailable"),
+                RuntimeErrorCode::ProviderUnavailable,
+            ),
+            (service("numbat-canary-code"), RuntimeErrorCode::Internal),
+            (
+                SdkError::timeout_error("numbat-canary timeout"),
+                RuntimeErrorCode::Timeout,
+            ),
+            (
+                SdkError::dispatch_failure(ConnectorError::timeout("numbat-canary".into())),
+                RuntimeErrorCode::Timeout,
+            ),
+            (
+                SdkError::dispatch_failure(ConnectorError::io("numbat-canary".into())),
+                RuntimeErrorCode::NetworkUnreachable,
+            ),
+            (
+                SdkError::dispatch_failure(ConnectorError::other("numbat-canary".into(), None)),
+                RuntimeErrorCode::Internal,
+            ),
+            (
+                SdkError::response_error("numbat-canary", ()),
+                RuntimeErrorCode::InvalidResponse,
+            ),
+            (
+                SdkError::construction_failure("numbat-canary"),
+                RuntimeErrorCode::Internal,
+            ),
+        ];
+        for (error, code) in cases {
+            let diagnostic = sts_failure_diagnostic(&error, None);
+            let RuntimeDiagnostic::Runtime(detail) = &diagnostic else {
+                panic!("a runtime diagnostic");
+            };
+            assert_eq!(detail.code, code, "{diagnostic:?}");
+            let serialized = serde_json::to_string(&diagnostic).expect("serialize diagnostic");
+            for canary in ["numbat", "111122223333", "arn:"] {
+                assert!(!serialized.contains(canary), "{canary} in {serialized}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_stopped_sts_redirect_is_a_rejected_request() {
+        use aws_sdk_sts::error::{ErrorMetadata, SdkError};
+        use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
+
+        // A 307 with an off-origin Location and an empty body: no STS code.
+        let error: SdkError<GetCallerIdentityError, ()> = SdkError::service_error(
+            GetCallerIdentityError::generic(ErrorMetadata::builder().build()),
+            (),
+        );
+        let diagnostic = sts_failure_diagnostic(&error, Some(307));
+        let RuntimeDiagnostic::Runtime(detail) = &diagnostic else {
+            panic!("a runtime diagnostic");
+        };
+        assert_eq!(detail.code, RuntimeErrorCode::RequestRejected);
+        assert_eq!(
+            detail.context.status_class,
+            Some(audio_graph_ipc_contract::runtime_diagnostic::RuntimeStatusClass::Redirect)
+        );
+        // Without the status, the same empty error stays internal.
+        let RuntimeDiagnostic::Runtime(detail) = sts_failure_diagnostic(&error, None) else {
+            panic!("a runtime diagnostic");
+        };
+        assert_eq!(detail.code, RuntimeErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn the_sts_check_reports_a_stopped_redirect_as_a_rejected_request() {
+        // Through the SDK: its HTTP layer does not follow the 307, and the
+        // check reads the raw status the error carries.
+        let endpoint = spawn_raw_http_mock(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        )
+        .await;
+        let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-1"))
+            .credentials_provider(aws_credential_types::Credentials::new(
+                "access-key",
+                "secret-key",
+                None,
+                None,
+                "test",
+            ))
+            .endpoint_url(endpoint)
+            .load()
+            .await;
+
+        let error = sts_caller_identity_check(&sdk_config)
+            .await
+            .expect_err("a redirect is not an identity");
+
+        let AppError::RuntimeDiagnostic(RuntimeDiagnostic::Runtime(detail)) = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(detail.code, RuntimeErrorCode::RequestRejected);
+        assert_eq!(
+            detail.context.status_class,
+            Some(audio_graph_ipc_contract::runtime_diagnostic::RuntimeStatusClass::Redirect)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aws_check_with_no_valid_region_is_invalid_configuration_without_the_region() {
+        for region in ["", "  ", "numbatcanaryregion"] {
+            let error = test_aws_credentials(
+                region.to_string(),
+                crate::settings::AwsCredentialSource::DefaultChain,
+                None,
+                None,
+            )
+            .await
+            .expect_err("no region");
+            let AppError::RuntimeDiagnostic(RuntimeDiagnostic::Runtime(detail)) = &error else {
+                panic!("{region:?}: {error:?}");
+            };
+            assert_eq!(detail.code, RuntimeErrorCode::InvalidConfiguration);
+            let serialized = serde_json::to_string(&error).expect("serialize error");
+            assert!(!serialized.contains("numbatcanary"), "{serialized}");
         }
     }
 
@@ -21964,10 +22649,7 @@ mod tests {
 
         assert_eq!(readiness.provider_id, "asr.moonshine");
         assert_eq!(readiness.status, ProviderReadinessStatus::Unchecked);
-        assert_eq!(
-            readiness.message,
-            "Local model readiness is checked by the model manager"
-        );
+        assert_eq!(readiness.note, ProviderReadinessNote::LocalModelsManaged);
         assert_eq!(readiness.runtime, None);
         assert_eq!(readiness.model_count, Some(3));
         assert_eq!(readiness.model_catalog.len(), 3);
@@ -22012,7 +22694,12 @@ mod tests {
                     present: false,
                 }]
             );
-            assert!(missing.message.contains(key));
+            assert_eq!(
+                missing.note,
+                ProviderReadinessNote::MissingCredentials {
+                    keys: vec![key.to_string()]
+                }
+            );
 
             let present = base_provider_readiness(descriptor, &settings, &saved_key, 32);
             assert_eq!(present.status, ProviderReadinessStatus::Unchecked);
@@ -22023,10 +22710,7 @@ mod tests {
                     present: true,
                 }]
             );
-            assert_eq!(
-                present.message,
-                "No automatic health probe is available for this provider yet"
-            );
+            assert_eq!(present.note, ProviderReadinessNote::NoAutomaticProbe);
             assert!(
                 !provider_has_automatic_health_probe(descriptor, &settings),
                 "{provider_id} should remain explicitly unchecked until a safe probe is wired"
@@ -22046,12 +22730,23 @@ mod tests {
         ));
         std::fs::create_dir_all(&models_dir).unwrap();
 
-        let message = local_model_readiness_message(descriptor, &models_dir)
+        let summary = local_model_readiness_summary(descriptor, &models_dir)
             .expect("moonshine should have local model readiness");
+        let ProviderReadinessNote::LocalModels {
+            ready,
+            total,
+            missing,
+            invalid,
+            planned,
+        } = local_model_readiness_note(descriptor, summary)
+        else {
+            panic!("a local model note");
+        };
 
-        assert!(message.contains("No local model files are ready yet"));
-        assert!(message.contains(crate::models::MOONSHINE_SMALL_STREAMING_EN));
-        assert!(message.contains("not selectable yet"));
+        assert_eq!((ready, total), (0, 3));
+        assert!(missing.contains(&crate::models::MOONSHINE_SMALL_STREAMING_EN.to_string()));
+        assert!(invalid.is_empty());
+        assert!(planned, "moonshine is not selectable yet");
 
         let _ = std::fs::remove_dir_all(models_dir);
     }
@@ -22075,12 +22770,26 @@ mod tests {
         std::fs::create_dir_all(&tiny_dir).unwrap();
         std::fs::write(tiny_dir.join("tokenizer.bin"), b"component").unwrap();
 
-        let message = local_model_readiness_message(descriptor, &models_dir)
+        let summary = local_model_readiness_summary(descriptor, &models_dir)
             .expect("moonshine should have local model readiness");
+        let ProviderReadinessNote::LocalModels {
+            ready,
+            total,
+            missing,
+            ..
+        } = local_model_readiness_note(descriptor, summary)
+        else {
+            panic!("a local model note");
+        };
 
-        assert!(message.contains("Local model files ready: 1/3"));
-        assert!(message.contains("moonshine-tiny-streaming-en missing"));
-        assert!(message.contains(crate::models::MOONSHINE_MEDIUM_STREAMING_EN));
+        assert_eq!((ready, total), (1, 3));
+        assert_eq!(
+            missing,
+            vec![
+                crate::models::MOONSHINE_MEDIUM_STREAMING_EN.to_string(),
+                crate::models::MOONSHINE_TINY_STREAMING_EN.to_string(),
+            ]
+        );
 
         let _ = std::fs::remove_dir_all(models_dir);
     }
@@ -22125,7 +22834,6 @@ mod tests {
             true,
             1,
             Some(LocalRuntimeProbeOutcome::LoadFailed {
-                message: "failed to load moonshine shared library".to_string(),
                 model_id: Some(crate::models::MOONSHINE_SMALL_STREAMING_EN.to_string()),
             }),
         );
@@ -22475,7 +23183,6 @@ mod tests {
             2,
             2,
             Some(LocalRuntimeProbeOutcome::LoadFailed {
-                message: "failed to load sherpa-onnx diarization".to_string(),
                 model_id: Some(model_id.clone()),
             }),
         );
@@ -22528,7 +23235,14 @@ mod tests {
         );
 
         assert_eq!(readiness.status, ProviderReadinessStatus::Unchecked);
-        assert!(readiness.message.contains("Local model files ready: 2/2"));
+        assert!(matches!(
+            readiness.note,
+            ProviderReadinessNote::LocalModels {
+                ready: 2,
+                total: 2,
+                ..
+            }
+        ));
         let runtime = readiness
             .runtime
             .expect("clustering diarization runtime readiness");
@@ -22753,10 +23467,15 @@ mod tests {
             sortformer_summary.missing,
             vec![crate::models::SORTFORMER_MODEL_FILENAME.to_string()]
         );
-        assert!(
-            local_model_readiness_message(sortformer, &models_dir)
-                .expect("sortformer message")
-                .contains(crate::models::SORTFORMER_MODEL_FILENAME)
+        assert_eq!(
+            local_model_readiness_note(sortformer, sortformer_summary),
+            ProviderReadinessNote::LocalModels {
+                ready: 0,
+                total: 1,
+                missing: vec![crate::models::SORTFORMER_MODEL_FILENAME.to_string()],
+                invalid: Vec::new(),
+                planned: true,
+            }
         );
 
         let clustering = crate::provider_registry::descriptor_by_id("diarization.clustering");
@@ -22775,14 +23494,10 @@ mod tests {
                 .missing
                 .contains(&crate::models::DIAR_EMB_TITANET_FILENAME.to_string())
         );
-        assert!(clustering_summary.invalid.iter().any(|entry| {
-            entry.contains(crate::models::DIAR_SEG_PYANNOTE_DIR)
-                && entry.contains("model.int8.onnx")
-        }));
-        assert!(
-            local_model_readiness_message(clustering, &models_dir)
-                .expect("clustering message")
-                .contains(crate::models::DIAR_EMB_TITANET_FILENAME)
+        // Only registry model ids are kept: which component was empty is not.
+        assert_eq!(
+            clustering_summary.invalid,
+            vec![crate::models::DIAR_SEG_PYANNOTE_DIR.to_string()]
         );
 
         std::fs::remove_dir_all(&models_dir).ok();
@@ -22827,22 +23542,12 @@ mod tests {
                 .contains(&crate::models::DIAR_EMB_TITANET_FILENAME.to_string()),
             "a truncated embedding must not be reported ready"
         );
-        let invalid_entry = summary
-            .invalid
-            .iter()
-            .find(|entry| entry.contains(crate::models::DIAR_EMB_TITANET_FILENAME))
-            .expect("truncated embedding must be classified invalid");
-        assert!(
-            invalid_entry.contains("too small") && invalid_entry.contains("at least"),
-            "invalid reason must explain the size shortfall, got: {invalid_entry}"
+        // The truncated embedding is invalid, by its registry model id.
+        assert_eq!(
+            summary.invalid,
+            vec![crate::models::DIAR_EMB_TITANET_FILENAME.to_string()]
         );
-
-        // The user-facing readiness message surfaces the same clear reason.
-        assert!(
-            local_model_readiness_message(clustering, &models_dir)
-                .expect("clustering message")
-                .contains("too small")
-        );
+        assert!(summary.missing.is_empty());
 
         std::fs::remove_dir_all(&models_dir).ok();
     }
@@ -22889,10 +23594,7 @@ mod tests {
 
         assert_eq!(readiness.status, ProviderReadinessStatus::Unchecked);
         assert!(!readiness.automatic_probe_available);
-        assert_eq!(
-            readiness.message,
-            "Vertex AI readiness is not probed automatically yet"
-        );
+        assert_eq!(readiness.note, ProviderReadinessNote::VertexNotProbed);
         assert_eq!(readiness.checked_at, None);
     }
 
@@ -22915,10 +23617,7 @@ mod tests {
 
         assert_eq!(readiness.status, ProviderReadinessStatus::Unchecked);
         assert!(!readiness.automatic_probe_available);
-        assert_eq!(
-            readiness.message,
-            "Vertex AI project ID and location must be configured before readiness can be checked"
-        );
+        assert_eq!(readiness.note, ProviderReadinessNote::VertexProjectRequired);
         assert!(!should_probe_provider(
             descriptor,
             &active_provider_ids(&settings, true),
@@ -22992,10 +23691,7 @@ mod tests {
 
         assert_eq!(readiness.status, ProviderReadinessStatus::Unchecked);
         assert!(!readiness.automatic_probe_available);
-        assert_eq!(
-            readiness.message,
-            "AWS profile name must be configured before readiness can be checked"
-        );
+        assert_eq!(readiness.note, ProviderReadinessNote::AwsProfileRequired);
         assert!(!should_probe_provider(
             descriptor,
             &active_provider_ids(&settings, true),
@@ -23407,73 +24103,24 @@ mod tests {
     }
 
     #[test]
-    fn cloud_asr_connection_error_redacts_resolved_api_key() {
-        let api_key = "sk-cloud-asr-test-secret";
-        let message = cloud_asr_connection_error_message(
-            reqwest::StatusCode::FORBIDDEN,
-            &format!(
-                r#"{{"error":"provider echoed {api_key}","authorization":"Bearer bearer-asr-secret-12345","url":"https://provider.example/models?api_key=query-asr-secret-12345"}}"#
-            ),
-            Some(api_key),
-        );
-
-        assert!(
-            message.contains("403 Forbidden"),
-            "error must carry status, got: {message}"
-        );
-        assert!(
-            message.contains("provider echoed"),
-            "error must carry body context, got: {message}"
-        );
-        assert!(
-            !message.contains(api_key),
-            "error must redact the resolved key, got: {message}"
-        );
-        assert!(
-            !message.contains("bearer-asr-secret-12345"),
-            "error must redact bearer echoes, got: {message}"
-        );
-        assert!(
-            !message.contains("query-asr-secret-12345"),
-            "error must redact URL query credentials, got: {message}"
-        );
-        assert!(
-            message.contains("<redacted>"),
-            "error must mark the redacted value, got: {message}"
-        );
-        // This case is a 403, not a 401 — must NOT carry the 401-only
-        // credential-rejected marker (audio-graph-57cc).
-        assert!(!message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
-    }
-
-    #[test]
-    fn cloud_asr_connection_error_401_carries_credential_rejected_prefix() {
-        // audio-graph-57cc: the generic OpenAI-compatible readiness arm
-        // (asr.api / llm.cerebras / llm.sambanova / llm.api) shares this
-        // helper, so a 401 there also gets the stable marker — but only when
-        // a key was actually sent.
-        let message = cloud_asr_connection_error_message(
-            reqwest::StatusCode::UNAUTHORIZED,
-            r#"{"error":"invalid api key"}"#,
-            Some("test-key-not-real"),
-        );
-
-        assert!(message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
-    }
-
-    #[test]
-    fn cloud_asr_connection_error_401_without_key_stays_generic() {
-        // Codex P2 (PR #92): localhost/loopback OpenAI-compatible endpoints
-        // are probed with NO saved key; a 401 from them must not claim "the
-        // saved key was rejected".
-        let message = cloud_asr_connection_error_message(
-            reqwest::StatusCode::UNAUTHORIZED,
-            r#"{"error":"auth required"}"#,
-            None,
-        );
-
-        assert!(!message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
-        assert!(message.contains("401"));
+    fn a_provider_check_status_is_classified_without_reading_the_body() {
+        let code = |status: u16, credential_sent: bool| match provider_check_status(
+            reqwest::StatusCode::from_u16(status).expect("status"),
+            credential_sent,
+        ) {
+            Err(AppError::RuntimeDiagnostic(RuntimeDiagnostic::Runtime(detail))) => {
+                Some(detail.code)
+            }
+            Err(other) => panic!("{status}: {other:?}"),
+            Ok(()) => None,
+        };
+        assert_eq!(code(200, true), None);
+        assert_eq!(code(401, true), Some(RuntimeErrorCode::CredentialRejected));
+        // A keyless loopback endpoint that answers 401 did not reject a key.
+        assert_ne!(code(401, false), Some(RuntimeErrorCode::CredentialRejected));
+        assert_eq!(code(403, true), Some(RuntimeErrorCode::PermissionDenied));
+        assert_eq!(code(429, true), Some(RuntimeErrorCode::RateLimited));
+        assert_eq!(code(500, true), Some(RuntimeErrorCode::ProviderUnavailable));
     }
 
     #[test]
@@ -23484,22 +24131,6 @@ mod tests {
         let api_key = gemini_api_key_from_store(&store).expect("saved key");
 
         assert_eq!(api_key, "AIza-saved");
-    }
-
-    #[test]
-    fn gemini_api_key_connection_error_401_carries_credential_rejected_prefix() {
-        // audio-graph-57cc: same stable-prefix contract as the ASR probes.
-        let message = gemini_api_key_connection_error_message(reqwest::StatusCode::UNAUTHORIZED);
-
-        assert!(message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
-    }
-
-    #[test]
-    fn gemini_api_key_connection_error_429_has_no_credential_rejected_prefix() {
-        let message =
-            gemini_api_key_connection_error_message(reqwest::StatusCode::TOO_MANY_REQUESTS);
-
-        assert!(!message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
     }
 
     #[test]
@@ -23651,53 +24282,6 @@ mod tests {
     }
 
     #[test]
-    fn deepgram_connection_error_redacts_key_echoes() {
-        let api_key = "dg-provider-secret";
-        let message = deepgram_connection_error_message(
-            reqwest::StatusCode::UNAUTHORIZED,
-            &format!(r#"{{"error":"bad token {api_key}"}}"#),
-            Some(api_key),
-        );
-
-        assert!(message.contains("401 Unauthorized"));
-        assert!(message.contains("bad token"));
-        assert!(!message.contains(api_key));
-        assert!(message.contains("<redacted>"));
-    }
-
-    #[test]
-    fn deepgram_connection_error_401_carries_credential_rejected_prefix() {
-        // audio-graph-57cc: a 401 readiness message must carry the stable
-        // `Credential rejected (401):` prefix so the frontend classifier
-        // (`isCredentialRejectedReadinessMessage`, ProviderReadinessPanel.tsx)
-        // can offer the "fix your key" recovery action instead of the generic
-        // retry copy.
-        let message = deepgram_connection_error_message(
-            reqwest::StatusCode::UNAUTHORIZED,
-            r#"{"error":"bad token"}"#,
-            None,
-        );
-
-        assert!(message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
-    }
-
-    #[test]
-    fn deepgram_connection_error_403_has_no_credential_rejected_prefix() {
-        // A 403 (Forbidden) is a distinct rejection class (e.g. a
-        // transcription-only key hitting an endpoint that needs the `manage`
-        // scope, per the /v1/models comment above) — not the credential-401
-        // marker.
-        let message = deepgram_connection_error_message(
-            reqwest::StatusCode::FORBIDDEN,
-            r#"{"error":"missing scope"}"#,
-            None,
-        );
-
-        assert!(!message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
-        assert!(message.contains("403 Forbidden"));
-    }
-
-    #[test]
     fn soniox_api_key_resolution_uses_saved_key_when_draft_is_blank() {
         let mut store = crate::credentials::CredentialStore::default();
         store.soniox_api_key = Some("  sx-saved  ".to_string());
@@ -23770,33 +24354,6 @@ mod tests {
     }
 
     #[test]
-    fn soniox_connection_error_redacts_key_echoes() {
-        let api_key = "sx-provider-secret";
-        let message = soniox_connection_error_message(
-            reqwest::StatusCode::UNAUTHORIZED,
-            &format!(r#"{{"message":"bad bearer {api_key}"}}"#),
-            Some(api_key),
-        );
-
-        assert!(message.contains("401 Unauthorized"));
-        assert!(message.contains("bad bearer"));
-        assert!(!message.contains(api_key));
-        assert!(message.contains("<redacted>"));
-    }
-
-    #[test]
-    fn soniox_connection_error_401_carries_credential_rejected_prefix() {
-        // audio-graph-57cc: same stable-prefix contract as Deepgram above.
-        let message = soniox_connection_error_message(
-            reqwest::StatusCode::UNAUTHORIZED,
-            r#"{"message":"bad bearer"}"#,
-            None,
-        );
-
-        assert!(message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
-    }
-
-    #[test]
     fn soniox_readiness_uses_saved_key_for_an_explicit_diagnostic() {
         let descriptor = crate::provider_registry::provider_registry()
             .iter()
@@ -23810,7 +24367,7 @@ mod tests {
 
         assert_eq!(readiness.status, ProviderReadinessStatus::Unchecked);
         assert!(readiness.automatic_probe_available);
-        assert_eq!(readiness.message, "Ready to check with saved credentials");
+        assert_eq!(readiness.note, ProviderReadinessNote::ReadyToCheck);
         let requested = vec!["asr.soniox".to_string()];
         let requested_ids = requested_provider_ids(&settings, false, Some(&requested));
         assert!(should_probe_provider(
@@ -23833,8 +24390,10 @@ mod tests {
         let missing = base_provider_readiness(descriptor, &settings, &store, 22);
         assert_eq!(missing.status, ProviderReadinessStatus::MissingCredentials);
         assert_eq!(
-            missing.message,
-            "Missing saved credential(s): revai_api_key"
+            missing.note,
+            ProviderReadinessNote::MissingCredentials {
+                keys: vec!["revai_api_key".to_string()]
+            }
         );
 
         store.revai_api_key = Some("revai-provider-secret".to_string());
@@ -23842,10 +24401,7 @@ mod tests {
 
         assert_eq!(readiness.status, ProviderReadinessStatus::Unchecked);
         assert!(!readiness.automatic_probe_available);
-        assert_eq!(
-            readiness.message,
-            "No automatic health probe is available for this provider yet"
-        );
+        assert_eq!(readiness.note, ProviderReadinessNote::NoAutomaticProbe);
         assert_eq!(readiness.model_count, Some(1));
         assert_eq!(readiness.model_catalog[0].id, "machine_v2");
         assert_eq!(readiness.credentials.len(), 1);
@@ -23870,22 +24426,6 @@ mod tests {
         let api_key = assemblyai_api_key_from_store(&store).expect("saved key");
 
         assert_eq!(api_key, "aai-saved");
-    }
-
-    #[test]
-    fn assemblyai_connection_error_401_carries_credential_rejected_prefix() {
-        // audio-graph-57cc: same stable-prefix contract as the other ASR probes.
-        let message = assemblyai_connection_error_message(reqwest::StatusCode::UNAUTHORIZED);
-
-        assert!(message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
-    }
-
-    #[test]
-    fn assemblyai_connection_error_500_has_no_credential_rejected_prefix() {
-        let message =
-            assemblyai_connection_error_message(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-
-        assert!(!message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
     }
 
     #[test]

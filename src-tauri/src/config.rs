@@ -50,11 +50,9 @@ pub fn load_default_config() -> &'static DefaultConfig {
     CONFIG.get_or_init(
         || match toml::from_str::<DefaultConfig>(BUNDLED_DEFAULT_CONFIG_TOML) {
             Ok(config) => config,
-            Err(e) => {
-                log::warn!(
-                    "Failed to parse bundled config/default.toml; using hardcoded defaults: {}",
-                    e
-                );
+            Err(_) => {
+                // Closed text, like every log on the settings-load path.
+                log::warn!("Failed to parse bundled config/default.toml; using hardcoded defaults");
                 DefaultConfig::default()
             }
         },
