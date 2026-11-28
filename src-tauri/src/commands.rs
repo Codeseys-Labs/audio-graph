@@ -2521,12 +2521,10 @@ async fn start_capture_impl(
 }
 
 /// Close a previous start's CaptureStarted row whose append failed, if it
-/// did reach the ledger: count the session's lifecycle rows, and append a
-/// CaptureStopped only for a Started row that is actually there. Leaves the
-/// uncertainty recorded (and refuses the start) when the ledger cannot be read
-/// or the closing row cannot be written.
+/// did reach the ledger. Leaves the uncertainty recorded (and refuses the
+/// start) when the ledger cannot be read or the closing row cannot be
+/// written.
 fn close_uncertain_capture_start(state: &AppState) -> AppResult<()> {
-    use crate::persistence::DataMovementEventType as Movement;
     let Some(session_id) = state
         .capture_manager
         .lock()
@@ -2540,30 +2538,36 @@ fn close_uncertain_capture_start(state: &AppState) -> AppResult<()> {
         .read()
         .map(|settings| settings.privacy_mode)
         .unwrap_or_default();
-    let resolved = crate::persistence::load_data_movement_events(&session_id).and_then(|events| {
-        let count = |kind: Movement| {
-            events
-                .iter()
-                .filter(|event| event.event_type == kind)
-                .count()
-        };
-        if count(Movement::CaptureStarted) > count(Movement::CaptureStopped) {
-            append_capture_lifecycle_movement_for(
-                &session_id,
-                privacy_mode,
-                Movement::CaptureStopped,
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    });
-    if resolved.is_err() {
+    if close_unmatched_capture_start(&session_id, privacy_mode).is_err() {
         if let Ok(mut manager) = state.capture_manager.lock() {
             manager.mark_capture_start_uncertain(session_id);
         }
         return Err(AppError::Unknown(
             "Failed to record the capture start".to_string(),
         ));
+    }
+    Ok(())
+}
+
+/// Count `session_id`'s capture lifecycle rows and append CaptureStopped only
+/// for a CaptureStarted row that has no match: the close for a start row
+/// whose append reported failure but may have landed. Used by the next start
+/// and by app shutdown.
+pub(crate) fn close_unmatched_capture_start(
+    session_id: &str,
+    privacy_mode: crate::settings::PrivacyMode,
+) -> Result<(), String> {
+    use crate::persistence::DataMovementEventType as Movement;
+    let events = crate::persistence::load_data_movement_events(session_id)?;
+    let count = |kind: Movement| {
+        events
+            .iter()
+            .filter(|event| event.event_type == kind)
+            .count()
+    };
+    if count(Movement::CaptureStarted) > count(Movement::CaptureStopped) {
+        append_capture_lifecycle_movement_for(session_id, privacy_mode, Movement::CaptureStopped)
+            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }

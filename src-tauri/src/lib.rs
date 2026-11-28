@@ -153,10 +153,24 @@ struct ShutdownHandles {
 /// Every step is individually timeout-bounded; the function NEVER blocks the
 /// exit indefinitely, even on a wedged disk or network.
 fn stop_captures_and_close_movement(h: &ShutdownHandles) {
-    let stopped_sources = match h.capture_manager.lock() {
-        Ok(mut manager) => manager.stop_all(),
-        Err(poisoned) => poisoned.into_inner().stop_all(),
+    let (stopped_sources, uncertain_start) = match h.capture_manager.lock() {
+        Ok(mut manager) => (manager.stop_all(), manager.take_uncertain_capture_start()),
+        Err(poisoned) => {
+            let mut manager = poisoned.into_inner();
+            (manager.stop_all(), manager.take_uncertain_capture_start())
+        }
     };
+    let privacy_mode = match h.app_settings.read() {
+        Ok(settings) => settings.privacy_mode,
+        Err(poisoned) => poisoned.into_inner().privacy_mode,
+    };
+    // A start whose CaptureStarted append reported failure published
+    // nothing, but its row may have landed: close it if it did.
+    if let Some(session_id) = uncertain_start
+        && crate::commands::close_unmatched_capture_start(&session_id, privacy_mode).is_err()
+    {
+        log::error!("Graceful shutdown: failed to resolve an uncertain capture start");
+    }
     let capture_was_published = match h.is_capturing.read() {
         Ok(active) => *active,
         Err(poisoned) => *poisoned.into_inner(),
@@ -168,10 +182,6 @@ fn stop_captures_and_close_movement(h: &ShutdownHandles) {
     let session_id = match h.session_id.read() {
         Ok(session_id) => session_id.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
-    };
-    let privacy_mode = match h.app_settings.read() {
-        Ok(settings) => settings.privacy_mode,
-        Err(poisoned) => poisoned.into_inner().privacy_mode,
     };
     if let Err(error) = crate::commands::append_capture_lifecycle_movement_for(
         &session_id,
@@ -891,6 +901,75 @@ mod shutdown_tests {
         ] {
             assert_ne!(writer, Some(false));
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clean_shutdown_closes_a_start_row_whose_append_reported_failure() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "audio-graph-shutdown-uncertain-start-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _data_root = DataDirGuard::set(&root);
+        let app = AppState::new();
+        let session_id = app.current_session_id();
+        // The start's CaptureStarted row landed although its append reported
+        // a failure, so nothing was published and the start is uncertain.
+        crate::commands::append_capture_lifecycle_movement_for(
+            &session_id,
+            crate::settings::PrivacyMode::default(),
+            crate::persistence::DataMovementEventType::CaptureStarted,
+        )
+        .unwrap();
+        app.capture_manager
+            .lock()
+            .unwrap()
+            .mark_capture_start_uncertain(session_id.clone());
+
+        let handles = ShutdownHandles {
+            session_id: app.session_id.clone(),
+            autosave_stop: app.autosave_stop.clone(),
+            graph_autosave_thread: app.graph_autosave_thread.clone(),
+            knowledge_graph: app.knowledge_graph.clone(),
+            transcript_buffer: app.transcript_buffer.clone(),
+            transcript_writer: app.transcript_writer.clone(),
+            transcript_event_writer: app.transcript_event_writer.clone(),
+            projection_event_writer: app.projection_event_writer.clone(),
+            capture_manager: app.capture_manager.clone(),
+            app_settings: app.app_settings.clone(),
+            is_capturing: app.is_capturing.clone(),
+            is_transcribing: app.is_transcribing.clone(),
+            is_gemini_active: app.is_gemini_active.clone(),
+            is_converse_active: app.is_converse_active.clone(),
+            is_openai_realtime_active: app.is_openai_realtime_active.clone(),
+        };
+
+        stop_captures_and_close_movement(&handles);
+
+        let kinds: Vec<_> = crate::persistence::load_data_movement_events(&session_id)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                crate::persistence::DataMovementEventType::CaptureStarted,
+                crate::persistence::DataMovementEventType::CaptureStopped,
+            ]
+        );
+        assert!(
+            app.capture_manager
+                .lock()
+                .unwrap()
+                .take_uncertain_capture_start()
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
