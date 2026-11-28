@@ -143,7 +143,10 @@ rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.gi
 # `NtSetInformationFile`, which renames the authority journal relative to the
 # held root handle; the Win32 `SetFileInformationByHandle` wrapper resolves a
 # relative rename target against the process working directory.
+# `Wdk_Foundation` adds `OBJECT_ATTRIBUTES`, so `NtCreateFile` can open the
+# journal's files relative to that handle as well.
 windows = { version = "0.62.2", features = [
+    "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",

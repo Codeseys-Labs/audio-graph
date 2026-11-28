@@ -97,9 +97,16 @@ fn valid_authority_instance_id(value: &str) -> bool {
 
 pub(super) trait AuthorityMutationLock: Send {}
 
+/// Every method but `acquire_mutation_lock` runs with the mutation lock
+/// held.
 pub(super) trait AuthorityJournalBoundary: Send + Sync {
     fn read(&self) -> Result<Option<Vec<u8>>, CredentialStoreFailure>;
+    /// `Ok` means these exact bytes were read back from the place they were
+    /// published, so the caller need not read them again.
     fn replace(&self, bytes: &[u8]) -> Result<(), CredentialStoreFailure>;
+    /// Removes what an earlier replace failed to discard, or fails closed
+    /// when it cannot. Run when a store opens.
+    fn remove_stray_staged(&self) -> Result<(), CredentialStoreFailure>;
     fn acquire_mutation_lock(
         &self,
     ) -> Result<Box<dyn AuthorityMutationLock>, CredentialStoreFailure>;
@@ -279,6 +286,13 @@ impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
         }
     }
 
+    fn remove_stray_staged(&self) -> Result<(), CredentialStoreFailure> {
+        match HeldDirectory::open_existing(&self.root)? {
+            Some(directory) => directory.sweep_staged(JOURNAL_FILE_NAME),
+            None => Ok(()),
+        }
+    }
+
     fn acquire_mutation_lock(
         &self,
     ) -> Result<Box<dyn AuthorityMutationLock>, CredentialStoreFailure> {
@@ -298,7 +312,7 @@ impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{
         AtomicJournalFileSystem, AtomicJournalWriter, AuthorityJournalBoundary,
         FileAuthorityJournalBoundary, HeldDirectory, JOURNAL_FILE_NAME,
@@ -310,6 +324,8 @@ mod tests {
     use std::io::{BufRead, Read, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    #[cfg(windows)]
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     const CHILD_MODE_ENV: &str = "AUDIO_GRAPH_FB2B_LOCK_CHILD_MODE";
@@ -648,6 +664,58 @@ mod tests {
         assert_eq!(names, [std::ffi::OsString::from(JOURNAL_FILE_NAME)]);
 
         std::fs::remove_dir_all(&base).expect("remove isolated replace test directory");
+    }
+
+    /// A staged file whose discard failed is cleaned up by the next staging
+    /// in the same root. Only the exact shape of a generated staged name is
+    /// reserved: a lookalike whose token is not a version 4 UUID stays.
+    #[test]
+    fn the_next_replace_removes_a_stray_staged_file() {
+        let base = scratch("stray-sweep");
+        let root = base.join("journal");
+        let journal = boundary(&base, "journal", "namespace");
+        journal.replace(b"first-journal").expect("first replace");
+        let stray = root.join(format!(
+            ".{JOURNAL_FILE_NAME}.{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&stray, b"stray-journal").expect("plant stray staged file");
+        let mut token = uuid::Uuid::new_v4().simple().to_string();
+        token.replace_range(12..13, "1");
+        let lookalike = root.join(format!(".{JOURNAL_FILE_NAME}.{token}.tmp"));
+        std::fs::write(&lookalike, b"not-ours").expect("plant lookalike");
+
+        journal.replace(b"second-journal").expect("second replace");
+
+        assert!(!stray.exists(), "stray staged file survived");
+        assert_eq!(
+            std::fs::read(&lookalike).expect("lookalike survives"),
+            b"not-ours"
+        );
+        assert_eq!(journal.read(), Ok(Some(b"second-journal".to_vec())));
+        std::fs::remove_dir_all(&base).expect("remove isolated stray-sweep directory");
+    }
+
+    /// A stray that cannot be removed is reported as a closed failure
+    /// rather than left behind in silence, and nothing is published.
+    #[test]
+    fn a_stray_that_cannot_be_removed_fails_the_replace_closed() {
+        let base = scratch("stray-refused");
+        let root = base.join("journal");
+        let journal = boundary(&base, "journal", "namespace");
+        journal.replace(b"first-journal").expect("first replace");
+        std::fs::create_dir(root.join(format!(
+            ".{JOURNAL_FILE_NAME}.{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        )))
+        .expect("plant unremovable stray");
+
+        assert_eq!(
+            journal.replace(b"second-journal"),
+            Err(CredentialStoreFailure::Unavailable)
+        );
+        assert_eq!(journal.read(), Ok(Some(b"first-journal".to_vec())));
+        std::fs::remove_dir_all(&base).expect("remove isolated stray-refused directory");
     }
 
     #[cfg(unix)]
@@ -1192,26 +1260,65 @@ mod tests {
             base.join("namespace"),
             Arc::new(SwapBeforeStaging { base: base.clone() }),
         );
-        assert_eq!(
-            journal.replace(b"journal"),
-            Err(CredentialStoreFailure::PermissionHardeningFailed)
-        );
+        // Every child of the held root is opened relative to its handle, so
+        // the swapped ancestor never comes into play: the journal lands in
+        // the held root and nothing at all reaches the decoy.
+        assert_eq!(journal.replace(b"journal"), Ok(()));
 
         assert_protected_owner_only(&windows_dacl(&held, &base));
         assert_eq!(windows_dacl(&decoy, &base), decoy_dacl);
-        assert!(!held.join(JOURNAL_FILE_NAME).exists());
-        assert!(!decoy.join(JOURNAL_FILE_NAME).exists());
-        for entry in std::fs::read_dir(&decoy).expect("list decoy root") {
-            let entry = entry.expect("decoy entry");
-            assert_eq!(
-                entry.metadata().expect("decoy entry metadata").len(),
-                0,
-                "journal bytes reached the decoy"
-            );
-        }
+        assert_eq!(
+            std::fs::read(held.join(JOURNAL_FILE_NAME)).expect("read held journal"),
+            b"journal"
+        );
+        assert_eq!(
+            std::fs::read_dir(&decoy).expect("list decoy root").count(),
+            0,
+            "an entry reached the decoy"
+        );
 
         std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
         std::fs::remove_dir_all(&base).expect("remove isolated Windows swap test directory");
+    }
+
+    /// The stray sweep lists the held root itself, so an ancestor swapped to
+    /// a directory with no journal root neither hides a stray nor fails the
+    /// replace.
+    #[cfg(windows)]
+    #[test]
+    fn windows_stray_sweep_lists_the_held_root_after_an_ancestor_swap() {
+        let base = scratch("windows-swap-sweep");
+        let held = base.join("held").join("journal");
+        let decoy = base.join("decoy");
+        std::fs::create_dir_all(&held).expect("create held journal root");
+        std::fs::create_dir_all(&decoy).expect("create decoy without a journal root");
+        point_parent_junction(&base, "held");
+        let stray = held.join(format!(
+            ".{JOURNAL_FILE_NAME}.{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&stray, b"stray-journal").expect("plant stray staged file");
+
+        let journal = FileAuthorityJournalBoundary::with_file_system(
+            base.join("parent").join("journal"),
+            base.join("namespace"),
+            Arc::new(SwapBeforeStaging { base: base.clone() }),
+        );
+        assert_eq!(journal.replace(b"journal"), Ok(()));
+
+        assert!(!stray.exists(), "stray staged file survived");
+        assert_eq!(
+            std::fs::read(held.join(JOURNAL_FILE_NAME)).expect("read held journal"),
+            b"journal"
+        );
+        assert_eq!(
+            std::fs::read_dir(&decoy).expect("list decoy").count(),
+            0,
+            "an entry reached the decoy"
+        );
+
+        std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
+        std::fs::remove_dir_all(&base).expect("remove isolated Windows sweep test directory");
     }
 
     /// Points the `parent` junction in `base` at `target`, replacing it if it
@@ -1259,7 +1366,7 @@ mod tests {
     }
 
     /// Points the ancestor at the decoy after the staged bytes are flushed and
-    /// before they are published, then points it back for the readback.
+    /// before they are published, and leaves it there through the readback.
     #[cfg(windows)]
     struct SwapBetweenFlushAndRename {
         base: PathBuf,
@@ -1281,9 +1388,7 @@ mod tests {
             let Self { mut staged, base } = *self;
             staged.sync()?;
             point_parent_junction(&base, "decoy");
-            let published = staged.publish();
-            point_parent_junction(&base, "held");
-            published
+            staged.publish()
         }
     }
 
@@ -1337,6 +1442,101 @@ mod tests {
 
         std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
         std::fs::remove_dir_all(&base).expect("remove isolated Windows publish-swap directory");
+    }
+
+    /// Between flush and rename of the next publication after it is armed,
+    /// swaps the `parent` junction from the held root to a decoy that has no
+    /// journal root, and leaves it there.
+    #[cfg(windows)]
+    struct ArmedSwapBetweenFlushAndRename {
+        base: PathBuf,
+        armed: Arc<AtomicBool>,
+    }
+
+    #[cfg(windows)]
+    struct ArmedSwapWriter<'directory> {
+        staged: super::held_directory::StagedFile<'directory>,
+        swap_in: Option<PathBuf>,
+    }
+
+    #[cfg(windows)]
+    impl AtomicJournalWriter for ArmedSwapWriter<'_> {
+        fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.staged.write_all(bytes)
+        }
+
+        fn commit(self: Box<Self>) -> std::io::Result<()> {
+            let Self {
+                mut staged,
+                swap_in,
+            } = *self;
+            staged.sync()?;
+            if let Some(base) = swap_in {
+                point_parent_junction(&base, "decoy");
+            }
+            staged.publish()
+        }
+    }
+
+    #[cfg(windows)]
+    impl AtomicJournalFileSystem for ArmedSwapBetweenFlushAndRename {
+        fn open_atomic<'directory>(
+            &self,
+            directory: &'directory HeldDirectory,
+            name: &str,
+        ) -> Result<Box<dyn AtomicJournalWriter + 'directory>, CredentialStoreFailure> {
+            Ok(Box::new(ArmedSwapWriter {
+                staged: directory.create_staged(name)?,
+                swap_in: self
+                    .armed
+                    .swap(false, Ordering::SeqCst)
+                    .then(|| self.base.clone()),
+            }))
+        }
+
+        fn read(
+            &self,
+            directory: &HeldDirectory,
+            name: &str,
+            limit: usize,
+        ) -> Result<Option<Vec<u8>>, CredentialStoreFailure> {
+            super::SystemAtomicJournalFileSystem.read(directory, name, limit)
+        }
+    }
+
+    /// A journal boundary reached through a `parent` junction, with a switch
+    /// that arms one ancestor swap during its next publication. Returns the
+    /// scratch base, the held journal root, the switch and the boundary.
+    #[cfg(windows)]
+    pub(in crate::credentials::adapters) fn armed_ancestor_swap_boundary(
+        label: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        Arc<AtomicBool>,
+        FileAuthorityJournalBoundary,
+    ) {
+        let base = scratch(label);
+        let held = base.join("held").join("journal");
+        std::fs::create_dir_all(&held).expect("create held journal root");
+        std::fs::create_dir_all(base.join("decoy")).expect("create decoy without a journal root");
+        point_parent_junction(&base, "held");
+        let armed = Arc::new(AtomicBool::new(false));
+        let boundary = FileAuthorityJournalBoundary::with_file_system(
+            base.join("parent").join("journal"),
+            base.join("namespace"),
+            Arc::new(ArmedSwapBetweenFlushAndRename {
+                base: base.clone(),
+                armed: armed.clone(),
+            }),
+        );
+        (base, held, armed, boundary)
+    }
+
+    #[cfg(windows)]
+    pub(in crate::credentials::adapters) fn remove_ancestor_swap_fixture(base: &Path) {
+        std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
+        std::fs::remove_dir_all(base).expect("remove isolated ancestor-swap directory");
     }
 
     /// Points the ancestor at the decoy, then fails the write, so the staged
