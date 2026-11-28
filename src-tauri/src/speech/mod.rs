@@ -7466,8 +7466,7 @@ impl FluxTurnClock {
     ) -> Option<events::AsrSpanRevisionPayload> {
         if matches!(
             turn.kind,
-            events::TurnEventKind::SpeechStarted
-                | events::TurnEventKind::UtteranceEnd
+            events::TurnEventKind::UtteranceEnd
                 | events::TurnEventKind::SpeechFinal
         ) {
             return None;
@@ -7476,7 +7475,7 @@ impl FluxTurnClock {
             return None;
         }
         let now = self.origin.elapsed().as_secs_f64();
-        if matches!(turn.kind, events::TurnEventKind::StartOfTurn) {
+        if matches!(turn.kind, events::TurnEventKind::SpeechStarted) {
             self.active.remove(&turn.source_id);
         }
         let anchored = turn

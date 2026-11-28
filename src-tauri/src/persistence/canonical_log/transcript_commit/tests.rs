@@ -775,6 +775,9 @@ fn session_lock_serializes_readers_and_writers_without_blocking_another_session(
     let lock_path = transcript_coordination_path(&f.path);
     for writer_waits in [true, false] {
         let held = wait_for_transcript_lock(&lock_path, writer_waits, false).unwrap();
+        let other = "session-pear";
+        let path = f.path.with_file_name(format!("{other}.events.jsonl"));
+        assert_eq!(commit_transcript(&path, other, &first).unwrap().sequence, 1);
         let path = f.path.clone();
         let (observed, waiter) = mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -800,9 +803,6 @@ fn session_lock_serializes_readers_and_writers_without_blocking_another_session(
         waiter
             .recv_timeout(HANG_LIMIT)
             .expect("peer actually attempted the conflicting lock");
-        let other = "session-pear";
-        let path = f.path.with_file_name(format!("{other}.events.jsonl"));
-        assert_eq!(commit_transcript(&path, other, &first).unwrap().sequence, 1);
         drop(held);
         worker.join().unwrap();
     }
