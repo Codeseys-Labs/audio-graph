@@ -131,6 +131,7 @@ impl ShadowWork {
             settings: &self.settings,
             privacy: self.privacy,
             models_dir: &self.models_dir,
+            schema_version: LIVE_ASSIST_SCHEMA_VERSION,
             basis,
             repository: &repository,
             engines: &self.runtime.engines,
