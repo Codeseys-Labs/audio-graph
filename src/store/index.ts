@@ -80,6 +80,8 @@ import type {
   ChatMessage,
   ChatResponse,
   ChatStreamEvent,
+  ChatStreamFailedEvent,
+  ChatThreadMessage,
   ChatTokenDeltaEvent,
   ChatTokenDoneEvent,
   DiarizationSpanRevisionEvent,
@@ -119,6 +121,10 @@ import {
   errorToMessage,
 } from "../utils/errorToMessage";
 import { fuzzyEntityNameMatch } from "../utils/materializedGraph";
+import {
+  normalizeRuntimeDiagnostic,
+  parseRuntimeDiagnosticAppError,
+} from "../utils/runtimeDiagnostic";
 import { createAnswerDraftsSlice } from "./answerDrafts";
 import {
   CHAT_STREAM_DELTA_THROTTLE_MS,
@@ -275,19 +281,6 @@ function questionTextForProposal(proposal: AgentProposalEvent): string {
       "",
     ) || proposal.title
   );
-}
-
-/** `finish_reason` values of the shape `"error: <detail>"` are how
- * `ChatTokenDoneEvent` (and, per the synthesis, the answer-card commands'
- * shared `ChatStreamEvent` channel) carries a stream failure — mirrors
- * `finalizeChatStream`'s own `startsWith("error:")` check below. Returns the
- * detail text (or a generic fallback) when it matches, `null` otherwise. */
-function answerStreamErrorDetail(
-  finishReason: string | null | undefined,
-): string | null {
-  if (!finishReason?.startsWith("error:")) return null;
-  const detail = finishReason.slice("error:".length).trim();
-  return detail || i18n.t("agent.answerFailedGeneric");
 }
 
 function upsertLiveAssistCardRecord(
@@ -2198,7 +2191,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         if (armedRequestId === null) return;
         get().appendAnswerDraftDelta(proposalId, armedRequestId, delta);
       },
-      onDone: (doneEvent) => {
+      onDone: () => {
         // audio-graph-83cc T4 fix-round finding (minor): a SUPERSEDED
         // dispatch's terminal frame must never clobber a newer dispatch's
         // draft for the same card (e.g. a double-click on Ask AI/Retry
@@ -2206,6 +2199,16 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         // `armedRequestId` for `proposalId`). Mirrors the staleness guard
         // `appendAnswerDraftDelta` already applies to delta frames, extended
         // to the terminal write here.
+        if (get().answerDrafts[proposalId]?.requestId !== armedRequestId) {
+          return;
+        }
+        // The durable `CardAnswer` is expected to land on `liveAssistCards`
+        // via the backend's own event (see `answerDrafts.ts`'s module doc) —
+        // clear the transient draft rather than leave a stale "streaming"
+        // ghost.
+        get().clearAnswerDraft(proposalId);
+      },
+      onFailed: (failedEvent) => {
         if (get().answerDrafts[proposalId]?.requestId !== armedRequestId) {
           return;
         }
@@ -2218,20 +2221,12 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         // dispatches too. Drop-not-queue (deliverable c) is scoped to the
         // dispatch-START refusal in the `catch` below, not to a
         // post-acceptance stream error.
-        const errorDetail = answerStreamErrorDetail(doneEvent.finish_reason);
-        if (errorDetail !== null) {
-          get().setAnswerDraft(proposalId, {
-            status: "failed",
-            text: errorDetail,
-            requestId: armedRequestId,
-          });
-          return;
-        }
-        // Non-error terminal frame: the durable `CardAnswer` is expected to
-        // land on `liveAssistCards` via the backend's own event once T3
-        // lands (see `answerDrafts.ts`'s module doc) — clear the transient
-        // draft rather than leave a stale "streaming" ghost.
-        get().clearAnswerDraft(proposalId);
+        get().setAnswerDraft(proposalId, {
+          status: "failed",
+          text: failedEvent.full_text,
+          requestId: armedRequestId,
+          failure: normalizeRuntimeDiagnostic(failedEvent.diagnostic),
+        });
       },
     });
 
@@ -2307,7 +2302,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         if (cardId === null || armedRequestId === null) return;
         get().appendAnswerDraftDelta(cardId, armedRequestId, delta);
       },
-      onDone: (doneEvent) => {
+      onDone: () => {
         if (cardId === null) return;
         // audio-graph-83cc T4 fix-round finding (minor): same staleness
         // guard as `answerQuestionCard`'s `onDone` — see that action's
@@ -2317,16 +2312,19 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         if (get().answerDrafts[cardId]?.requestId !== armedRequestId) {
           return;
         }
-        const errorDetail = answerStreamErrorDetail(doneEvent.finish_reason);
-        if (errorDetail !== null) {
-          get().setAnswerDraft(cardId, {
-            status: "failed",
-            text: errorDetail,
-            requestId: armedRequestId,
-          });
+        get().clearAnswerDraft(cardId);
+      },
+      onFailed: (failedEvent) => {
+        if (cardId === null) return;
+        if (get().answerDrafts[cardId]?.requestId !== armedRequestId) {
           return;
         }
-        get().clearAnswerDraft(cardId);
+        get().setAnswerDraft(cardId, {
+          status: "failed",
+          text: failedEvent.full_text,
+          requestId: armedRequestId,
+          failure: normalizeRuntimeDiagnostic(failedEvent.diagnostic),
+        });
       },
     });
 
@@ -3440,8 +3438,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // streaming reply to grow into. Channel `delta` frames append onto the
     // placeholder; finalizeChatStream replaces its content with the
     // authoritative full_text from the `done` frame.
-    const userMsg: ChatMessage = { role: "user", content: message };
-    const assistantPlaceholder: ChatMessage = {
+    const userMsg: ChatThreadMessage = { role: "user", content: message };
+    const assistantPlaceholder: ChatThreadMessage = {
       role: "assistant",
       content: "",
     };
@@ -3467,7 +3465,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // buffer and flushes them (at most once per CHAT_DELTA_THROTTLE_MS) once
     // the id is armed; a `done` frame drains synchronously before finalizing.
     let requestId: string | null = null;
-    let doneEvent: ChatTokenDoneEvent | null = null;
+    let terminal: ChatStreamEvent | null = null;
     let pendingDelta = "";
     let latestFinishReason: string | undefined;
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -3499,12 +3497,14 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       }
       flushDeltas();
     };
-    const applyDone = () => {
-      if (doneEvent === null) return;
+    const applyTerminal = () => {
+      const current = terminal;
+      if (current === null || current.event === "delta") return;
       // Drain queued deltas first so the assistant message reflects everything
       // received before finalizing with the authoritative full_text.
       drainNow();
-      get().finalizeChatStream(doneEvent);
+      if (current.event === "done") get().finalizeChatStream(current.data);
+      else get().finalizeChatStreamFailure(current.data);
     };
 
     const channel = new Channel<ChatStreamEvent>();
@@ -3515,9 +3515,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         scheduleFlush();
       } else {
         // Terminal frame. If the invoke hasn't resolved yet (id not armed),
-        // hold it — applyDone runs the moment the id is armed below.
-        doneEvent = msg.data;
-        if (requestId !== null) applyDone();
+        // hold it — applyTerminal runs the moment the id is armed below.
+        terminal = msg;
+        if (requestId !== null) applyTerminal();
       }
     };
 
@@ -3540,7 +3540,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // Id armed: flush any deltas that arrived before it, then apply a
       // terminal frame if one already landed (done-before-resolve ordering).
       drainNow();
-      if (doneEvent !== null) applyDone();
+      if (terminal !== null) applyTerminal();
       // The channel handler above drives the rest of the stream, routing
       // frames into the placeholder we just inserted.
       return;
@@ -3580,10 +3580,12 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         };
       });
     } catch (e) {
-      const errorMsg: ChatMessage = {
-        role: "assistant",
-        content: `Error: ${errorToMessage(e)}`,
-      };
+      // A failed LLM call rejects with the closed diagnostic; it renders
+      // through the same failed-turn bubble as a failed stream.
+      const diagnostic = parseRuntimeDiagnosticAppError(e)?.diagnostic;
+      const errorMsg: ChatThreadMessage = diagnostic
+        ? { role: "assistant", content: "", failure: diagnostic }
+        : { role: "assistant", content: `Error: ${errorToMessage(e)}` };
       set((state) => {
         const last = state.chatMessages[state.chatMessages.length - 1];
         const isPlaceholder =
@@ -3643,30 +3645,41 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         };
       }
       // Authoritative: replace whatever the deltas accumulated with
-      // the final full_text. Handles three cases:
+      // the final full_text. Handles two cases:
       //   1. The provider revised the reply on the terminal chunk.
       //   2. We dropped a delta event (network glitch, IPC backlog).
-      //   3. The stream terminated with an error (e.g. HTTP 429 rate
-      //      limit) — surface it in the bubble instead of leaving it
-      //      blank, which previously looked like a silent hang.
-      let finalContent: string;
-      if (event.finish_reason?.startsWith("error:")) {
-        const detail = event.finish_reason.slice("error:".length).trim();
-        const friendly = /429|rate.?limit|too many requests/i.test(detail)
-          ? "Rate limited by the model provider (HTTP 429). The free tier is capped — switch to a non-`:free` OpenRouter model or add credits, then try again."
-          : detail || "the request failed";
-        finalContent =
-          (event.full_text ? `${event.full_text}\n\n` : "") +
-          `⚠️ Chat failed: ${friendly}`;
-      } else if (
-        event.finish_reason === "cancelled" &&
-        event.full_text === ""
-      ) {
-        finalContent = `${last.content} [cancelled]`;
-      } else {
-        finalContent = event.full_text;
+      const finalContent =
+        event.finish_reason === "cancelled" && event.full_text === ""
+          ? `${last.content} [cancelled]`
+          : event.full_text;
+      const updated: ChatThreadMessage = { ...last, content: finalContent };
+      return {
+        chatMessages: [...state.chatMessages.slice(0, -1), updated],
+        isChatLoading: false,
+        streamingChatRequestId: null,
+      };
+    });
+  },
+  finalizeChatStreamFailure: (event: ChatStreamFailedEvent) => {
+    const current = get().streamingChatRequestId;
+    if (current !== null && current !== event.request_id) {
+      return;
+    }
+    set((state) => {
+      if (state.chatMessages.at(-1)?.role !== "assistant") {
+        return {
+          isChatLoading: false,
+          streamingChatRequestId: null,
+        };
       }
-      const updated: ChatMessage = { ...last, content: finalContent };
+      // A failed turn shows its partial text (if any) and the closed
+      // diagnostic. A malformed diagnostic normalizes to the fixed internal
+      // tuple, so no raw wire value ever reaches the bubble.
+      const updated: ChatThreadMessage = {
+        role: "assistant",
+        content: event.full_text,
+        failure: normalizeRuntimeDiagnostic(event.diagnostic),
+      };
       return {
         chatMessages: [...state.chatMessages.slice(0, -1), updated],
         isChatLoading: false,

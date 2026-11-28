@@ -148,10 +148,45 @@ pub const AWS_ERROR: &str = "aws-error";
 
 // The streaming-chat token deltas + terminal frame (previously the
 // `chat-token-delta` / `chat-token-done` events, plan A3 / ADR-0006) moved off
-// the event system onto a per-invocation `tauri::ipc::Channel<ChatStreamEvent>`
+// the event system onto a per-invocation `tauri::ipc::Channel<ChatStreamFrame>`
 // returned by `start_streaming_chat` (audio-graph-1534) — the event system is
-// not designed for the 20-100+/sec per-token throughput. See
-// `crate::llm::streaming::ChatStreamEvent`.
+// not designed for the 20-100+/sec per-token throughput.
+
+/// One frame on a streaming-chat or card-answer channel. The
+/// `#[serde(tag = "event", content = "data")]` shape is a discriminated
+/// union for the frontend's single `channel.onmessage` handler. Every
+/// stream ends with exactly one `done` or `failed` frame.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "event", content = "data")]
+pub enum ChatStreamFrame {
+    /// One generated token-delta chunk.
+    #[serde(rename = "delta")]
+    Delta {
+        request_id: String,
+        delta: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
+    },
+    /// The stream completed, or the user cancelled it
+    /// (`finish_reason == "cancelled"`).
+    #[serde(rename = "done")]
+    Done {
+        request_id: String,
+        full_text: String,
+        finish_reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::llm::streaming::StreamUsage>,
+    },
+    /// The stream failed. `full_text` is model output produced before the
+    /// failure: partial product data for display, never written to chat
+    /// history and never replayed to a provider.
+    #[serde(rename = "failed")]
+    Failed {
+        request_id: String,
+        full_text: String,
+        diagnostic: RuntimeDiagnostic,
+    },
+}
 
 /// Event emitted after a chat/LLM completion's provider-reported token usage
 /// has been persisted to the session usage file.
@@ -752,8 +787,16 @@ pub struct CardAnswer {
     /// `Failed` answer carries the route that was attempted.
     pub route_id: String,
     pub requested_by: CardOrigin,
+    /// Finish reason of an `Answered` or `Interrupted` stream. A `Failed`
+    /// answer carries [`Self::diagnostic`] instead. Records written before the
+    /// closed outcome may hold a free-form failure string here; it is kept
+    /// only so those records still load and is never rendered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// Closed failure diagnostic of a `Failed` answer. Absent on answers that
+    /// did not fail and on records written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<RuntimeDiagnostic>,
     /// `None` when the provider omitted usage (the existing
     /// `persist_llm_usage_for_session` early-return, `commands.rs`) — never
     /// a fabricated zero.
@@ -1268,6 +1311,7 @@ mod tests {
                 route_id: "route.openrouter".to_string(),
                 requested_by: CardOrigin::User,
                 finish_reason: Some("stop".to_string()),
+                diagnostic: None,
                 total_tokens: Some(42),
                 answered_at_ms: 1_700_000_001_000,
             }),
@@ -1298,6 +1342,7 @@ mod tests {
             route_id: "route.openrouter".to_string(),
             requested_by: CardOrigin::Transcript,
             finish_reason: None,
+            diagnostic: None,
             total_tokens: None,
             answered_at_ms: 1_700_000_000_000,
         };
@@ -1313,6 +1358,7 @@ mod tests {
         let obj = json.as_object().unwrap();
         assert!(!obj.contains_key("notes_last_sequence"));
         assert!(!obj.contains_key("finish_reason"));
+        assert!(!obj.contains_key("diagnostic"));
         assert!(!obj.contains_key("total_tokens"));
 
         let full = CardAnswer {
@@ -1325,6 +1371,7 @@ mod tests {
             route_id: "route.openrouter".to_string(),
             requested_by: CardOrigin::User,
             finish_reason: Some("stop".to_string()),
+            diagnostic: None,
             total_tokens: Some(128),
             answered_at_ms: 1_700_000_001_000,
         };
@@ -1335,6 +1382,90 @@ mod tests {
         assert_eq!(json["finish_reason"], "stop");
         assert_eq!(json["total_tokens"], 128);
         assert_eq!(json["truncated"], true);
+    }
+
+    #[test]
+    fn failed_card_answer_stores_a_closed_diagnostic_and_legacy_records_still_load() {
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic, RuntimeOperation,
+            RuntimeSafeRecoveryAction,
+        };
+        let diagnostic = RuntimeDiagnostic::from(RuntimeErrorDiagnostic::new(
+            RuntimeErrorCode::RateLimited,
+            true,
+            RuntimeSafeRecoveryAction::RetryAfterDelay,
+            RuntimeDiagnosticContext::new(RuntimeOperation::LanguageModelInference),
+        ));
+        let failed = CardAnswer {
+            status: CardAnswerStatus::Failed,
+            text: String::new(),
+            truncated: false,
+            evidence_span_ids: vec![],
+            evidence_graph_ids: vec![],
+            notes_last_sequence: None,
+            route_id: "route.openrouter".to_string(),
+            requested_by: CardOrigin::User,
+            finish_reason: None,
+            diagnostic: Some(diagnostic.clone()),
+            total_tokens: None,
+            answered_at_ms: 1_700_000_001_000,
+        };
+        let json = serde_json::to_value(&failed).expect("serialize failed CardAnswer");
+        assert!(!json.as_object().unwrap().contains_key("finish_reason"));
+        assert_eq!(json["diagnostic"]["kind"], "runtime");
+        assert_eq!(json["diagnostic"]["detail"]["code"], "rate_limited");
+        let round_trip: CardAnswer = serde_json::from_value(json).expect("reload failed answer");
+        assert_eq!(round_trip.diagnostic, Some(diagnostic));
+
+        // Written before the closed outcome: the failure is a free-form
+        // `finish_reason` string and there is no `diagnostic`.
+        let legacy: CardAnswer = serde_json::from_value(serde_json::json!({
+            "status": "failed",
+            "text": "",
+            "truncated": false,
+            "evidence_span_ids": [],
+            "evidence_graph_ids": [],
+            "route_id": "route.openrouter",
+            "requested_by": "transcript",
+            "finish_reason": "error: Streaming chat HTTP error: status=500",
+            "answered_at_ms": 1_700_000_000_000u64
+        }))
+        .expect("a pre-diagnostic failed answer still loads");
+        assert_eq!(legacy.status, CardAnswerStatus::Failed);
+        assert_eq!(legacy.diagnostic, None);
+    }
+
+    #[test]
+    fn failed_chat_stream_frame_carries_the_diagnostic_on_the_wire() {
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeDiagnosticContext, RuntimeOperation,
+        };
+        let frame = ChatStreamFrame::Failed {
+            request_id: "req-1".to_string(),
+            full_text: "partial".to_string(),
+            diagnostic: RuntimeDiagnostic::internal(RuntimeDiagnosticContext::new(
+                RuntimeOperation::LanguageModelInference,
+            )),
+        };
+        assert_eq!(
+            serde_json::to_value(frame).expect("serialize failed frame"),
+            serde_json::json!({
+                "event": "failed",
+                "data": {
+                    "request_id": "req-1",
+                    "full_text": "partial",
+                    "diagnostic": {
+                        "kind": "runtime",
+                        "detail": {
+                            "code": "internal",
+                            "retryable": false,
+                            "recovery_action": "none",
+                            "context": { "operation": "language_model_inference" }
+                        }
+                    }
+                }
+            })
+        );
     }
 
     /// `CardAnswer::cap_text` (fix-round addition): truncates to
@@ -1355,6 +1486,7 @@ mod tests {
             route_id: "route.openrouter".to_string(),
             requested_by: CardOrigin::Transcript,
             finish_reason: None,
+            diagnostic: None,
             total_tokens: None,
             answered_at_ms: 1_700_000_000_000,
         };
@@ -1389,6 +1521,7 @@ mod tests {
                 route_id: "route.openrouter".to_string(),
                 requested_by: CardOrigin::Transcript,
                 finish_reason: None,
+                diagnostic: None,
                 total_tokens: None,
                 answered_at_ms: 1_700_000_000_000,
             };

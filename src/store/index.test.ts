@@ -10,7 +10,18 @@ import type {
   LiveAssistCardRecord,
   ProjectionPatch,
 } from "../types";
+import { SAFE_INTERNAL_RUNTIME_DIAGNOSTIC } from "../utils/runtimeDiagnostic";
 import { useAudioGraphStore } from "./index";
+
+const RATE_LIMITED_DIAGNOSTIC = {
+  kind: "runtime",
+  detail: {
+    code: "rate_limited",
+    retryable: true,
+    recovery_action: "retry_after_delay",
+    context: { operation: "language_model_inference" },
+  },
+} as const;
 
 function selectableSettings(overrides: Partial<AppSettings> = {}): AppSettings {
   return {
@@ -4061,6 +4072,79 @@ describe("AudioGraphStore", () => {
     });
   });
 
+  it("marks the placeholder as a failed turn with its partial text on a failed frame", async () => {
+    const reqId = "req-failed";
+    const { getChannel, resolveStart } = captureStreamChannel();
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    const channel = getChannel();
+    resolveStart(reqId);
+    await sendPromise;
+
+    channel.onmessage?.({
+      event: "failed",
+      data: {
+        request_id: reqId,
+        full_text: "Partial reply",
+        diagnostic: RATE_LIMITED_DIAGNOSTIC,
+      },
+    });
+
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages.at(-1)).toEqual({
+      role: "assistant",
+      content: "Partial reply",
+      failure: RATE_LIMITED_DIAGNOSTIC,
+    });
+    expect(s.isChatLoading).toBe(false);
+    expect(s.streamingChatRequestId).toBeNull();
+    expect(JSON.stringify(s.chatMessages)).not.toContain("runtime/");
+  });
+
+  it("fails closed to the fixed internal diagnostic for a malformed failed frame", () => {
+    useAudioGraphStore.setState({
+      chatMessages: [
+        { role: "user", content: "ping" },
+        { role: "assistant", content: "" },
+      ],
+      isChatLoading: true,
+      streamingChatRequestId: "req-bad",
+    });
+
+    useAudioGraphStore.getState().finalizeChatStreamFailure({
+      request_id: "req-bad",
+      full_text: "",
+      diagnostic: { kind: "runtime", detail: { code: "runtime/leaked-text" } },
+    });
+
+    expect(useAudioGraphStore.getState().chatMessages.at(-1)?.failure).toEqual(
+      SAFE_INTERNAL_RUNTIME_DIAGNOSTIC,
+    );
+  });
+
+  it("renders a diagnostic rejection from the blocking fallback as a failed turn, not text", async () => {
+    useAudioGraphStore.setState({ chatMessages: [], isChatLoading: false });
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        throw new Error("streaming unsupported by provider");
+      }
+      if (cmd === "send_chat_message") {
+        throw {
+          code: "runtime_diagnostic",
+          diagnostic: RATE_LIMITED_DIAGNOSTIC,
+        };
+      }
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().sendChatMessage("hello");
+
+    expect(useAudioGraphStore.getState().chatMessages.at(-1)).toEqual({
+      role: "assistant",
+      content: "",
+      failure: RATE_LIMITED_DIAGNOSTIC,
+    });
+  });
+
   // -----------------------------------------------------------------------
   // Answer-card actions (audio-graph-83cc T4) — `askQuestion` (composer,
   // mints a card via `ask_question_card`) and `answerQuestionCard` (manual
@@ -4160,7 +4244,7 @@ describe("AudioGraphStore", () => {
       ).toBeUndefined();
     });
 
-    it("sets a failed draft (never throwing) on a done frame carrying an error finish_reason", async () => {
+    it("sets a failed draft (never throwing) with the partial text and the closed diagnostic on a failed frame", async () => {
       const { getChannel, resolveDispatch } = captureAnswerChannel<{
         request_id: string;
       }>("answer_question_card");
@@ -4180,18 +4264,19 @@ describe("AudioGraphStore", () => {
       await promise;
 
       channel.onmessage?.({
-        event: "done",
+        event: "failed",
         data: {
           request_id: "req-err",
-          full_text: "",
-          finish_reason: "error: rate limited",
+          full_text: "Partial",
+          diagnostic: RATE_LIMITED_DIAGNOSTIC,
         },
       });
 
       expect(useAudioGraphStore.getState().answerDrafts["card-err"]).toEqual({
         status: "failed",
-        text: "rate limited",
+        text: "Partial",
         requestId: "req-err",
+        failure: RATE_LIMITED_DIAGNOSTIC,
       });
     });
 

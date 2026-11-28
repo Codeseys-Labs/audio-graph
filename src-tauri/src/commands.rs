@@ -3546,16 +3546,18 @@ pub async fn configure_api_endpoint(
 // ---------------------------------------------------------------------------
 
 /// Build the per-request graph + transcript context block used as the chat
-/// system prompt, and append the user message to history.
+/// system prompt, and the message list for this request.
 ///
-/// Returns `(messages, graph_context)` ready to feed either the streaming
-/// or blocking chat path. Locks are taken under short critical sections
-/// and released before any string formatting (I4 fix carried over from
-/// the legacy `send_chat_message` body).
+/// Returns `(messages, graph_context, user_turn)` ready to feed either the
+/// streaming or blocking chat path. `messages` is the stored history plus
+/// `user_turn`; the history itself is left untouched until the call
+/// succeeds (see [`push_chat_turn`]). Locks are taken under short critical
+/// sections and released before any string formatting (I4 fix carried over
+/// from the legacy `send_chat_message` body).
 fn prepare_chat_request(
     state: &AppState,
     message: String,
-) -> Result<(Vec<ChatMessage>, String), String> {
+) -> Result<(Vec<ChatMessage>, String, ChatMessage), String> {
     let snapshot = {
         let kg = state
             .knowledge_graph
@@ -3592,43 +3594,56 @@ fn prepare_chat_request(
         ctx
     };
 
-    let user_msg = ChatMessage {
+    let user_turn = ChatMessage {
         role: "user".to_string(),
         content: message,
     };
-    {
-        let mut history = state
-            .chat_history
-            .write()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        history.push(user_msg);
-        cap_chat_history(&mut history);
-    }
-    let messages: Vec<ChatMessage> = {
-        let history = state
-            .chat_history
-            .read()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        history.clone()
-    };
-    Ok((messages, graph_context))
+    let mut messages: Vec<ChatMessage> = state
+        .chat_history
+        .read()
+        .map_err(|e| format!("Lock error: {}", e))?
+        .clone();
+    messages.push(user_turn.clone());
+    cap_chat_history(&mut messages);
+    Ok((messages, graph_context, user_turn))
 }
 
-/// Append the assistant message to chat history. Best-effort: lock-poisoning
-/// returns an error but the caller should still surface the reply to the
-/// user — chat_history is a UX convenience, not a correctness invariant.
-fn append_assistant_message(state: &AppState, content: String) -> Result<ChatMessage, String> {
-    let assistant_msg = ChatMessage {
+/// Append one finished chat turn. A failed call appends nothing, neither its
+/// user message nor any partial reply, so the next request replays exactly
+/// the history that preceded the failed one.
+fn push_chat_turn(
+    history: &mut Vec<ChatMessage>,
+    user_turn: ChatMessage,
+    assistant_turn: Option<ChatMessage>,
+) {
+    history.push(user_turn);
+    history.extend(assistant_turn);
+    cap_chat_history(history);
+}
+
+/// Record a finished turn in `state.chat_history` and return its assistant
+/// message.
+fn record_chat_turn(
+    state: &AppState,
+    user_turn: ChatMessage,
+    reply: String,
+) -> Result<ChatMessage, String> {
+    let assistant_turn = ChatMessage {
         role: "assistant".to_string(),
-        content,
+        content: reply,
     };
     let mut history = state
         .chat_history
         .write()
         .map_err(|e| format!("Lock error: {}", e))?;
-    history.push(assistant_msg.clone());
-    cap_chat_history(&mut history);
-    Ok(assistant_msg)
+    push_chat_turn(&mut history, user_turn, Some(assistant_turn.clone()));
+    Ok(assistant_turn)
+}
+
+fn llm_internal_diagnostic() -> RuntimeDiagnostic {
+    RuntimeDiagnostic::internal(RuntimeDiagnosticContext::new(
+        RuntimeOperation::LanguageModelInference,
+    ))
 }
 
 /// Maximum chat messages retained in memory. Chat history is unbounded by
@@ -3732,12 +3747,14 @@ fn stream_params_from_settings(
 /// Spawn the streaming-chat task for `request_id`.
 ///
 /// Drives `crate::llm::streaming::stream_chat` to completion, sending one
-/// [`ChatStreamEvent::Delta`] per [`crate::llm::streaming::TokenDelta::Delta`]
-/// and exactly one [`ChatStreamEvent::Done`] on terminal (Done / Error /
-/// Cancelled) over the per-invocation `channel` (audio-graph-1534: this hot
-/// path streams 20-100+ token deltas/sec, so it uses `tauri::ipc::Channel`
-/// rather than `AppHandle::emit`). Removes the request from
-/// `state.stream_registry` on terminal so a stale id cannot be cancelled later.
+/// [`events::ChatStreamFrame::Delta`] per
+/// [`crate::llm::streaming::TokenDelta::Delta`] and exactly one terminal
+/// `Done` (completed or cancelled) or `Failed` frame over the per-invocation
+/// `channel` (audio-graph-1534: this hot path streams 20-100+ token
+/// deltas/sec, so it uses `tauri::ipc::Channel` rather than
+/// `AppHandle::emit`). Removes the request from `state.stream_registry` on
+/// terminal so a stale id cannot be cancelled later. Only a completed or
+/// cancelled stream records `user_turn` in chat history.
 ///
 /// At most one active chat stream per session: any prior live registry entry
 /// is cancelled before the new stream registers (AUD-STR1 P1). The frontend
@@ -3746,18 +3763,18 @@ fn stream_params_from_settings(
 #[allow(clippy::too_many_arguments)]
 fn spawn_stream_task(
     app: tauri::AppHandle,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     state: &AppState,
     request_id: String,
     provider: crate::settings::LlmProvider,
     history: Vec<ChatMessage>,
     graph_context: String,
     settings: crate::settings::AppSettings,
+    user_turn: ChatMessage,
     persist_to_history: bool,
 ) {
     use crate::llm::streaming::{
-        ChatStreamEvent, StreamChatRequest, StreamSourceMetadata, TokenDelta,
-        stream_chat_with_request,
+        StreamChatRequest, StreamSourceMetadata, TokenDelta, stream_chat_with_request,
     };
 
     let params = stream_params_from_settings(&settings);
@@ -3844,7 +3861,7 @@ fn spawn_stream_task(
                     {
                         log::warn!("speak-aloud append_delta failed: {}", e);
                     }
-                    if let Err(e) = channel.send(ChatStreamEvent::Delta {
+                    if let Err(e) = channel.send(events::ChatStreamFrame::Delta {
                         request_id: request_id_for_task.clone(),
                         delta: content,
                         finish_reason,
@@ -3872,11 +3889,14 @@ fn spawn_stream_task(
                     finish_reason,
                 } => {
                     if persist_to_history && let Ok(mut history) = chat_history.write() {
-                        history.push(ChatMessage {
-                            role: "assistant".to_string(),
-                            content: full_text.clone(),
-                        });
-                        cap_chat_history(&mut history);
+                        push_chat_turn(
+                            &mut history,
+                            user_turn,
+                            Some(ChatMessage {
+                                role: "assistant".to_string(),
+                                content: full_text.clone(),
+                            }),
+                        );
                     }
                     if let Some(p) = pipe.take()
                         && let Err(e) = p.finish()
@@ -3885,7 +3905,7 @@ fn spawn_stream_task(
                     }
                     let tokens_used = tokens_used_from_stream_usage(usage.clone());
                     persist_llm_usage_for_session(&app, &session_id_for_usage, tokens_used);
-                    if let Err(e) = channel.send(ChatStreamEvent::Done {
+                    if let Err(e) = channel.send(events::ChatStreamFrame::Done {
                         request_id: request_id_for_task.clone(),
                         full_text,
                         finish_reason,
@@ -3904,19 +3924,19 @@ fn spawn_stream_task(
                     diagnostic,
                     full_text,
                 } => {
-                    let message = diagnostic.to_string();
-                    log::warn!("Streaming chat error: {}", message);
+                    // Nothing is recorded in chat history, so the partial
+                    // text sent below is never replayed to a provider.
+                    log::warn!("Streaming chat failed: {diagnostic}");
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    if let Err(e) = channel.send(ChatStreamEvent::Done {
+                    if let Err(e) = channel.send(events::ChatStreamFrame::Failed {
                         request_id: request_id_for_task.clone(),
                         full_text,
-                        finish_reason: format!("error: {}", message),
-                        usage: None,
+                        diagnostic,
                     }) {
                         log::warn!(
-                            "chat stream {}: error-done channel send failed: {}",
+                            "chat stream {}: failed-frame channel send failed: {}",
                             request_id_for_task,
                             e
                         );
@@ -3925,10 +3945,14 @@ fn spawn_stream_task(
                     break;
                 }
                 TokenDelta::Cancelled { full_text } => {
+                    // A cancel keeps the user's turn but not the partial reply.
+                    if persist_to_history && let Ok(mut history) = chat_history.write() {
+                        push_chat_turn(&mut history, user_turn, None);
+                    }
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    if let Err(e) = channel.send(ChatStreamEvent::Done {
+                    if let Err(e) = channel.send(events::ChatStreamFrame::Done {
                         request_id: request_id_for_task.clone(),
                         full_text,
                         finish_reason: "cancelled".to_string(),
@@ -3951,7 +3975,7 @@ fn spawn_stream_task(
 /// Start a streaming chat request. Returns the `request_id` immediately so
 /// the frontend can correlate the stream back to this call (and cancel it via
 /// `cancel_streaming_chat`). Token deltas + the terminal frame are delivered
-/// over the caller-supplied `channel` (`tauri::ipc::Channel<ChatStreamEvent>`,
+/// over the caller-supplied `channel` (`tauri::ipc::Channel<ChatStreamFrame>`,
 /// audio-graph-1534) rather than the legacy `chat-token-delta` /
 /// `chat-token-done` events — the channel is ordered, per-invocation, and
 /// avoids the per-token serialize + event-router + JS-bridge cost the event
@@ -3966,11 +3990,11 @@ fn spawn_stream_task(
 #[tauri::command]
 pub async fn start_streaming_chat(
     message: String,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
-    log::info!("start_streaming_chat called ({} chars)", message.len());
+    log::info!("start_streaming_chat called");
     // audio-graph-81a5: content-free, session-scoped chat-invocation counter
     // (correlation proxy for Ask-AI on a question card; see card_telemetry's
     // module doc for why this is not attribution).
@@ -4023,7 +4047,7 @@ pub async fn start_streaming_chat(
     }
 
     sync_llm_clients(state.inner()).await?;
-    let (messages, graph_context) = prepare_chat_request(state.inner(), message)?;
+    let (messages, graph_context, user_turn) = prepare_chat_request(state.inner(), message)?;
     let request_id = uuid::Uuid::new_v4().to_string();
     spawn_stream_task(
         app,
@@ -4034,7 +4058,8 @@ pub async fn start_streaming_chat(
         messages,
         graph_context,
         settings,
-        true, // persist assistant reply to chat history
+        user_turn,
+        true, // record the finished turn in chat history
     );
     Ok(request_id)
 }
@@ -4076,7 +4101,7 @@ pub async fn send_chat_message(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<ChatResponse> {
-    log::info!("send_chat_message called ({} chars)", message.len());
+    log::info!("send_chat_message called");
     // audio-graph-81a5: content-free, session-scoped chat-invocation counter
     // (correlation proxy for Ask-AI on a question card; see card_telemetry's
     // module doc for why this is not attribution).
@@ -4102,7 +4127,7 @@ pub async fn send_chat_message(
     }
 
     sync_llm_clients(state.inner()).await?;
-    let (messages, graph_context) = prepare_chat_request(state.inner(), message)?;
+    let (messages, graph_context, user_turn) = prepare_chat_request(state.inner(), message)?;
 
     // Streaming path — accumulate to full text via the same producer the
     // event-driven command uses. The shim doesn't fire IPC events itself;
@@ -4120,7 +4145,7 @@ pub async fn send_chat_message(
             &settings,
             requires_cloud_content_transfer,
         );
-        let request = StreamChatRequest::new(llm_provider, messages, graph_context.clone(), params)
+        let request = StreamChatRequest::new(llm_provider, messages, graph_context, params)
             .with_content_egress_policy(content_egress_policy)
             .with_backend_handles(stream_backend_handles_from_state(state.inner()))
             .with_source_metadata(StreamSourceMetadata {
@@ -4153,31 +4178,15 @@ pub async fn send_chat_message(
                     tokens_used = tokens_used_from_stream_usage(usage);
                     break;
                 }
-                TokenDelta::Error {
-                    diagnostic,
-                    full_text: partial,
-                } => {
-                    let message = diagnostic.to_string();
-                    log::warn!("send_chat_message streaming error: {}", message);
-                    let fallback = if partial.is_empty() {
-                        format!(
-                            "I couldn't generate a streaming response (LLM error: {}).\n\n{}",
-                            message, graph_context
-                        )
-                    } else {
-                        partial
-                    };
-                    let assistant_msg = append_assistant_message(state.inner(), fallback)?;
-                    // No usage signal: a stream that errors mid-flight never
-                    // reaches the terminal `usage` block, so the real token count
-                    // is genuinely unavailable here.
-                    return Ok(ChatResponse {
-                        message: assistant_msg,
-                        tokens_used: 0,
-                    });
+                TokenDelta::Error { diagnostic, .. } => {
+                    // Chat history keeps neither turn. This command returns
+                    // only a whole reply, so partial text from a failed call
+                    // is discarded rather than presented as an answer.
+                    log::warn!("send_chat_message failed: {diagnostic}");
+                    return Err(diagnostic.into());
                 }
                 TokenDelta::Cancelled { full_text: partial } => {
-                    let assistant_msg = append_assistant_message(state.inner(), partial)?;
+                    let assistant_msg = record_chat_turn(state.inner(), user_turn, partial)?;
                     // No usage signal: a cancelled stream is dropped before the
                     // terminal `usage` block arrives, so no real count exists.
                     return Ok(ChatResponse {
@@ -4187,7 +4196,7 @@ pub async fn send_chat_message(
                 }
             }
         }
-        let assistant_msg = append_assistant_message(state.inner(), full_text)?;
+        let assistant_msg = record_chat_turn(state.inner(), user_turn, full_text)?;
         persist_llm_usage_for_session(&app, &state.current_session_id(), tokens_used);
         return Ok(ChatResponse {
             message: assistant_msg,
@@ -4197,37 +4206,28 @@ pub async fn send_chat_message(
 
     // Legacy blocking path: native engines + bedrock until their streaming
     // support lands. Wrap the synchronous executor call in
-    // `spawn_blocking` so we don't stall the runtime worker. Clone the
-    // graph context once so we still have it for the error fallback path.
-    let executor = state.llm_executor.clone();
-    let graph_for_error = graph_context.clone();
-    // `chat_with_history` now returns the reply text plus the token usage the
+    // `spawn_blocking` so we don't stall the runtime worker.
+    // `chat_with_history` returns the reply text plus the token usage the
     // backend reported. The native `LlmEngine` surfaces a real (prompt +
     // completion) count; the cloud backends routed through this blocking path
     // (Bedrock via ApiClient, OpenRouter blocking, mistral.rs) report 0 because
     // their `chat_with_history` signatures don't carry usage yet — never
-    // fabricated. On error we synthesize a fallback message with no count.
-    let (response_text, tokens_used) = match tokio::task::spawn_blocking(move || {
+    // fabricated.
+    let executor = state.llm_executor.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
         executor.chat_with_history(messages, graph_context, llm_provider)
     })
     .await
-    .map_err(|e| format!("chat task join failed: {}", e))?
-    {
-        Ok(outcome) => (outcome.text, outcome.tokens_used),
-        Err(e) => (
-            format!(
-                "I couldn't generate a detailed response (LLM error: {}). \
-                 Please check the LLM provider configuration.\n\n{}",
-                e, graph_for_error
-            ),
-            0,
-        ),
-    };
-    let assistant_msg = append_assistant_message(state.inner(), response_text)?;
-    persist_llm_usage_for_session(&app, &state.current_session_id(), tokens_used);
+    .map_err(|_| AppError::from(llm_internal_diagnostic()))?
+    .map_err(|diagnostic| {
+        log::warn!("send_chat_message failed: {diagnostic}");
+        AppError::from(diagnostic)
+    })?;
+    let assistant_msg = record_chat_turn(state.inner(), user_turn, outcome.text)?;
+    persist_llm_usage_for_session(&app, &state.current_session_id(), outcome.tokens_used);
     Ok(ChatResponse {
         message: assistant_msg,
-        tokens_used,
+        tokens_used: outcome.tokens_used,
     })
 }
 
@@ -5952,9 +5952,11 @@ struct CardAnswerContext {
 
 /// Build, cap, and persist the `CardAnswer` on the stream's terminal frame
 /// (deliverable a: "persist ONCE on the terminal frame — never per-delta"),
-/// append the terminal ledger row, emit `AGENT_CARD_UPDATE`, and log the
-/// `Completed`/`Failed` telemetry event (`Interrupted` also logs `Failed` —
-/// deliverable f names exactly four telemetry events, not five).
+/// after appending the terminal ledger row, then emit `AGENT_CARD_UPDATE`
+/// and log the `Completed`/`Failed` telemetry event (`Interrupted` also logs
+/// `Failed` — deliverable f names exactly four telemetry events, not five).
+/// The ledger row lands first so anyone who observes the finished answer
+/// also finds its terminal row.
 ///
 /// Re-fetches the card fresh from disk rather than reusing a copy captured
 /// at dispatch time, so a concurrent approve/dismiss that landed while the
@@ -5966,6 +5968,7 @@ fn finalize_card_answer(
     status: events::CardAnswerStatus,
     full_text: String,
     finish_reason: Option<String>,
+    diagnostic: Option<RuntimeDiagnostic>,
     total_tokens: Option<u64>,
 ) {
     let mut answer = events::CardAnswer {
@@ -5978,6 +5981,7 @@ fn finalize_card_answer(
         route_id: ctx.route_id.clone(),
         requested_by: ctx.requested_by,
         finish_reason,
+        diagnostic,
         total_tokens,
         answered_at_ms: unix_millis(),
     };
@@ -5987,6 +5991,19 @@ fn finalize_card_answer(
     // validator error, exactly the seam `CardAnswer::cap_text`'s own doc
     // comment describes.
     answer.cap_text();
+
+    let has_notes = ctx.notes_last_sequence.is_some();
+    let terminal_event = build_assist_answer_terminal_event(
+        &ctx.session_id,
+        ctx.auto,
+        &ctx.card_id,
+        &ctx.provider_id_for_ledger,
+        ctx.requires_cloud_transfer,
+        ctx.cloud_transfer_allowed,
+        has_notes,
+        status,
+    );
+    append_assist_answer_ledger_event(&ctx.session_id, &terminal_event);
 
     match existing_live_assist_card(&ctx.session_id, &ctx.card_id) {
         Some(mut card) => {
@@ -6010,19 +6027,6 @@ fn finalize_card_answer(
             );
         }
     }
-
-    let has_notes = ctx.notes_last_sequence.is_some();
-    let terminal_event = build_assist_answer_terminal_event(
-        &ctx.session_id,
-        ctx.auto,
-        &ctx.card_id,
-        &ctx.provider_id_for_ledger,
-        ctx.requires_cloud_transfer,
-        ctx.cloud_transfer_allowed,
-        has_notes,
-        status,
-    );
-    append_assist_answer_ledger_event(&ctx.session_id, &terminal_event);
 
     let telemetry_event = match status {
         events::CardAnswerStatus::Answered => {
@@ -6055,7 +6059,7 @@ fn finalize_card_answer(
 #[allow(clippy::too_many_arguments)]
 fn spawn_card_answer_stream_task(
     app: tauri::AppHandle,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     state: &AppState,
     request_id: String,
     provider: crate::settings::LlmProvider,
@@ -6064,9 +6068,7 @@ fn spawn_card_answer_stream_task(
     effective_speak_aloud: bool,
     ctx: CardAnswerContext,
 ) {
-    use crate::llm::streaming::{
-        ChatStreamEvent, StreamSourceMetadata, TokenDelta, stream_chat_with_request,
-    };
+    use crate::llm::streaming::{StreamSourceMetadata, TokenDelta, stream_chat_with_request};
 
     let params = stream_params_from_settings(&settings);
     let content_egress_policy = provider_content_egress_policy_from_settings(
@@ -6153,7 +6155,7 @@ fn spawn_card_answer_stream_task(
                         log::warn!("speak-aloud append_delta failed: {}", e);
                     }
                     if channel_alive
-                        && let Err(e) = channel.send(ChatStreamEvent::Delta {
+                        && let Err(e) = channel.send(events::ChatStreamFrame::Delta {
                             request_id: request_id_for_task.clone(),
                             delta: content,
                             finish_reason,
@@ -6184,7 +6186,7 @@ fn spawn_card_answer_stream_task(
                     persist_llm_usage_for_session(&app, &ctx.session_id, tokens_used);
                     let total_tokens = (tokens_used > 0).then(|| u64::from(tokens_used));
                     if channel_alive
-                        && let Err(e) = channel.send(ChatStreamEvent::Done {
+                        && let Err(e) = channel.send(events::ChatStreamFrame::Done {
                             request_id: request_id_for_task.clone(),
                             full_text: full_text.clone(),
                             finish_reason: finish_reason.clone(),
@@ -6204,6 +6206,7 @@ fn spawn_card_answer_stream_task(
                         events::CardAnswerStatus::Answered,
                         full_text,
                         Some(finish_reason).filter(|s| !s.is_empty()),
+                        None,
                         total_tokens,
                     );
                     return;
@@ -6212,40 +6215,19 @@ fn spawn_card_answer_stream_task(
                     diagnostic,
                     full_text,
                 } => {
-                    let message = diagnostic.to_string();
-                    // Fix-round finding (scope-honesty review, minor,
-                    // declined as a functional change): `message` here is
-                    // already `crate::error::redacted_error_excerpt`'d at
-                    // its source in `llm/streaming.rs` (secrets stripped,
-                    // bounded to 200 chars) before it ever reaches this
-                    // channel — the SAME redaction convention
-                    // `redacted_provider_diagnostic` wraps (it is that
-                    // function plus a wider bound, not a distinct
-                    // "class"-reduction step; error.rs has no separate
-                    // class-only reducer to call into here). This line is a
-                    // byte-for-byte mirror of the pre-existing
-                    // `start_streaming_chat` error line just above it in
-                    // this file. Declined further reduction: doing so only
-                    // for this new call site while leaving the identical,
-                    // pre-existing chat line as-is would create an
-                    // inconsistency with no clear security win, and
-                    // widening the redaction convention itself is out of
-                    // this ticket's scope.
-                    log::warn!("Card answer streaming error: {}", message);
+                    log::warn!("Card answer stream failed: {diagnostic}");
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    let finish_reason = format!("error: {}", message);
                     if channel_alive
-                        && let Err(e) = channel.send(ChatStreamEvent::Done {
+                        && let Err(e) = channel.send(events::ChatStreamFrame::Failed {
                             request_id: request_id_for_task.clone(),
                             full_text: full_text.clone(),
-                            finish_reason: finish_reason.clone(),
-                            usage: None,
+                            diagnostic: diagnostic.clone(),
                         })
                     {
                         log::warn!(
-                            "card answer stream {}: error-done channel send failed: {}",
+                            "card answer stream {}: failed-frame channel send failed: {}",
                             request_id_for_task,
                             e
                         );
@@ -6256,7 +6238,8 @@ fn spawn_card_answer_stream_task(
                         &ctx,
                         events::CardAnswerStatus::Failed,
                         full_text,
-                        Some(finish_reason),
+                        None,
+                        Some(diagnostic),
                         None,
                     );
                     return;
@@ -6266,7 +6249,7 @@ fn spawn_card_answer_stream_task(
                         let _ = p.cancel();
                     }
                     if channel_alive
-                        && let Err(e) = channel.send(ChatStreamEvent::Done {
+                        && let Err(e) = channel.send(events::ChatStreamFrame::Done {
                             request_id: request_id_for_task.clone(),
                             full_text: full_text.clone(),
                             finish_reason: "cancelled".to_string(),
@@ -6286,6 +6269,7 @@ fn spawn_card_answer_stream_task(
                         events::CardAnswerStatus::Interrupted,
                         full_text,
                         Some("cancelled".to_string()),
+                        None,
                         None,
                     );
                     return;
@@ -6312,7 +6296,7 @@ fn spawn_card_answer_stream_task(
 async fn answer_question_card_impl(
     proposal_id: String,
     auto: bool,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     app: tauri::AppHandle,
     state: &AppState,
 ) -> AppResult<AnswerDispatch> {
@@ -6738,7 +6722,7 @@ fn delete_orphaned_mint(session_id: &str, proposal_id: &str) {
 /// test cannot call the `#[tauri::command]`-annotated function below
 /// directly without standing up a full mock webview + IPC round trip
 /// (disproportionate for this ticket's scope, and fragile for a
-/// `Channel<ChatStreamEvent>` argument's wire encoding). Pulling the actual
+/// `Channel<ChatStreamFrame>` argument's wire encoding). Pulling the actual
 /// logic out into this plain `&AppState`-taking function means a test CAN
 /// call it directly — the annotated wrapper below is then a one-line
 /// delegation, correct by inspection.
@@ -6746,7 +6730,7 @@ async fn dispatch_answer_question_card(
     proposal_id: String,
     question: String,
     auto: bool,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     app: tauri::AppHandle,
     state: &AppState,
 ) -> AppResult<AnswerQuestionCardDispatch> {
@@ -6764,7 +6748,7 @@ pub async fn answer_question_card(
     proposal_id: String,
     question: String,
     auto: bool,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<AnswerQuestionCardDispatch> {
@@ -6791,7 +6775,7 @@ pub async fn answer_question_card(
 /// `#[tauri::command]`-annotated wrapper itself.
 async fn dispatch_ask_question_card(
     text: String,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     app: tauri::AppHandle,
     state: &AppState,
 ) -> AppResult<AskQuestionCardDispatch> {
@@ -6817,7 +6801,7 @@ async fn dispatch_ask_question_card(
 #[tauri::command]
 pub async fn ask_question_card(
     text: String,
-    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
+    channel: tauri::ipc::Channel<events::ChatStreamFrame>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<AskQuestionCardDispatch> {
@@ -14540,6 +14524,7 @@ mod tests {
                 route_id: "route.openrouter".to_string(),
                 requested_by: events::CardOrigin::User,
                 finish_reason: Some("stop".to_string()),
+                diagnostic: None,
                 total_tokens: Some(50),
                 answered_at_ms: 1_700_000_000_075,
             }),
@@ -17066,6 +17051,7 @@ mod tests {
                 route_id: "route.openrouter".to_string(),
                 requested_by: events::CardOrigin::Transcript,
                 finish_reason: Some("stop".to_string()),
+                diagnostic: None,
                 total_tokens: Some(1200),
                 answered_at_ms: 1_700_000_000_500 + i as u64,
             });
@@ -24646,6 +24632,7 @@ mod tests {
             route_id: "route.openrouter".to_string(),
             requested_by: events::CardOrigin::Transcript,
             finish_reason: Some("stop".to_string()),
+            diagnostic: None,
             total_tokens: Some(42),
             answered_at_ms: 1_700_000_000_500,
         });
@@ -25287,6 +25274,7 @@ mod tests {
             events::CardAnswerStatus::Answered,
             "The roadmap moved the launch to Q3.".to_string(),
             Some("stop".to_string()),
+            None,
             Some(42),
         );
 
@@ -25374,6 +25362,7 @@ mod tests {
             events::CardAnswerStatus::Answered,
             oversized,
             Some("length".to_string()),
+            None,
             Some(9000),
         );
 
@@ -26069,11 +26058,11 @@ mod tests {
     // uses) is possible after all; these two tests exercise it.
     // =======================================================================
 
-    /// A no-op sink for a `ChatStreamEvent` channel — the test only needs
+    /// A no-op sink for a `ChatStreamFrame` channel — the test only needs
     /// the CALL to succeed and the background task to run; frame content is
     /// asserted by re-reading the persisted card instead of by inspecting
     /// what this channel receives.
-    fn noop_answer_channel() -> tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent> {
+    fn noop_answer_channel() -> tauri::ipc::Channel<events::ChatStreamFrame> {
         tauri::ipc::Channel::new(|_body| Ok(()))
     }
 
@@ -26512,6 +26501,343 @@ mod tests {
             assert_eq!(answer.status, events::CardAnswerStatus::Answered);
             assert_eq!(answer.text, "Manual retry answer.");
         });
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    // #526: a failed chat returns a closed diagnostic and records no turn.
+
+    const CHAT_TRANSCRIPT_SENTINEL: &str = "kkkk-transcript-sentinel-kkkk";
+    const CHAT_PROVIDER_CANARY: &str = "PROVIDER-BODY-CANARY";
+    const PARTIAL_REPLY: &str = "Partial reply before the drop";
+
+    /// Single-shot HTTP mock that answers with `response` verbatim.
+    async fn spawn_raw_http_mock(response: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let mut request = String::new();
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    request.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if request.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The provider fails before sending a single token.
+    fn http_500_response() -> String {
+        let body = format!("{{\"error\":\"{CHAT_PROVIDER_CANARY}\"}}");
+        format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The provider sends one delta, then the body ends short of its
+    /// declared length.
+    fn truncated_sse_response() -> String {
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{PARTIAL_REPLY}\"}}}}]}}\n\n"
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len() + 512
+        )
+    }
+
+    /// Plant the transcript sentinel and one earlier turn, so "history is
+    /// unchanged" is not vacuously true. Returns that history as JSON.
+    fn seed_chat_session(state: &AppState) -> serde_json::Value {
+        state
+            .transcript_buffer
+            .write()
+            .unwrap()
+            .push_back(TranscriptSegment {
+                id: "segment-sentinel".to_string(),
+                source_id: "source-1".to_string(),
+                speaker_id: None,
+                speaker_label: Some("Speaker 1".to_string()),
+                text: CHAT_TRANSCRIPT_SENTINEL.to_string(),
+                start_time: 1.0,
+                end_time: 2.0,
+                confidence: 0.9,
+            });
+        *state.chat_history.write().unwrap() = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "earlier question".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "earlier answer".to_string(),
+            },
+        ];
+        chat_history_json(state)
+    }
+
+    fn chat_history_json(state: &AppState) -> serde_json::Value {
+        serde_json::to_value(&*state.chat_history.read().unwrap()).unwrap()
+    }
+
+    type ChatFrames = tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>;
+
+    fn recording_chat_channel() -> (tauri::ipc::Channel<events::ChatStreamFrame>, ChatFrames) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let channel = tauri::ipc::Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                let _ = tx.send(serde_json::from_str(&json).expect("frame JSON"));
+            }
+            Ok(())
+        });
+        (channel, rx)
+    }
+
+    async fn terminal_chat_frame(frames: &mut ChatFrames) -> serde_json::Value {
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(20), frames.recv())
+                .await
+                .expect("terminal frame in time")
+                .expect("channel open");
+            if frame["event"] != "delta" {
+                return frame;
+            }
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn chat_failure_before_the_first_token_returns_a_diagnostic_and_records_nothing() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("chat-failure-before-first-token");
+        let _guard = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        let prior = seed_chat_session(&state);
+        // A length that would be easy to spot in a log line.
+        let message = "q".repeat(39_017);
+
+        // A current-thread runtime keeps the command and its stream task on
+        // this thread, where the log capture records them.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let capture = crate::test_log_capture::ThreadLogCapture::start();
+        let (error, frame) = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(http_500_response()).await,
+            );
+            let error = send_chat_message(message.clone(), app.clone(), manager.state())
+                .await
+                .expect_err("a failed chat is an error, not a reply");
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(http_500_response()).await,
+            );
+            let (channel, mut frames) = recording_chat_channel();
+            start_streaming_chat(message.clone(), channel, app.clone(), manager.state())
+                .await
+                .expect("the stream starts");
+            (error, terminal_chat_frame(&mut frames).await)
+        });
+        let logs = crate::test_log_capture::render(&capture.finish());
+
+        let error = serde_json::to_value(&error).expect("serialize the IPC error");
+        assert_eq!(error["code"], "runtime_diagnostic", "{error}");
+        assert_eq!(error["diagnostic"]["kind"], "runtime", "{error}");
+        assert_eq!(frame["event"], "failed", "{frame}");
+        assert_eq!(frame["data"]["full_text"], "", "{frame}");
+        assert_eq!(frame["data"]["diagnostic"]["kind"], "runtime", "{frame}");
+        assert_eq!(chat_history_json(&state), prior);
+        let history = chat_history_json(&state).to_string();
+        for surface in [error.to_string(), frame.to_string(), history, logs.clone()] {
+            assert!(!surface.contains(CHAT_TRANSCRIPT_SENTINEL), "{surface}");
+            assert!(!surface.contains(CHAT_PROVIDER_CANARY), "{surface}");
+        }
+        assert!(!logs.contains("39017"), "{logs}");
+        crate::test_log_capture::assert_process_logs_exclude(&[
+            CHAT_TRANSCRIPT_SENTINEL,
+            CHAT_PROVIDER_CANARY,
+        ]);
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn chat_failure_after_partial_text_keeps_it_out_of_history_and_the_next_request() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("chat-failure-after-partial-text");
+        let _guard = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        let prior = seed_chat_session(&state);
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        let (frame, error) = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(truncated_sse_response()).await,
+            );
+            let (channel, mut frames) = recording_chat_channel();
+            start_streaming_chat(
+                "first question".to_string(),
+                channel,
+                app.clone(),
+                manager.state(),
+            )
+            .await
+            .expect("the stream starts");
+            let frame = terminal_chat_frame(&mut frames).await;
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(truncated_sse_response()).await,
+            );
+            let error =
+                send_chat_message("second question".to_string(), app.clone(), manager.state())
+                    .await
+                    .expect_err("a failed chat is an error, not a reply");
+            (frame, error)
+        });
+
+        // The streaming terminal carries the partial text for display, as a
+        // failed turn.
+        assert_eq!(frame["event"], "failed", "{frame}");
+        assert_eq!(frame["data"]["full_text"], PARTIAL_REPLY, "{frame}");
+        // The accumulating command discards it: its contract is a whole reply.
+        let error = serde_json::to_value(&error).expect("serialize the IPC error");
+        assert_eq!(error["code"], "runtime_diagnostic", "{error}");
+        assert!(!error.to_string().contains(PARTIAL_REPLY), "{error}");
+
+        // Neither failed call recorded a turn, so the next request sends the
+        // earlier history plus only its own question.
+        assert_eq!(chat_history_json(&state), prior);
+        let (next, _, _) = prepare_chat_request(&state, "next question".to_string())
+            .expect("prepare the next request");
+        let mut expected = prior.as_array().unwrap().clone();
+        expected.push(serde_json::json!({ "role": "user", "content": "next question" }));
+        assert_eq!(
+            serde_json::to_value(&next).unwrap(),
+            serde_json::Value::Array(expected)
+        );
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn failed_card_answer_persists_a_closed_diagnostic_instead_of_an_error_string() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("failed-card-answer-diagnostic");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        let card_id = "failing-card";
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_id, &seed)
+            .expect("seed the card");
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        let answered = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(http_500_response()).await,
+            );
+            let dispatch = answer_question_card_impl(
+                card_id.to_string(),
+                false,
+                noop_answer_channel(),
+                app_handle,
+                &state,
+            )
+            .await
+            .expect("the dispatch call itself must not error");
+            assert!(matches!(dispatch, AnswerDispatch::Dispatched { .. }));
+            wait_for_answered_card(&session_id, card_id).await
+        });
+
+        let answer = answered.answer.as_ref().expect("answer persisted");
+        assert_eq!(answer.status, events::CardAnswerStatus::Failed);
+        assert_eq!(answer.finish_reason, None);
+        assert_eq!(answer.diagnostic, Some(llm_internal_diagnostic()));
+        let record = serde_json::to_string(&answered).expect("serialize the card");
+        assert!(!record.contains(CHAT_PROVIDER_CANARY), "{record}");
+        assert!(!record.contains("error:"), "{record}");
+
+        // The terminal ledger row is written before the answer is visible.
+        let ledger_rows = FileMemoryRepository::user_data()
+            .load_data_movement_events(&session_id)
+            .expect("load movement ledger");
+        assert_eq!(
+            ledger_rows
+                .iter()
+                .map(|row| row.event_type)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::persistence::DataMovementEventType::ProviderCallStarted,
+                crate::persistence::DataMovementEventType::ProviderCallFailed,
+            ]
+        );
+
         state
             .api_client
             .lock()

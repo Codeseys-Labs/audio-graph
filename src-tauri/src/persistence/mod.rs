@@ -4165,6 +4165,7 @@ mod local_memory_repository_tests {
             route_id: "route.openrouter".into(),
             requested_by,
             finish_reason: Some("stop".into()),
+            diagnostic: None,
             total_tokens: Some(64),
             answered_at_ms: 1_700_000_000_200,
         }
