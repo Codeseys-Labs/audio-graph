@@ -777,9 +777,10 @@ pub const MAX_CARD_ANSWER_TEXT_CHARS: usize = 4_000;
 #[serde(remote = "Self")]
 pub struct CardAnswer {
     pub status: CardAnswerStatus,
-    /// Full answer text from the stream's terminal frame. Non-empty unless
-    /// `status == Failed`, and capped at [`MAX_CARD_ANSWER_TEXT_CHARS`]
-    /// (both validator-enforced, `persistence::validate_live_assist_card`).
+    /// Full answer text from the stream's terminal frame. Non-empty for an
+    /// `Answered` answer, possibly empty for one cut short, and capped at
+    /// [`MAX_CARD_ANSWER_TEXT_CHARS`] (both validator-enforced,
+    /// `persistence::validate_live_assist_card`).
     /// Prefer constructing via [`CardAnswer::cap_text`] over building this
     /// field directly so an over-cap answer is truncated-and-marked instead
     /// of rejected-and-lost at persistence time.

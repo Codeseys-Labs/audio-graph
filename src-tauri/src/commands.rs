@@ -6059,6 +6059,10 @@ struct CardAnswerContext {
     provider_id_for_ledger: String,
     requires_cloud_transfer: bool,
     cloud_transfer_allowed: bool,
+    /// The live session id (`AppState::session_id`), read when the answer is
+    /// finalized so a card from a session that has since rotated is not
+    /// announced into the new one.
+    live_session: std::sync::Arc<std::sync::RwLock<String>>,
 }
 
 /// How one card-answer attempt ended: what [`finalize_card_answer`] persists,
@@ -6093,6 +6097,11 @@ impl Drop for CardAnswerSlot {
 /// Re-fetches the card fresh from disk rather than reusing a copy captured
 /// at dispatch time, so a concurrent approve/dismiss that landed while the
 /// stream was in flight is not clobbered by a stale `existing` snapshot.
+///
+/// Returns a closed `internal` diagnostic when the card could not be
+/// written, so the caller reports a failure rather than a normal terminal
+/// frame. The card is announced only once written, and only while its
+/// session is still the live one.
 #[allow(clippy::too_many_arguments)]
 fn finalize_card_answer(
     app: &tauri::AppHandle,
@@ -6102,7 +6111,7 @@ fn finalize_card_answer(
     finish_reason: Option<String>,
     diagnostic: Option<RuntimeDiagnostic>,
     total_tokens: Option<u64>,
-) {
+) -> Result<(), RuntimeDiagnostic> {
     let mut answer = events::CardAnswer {
         status,
         text: full_text,
@@ -6137,16 +6146,29 @@ fn finalize_card_answer(
     );
     append_assist_answer_ledger_event(&ctx.session_id, &terminal_event);
 
-    match existing_live_assist_card(&ctx.session_id, &ctx.card_id) {
+    let persisted = match existing_live_assist_card(&ctx.session_id, &ctx.card_id) {
         Some(mut card) => {
             card.answer = Some(answer);
             card.updated_at_ms = unix_millis();
             // The write error names the session's file path, so only a fixed
-            // message is logged; a card that was not written is not announced.
+            // message is logged.
             match FileMemoryRepository::user_data().upsert_live_assist_card(&ctx.session_id, &card)
             {
-                Ok(()) => events::emit_or_log(app, events::AGENT_CARD_UPDATE, card),
-                Err(_) => log::warn!("Failed to persist the answer for card_id={}", ctx.card_id),
+                Ok(()) => {
+                    let still_live = *ctx
+                        .live_session
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        == ctx.session_id;
+                    if still_live {
+                        events::emit_or_log(app, events::AGENT_CARD_UPDATE, card);
+                    }
+                    Ok(())
+                }
+                Err(_) => {
+                    log::warn!("Failed to persist the answer for card_id={}", ctx.card_id);
+                    Err(llm_internal_diagnostic())
+                }
             }
         }
         None => {
@@ -6154,8 +6176,9 @@ fn finalize_card_answer(
                 "Card answer terminal frame arrived but card_id={} no longer exists; answer not persisted",
                 ctx.card_id
             );
+            Ok(())
         }
-    }
+    };
 
     let telemetry_event = match status {
         events::CardAnswerStatus::Answered => {
@@ -6172,6 +6195,7 @@ fn finalize_card_answer(
         ctx.auto,
         telemetry_event,
     );
+    persisted
 }
 
 /// Spawn the answer stream task. Deliberately NOT a call to
@@ -6387,7 +6411,7 @@ fn spawn_card_answer_stream_task(
         };
 
         // Persist, then free the slot, then tell the frontend.
-        finalize_card_answer(
+        let persisted = finalize_card_answer(
             &app,
             &ctx,
             terminal.status,
@@ -6398,7 +6422,15 @@ fn spawn_card_answer_stream_task(
         );
         drop(registration);
         drop(slot);
-        if channel_alive && let Err(e) = channel.send(terminal.frame) {
+        let frame = match persisted {
+            Ok(()) => terminal.frame,
+            Err(diagnostic) => ChatStreamFrame::Failed {
+                request_id: request_id_for_task.clone(),
+                full_text: String::new(),
+                diagnostic,
+            },
+        };
+        if channel_alive && let Err(e) = channel.send(frame) {
             log::warn!(
                 "card answer stream {}: terminal channel send failed: {}",
                 request_id_for_task,
@@ -6571,6 +6603,7 @@ async fn answer_question_card_impl(
         provider_id_for_ledger,
         requires_cloud_transfer,
         cloud_transfer_allowed,
+        live_session: state.session_id.clone(),
     };
     spawn_card_answer_stream_task(
         app,
@@ -11170,6 +11203,14 @@ fn ensure_session_idle_for_rotation(state: &AppState) -> AppResult<()> {
     if !state.stream_registry.is_empty() {
         return Err(AppError::SessionInvalid {
             reason: "wait for or cancel the active chat before starting a new session".to_string(),
+        });
+    }
+    // A cancelled card answer leaves the registry at once but keeps this slot
+    // until its answer is written to its own session.
+    if state.card_answer_in_flight.load(Ordering::SeqCst) {
+        return Err(AppError::SessionInvalid {
+            reason: "wait for the live-assist answer to finish before starting a new session"
+                .to_string(),
         });
     }
     Ok(())
@@ -25358,6 +25399,7 @@ mod tests {
             provider_id_for_ledger: "llm.openrouter".to_string(),
             requires_cloud_transfer: true,
             cloud_transfer_allowed: true,
+            live_session: std::sync::Arc::new(std::sync::RwLock::new(session_id.to_string())),
         }
     }
 
@@ -25396,7 +25438,8 @@ mod tests {
             Some("stop".to_string()),
             None,
             Some(42),
-        );
+        )
+        .expect("the answer is written");
 
         let audit = FileMemoryRepository::user_data()
             .load_live_assist_card_audit(session_id)
@@ -25484,7 +25527,8 @@ mod tests {
             Some("length".to_string()),
             None,
             Some(9000),
-        );
+        )
+        .expect("the capped answer is written");
 
         let current = FileMemoryRepository::user_data()
             .load_live_assist_cards(session_id)
@@ -27500,6 +27544,168 @@ mod tests {
                     retry_admitted: true,
                 },
             ]
+        );
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_cancelled_card_answer_holds_off_rotation_and_stays_out_of_the_next_session() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("card-answer-cancel-then-rotate");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_a = state.current_session_id();
+        let card_id = "cancelled-before-rotation";
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_a,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_a, &seed)
+            .expect("seed the card");
+        let announced = Arc::new(Mutex::new(Vec::<String>::new()));
+        let announced_for_listener = announced.clone();
+        let listener_id = app_handle.listen_any(events::AGENT_CARD_UPDATE, move |event| {
+            if event.payload().contains(card_id) {
+                announced_for_listener
+                    .lock()
+                    .unwrap()
+                    .push(event.payload().to_owned());
+            }
+        });
+
+        // A current-thread runtime runs the answer task only at the next
+        // await, so the cancel lands before its first token.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let seen = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(complete_sse_response("the old session's answer")).await,
+            );
+            let (channel, mut frames) = recording_chat_channel();
+            let dispatch = answer_question_card_impl(
+                card_id.to_string(),
+                false,
+                channel,
+                app_handle.clone(),
+                &state,
+            )
+            .await
+            .expect("the dispatch call itself must not error");
+            let AnswerDispatch::Dispatched { request_id } = dispatch else {
+                panic!("the answer is dispatched");
+            };
+            assert!(state.stream_registry.cancel(&request_id));
+            assert!(state.stream_registry.is_empty());
+            assert!(matches!(
+                ensure_session_idle_for_rotation(&state),
+                Err(AppError::SessionInvalid { .. })
+            ));
+            // Rotate anyway, as if the check were bypassed: the late answer
+            // still lands in its own session and is not announced.
+            assert!(matches!(
+                state.rotate_session("session-after-the-cancel"),
+                crate::state::RotateOutcome::Rotated(_)
+            ));
+            chat_frames_through_terminal(&mut frames).await
+        });
+        app_handle.unlisten(listener_id);
+
+        let frame = seen.last().expect("a terminal frame");
+        assert_eq!(frame["event"], "done", "{frame}");
+        assert_eq!(frame["data"]["finish_reason"], "cancelled", "{frame}");
+        let answer = existing_live_assist_card(&session_a, card_id)
+            .and_then(|card| card.answer)
+            .expect("the interruption is written to the old session");
+        assert_eq!(answer.status, events::CardAnswerStatus::Interrupted);
+        assert_eq!(answer.text, "");
+        assert_eq!(*announced.lock().unwrap(), Vec::<String>::new());
+
+        state
+            .api_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drain_test_writers(&state);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_card_answer_that_cannot_be_written_ends_on_a_failed_frame() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("card-answer-write-failure");
+        let _guard = HomeGuard::set(&dir);
+
+        let state = AppState::new();
+        let app_handle = crate::speech::shared_test_app_handle();
+        let session_id = state.current_session_id();
+        let card_id = "unwritable-card";
+        let seed = answer_engine_test_card(
+            card_id,
+            &session_id,
+            events::AgentProposalKind::Question,
+            Some(events::SignalGrade::Strong),
+            vec!["span-1".to_string()],
+        );
+        FileMemoryRepository::user_data()
+            .upsert_live_assist_card(&session_id, &seed)
+            .expect("seed the card");
+        // A directory where the card's audit log belongs makes the next card
+        // write fail.
+        let audit_log = crate::user_data::resolve_live_assist_current_path(&session_id)
+            .expect("resolve the card file")
+            .with_file_name(format!("{session_id}.jsonl"));
+        std::fs::remove_file(&audit_log).expect("remove the audit log");
+        std::fs::create_dir(&audit_log).expect("block the audit log");
+
+        let rt = tokio::runtime::Runtime::new().expect("build a plain tokio runtime");
+        let seen = rt.block_on(async {
+            point_state_at_mock_llm_provider(
+                &state,
+                spawn_raw_http_mock(complete_sse_response("an answer that cannot be saved")).await,
+            );
+            let (channel, mut frames) = recording_chat_channel();
+            let dispatch =
+                answer_question_card_impl(card_id.to_string(), false, channel, app_handle, &state)
+                    .await
+                    .expect("the dispatch call itself must not error");
+            assert!(matches!(dispatch, AnswerDispatch::Dispatched { .. }));
+            chat_frames_through_terminal(&mut frames).await
+        });
+
+        let frame = seen.last().expect("a terminal frame");
+        assert_eq!(frame["event"], "failed", "{frame}");
+        assert_eq!(
+            frame["data"]["diagnostic"]["detail"]["code"], "internal",
+            "{frame}"
+        );
+        assert_eq!(
+            existing_live_assist_card(&session_id, card_id).and_then(|card| card.answer),
+            None
         );
 
         state
