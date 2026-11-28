@@ -24,6 +24,11 @@ function note(
     body: overrides.body ?? "",
     tags: overrides.tags ?? [],
     heading_level: overrides.heading_level ?? null,
+    valid_until_ms: overrides.valid_until_ms ?? null,
+    // Issue #255 fixture fields — defaults mirror a note materialized by an
+    // `upsert_note` (no block history).
+    blocks: overrides.blocks ?? [],
+    valid_from_ms: overrides.valid_from_ms ?? 0,
     updated_by_sequence: overrides.updated_by_sequence ?? 1,
     updated_at_ms: overrides.updated_at_ms ?? 0,
     basis: null,

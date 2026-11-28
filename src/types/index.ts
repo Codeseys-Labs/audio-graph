@@ -2046,6 +2046,28 @@ export type ProjectionOperation =
       after_id?: string | null;
     }
   | {
+      type: "invalidate_note";
+      id: string;
+    }
+  | {
+      type: "upsert_note_block";
+      note_id: string;
+      block_id: string;
+      text: string;
+    }
+  | {
+      type: "invalidate_note_block";
+      note_id: string;
+      block_id: string;
+    }
+  | {
+      type: "replace_note_text";
+      note_id: string;
+      block_id: string;
+      search: string;
+      replace: string;
+    }
+  | {
       type: "upsert_graph_node";
       id: string;
       name: string;
@@ -2138,11 +2160,39 @@ export interface ProjectionPatch {
   created_at_ms: number;
 }
 
+/**
+ * Mirrors Rust's `NoteBlock` (`src-tauri/src/projections.rs`, issue #255 /
+ * ADR-0025 §2) — one addressable sub-note block with the same temporal
+ * validity posture as `MaterializedGraphNode` above: `valid_until_ms` absent
+ * or `null` = active, `number` = soft-invalidated (hidden from the derived
+ * note `body`, retained in materialized state for audit). `valid_from_ms`
+ * defaults to `0` server-side on legacy rows, so treat a missing value as
+ * "no stamp", never as meaningful time.
+ */
+export interface NoteBlock {
+  block_id: string;
+  text: string;
+  valid_from_ms: number;
+  valid_until_ms?: number | null;
+}
+
 export interface MaterializedNote {
   id: string;
   title: string;
   body: string;
   tags: string[];
+  /**
+   * Issue #255 (ADR-0025 §2): addressable sub-note blocks. Optional because
+   * the Rust side skips serializing an empty vec — absent/undefined means
+   * "no block history" (every pre-#255 note deserialized from a persisted
+   * snapshot), never anything else. Every note materialized SINCE the
+   * contract carries exactly one seed block under the reserved `"body"` id
+   * holding the last `upsert_note`-asserted body (mirrors
+   * `MaterializedNote::BODY_BLOCK_ID`), so `body == join(active blocks,
+   * "\n\n")` holds from creation and a `replace_note_text` can anchor into a
+   * pure-`upsert_note` note.
+   */
+  blocks?: NoteBlock[];
   /**
    * Additive/optional, same contract as `ProjectionOperation`'s
    * `upsert_note.heading_level` above (W1, audio-graph-a6b5, still in
@@ -2155,6 +2205,16 @@ export interface MaterializedNote {
   updated_at_ms: number;
   basis: unknown;
   provenance: unknown;
+  /**
+   * Issue #255 (ADR-0025 §2): note-level temporal validity, mirroring
+   * `MaterializedGraphNode`'s fields below exactly. `valid_until_ms`
+   * absent/`null` = active; `number` = soft-invalidated by an
+   * `invalidate_note` operation — hidden from active rendering, retained in
+   * materialized state for audit. Legacy rows deserialize as `valid_from_ms:
+   * 0` server-side; treat missing as "no stamp".
+   */
+  valid_from_ms: number;
+  valid_until_ms?: number | null;
 }
 
 export interface MaterializedNotes {
