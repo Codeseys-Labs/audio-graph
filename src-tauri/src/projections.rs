@@ -2425,11 +2425,77 @@ impl fmt::Debug for MaterializedNote {
     }
 }
 
+/// Historical views retain their verified contents until a scheduled repair commits.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionRecoveryStatus {
+    RecomputeRequired,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionCoverageStatus {
+    BehindTranscript,
+}
+
+impl TranscriptLedger {
+    /// Fold the verified source in canonical order, checking replacement
+    /// rules once per revision and sorting the final spans only once.
+    pub(crate) fn replay_source_prefix(
+        session_id: &str,
+        events_prefix: &[TranscriptEvent],
+    ) -> Result<TranscriptLedger, TranscriptLedgerError> {
+        let mut map = BTreeMap::new();
+        let mut accepted = 0u64;
+        for event in events_prefix {
+            fast_apply_transcript_event(&mut map, event.clone())?;
+            accepted += 1;
+        }
+        let mut ledger = TranscriptLedger {
+            schema_version: TranscriptLedger::SCHEMA_VERSION,
+            session_id: session_id.to_string(),
+            accepted_event_count: accepted,
+            latest_spans: map.into_values().collect(),
+        };
+        ledger.sort_latest_spans();
+        Ok(ledger)
+    }
+
+    /// Only an eligible span missing at its exact current revision is evidence
+    /// that this lane trails the transcript. A speaker-only change or a saved
+    /// interim is not a recovered final.
+    pub(crate) fn projection_coverage(
+        &self,
+        basis: Option<&ProjectionBasis>,
+    ) -> Option<ProjectionCoverageStatus> {
+        let covered = basis
+            .map(|b| b.resolve_covered_events(&self.latest_spans))
+            .unwrap_or_default();
+        let identities: std::collections::BTreeSet<_> = covered
+            .iter()
+            .map(|e| (&e.span_id, e.revision_number))
+            .collect();
+        self.latest_spans
+            .iter()
+            .filter(|e| projection_event_is_eligible(e))
+            .any(|e| !identities.contains(&(&e.span_id, e.revision_number)))
+            .then_some(ProjectionCoverageStatus::BehindTranscript)
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct MaterializedNotes {
     pub schema_version: u32,
     pub session_id: String,
     pub last_sequence: u64,
+    /// Global sequence and hash of the last projection patch materialized for this kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_log_head: Option<crate::persistence::canonical_log::VerifiedTranscriptHead>,
+    /// Calculated from the canonical gap evidence and its receipted repairs.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub projection_recovery: Option<ProjectionRecoveryStatus>,
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub transcript_coverage: Option<ProjectionCoverageStatus>,
     pub notes: Vec<MaterializedNote>,
 }
 
@@ -2454,6 +2520,9 @@ impl MaterializedNotes {
             schema_version: Self::SCHEMA_VERSION,
             session_id: session_id.into(),
             last_sequence: 0,
+            projection_log_head: None,
+            projection_recovery: None,
+            transcript_coverage: None,
             notes: Vec::new(),
         }
     }
@@ -2922,6 +2991,14 @@ pub struct MaterializedGraph {
     pub schema_version: u32,
     pub session_id: String,
     pub last_sequence: u64,
+    /// Global sequence and hash of the last projection patch materialized for this kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_log_head: Option<crate::persistence::canonical_log::VerifiedTranscriptHead>,
+    /// Calculated from the canonical gap evidence and its receipted repairs.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub projection_recovery: Option<ProjectionRecoveryStatus>,
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub transcript_coverage: Option<ProjectionCoverageStatus>,
     pub nodes: Vec<MaterializedGraphNode>,
     pub edges: Vec<MaterializedGraphEdge>,
     /// Raw model-supplied node id -> the id `upsert_node` ACTUALLY landed it
@@ -2966,6 +3043,9 @@ impl MaterializedGraph {
             schema_version: Self::SCHEMA_VERSION,
             session_id: session_id.into(),
             last_sequence: 0,
+            projection_log_head: None,
+            projection_recovery: None,
+            transcript_coverage: None,
             nodes: Vec::new(),
             edges: Vec::new(),
             id_aliases: BTreeMap::new(),
@@ -4021,26 +4101,6 @@ impl<'a> LedgerHistory<'a> {
         timeline
     }
 
-    fn fresh_fold_transcript_or_error(
-        session_id: &str,
-        events_prefix: &[TranscriptEvent],
-    ) -> Result<TranscriptLedger, TranscriptLedgerError> {
-        let mut map = BTreeMap::new();
-        let mut accepted = 0u64;
-        for event in events_prefix {
-            fast_apply_transcript_event(&mut map, event.clone())?;
-            accepted += 1;
-        }
-        let mut ledger = TranscriptLedger {
-            schema_version: TranscriptLedger::SCHEMA_VERSION,
-            session_id: session_id.to_string(),
-            accepted_event_count: accepted,
-            latest_spans: map.into_values().collect(),
-        };
-        ledger.sort_latest_spans();
-        Ok(ledger)
-    }
-
     fn fresh_fold_speaker_or_error(
         session_id: &str,
         events_prefix: &[DiarizationSpanRevision],
@@ -4127,7 +4187,7 @@ impl<'a> LedgerHistory<'a> {
             Ok(self.materialize_transcript_ledger())
         } else {
             debug_assert!(target_len < self.transcript_applied_len);
-            Self::fresh_fold_transcript_or_error(
+            TranscriptLedger::replay_source_prefix(
                 self.session_id,
                 &self.transcript_events[..target_len],
             )
@@ -4209,6 +4269,17 @@ impl<'a> LedgerHistory<'a> {
 }
 
 impl MaterializedProjectionState {
+    pub(crate) fn bind_projection_head(
+        &mut self,
+        kind: &ProjectionKind,
+        head: crate::persistence::canonical_log::VerifiedTranscriptHead,
+    ) {
+        match kind {
+            ProjectionKind::Notes => self.notes.projection_log_head = Some(head),
+            ProjectionKind::Graph => self.graph.projection_log_head = Some(head),
+        }
+    }
+
     pub fn new(session_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
         Self {
@@ -10012,9 +10083,9 @@ mod tests {
             "runtime scheduler must not start consuming speaker-timeline basis spans"
         );
 
-        let state_source = include_str!("state.rs");
+        let state_source = include_str!("state/projection_apply.rs");
         assert!(
-            state_source.contains(".apply_validated_patch_reporting_currency(ledger, &patch)"),
+            state_source.contains(".apply_validated_patch_reporting_currency(&ledger, &patch)"),
             "live runtime apply must retain the transcript-only validation seam"
         );
         assert!(

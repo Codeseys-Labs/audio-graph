@@ -70,6 +70,13 @@ pub(crate) enum StrictCanonicalRead<T> {
 }
 
 impl<T> StrictCanonicalRead<T> {
+    pub(crate) fn records(&self) -> &[super::canonical_log::CanonicalRecord<T>] {
+        match self {
+            Self::Missing => &[],
+            Self::Present(snapshot) => &snapshot.records,
+        }
+    }
+
     /// Compatibility projection for callers whose contract still models a
     /// missing stream and a present-empty stream as the same empty row list.
     pub(crate) fn into_payloads(self) -> Vec<T> {
@@ -128,6 +135,8 @@ fn load_strict_canonical_stream<T: DeserializeOwned>(
 ) -> Result<StrictCanonicalRead<T>, CanonicalReaderError> {
     let result = if descriptor == TRANSCRIPT_REVISIONS {
         super::canonical_log::read_committed(path, session_id)
+    } else if descriptor == PROJECTION_PATCHES {
+        super::canonical_log::read_committed_projection(path, session_id)
     } else {
         load_canonical_stream(
             path,

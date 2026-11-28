@@ -140,7 +140,14 @@ impl Commit<'_> {
             }
             drop(recovered);
             drop(lease);
-            self.run(None, None, process_owner(), verified)?;
+            self.run(
+                None,
+                None,
+                &[],
+                CommitExpectation::default(),
+                process_owner(),
+                verified,
+            )?;
             lease = self.acquire_lease()?;
         }
         let intent_path = self.path.with_added_extension("attempt");
@@ -167,7 +174,9 @@ impl Commit<'_> {
         let Some(plan) = self.plan_group(events, prefix)? else {
             return Ok(None);
         };
+        let witness = tier::ReceiptTierWitness::from_frame(&plan.frames[0]);
         let intent = Intent {
+            projection_lanes: Vec::new(),
             attempt: Uuid::new_v4().to_string(),
             owner: process_owner().to_owned(),
             after: head(&prefix.stream),
@@ -175,14 +184,33 @@ impl Commit<'_> {
             source_was_absent: false,
             frame_len: plan.bytes.len() as u64,
             frame_hash: digest(&plan.bytes),
-            members: plan.members,
+            members: plan.members.clone(),
         };
+        self.record_attempt_origin(&intent, &prefix.stream)?;
         let descriptor =
             serde_json::to_vec(&intent).map_err(|_| TranscriptCommitError::InvalidHistory)?;
         self.publish_intent(&mut lease, &intent_path, &descriptor)?;
         #[cfg(test)]
         kill_at(Cut::KillIntent);
-        let receipts = self.write_group(&intent, &plan.bytes, events, &mut file, &mut lease)?;
+        let receipts = self.write_group(&intent, &plan, &mut file)?;
+        self.record_barrier(&witness, &prefix.stream, None)?;
+        if let Err(error) = self.finish_intent(&self.path.with_added_extension("attempt")) {
+            lease.pending.as_mut().unwrap().retiring = Some(
+                events
+                    .iter()
+                    .cloned()
+                    .zip(receipts.iter().copied())
+                    .zip(&plan.frames)
+                    .map(|((event, receipt), frame)| RecoveredEvent {
+                        event,
+                        receipt,
+                        record_hash: frame.record_hash.clone(),
+                    })
+                    .collect(),
+            );
+            return Err(error);
+        }
+        lease.pending = None;
         for (frame, event) in plan.frames.into_iter().zip(events) {
             prefix.stream.head = Some(CanonicalStreamHead {
                 sequence: frame.sequence,
@@ -214,11 +242,10 @@ impl Commit<'_> {
     fn write_group(
         &self,
         intent: &Intent,
-        bytes: &[u8],
-        events: &[TranscriptEvent],
+        plan: &Plan,
         file: &mut File,
-        lease: &mut Lease,
     ) -> Result<Vec<TranscriptReceipt>, TranscriptCommitError> {
+        let bytes = &plan.bytes;
         self.guard
             .revalidate_recovery_source(self.path, file)
             .map_err(TranscriptCommitError::Rejected)?;
@@ -251,18 +278,6 @@ impl Commit<'_> {
                 barrier,
             })
             .collect();
-        if let Err(error) = self.finish_intent(&self.path.with_added_extension("attempt")) {
-            lease.pending.as_mut().unwrap().retiring = Some(
-                events
-                    .iter()
-                    .cloned()
-                    .zip(receipts.iter().copied())
-                    .map(|(event, receipt)| RecoveredTranscript { event, receipt })
-                    .collect(),
-            );
-            return Err(error);
-        }
-        lease.pending = None;
         Ok(receipts)
     }
 }

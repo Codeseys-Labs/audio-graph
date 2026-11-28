@@ -195,6 +195,7 @@ fn restart_refuses_a_matching_complete_frame_that_cannot_replay() {
         panic!("expected a structurally valid frame");
     };
     let intent = Intent {
+        projection_lanes: Vec::new(),
         attempt: Uuid::new_v4().to_string(),
         owner: Uuid::new_v4().to_string(),
         source_was_absent: false,

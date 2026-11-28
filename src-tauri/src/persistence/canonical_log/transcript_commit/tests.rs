@@ -196,7 +196,11 @@ fn interrupted_writer_child() {
     let Some(path) = std::env::var_os(CHILD_PATH) else {
         return;
     };
-    let cut = match std::env::var(CHILD_CUT).unwrap().as_str() {
+    let checkpoint = std::env::var(CHILD_CUT).unwrap();
+    if let Some(projection_cut) = checkpoint.strip_prefix("projection-") {
+        super::projection_tests::interrupt_patch(Path::new(&path), projection_cut);
+    }
+    let cut = match checkpoint.as_str() {
         "group-torn" => Cut::KillGroupTorn,
         "group-member" => Cut::KillGroupMember,
         "group-complete" => Cut::KillComplete,
@@ -265,7 +269,7 @@ fn interrupted_writer_child() {
 
 /// The child signals from between the write and its durability barrier. The
 /// deadline bounds a broken handshake; scheduling never selects a crash cut.
-fn kill_at_writer_checkpoint(path: &Path, checkpoint: &str, while_alive: impl FnOnce()) {
+pub(super) fn kill_at_writer_checkpoint(path: &Path, checkpoint: &str, while_alive: impl FnOnce()) {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
         .env(CHILD_PATH, path)
@@ -717,6 +721,7 @@ fn process_kill_with_only_a_durable_intent_records_an_empty_suffix_and_restores_
     assert_eq!(
         transcript_gaps(&fixture.path).unwrap(),
         vec![TranscriptGap {
+            projection_lanes: Vec::new(),
             stream: GapStream::TranscriptRevisions,
             after: None,
             suffix_quarantined: false
@@ -799,6 +804,7 @@ fn interrupted_first_revision_preserves_the_legacy_display_and_leaves_sequence_o
     assert_eq!(
         gaps,
         vec![TranscriptGap {
+            projection_lanes: Vec::new(),
             stream: GapStream::TranscriptRevisions,
             after: None,
             suffix_quarantined: true,
@@ -858,6 +864,7 @@ fn startup_for_a_fresh_session_recovers_a_torn_frame_and_records_a_gap_at_the_ol
     assert_eq!(
         gaps,
         vec![TranscriptGap {
+            projection_lanes: Vec::new(),
             stream: GapStream::TranscriptRevisions,
             after: Some(VerifiedTranscriptHead {
                 sequence: first_receipt.sequence,
@@ -1575,4 +1582,185 @@ fn exact_first_create_retry_keeps_its_namespace_receipt() {
         CanonicalDurabilityBarrier::FileAndParentNamespace
     };
     assert_eq!(receipt.barrier, expected);
+}
+
+#[test]
+fn tier_witness_distinguishes_a_kept_weak_origin_from_a_successful_weak_sync() {
+    let f = Fixture::new();
+    let first = transcript_event("leaf", CONTENT);
+    let second = transcript_event("root", CONTENT);
+    let s = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    let originally_qualified = !s.is_unqualified();
+    s.commit_after(&first, Some(0)).unwrap();
+    let initial = f.replay();
+    let mut weak = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    weak.tier = None;
+    CUT.set(Some(Cut::Sync));
+    assert!(weak.commit_after(&second, Some(1)).is_err());
+    let prefix_evidence = tier::receipt_evidence(&f.path, &initial.records);
+    if originally_qualified {
+        assert!(prefix_evidence.synced_unqualified.is_none());
+        assert_eq!(prefix_evidence.qualified.as_ref().unwrap().sequence, 1);
+    }
+    let descriptor = f.path.with_added_extension("attempt");
+    let origin = f.path.with_added_extension("attempt-origin");
+    let bytes = fs::read(&descriptor).unwrap();
+    let intent: Intent = serde_json::from_slice(&bytes).unwrap();
+    // Old floor-v1 readers reject unknown descriptor fields.
+    let old_keys = [
+        "attempt",
+        "owner",
+        "after",
+        "base_len",
+        "source_was_absent",
+        "frame_len",
+        "frame_hash",
+        "members",
+    ];
+    let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        wire.as_object()
+            .unwrap()
+            .keys()
+            .all(|k| old_keys.contains(&k.as_str()))
+    );
+    if originally_qualified {
+        assert_eq!(fs::read(&origin).unwrap(), intent.attempt.as_bytes());
+        let (_, ongoing) =
+            super::super::transcript_export::read_for_export(&f.path, 65536, || Ok(())).unwrap();
+        assert_eq!(
+            ongoing.unwrap().unqualified_attempt_id.as_deref(),
+            Some(intent.attempt.as_str())
+        );
+    }
+    let resumed = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    resumed.resolve_pending().unwrap();
+    let rows = f.replay().records;
+    let evidence = tier::receipt_evidence(&f.path, &rows);
+    if originally_qualified {
+        let kept = evidence.recovered_from_unqualified_attempt.unwrap();
+        assert_eq!(kept.sequence, 2);
+        assert_eq!(kept.record_hash, rows[1].record_hash);
+        assert!(evidence.synced_unqualified.is_none());
+    } else {
+        assert_eq!(evidence.synced_unqualified.unwrap().sequence, 1);
+        assert!(evidence.recovered_from_unqualified_attempt.is_none());
+    }
+    assert!(!origin.exists() && !descriptor.exists());
+}
+
+#[test]
+fn abandoned_weak_witness_is_replaced_and_subsequent_receipts_reuse_verified_evidence() {
+    let f = Fixture::new();
+    let mut s = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    s.tier = None;
+    CUT.set(Some(Cut::Short));
+    assert!(
+        s.commit_after(&transcript_event("seed", CONTENT), Some(0))
+            .is_err()
+    );
+    assert!(tier::receipt_evidence::<TranscriptEvent>(&f.path, &[]).is_empty());
+    s.resolve_pending().unwrap();
+    s.commit_after(&transcript_event("twig", CONTENT), Some(0))
+        .unwrap();
+    let marker = f.path.with_added_extension("unqualified-receipt");
+    let observed = fs::read(&marker).unwrap();
+    let first = f.replay().records;
+    assert_eq!(
+        tier::receipt_evidence(&f.path, &first)
+            .synced_unqualified
+            .unwrap()
+            .record_hash,
+        first[0].record_hash
+    );
+    for (prior, span) in [(1, "root"), (2, "stem")] {
+        s.commit_after(&transcript_event(span, CONTENT), Some(prior))
+            .unwrap();
+    }
+    assert_eq!(fs::read(&marker).unwrap(), observed);
+    let inventory = transcript_recovery_artifacts(&f.path).unwrap();
+    assert!(inventory.contains(&marker));
+}
+
+#[test]
+fn legacy_frames_and_unreadable_evidence_make_no_positive_qualification_claim() {
+    let f = Fixture::new();
+    let original = transcript_event("seed", CONTENT);
+    fs::write(&f.path, serde_json::to_vec(&original).unwrap()).unwrap();
+    let records = f.replay().records;
+    assert!(tier::receipt_evidence(&f.path, &records).is_empty());
+    fs::write(f.path.with_added_extension("qualified-receipt"), b"plum").unwrap();
+    let evidence = tier::receipt_evidence(&f.path, &records);
+    assert!(evidence.evidence_unavailable);
+    assert!(evidence.qualified.is_none() && evidence.synced_unqualified.is_none());
+}
+
+#[test]
+fn identical_redelivery_after_a_torn_or_empty_weak_attempt_never_claims_a_weak_sync() {
+    for cut in [Cut::Short, Cut::Full] {
+        let f = Fixture::new();
+        let qualified = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+        if qualified.is_unqualified() {
+            return;
+        }
+        let mut weak = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+        weak.tier = None;
+        let event = transcript_event("twig", CONTENT);
+        CUT.set(Some(cut));
+        assert!(weak.commit_after(&event, Some(0)).is_err());
+        let intent: Intent =
+            serde_json::from_slice(&fs::read(f.path.with_added_extension("attempt")).unwrap())
+                .unwrap();
+        let origin = f.path.with_added_extension("attempt-origin");
+        assert_eq!(fs::read(&origin).unwrap(), intent.attempt.as_bytes());
+        assert!(!f.path.with_added_extension("unqualified-receipt").exists());
+        let receipt = qualified.commit_after(&event, Some(0)).unwrap();
+        assert_eq!(receipt.sequence, 1);
+        assert_eq!(digest(&fs::read(&f.path).unwrap()), intent.frame_hash);
+        let evidence = tier::receipt_evidence(&f.path, &f.replay().records);
+        assert_eq!(evidence.qualified.unwrap().sequence, 1);
+        assert!(
+            evidence.synced_unqualified.is_none()
+                && evidence.recovered_from_unqualified_attempt.is_none()
+        );
+        assert!(!origin.exists());
+    }
+}
+
+#[test]
+fn exact_retry_records_the_new_barrier_and_stale_origin_ids_cannot_label_recovery() {
+    let f = Fixture::new();
+    let native = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    let origin = f.path.with_added_extension("attempt-origin");
+    fs::write(&origin, Uuid::new_v4().to_string()).unwrap();
+    native.ready().unwrap();
+    assert!(!origin.exists());
+    if native.is_unqualified() {
+        return;
+    }
+    let mut weak = PreparedTranscriptStorage::open(&f.path, SESSION).unwrap();
+    weak.tier = None;
+    let first = transcript_event("leaf", CONTENT);
+    native.commit_after(&first, Some(0)).unwrap();
+    let retried = weak.commit_after(&first, Some(0)).unwrap();
+    assert!(retried.already_accepted);
+    let evidence = tier::receipt_evidence(&f.path, &f.replay().records);
+    assert_eq!(evidence.qualified, evidence.synced_unqualified);
+    assert!(evidence.qualified.is_some() && evidence.recovered_from_unqualified_attempt.is_none());
+    // A previous weak receipt already witnesses the stream. Another weak
+    // attempt must not add a per-event origin publication.
+    CUT.set(Some(Cut::Sync));
+    assert!(
+        weak.commit_after(&transcript_event("stem", CONTENT), Some(1))
+            .is_err()
+    );
+    assert!(!origin.exists());
+    fs::write(&origin, Uuid::new_v4().to_string()).unwrap();
+    let (_, ongoing) =
+        super::super::transcript_export::read_for_export(&f.path, 65536, || Ok(())).unwrap();
+    assert!(ongoing.unwrap().unqualified_attempt_id.is_none());
+    native.resolve_pending().unwrap();
+    let evidence = tier::receipt_evidence(&f.path, &f.replay().records);
+    assert!(evidence.recovered_from_unqualified_attempt.is_none());
+    assert!(!origin.exists());
 }

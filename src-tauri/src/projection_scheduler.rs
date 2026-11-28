@@ -283,6 +283,10 @@ pub struct ProjectionScheduler {
     ttft_estimate_source: ProjectionTtftEstimateSource,
     next_job_index: u64,
     in_flight: Option<ProjectionJob>,
+    /// Gap identities captured when this live session resumed. Moved to the
+    /// job exactly once. Historical readers never construct these requests.
+    resume_gaps: Vec<String>,
+    repair_job: Option<(String, Vec<String>)>,
     pending_basis: Option<ProjectionBasis>,
     last_completed_basis: Option<ProjectionBasis>,
     last_failed_basis: Option<ProjectionBasis>,
@@ -353,6 +357,8 @@ impl ProjectionScheduler {
             ttft_estimate_source,
             next_job_index: 0,
             in_flight: None,
+            resume_gaps: Vec::new(),
+            repair_job: None,
             pending_basis: None,
             last_completed_basis: None,
             last_failed_basis: None,
@@ -677,6 +683,10 @@ impl ProjectionScheduler {
         self.metrics.failed_jobs += 1;
         self.pending_basis = None;
 
+        let resumed_repair = self
+            .repair_job
+            .take()
+            .is_some_and(|(id, _)| id == failed.id);
         match ledger.classify_basis_currency(&failed.basis, None) {
             BasisCurrency::Current => {
                 if self.last_failed_basis.as_ref() == Some(&failed.basis) {
@@ -688,6 +698,9 @@ impl ProjectionScheduler {
                     // `start_job` and cleared only on success, per its
                     // field doc.
                     self.failed_attempts = 1;
+                }
+                if resumed_repair {
+                    self.failed_attempts = PROJECTION_LANE_ATTEMPT_BUDGET;
                 }
                 self.last_failed_basis = Some(failed.basis);
                 // ADR-0045 decision 3 (audio-graph-bf5d): arm exactly one
@@ -841,6 +854,7 @@ impl ProjectionScheduler {
         priority: ProjectionPriority,
         now_ms: u64,
     ) -> ProjectionJob {
+        self.repair_job = None;
         self.next_job_index += 1;
         let job = ProjectionJob {
             id: self.current_job_id(),
@@ -923,6 +937,27 @@ impl ProjectionScheduler {
         } else {
             ProjectionCoalescingReason::TtftWindow
         }
+    }
+
+    /// Consume the outstanding gaps once for this capture, even at an already covered basis.
+    fn take_resume_repair(
+        &mut self,
+        ledger: &TranscriptLedger,
+        now_ms: u64,
+    ) -> ProjectionSchedulerDecision {
+        if self.resume_gaps.is_empty()
+            || self.in_flight.is_some()
+            || self.session_id != ledger.session_id
+        {
+            return ProjectionSchedulerDecision::Idle;
+        }
+        let basis = ledger.current_projection_basis();
+        if basis.span_revisions.is_empty() {
+            return ProjectionSchedulerDecision::Idle;
+        }
+        let job = self.start_job(basis, ProjectionPriority::Background, now_ms);
+        self.repair_job = Some((job.id.clone(), std::mem::take(&mut self.resume_gaps)));
+        ProjectionSchedulerDecision::StartJob { job }
     }
 
     /// Per-lane half of [`ProjectionSchedulers::reseed_coverage_heads`]
@@ -1331,6 +1366,46 @@ impl ProjectionSchedulers {
         }
     }
 
+    /// Seed the live session from one read of its accepted patches and recovery gaps.
+    pub(crate) fn attach_capture(
+        &mut self,
+        session: &str,
+        heads: (Option<ProjectionBasis>, Option<ProjectionBasis>),
+        notes_gaps: &[String],
+        graph_gaps: &[String],
+    ) -> Result<(), String> {
+        if self.notes.session_id != session || self.graph.session_id != session {
+            return Err("projection capture session changed".into());
+        }
+        self.clear_orphaned_deferred_retries();
+        self.reseed_coverage_heads(heads);
+        self.notes.resume_gaps = notes_gaps.to_vec();
+        self.graph.resume_gaps = graph_gaps.to_vec();
+        Ok(())
+    }
+
+    pub(crate) fn take_capture_repairs(
+        &mut self,
+        ledger: &TranscriptLedger,
+        now_ms: u64,
+    ) -> ProjectionSchedulersObservation {
+        ProjectionSchedulersObservation {
+            notes: self.notes.take_resume_repair(ledger, now_ms),
+            graph: self.graph.take_resume_repair(ledger, now_ms),
+        }
+    }
+
+    pub(crate) fn repair_ids_for_job(&self, job: &ProjectionJob) -> &[String] {
+        let lane = match job.kind {
+            ProjectionKind::Notes => &self.notes,
+            ProjectionKind::Graph => &self.graph,
+        };
+        lane.repair_job
+            .as_ref()
+            .filter(|(id, _)| id == &job.id && lane.session_id == job.session_id)
+            .map_or(&[], |(_, ids)| ids.as_slice())
+    }
+
     /// ADR-0045 decision 6's disk-to-scheduler channel (audio-graph-5fd1):
     /// seed each lane's `last_completed_basis` from [`derive_coverage_heads`]'s
     /// output over the session's accepted `projection_patches` log. Callers
@@ -1438,6 +1513,71 @@ mod tests {
             asr_latency_ms: None,
             received_at_ms: 1_700_000_000_000 + revision_number,
         }
+    }
+
+    #[test]
+    fn capture_repair_bypasses_already_covered_basis_exactly_once_per_resume() {
+        let mut ledger = TranscriptLedger::new("orchard");
+        ledger.apply_event(event("oak", 1, "leaf")).unwrap();
+        let basis = ledger.current_projection_basis();
+        let heads = (Some(basis.clone()), Some(basis));
+        let ids = vec!["projection-gap-branch".to_string()];
+        let mut lanes = ProjectionSchedulers::new("orchard");
+        lanes
+            .attach_capture("orchard", heads.clone(), &ids, &[])
+            .unwrap();
+        let repairs = lanes.take_capture_repairs(&ledger, 1);
+        let ProjectionSchedulerDecision::StartJob { job } = repairs.notes else {
+            panic!("notes repair should start")
+        };
+        assert!(matches!(repairs.graph, ProjectionSchedulerDecision::Idle));
+        assert_eq!(lanes.repair_ids_for_job(&job), ids.as_slice());
+        assert!(matches!(
+            lanes.take_capture_repairs(&ledger, 2).notes,
+            ProjectionSchedulerDecision::Idle
+        ));
+        assert!(matches!(
+            lanes.fail_notes_in_flight(&job.id, "orchard", &ledger, 3),
+            ProjectionSchedulerDecision::FailedCurrent {
+                deferred_retry_at_ms: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            lanes.take_capture_repairs(&ledger, 4).notes,
+            ProjectionSchedulerDecision::Idle
+        ));
+        assert!(!matches!(
+            lanes.observe_ledger(&ledger, u64::MAX).notes,
+            ProjectionSchedulerDecision::StartJob { .. }
+        ));
+        lanes.attach_capture("orchard", heads, &ids, &[]).unwrap();
+        assert!(matches!(
+            lanes.take_capture_repairs(&ledger, 5).notes,
+            ProjectionSchedulerDecision::StartJob { .. }
+        ));
+    }
+
+    #[test]
+    fn another_sessions_gap_cannot_dispatch_a_capture_repair() {
+        let mut historical = TranscriptLedger::new("earlier");
+        historical.apply_event(event("oak", 1, "leaf")).unwrap();
+        let mut capture = ProjectionSchedulers::new("current");
+        let ids = vec!["projection-gap-branch".to_owned()];
+        assert!(
+            capture
+                .attach_capture(
+                    "earlier",
+                    (Some(historical.current_projection_basis()), None),
+                    &ids,
+                    &[]
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            capture.take_capture_repairs(&historical, 1).notes,
+            ProjectionSchedulerDecision::Idle
+        ));
     }
 
     fn partial_event(span_id: &str, revision_number: u64, text: &str) -> TranscriptEvent {

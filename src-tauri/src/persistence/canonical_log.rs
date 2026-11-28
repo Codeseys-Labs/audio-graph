@@ -1848,15 +1848,23 @@ struct PendingAppend {
 mod transcript_commit;
 #[cfg(test)]
 pub(crate) use transcript_commit::tests::interrupted_historical_caption;
+pub use transcript_commit::tier::StreamReceiptEvidence;
+pub(crate) use transcript_commit::tier::receipt_evidence;
 pub(crate) mod transcript_export;
-pub(crate) use transcript_commit::CapturedTranscript;
+pub(crate) use transcript_commit::{
+    CapturedTranscript, PreparedProjectionStorage, ProjectionReceipt,
+};
 pub(crate) use transcript_commit::{
     PreparedTranscriptStorage, commit_transcript, transcript_recovery_artifacts,
 };
 pub use transcript_commit::{
-    TranscriptCommitError, TranscriptGap, TranscriptReceipt, transcript_gaps,
+    TranscriptCommitError, TranscriptGap, TranscriptReceipt, VerifiedTranscriptHead,
+    transcript_gaps,
 };
-pub(super) use transcript_commit::{capture_committed, read_committed};
+pub(super) use transcript_commit::{
+    capture_committed, capture_committed_projection_bounded, read_committed,
+    read_committed_projection,
+};
 #[cfg(test)]
 pub(super) use transcript_commit::{simulate_disk_full, simulate_failed_sync};
 
