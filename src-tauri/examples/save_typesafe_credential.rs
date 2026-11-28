@@ -3,6 +3,7 @@ use audio_graph::credentials::save_typesafe_credential_from_reader;
 use std::io::IsTerminal;
 
 fn main() {
+    audio_graph::crash_handler::install();
     let stdin = std::io::stdin();
     let saved = std::env::args_os().len() == 1
         && !stdin.is_terminal()

@@ -1486,6 +1486,12 @@ mod tests {
         );
     }
 
+    #[test]
+    fn crash_handler_is_the_only_panic_integration_in_the_app_configuration() {
+        let options = sentry::apply_defaults(client_options());
+        assert!(options.integrations.iter().all(|i| i.name() != "panic"));
+    }
+
     /// A transport that clones out the (post-scrub) event of every envelope it
     /// receives so a test can inspect the tags the SDK actually applied.
     struct CapturingTransport {
