@@ -144,6 +144,30 @@ const idleStage: StageStatus = { type: "Idle" };
 let historicalLoadGeneration = 0;
 
 /**
+ * Capture-status transitions seen while a start is in flight. The Running
+ * event and a fatal reconciliation's Idle can both reach the store before
+ * the start's own response; a success that arrives after its capture already
+ * ended must not mark it running again.
+ */
+let pendingCaptureStart: { runningSeen: boolean; ended: boolean } | null = null;
+
+/** A well-formed acknowledgement of exactly the sources requested. */
+function isCaptureStartAck(
+  value: unknown,
+  sourceCount: number,
+): value is CaptureStartAck {
+  if (typeof value !== "object" || value === null) return false;
+  const ack = value as Partial<CaptureStartAck>;
+  return (
+    typeof ack.generation === "number" &&
+    Number.isFinite(ack.generation) &&
+    Array.isArray(ack.sources) &&
+    ack.sources.length === sourceCount &&
+    ack.sources.every((id) => typeof id === "string" && id.length > 0)
+  );
+}
+
+/**
  * A failed capture start names its failing source with the user's own label
  * for it: the backend identifies sources only by request position.
  */
