@@ -41,7 +41,7 @@
 //! streaming clients (`backoff_for_attempt`).
 
 use super::{
-    AsrSessionStop, AsrStopReason, BuiltInCredentialSetId, asr_diagnostic,
+    AsrReconnectReason, AsrSessionStop, AsrStopReason, BuiltInCredentialSetId, asr_diagnostic,
     is_terminal_reconnect_error, required_api_key, websocket_close, websocket_diagnostic,
     websocket_error, websocket_upgrade_error, websocket_write_error,
 };
@@ -109,6 +109,9 @@ pub enum OpenAiRealtimeEvent {
     /// `failed` event, or a local parse failure). The socket stays open.
     #[serde(rename = "error")]
     Error { message: RuntimeDiagnostic },
+    /// A diagnostic that leaves streaming or reconnecting active.
+    #[serde(rename = "advisory")]
+    Advisory { message: RuntimeDiagnostic },
     /// The connection has been established and the transcription session has
     /// been configured (`session.updated` received).
     #[serde(rename = "connected")]
@@ -121,7 +124,11 @@ pub enum OpenAiRealtimeEvent {
     /// `attempt` is 1-based: attempt 1 is the first retry after the initial
     /// loss.
     #[serde(rename = "reconnecting")]
-    Reconnecting { attempt: u32, backoff_secs: u64 },
+    Reconnecting {
+        attempt: u32,
+        backoff_secs: u64,
+        reason: AsrReconnectReason,
+    },
     /// The client successfully re-established the WebSocket after a disconnect
     /// (and re-sent `session.update`).
     #[serde(rename = "reconnected")]
@@ -836,6 +843,15 @@ async fn session_task_with_timing(
                     break;
                 }
 
+                let initial_reason = match &disconnect {
+                    DisconnectKind::ServerClose(diagnostic)
+                    | DisconnectKind::NetworkError(diagnostic)
+                    | DisconnectKind::ProtocolError(diagnostic) => {
+                        AsrReconnectReason::from_diagnostic(diagnostic)
+                    }
+                    DisconnectKind::SessionExpired => AsrReconnectReason::SessionRollover,
+                    _ => AsrReconnectReason::ConnectionLost,
+                };
                 let reconnected = loop {
                     match stop_signal.reason() {
                         Some(AsrStopReason::UserRequested) => break false,
@@ -871,6 +887,9 @@ async fn session_task_with_timing(
                     let _ = event_tx.send(OpenAiRealtimeEvent::Reconnecting {
                         attempt,
                         backoff_secs: backoff,
+                        reason: last_open_error
+                            .as_ref()
+                            .map_or(initial_reason, AsrReconnectReason::from_diagnostic),
                     });
 
                     stop_signal
@@ -909,7 +928,7 @@ async fn session_task_with_timing(
                                 break false;
                             }
                             last_open_error = Some(diag.clone());
-                            emit_error(&event_tx, diag);
+                            emit_advisory(&event_tx, diag);
                         }
                     }
                 };
@@ -1088,7 +1107,7 @@ async fn run_io(ctx: RunIoCtx<'_>, now: impl Fn() -> tokio::time::Instant) -> Di
                 if stop_signal.reason().is_some() || audio_rx.is_closed() {
                     return DisconnectKind::UserRequested;
                 }
-                emit_error(event_tx, websocket_diagnostic(Code::Timeout));
+                emit_advisory(event_tx, websocket_diagnostic(Code::Timeout));
                 return DisconnectKind::SetupTimeout;
             }
 
@@ -1253,7 +1272,7 @@ pub(super) fn handle_server_message(
         Err(_) => {
             let message = websocket_diagnostic(Code::InvalidResponse);
             log::warn!("OpenAI Realtime: {message}");
-            emit_error(tx, message);
+            emit_advisory(tx, message);
             return ServerMessage::Continue;
         }
     };
@@ -1316,7 +1335,7 @@ pub(super) fn handle_server_message(
             if is_terminal_reconnect_error(&message) {
                 return ServerMessage::TerminalError(message);
             }
-            emit_error(tx, message);
+            emit_advisory(tx, message);
             if msg_type == "error"
                 && error
                     .and_then(|error| error.get("code"))
@@ -1349,6 +1368,10 @@ pub(super) enum ServerMessage {
     SessionUpdated,
     TerminalError(RuntimeDiagnostic),
     SessionExpired,
+}
+
+fn emit_advisory(tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>, message: RuntimeDiagnostic) {
+    let _ = tx.send(OpenAiRealtimeEvent::Advisory { message });
 }
 
 fn emit_error(tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>, message: RuntimeDiagnostic) {
@@ -1477,7 +1500,7 @@ mod tests {
             ServerMessage::Continue
         );
         assert!(
-            matches!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), OpenAiRealtimeEvent::Error { message }
+            matches!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), OpenAiRealtimeEvent::Advisory { message }
             if message == websocket_diagnostic(Code::RateLimited))
         );
     }
@@ -1865,7 +1888,7 @@ mod tests {
         let events: Vec<_> = event_rx.try_iter().collect();
         assert!(matches!(events.as_slice(), [
             OpenAiRealtimeEvent::Connected,
-            OpenAiRealtimeEvent::Error { message },
+            OpenAiRealtimeEvent::Advisory { message },
             OpenAiRealtimeEvent::Disconnected,
             ..,
         ] if *message == websocket_diagnostic(Code::Timeout)));
@@ -1877,7 +1900,8 @@ mod tests {
                 _ => None,
             },
             |event| match event {
-                OpenAiRealtimeEvent::Error { message } => Some(message),
+                OpenAiRealtimeEvent::Error { message }
+                | OpenAiRealtimeEvent::Advisory { message } => Some(message),
                 _ => None,
             },
         );
@@ -1987,9 +2011,13 @@ mod tests {
                         events.as_slice(),
                         [
                             OpenAiRealtimeEvent::Connected,
-                            OpenAiRealtimeEvent::Error { message: expiry },
+                            OpenAiRealtimeEvent::Advisory { message: expiry },
                             OpenAiRealtimeEvent::Disconnected,
-                            OpenAiRealtimeEvent::Reconnecting { attempt: 1, .. },
+                            OpenAiRealtimeEvent::Reconnecting {
+                                attempt: 1,
+                                reason: AsrReconnectReason::SessionRollover,
+                                ..
+                            },
                             OpenAiRealtimeEvent::Error { message },
                         ] if *expiry == websocket_diagnostic(Code::Timeout) && *message == terminal
                     ),
@@ -2084,7 +2112,8 @@ mod tests {
             let errors: Vec<_> = events
                 .iter()
                 .filter_map(|event| match event {
-                    OpenAiRealtimeEvent::Error { message } => Some(message),
+                    OpenAiRealtimeEvent::Error { message }
+                    | OpenAiRealtimeEvent::Advisory { message } => Some(message),
                     _ => None,
                 })
                 .collect();
@@ -2281,7 +2310,7 @@ mod tests {
                     _ => panic!("expected a peer close or IO failure"),
                 };
                 let events = collect_io_errors(event_rx, |event| {
-                    let OpenAiRealtimeEvent::Error { message } = event else {
+                    let OpenAiRealtimeEvent::Advisory { message } = event else {
                         panic!("expected only provider error events");
                     };
                     message
@@ -2358,7 +2387,7 @@ mod tests {
         );
 
         match rx.recv().expect("error event") {
-            OpenAiRealtimeEvent::Error { message } => {
+            OpenAiRealtimeEvent::Advisory { message } => {
                 for leaked in [
                     api_key,
                     "bad key",
@@ -2759,7 +2788,7 @@ mod tests {
             &mut acc,
         );
         match rx.try_recv().unwrap() {
-            OpenAiRealtimeEvent::Error { message } => {
+            OpenAiRealtimeEvent::Advisory { message } => {
                 assert_eq!(message, websocket_diagnostic(Code::RateLimited));
             }
             other => panic!("Expected Error, got {other:?}"),
@@ -2780,7 +2809,7 @@ mod tests {
             &mut acc,
         );
         match rx.try_recv().unwrap() {
-            OpenAiRealtimeEvent::Error { message } => {
+            OpenAiRealtimeEvent::Advisory { message } => {
                 assert_eq!(message, websocket_diagnostic(Code::Internal));
             }
             other => panic!("Expected Error, got {other:?}"),
@@ -2793,7 +2822,7 @@ mod tests {
         let mut acc = HashMap::new();
         handle_server_message("not json", &tx, &mut acc);
         match rx.try_recv().unwrap() {
-            OpenAiRealtimeEvent::Error { message } => {
+            OpenAiRealtimeEvent::Advisory { message } => {
                 assert_eq!(message, websocket_diagnostic(Code::InvalidResponse));
             }
             other => panic!("Expected Error, got {other:?}"),
@@ -2886,6 +2915,7 @@ mod tests {
             OpenAiRealtimeEvent::Reconnecting {
                 attempt: 2,
                 backoff_secs: 2,
+                reason: AsrReconnectReason::ConnectionLost,
             },
             OpenAiRealtimeEvent::Reconnected,
         ];
@@ -3323,6 +3353,7 @@ mod tests {
             OpenAiRealtimeEvent::Reconnecting {
                 attempt,
                 backoff_secs,
+                ..
             } => {
                 assert_eq!(attempt, 1);
                 assert_eq!(backoff_secs, 1);
@@ -3336,7 +3367,7 @@ mod tests {
         );
 
         match recv_event(&event_rx, Duration::from_secs(2)).await {
-            OpenAiRealtimeEvent::Error { message } => {
+            OpenAiRealtimeEvent::Advisory { message } => {
                 assert_eq!(message, websocket_diagnostic(Code::NetworkUnreachable));
             }
             other => panic!("expected reconnect failure error, got {other:?}"),
@@ -3345,6 +3376,7 @@ mod tests {
             OpenAiRealtimeEvent::Reconnecting {
                 attempt,
                 backoff_secs,
+                ..
             } => {
                 assert_eq!(attempt, 2);
                 assert_eq!(backoff_secs, 2);
@@ -3498,6 +3530,7 @@ mod tests {
             OpenAiRealtimeEvent::Reconnecting {
                 attempt,
                 backoff_secs,
+                ..
             } => {
                 assert_eq!(attempt, 1);
                 assert_eq!(backoff_secs, 1);

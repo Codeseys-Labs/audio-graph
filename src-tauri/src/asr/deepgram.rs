@@ -23,7 +23,7 @@
 //! a `crossbeam_channel` that the speech processor consumes.
 
 use super::{
-    AsrSessionStop, AsrStopReason, BuiltInCredentialSetId, asr_diagnostic,
+    AsrReconnectReason, AsrSessionStop, AsrStopReason, BuiltInCredentialSetId, asr_diagnostic,
     is_terminal_reconnect_error, required_api_key, websocket_close, websocket_diagnostic,
     websocket_error, websocket_upgrade_error, websocket_write_error,
 };
@@ -70,9 +70,12 @@ pub enum DeepgramEvent {
         duration: f64,
         words: Vec<DeepgramWord>,
     },
-    /// A non-fatal error occurred.
+    /// The session ended with a terminal diagnostic.
     #[serde(rename = "error")]
     Error { message: RuntimeDiagnostic },
+    /// A diagnostic that leaves streaming or reconnecting active.
+    #[serde(rename = "advisory")]
+    Advisory { message: RuntimeDiagnostic },
     /// The connection has been established.
     #[serde(rename = "connected")]
     Connected,
@@ -84,7 +87,11 @@ pub enum DeepgramEvent {
     /// Emitted at the start of each reconnect attempt. `attempt` is 1-based:
     /// attempt 1 is the first retry after the initial loss.
     #[serde(rename = "reconnecting")]
-    Reconnecting { attempt: u32, backoff_secs: u64 },
+    Reconnecting {
+        attempt: u32,
+        backoff_secs: u64,
+        reason: AsrReconnectReason,
+    },
     /// The client successfully re-established the WebSocket after a disconnect.
     #[serde(rename = "reconnected")]
     Reconnected,
@@ -1293,6 +1300,14 @@ async fn session_task_with_backoff(
                 }
 
                 let mut last_open_error = None;
+                let initial_reason = match &disconnect {
+                    DisconnectKind::ServerClose(diagnostic)
+                    | DisconnectKind::NetworkError(diagnostic)
+                    | DisconnectKind::ProtocolError(diagnostic) => {
+                        AsrReconnectReason::from_diagnostic(diagnostic)
+                    }
+                    _ => AsrReconnectReason::ConnectionLost,
+                };
                 let reconnected = loop {
                     match stop_signal.reason() {
                         Some(AsrStopReason::UserRequested) => break false,
@@ -1330,6 +1345,9 @@ async fn session_task_with_backoff(
                     let _ = event_tx.send(DeepgramEvent::Reconnecting {
                         attempt,
                         backoff_secs: backoff,
+                        reason: last_open_error
+                            .as_ref()
+                            .map_or(initial_reason, AsrReconnectReason::from_diagnostic),
                     });
 
                     stop_signal
@@ -1366,7 +1384,7 @@ async fn session_task_with_backoff(
                                 break false;
                             }
                             last_open_error = Some(diag.clone());
-                            let _ = event_tx.send(DeepgramEvent::Error { message: diag });
+                            let _ = event_tx.send(DeepgramEvent::Advisory { message: diag });
                         }
                     }
                 };
@@ -1690,7 +1708,7 @@ fn process_server_message(
         Err(_) => {
             let message = websocket_diagnostic(Code::InvalidResponse);
             log::warn!("Deepgram: {message}");
-            let _ = tx.send(DeepgramEvent::Error { message });
+            let _ = tx.send(DeepgramEvent::Advisory { message });
             return None;
         }
     };
@@ -1708,7 +1726,7 @@ fn process_server_message(
         if is_terminal_reconnect_error(&message) {
             return Some(message);
         }
-        let _ = tx.send(DeepgramEvent::Error { message });
+        let _ = tx.send(DeepgramEvent::Advisory { message });
         return None;
     }
 
@@ -2387,7 +2405,7 @@ mod tests {
                     _ => panic!("expected a peer close or IO failure"),
                 };
                 let events = collect_io_errors(event_rx, |event| {
-                    let DeepgramEvent::Error { message } = event else {
+                    let DeepgramEvent::Advisory { message } = event else {
                         panic!("expected only provider error events");
                     };
                     message
@@ -3276,6 +3294,7 @@ mod tests {
             DeepgramEvent::Reconnecting {
                 attempt: 2,
                 backoff_secs: 2,
+                reason: AsrReconnectReason::ConnectionLost,
             },
             DeepgramEvent::Reconnected,
             DeepgramEvent::Turn {
@@ -4332,6 +4351,7 @@ mod tests {
             DeepgramEvent::Reconnecting {
                 attempt,
                 backoff_secs,
+                ..
             } => {
                 assert_eq!(attempt, 1);
                 assert_eq!(backoff_secs, 1);
@@ -4425,7 +4445,9 @@ mod tests {
             let errors: Vec<_> = events
                 .iter()
                 .filter_map(|event| match event {
-                    DeepgramEvent::Error { message } => Some(message),
+                    DeepgramEvent::Error { message } | DeepgramEvent::Advisory { message } => {
+                        Some(message)
+                    }
                     _ => None,
                 })
                 .collect();
@@ -4578,7 +4600,9 @@ mod tests {
                 _ => None,
             },
             |event| match event {
-                DeepgramEvent::Error { message } => Some(message),
+                DeepgramEvent::Error { message } | DeepgramEvent::Advisory { message } => {
+                    Some(message)
+                }
                 _ => None,
             },
         );
@@ -4665,6 +4689,7 @@ mod tests {
             DeepgramEvent::Reconnecting {
                 attempt,
                 backoff_secs,
+                ..
             } => {
                 assert_eq!(attempt, 1);
                 assert_eq!(backoff_secs, 1);

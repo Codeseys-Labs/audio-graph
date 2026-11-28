@@ -27,10 +27,10 @@ use crate::settings::AwsCredentialSource;
 use crate::state::TranscriptSegment;
 use std::time::Duration;
 
-use super::ProviderContentEgressPolicy;
 #[cfg(test)]
 use super::reconnect::backoff_for_attempt;
 use super::reconnect::{ReconnectStep, next_reconnect_step};
+use super::{AsrReconnectReason, ProviderContentEgressPolicy};
 
 const EXPLICIT_POLICY_REQUIRED: &str = "explicit_policy_required";
 
@@ -274,6 +274,10 @@ fn service_failure_diagnostic(failure: AwsServiceFailure) -> TranscribeFailure {
             RuntimeSafeRecoveryAction::Retry,
             Some(RuntimeStatusClass::ServerError),
         ),
+        // AWS assigns the same exception to concurrent-stream quota, rapid
+        // stream scaling, and maximum duration at open and in the result
+        // stream. The SDK exposes no structured discriminator.
+        // https://docs.aws.amazon.com/transcribe/latest/dg/streaming.html
         AwsServiceFailure::LimitExceeded => sdk_runtime_diagnostic(
             RuntimeErrorCode::CapacityExhausted,
             true,
@@ -470,7 +474,11 @@ fn final_segments_from_result(
 pub enum AwsTranscribeStatus {
     /// A recoverable drop was detected; a reconnect is scheduled after
     /// `backoff_secs` (1-based `attempt` on the shared ladder).
-    Reconnecting { attempt: u32, backoff_secs: u64 },
+    Reconnecting {
+        attempt: u32,
+        backoff_secs: u64,
+        reason: AsrReconnectReason,
+    },
     /// The stream was successfully re-established.
     Reconnected,
 }
@@ -482,9 +490,11 @@ enum DriveOutcome {
     UserStopped,
     /// The result stream ended cleanly (server finalized after input close).
     Completed,
-    /// A recoverable transport error (dispatch/timeout/response) or an
-    /// unexpected server close while still transcribing — reconnect.
-    Recoverable(TranscribeFailure),
+    /// A recoverable failure or a result stream that ended during capture.
+    Recoverable {
+        diagnostic: TranscribeFailure,
+        reason: AsrReconnectReason,
+    },
     /// A non-recoverable error (service/construction) — surface and stop.
     Unrecoverable(TranscribeFailure),
 }
@@ -500,12 +510,71 @@ enum LadderStep {
     GiveUp,
 }
 
-/// Whether a `DriveOutcome` warrants a reconnect attempt. Recoverable outcomes
-/// retry on the ladder; user-stop, clean completion, and unrecoverable errors
-/// do not (M1 / audio-graph-35de). Pure so the retry policy is unit-testable
-/// without a live AWS stream.
-fn should_reconnect(outcome: &DriveOutcome) -> bool {
-    matches!(outcome, DriveOutcome::Recoverable(_))
+impl DriveOutcome {
+    fn recoverable(diagnostic: TranscribeFailure) -> Self {
+        Self::Recoverable {
+            reason: AsrReconnectReason::from_diagnostic(&diagnostic.diagnostic),
+            diagnostic,
+        }
+    }
+
+    fn session_rollover(diagnostic: TranscribeFailure) -> Self {
+        Self::Recoverable {
+            diagnostic,
+            reason: AsrReconnectReason::SessionRollover,
+        }
+    }
+}
+
+fn is_capacity_limit(failure: &TranscribeFailure) -> bool {
+    matches!(&failure.diagnostic, RuntimeDiagnostic::Runtime(error)
+        if error.code == RuntimeErrorCode::CapacityExhausted)
+}
+
+fn stream_open_failure<R>(
+    error: &transcribe::error::SdkError<StartStreamTranscriptionError, R>,
+    connected_once: bool,
+) -> DriveOutcome {
+    let diagnostic = start_stream_sdk_diagnostic(error);
+    if connected_once && (is_capacity_limit(&diagnostic) || is_recoverable_sdk_error(error)) {
+        DriveOutcome::recoverable(diagnostic)
+    } else {
+        DriveOutcome::Unrecoverable(diagnostic)
+    }
+}
+
+fn stream_result_failure<R>(
+    error: &transcribe::error::SdkError<TranscriptResultStreamError, R>,
+    healthy_for: Duration,
+) -> DriveOutcome {
+    let diagnostic = transcript_stream_sdk_diagnostic(error);
+    if is_capacity_limit(&diagnostic) {
+        // AWS uses one exception for quota, rapid scaling, and session length.
+        // A limit after the healthy window suggests rollover. The SDK cannot
+        // confirm that inference. Failed reopens and short streams still
+        // climb the bounded reconnect ladder.
+        if should_reset_reconnect_budget(healthy_for) {
+            return DriveOutcome::session_rollover(diagnostic);
+        }
+        DriveOutcome::recoverable(diagnostic)
+    } else if is_recoverable_sdk_error(error) {
+        DriveOutcome::recoverable(diagnostic)
+    } else {
+        DriveOutcome::Unrecoverable(diagnostic)
+    }
+}
+
+fn stream_result_ended(is_transcribing: bool) -> DriveOutcome {
+    if is_transcribing {
+        DriveOutcome::session_rollover(sdk_runtime_diagnostic(
+            RuntimeErrorCode::ProviderUnavailable,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+            None,
+        ))
+    } else {
+        DriveOutcome::Completed
+    }
 }
 
 /// Parse a configured AWS language code, warning + falling back to `en-US` on an
@@ -717,10 +786,12 @@ fn spawn_audio_forwarder(
 /// Advance the shared reconnect ladder by one step: emit `Reconnecting`, then
 /// sleep the backoff in 100ms increments so an `is_transcribing` clear cancels
 /// promptly (matching the WebSocket siblings' cancellation semantics).
-async fn advance_reconnect_ladder(
+async fn advance_reconnect_ladder<F: Future<Output = ()>>(
     reconnect_attempts: &mut u32,
     is_transcribing: &Arc<AtomicBool>,
+    reason: AsrReconnectReason,
     on_status: &mut impl FnMut(AwsTranscribeStatus),
+    sleep: impl Fn(Duration) -> F,
 ) -> LadderStep {
     match next_reconnect_step(*reconnect_attempts) {
         ReconnectStep::Retry {
@@ -731,6 +802,7 @@ async fn advance_reconnect_ladder(
             on_status(AwsTranscribeStatus::Reconnecting {
                 attempt,
                 backoff_secs,
+                reason,
             });
             log::info!("AWS Transcribe: reconnecting (attempt {attempt}, backoff {backoff_secs}s)");
 
@@ -742,7 +814,7 @@ async fn advance_reconnect_ladder(
                     return LadderStep::Cancelled;
                 }
                 let step = Duration::from_millis(100).min(total - slept);
-                tokio::time::sleep(step).await;
+                sleep(step).await;
                 slept += step;
             }
 
@@ -752,6 +824,43 @@ async fn advance_reconnect_ladder(
             LadderStep::Continue
         }
         ReconnectStep::GiveUp { .. } => LadderStep::GiveUp,
+    }
+}
+
+async fn retry_stream<F: Future<Output = ()>>(
+    outcome: DriveOutcome,
+    healthy_for: Duration,
+    reconnect_attempts: &mut u32,
+    is_transcribing: &Arc<AtomicBool>,
+    on_status: &mut impl FnMut(AwsTranscribeStatus),
+    sleep: impl Fn(Duration) -> F,
+) -> Result<bool, TranscribeFailure> {
+    let (diagnostic, reason) = match outcome {
+        DriveOutcome::UserStopped | DriveOutcome::Completed => return Ok(false),
+        DriveOutcome::Unrecoverable(diagnostic) => return Err(diagnostic),
+        DriveOutcome::Recoverable { diagnostic, reason } => (diagnostic, reason),
+    };
+    if !is_transcribing.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    // Reset only after sustained health. An accepted stream that immediately
+    // fails must keep climbing toward the end of the ladder.
+    if should_reset_reconnect_budget(healthy_for) {
+        *reconnect_attempts = 0;
+    }
+    log::debug!("AWS Transcribe: reconnect reason={reason:?} diagnostic={diagnostic}");
+    match advance_reconnect_ladder(
+        reconnect_attempts,
+        is_transcribing,
+        reason,
+        on_status,
+        sleep,
+    )
+    .await
+    {
+        LadderStep::Continue => Ok(true),
+        LadderStep::Cancelled => Ok(false),
+        LadderStep::GiveUp => Err(diagnostic),
     }
 }
 
@@ -860,29 +969,20 @@ async fn run_streaming_session(
 
         let mut output = match builder.send().await {
             Ok(output) => output,
-            Err(e) => {
-                let diagnostic = start_stream_sdk_diagnostic(&e);
-                if !connected_once {
-                    // First connect failure surfaces immediately, matching the
-                    // WebSocket siblings' connect() contract.
-                    return Err(diagnostic);
-                }
-                if !is_recoverable_sdk_error(&e) {
-                    log::error!("AWS Transcribe: unrecoverable reconnect open error {diagnostic}");
-                    return Err(diagnostic);
-                }
-                log::warn!("AWS Transcribe: reconnect open failed (recoverable) {diagnostic}");
-                match advance_reconnect_ladder(
+            Err(error) => {
+                if retry_stream(
+                    stream_open_failure(&error, connected_once),
+                    Duration::ZERO,
                     &mut reconnect_attempts,
                     &is_transcribing,
                     &mut on_status,
+                    tokio::time::sleep,
                 )
-                .await
+                .await?
                 {
-                    LadderStep::Continue => continue,
-                    LadderStep::Cancelled => return Ok(()),
-                    LadderStep::GiveUp => return Err(diagnostic),
+                    continue;
                 }
+                return Ok(());
             }
         };
 
@@ -910,36 +1010,23 @@ async fn run_streaming_session(
         );
 
         // ---- DRIVE the connected stream ----
-        let outcome = loop {
+        let (outcome, healthy_for) = loop {
             let event = match output.transcript_result_stream.recv().await {
                 Ok(Some(event)) => event,
                 Ok(None) => {
-                    // Stream ended: a clean stop if the user already cleared
-                    // `is_transcribing`, otherwise an unexpected server close
-                    // (idle/duration limit) that warrants re-establishment.
-                    break if is_transcribing.load(Ordering::Relaxed) {
-                        DriveOutcome::Recoverable(sdk_runtime_diagnostic(
-                            RuntimeErrorCode::ProviderUnavailable,
-                            true,
-                            RuntimeSafeRecoveryAction::Retry,
-                            None,
-                        ))
-                    } else {
-                        DriveOutcome::Completed
-                    };
+                    break (
+                        stream_result_ended(is_transcribing.load(Ordering::Relaxed)),
+                        stream_established_at.elapsed(),
+                    );
                 }
-                Err(e) => {
-                    let diagnostic = transcript_stream_sdk_diagnostic(&e);
-                    break if is_recoverable_sdk_error(&e) {
-                        DriveOutcome::Recoverable(diagnostic)
-                    } else {
-                        DriveOutcome::Unrecoverable(diagnostic)
-                    };
+                Err(error) => {
+                    let healthy_for = stream_established_at.elapsed();
+                    break (stream_result_failure(&error, healthy_for), healthy_for);
                 }
             };
 
             if !is_transcribing.load(Ordering::Relaxed) {
-                break DriveOutcome::UserStopped;
+                break (DriveOutcome::UserStopped, Duration::ZERO);
             }
 
             if let transcribe::types::TranscriptResultStream::TranscriptEvent(ev) = event
@@ -975,49 +1062,17 @@ async fn run_streaming_session(
         drop(output);
         forwarder.join().await;
 
-        if !should_reconnect(&outcome) {
-            return match outcome {
-                DriveOutcome::UserStopped | DriveOutcome::Completed => {
-                    log::info!("AWS Transcribe: streaming session ended ({outcome:?})");
-                    Ok(())
-                }
-                DriveOutcome::Unrecoverable(diagnostic) => {
-                    log::error!("AWS Transcribe: unrecoverable stream error {diagnostic}");
-                    Err(diagnostic)
-                }
-                DriveOutcome::Recoverable(_) => unreachable!("guarded by should_reconnect"),
-            };
-        }
-
-        if !is_transcribing.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        let reconnect_diagnostic = match &outcome {
-            DriveOutcome::Recoverable(diagnostic) => diagnostic.clone(),
-            _ => unreachable!("reconnect path requires a recoverable outcome"),
-        };
-        log::warn!("AWS Transcribe: recoverable stream error, reconnecting {reconnect_diagnostic}");
-
-        // Earn a fresh reconnect budget only after sustained health. An
-        // accept-then-immediate-drop keeps climbing the ladder toward the
-        // documented 1/2/5/10 give-up instead of looping at attempt 1.
-        let healthy_for = stream_established_at.elapsed();
-        if should_reset_reconnect_budget(healthy_for) {
-            reconnect_attempts = 0;
-        } else {
-            log::warn!(
-                "AWS Transcribe: stream dropped after {}s (< {HEALTHY_STREAM_RESET_SECS}s healthy threshold); keeping reconnect budget at attempt {reconnect_attempts}",
-                healthy_for.as_secs()
-            );
-        }
-
-        match advance_reconnect_ladder(&mut reconnect_attempts, &is_transcribing, &mut on_status)
-            .await
+        if !retry_stream(
+            outcome,
+            healthy_for,
+            &mut reconnect_attempts,
+            &is_transcribing,
+            &mut on_status,
+            tokio::time::sleep,
+        )
+        .await?
         {
-            LadderStep::Continue => continue,
-            LadderStep::Cancelled => return Ok(()),
-            LadderStep::GiveUp => return Err(reconnect_diagnostic),
+            return Ok(());
         }
     }
 }
@@ -1029,6 +1084,137 @@ mod tests {
     use aws_sdk_transcribestreaming::types::Item;
     use crossbeam_channel::unbounded;
     use std::time::Duration;
+
+    fn limit() -> transcribe::types::error::LimitExceededException {
+        transcribe::types::error::LimitExceededException::builder()
+            .message("private limit note")
+            .build()
+    }
+
+    fn assert_capacity_limit(failure: TranscribeFailure) {
+        assert!(matches!(
+            &failure.diagnostic,
+            RuntimeDiagnostic::Runtime(error) if error.code == RuntimeErrorCode::CapacityExhausted
+                && error.retryable
+                && error.recovery_action == RuntimeSafeRecoveryAction::RetryAfterDelay
+        ));
+        assert!(!format!("{failure:?} {failure}").contains("private limit note"));
+    }
+
+    #[tokio::test]
+    async fn initial_stream_limit_surfaces_capacity_without_reconnecting() {
+        let error = transcribe::error::SdkError::service_error(
+            StartStreamTranscriptionError::LimitExceededException(limit()),
+            (),
+        );
+        let mut attempts = 0;
+        let failure = retry_stream(
+            stream_open_failure(&error, false),
+            Duration::ZERO,
+            &mut attempts,
+            &Arc::new(AtomicBool::new(true)),
+            &mut |_| panic!("first connect failure must not enter the ladder"),
+            |_| std::future::ready(()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 0);
+        assert_capacity_limit(failure);
+    }
+
+    #[tokio::test]
+    async fn short_stream_limit_retries_reopens_until_capacity_is_reported() {
+        let stream = transcribe::error::SdkError::service_error(
+            TranscriptResultStreamError::LimitExceededException(limit()),
+            (),
+        );
+        let open = transcribe::error::SdkError::service_error(
+            StartStreamTranscriptionError::LimitExceededException(limit()),
+            (),
+        );
+        let active = Arc::new(AtomicBool::new(true));
+        let short = Duration::from_secs(HEALTHY_STREAM_RESET_SECS) - Duration::from_millis(1);
+        let mut attempts = 0;
+        let mut statuses = Vec::new();
+        let mut outcome = stream_result_failure(&stream, short);
+        for _ in DEFAULT_BACKOFF_SECONDS {
+            assert!(
+                retry_stream(
+                    outcome,
+                    short,
+                    &mut attempts,
+                    &active,
+                    &mut |s| statuses.push(s),
+                    |_| std::future::ready(())
+                )
+                .await
+                .unwrap()
+            );
+            outcome = stream_open_failure(&open, true);
+        }
+        let failure = retry_stream(
+            outcome,
+            Duration::ZERO,
+            &mut attempts,
+            &active,
+            &mut |_| panic!("no notification after the budget was spent"),
+            |_| std::future::ready(()),
+        )
+        .await
+        .unwrap_err();
+        assert_capacity_limit(failure);
+        let expected: Vec<_> = DEFAULT_BACKOFF_SECONDS
+            .iter()
+            .enumerate()
+            .map(|(index, &backoff_secs)| AwsTranscribeStatus::Reconnecting {
+                attempt: (index + 1) as u32,
+                backoff_secs,
+                reason: AsrReconnectReason::ProviderRetryLater,
+            })
+            .collect();
+        assert_eq!(statuses, expected);
+    }
+
+    #[tokio::test]
+    async fn healthy_stream_limit_and_clean_end_schedule_a_rollover() {
+        let error = transcribe::error::SdkError::service_error(
+            TranscriptResultStreamError::LimitExceededException(limit()),
+            (),
+        );
+        let healthy = Duration::from_secs(HEALTHY_STREAM_RESET_SECS);
+        for outcome in [
+            stream_result_failure(&error, healthy),
+            stream_result_ended(true),
+        ] {
+            let mut attempts = 3;
+            let mut statuses = Vec::new();
+            assert!(
+                retry_stream(
+                    outcome,
+                    healthy,
+                    &mut attempts,
+                    &Arc::new(AtomicBool::new(true)),
+                    &mut |s| statuses.push(s),
+                    |_| std::future::ready(()),
+                )
+                .await
+                .unwrap()
+            );
+            assert_eq!(attempts, 1);
+            assert_eq!(
+                statuses,
+                [AwsTranscribeStatus::Reconnecting {
+                    attempt: 1,
+                    backoff_secs: 1,
+                    reason: AsrReconnectReason::SessionRollover,
+                }]
+            );
+        }
+        assert!(matches!(
+            stream_result_ended(false),
+            DriveOutcome::Completed
+        ));
+    }
 
     fn alt(text: &str, confidence: f64, speaker: Option<&str>) -> Alternative {
         let mut item = Item::builder().confidence(confidence);
@@ -1745,18 +1931,26 @@ mod tests {
         assert!(!is_recoverable_error_kind("unknown"));
     }
 
-    #[test]
-    fn should_reconnect_only_on_recoverable_outcome() {
-        // Only the recoverable transport outcome retries; user-stop, clean
-        // completion, and unrecoverable errors end the session.
-        assert!(should_reconnect(&DriveOutcome::Recoverable(
-            unknown_sdk_diagnostic()
-        )));
-        assert!(!should_reconnect(&DriveOutcome::UserStopped));
-        assert!(!should_reconnect(&DriveOutcome::Completed));
-        assert!(!should_reconnect(&DriveOutcome::Unrecoverable(
-            unknown_sdk_diagnostic()
-        )));
+    #[tokio::test]
+    async fn stopped_stream_does_not_reconnect() {
+        let mut attempts = 0;
+        let active = Arc::new(AtomicBool::new(true));
+        let mut on_status = |_| panic!("stop must not enter the ladder");
+        for outcome in [DriveOutcome::UserStopped, DriveOutcome::Completed] {
+            assert!(
+                !retry_stream(
+                    outcome,
+                    Duration::ZERO,
+                    &mut attempts,
+                    &active,
+                    &mut on_status,
+                    |_| std::future::ready(()),
+                )
+                .await
+                .unwrap()
+            );
+        }
+        assert_eq!(attempts, 0);
     }
 
     #[test]
@@ -1813,9 +2007,14 @@ mod tests {
         let mut attempts: u32 = 0;
         let mut statuses = Vec::new();
 
-        let step =
-            advance_reconnect_ladder(&mut attempts, &is_transcribing, &mut |s| statuses.push(s))
-                .await;
+        let step = advance_reconnect_ladder(
+            &mut attempts,
+            &is_transcribing,
+            AsrReconnectReason::ConnectionLost,
+            &mut |s| statuses.push(s),
+            tokio::time::sleep,
+        )
+        .await;
 
         assert!(matches!(step, LadderStep::Continue));
         assert_eq!(attempts, 1);
@@ -1823,7 +2022,8 @@ mod tests {
             statuses,
             vec![AwsTranscribeStatus::Reconnecting {
                 attempt: 1,
-                backoff_secs: 1
+                backoff_secs: 1,
+                reason: AsrReconnectReason::ConnectionLost,
             }]
         );
     }
@@ -1836,9 +2036,14 @@ mod tests {
 
         // With `is_transcribing` already cleared, the very first backoff poll
         // must cancel rather than sleep out the full ladder step.
-        let step =
-            advance_reconnect_ladder(&mut attempts, &is_transcribing, &mut |s| statuses.push(s))
-                .await;
+        let step = advance_reconnect_ladder(
+            &mut attempts,
+            &is_transcribing,
+            AsrReconnectReason::ConnectionLost,
+            &mut |s| statuses.push(s),
+            tokio::time::sleep,
+        )
+        .await;
 
         assert!(matches!(step, LadderStep::Cancelled));
         // The Reconnecting notification still fired before the cancel.
@@ -1854,9 +2059,14 @@ mod tests {
         let mut attempts: u32 = budget;
         let mut statuses = Vec::new();
 
-        let step =
-            advance_reconnect_ladder(&mut attempts, &is_transcribing, &mut |s| statuses.push(s))
-                .await;
+        let step = advance_reconnect_ladder(
+            &mut attempts,
+            &is_transcribing,
+            AsrReconnectReason::ConnectionLost,
+            &mut |s| statuses.push(s),
+            tokio::time::sleep,
+        )
+        .await;
 
         assert!(matches!(step, LadderStep::GiveUp));
         // No Reconnecting emitted once the schedule is exhausted.

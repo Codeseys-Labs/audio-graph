@@ -1465,6 +1465,17 @@
     "statusCredentialRejected": "The provider rejected the credential.",
     "statusCredentialExpired": "The provider credential expired.",
     "statusReconnecting": "Reconnecting to the provider.",
+    "reconnectReason": {
+      "session_rollover": "Starting a new streaming session.",
+      "connection_lost": "The streaming connection was interrupted.",
+      "provider_retry_later": "The provider asked us to wait before retrying."
+    },
+    "reconnectDelay": {
+      "immediate": "Retrying now.",
+      "short": "Retrying in a few seconds.",
+      "medium": "Retrying within half a minute.",
+      "long": "Retrying after a longer delay."
+    },
     "statusDegraded": "Degraded: {{reason}}",
     "diarizationDegradedReason": {
       "engine_not_compiled": "Speaker detection is running in basic mode — this build doesn't include the neural diarization engine.",

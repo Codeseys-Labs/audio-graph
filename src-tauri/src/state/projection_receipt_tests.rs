@@ -8,7 +8,10 @@ struct ReceiptFixture {
 impl ReceiptFixture {
     const SESSION: &'static str = "orchard";
     fn new() -> Self {
-        let dir = unique_tempdir("projection-receipt");
+        Self::new_in(unique_tempdir("projection-receipt"))
+    }
+
+    fn new_in(dir: std::path::PathBuf) -> Self {
         let repo = Arc::new(FileMemoryRepository::with_data_root(&dir));
         let runtime = ProjectionRuntimeHandle::in_memory_for_tests(Self::SESSION);
         let event = projection_transcript_event("stem", 1, "branch");
@@ -349,6 +352,38 @@ fn observe_projection_cache_memory(
 }
 
 #[cfg(not(debug_assertions))]
+fn profile_projection_apply(
+    f: &ReceiptFixture,
+    patch: ProjectionPatch,
+) -> crate::persistence::projection_profile::Sample {
+    use crate::persistence::projection_profile;
+    let (send, result) = std::sync::mpsc::channel();
+    let observe = move |save: &mut dyn FnMut() -> Result<(), String>| {
+        let start = std::time::Instant::now();
+        let saved = save();
+        let mut sample = projection_profile::sample();
+        sample.snapshot = start.elapsed();
+        send.send(sample).unwrap();
+        saved
+    };
+    let observe_graph = observe.clone();
+    let notes = f.repo.clone();
+    let graph = f.repo.clone();
+    let receipt = f
+        .runtime
+        .apply_runtime_projection_patch_with_savers(
+            ReceiptFixture::SESSION,
+            &f.basis,
+            patch,
+            move |id, lane| observe(&mut || notes.save_materialized_notes(id, lane)),
+            move |id, lane| observe_graph(&mut || graph.save_materialized_graph(id, lane)),
+        )
+        .unwrap();
+    assert!(receipt.materialized_snapshot_saved);
+    result.try_recv().unwrap()
+}
+
+#[cfg(not(debug_assertions))]
 #[test]
 #[ignore = "explicit release measurement of projection apply and cache save"]
 fn release_projection_receipt_latency() {
@@ -360,8 +395,12 @@ fn release_projection_receipt_latency() {
         measure_projection_cache_memory(root.into(), depth);
         return;
     }
-    let vary_history = std::env::var("AUDIOGRAPH_PROJECTION_HISTORY_MATRIX").as_deref() == Ok("1");
-    let cells: &[(usize, usize)] = if vary_history {
+    let profile = std::env::var("AUDIOGRAPH_PROJECTION_LOCK_PROFILE").as_deref() == Ok("1");
+    let vary_history =
+        profile || std::env::var("AUDIOGRAPH_PROJECTION_HISTORY_MATRIX").as_deref() == Ok("1");
+    let cells: &[(usize, usize)] = if profile {
+        &[(10_000, 10_000)]
+    } else if vary_history {
         &[(10_000, 0), (10_000, 1_000), (10_000, 10_000)]
     } else if std::env::var("AUDIOGRAPH_PROJECTION_LATENCY_10K_ONLY").as_deref() == Ok("1") {
         &[(10_000, 0)]
@@ -485,57 +524,84 @@ fn release_projection_receipt_latency() {
             f.apply_patch(runtime_graph_patch(first_sequence, f.basis.clone()))
                 .unwrap();
         }
-        for kind in [ProjectionKind::Notes, ProjectionKind::Graph] {
-            let mut sequence = first_sequence;
-            for changing in [false, true] {
-                let mut samples = Vec::new();
-                let mut starts = snapshot();
-                for i in 0..52 {
-                    if changing {
-                        let mut row =
-                            projection_transcript_event(&format!("later-{done}"), 1, "reed");
-                        row.start_time = done as f64;
-                        row.end_time = row.start_time + 1.;
-                        storage.commit_after(&row, Some(done as u64)).unwrap();
-                        let mut ledger = f.runtime.transcript_ledger.lock().unwrap();
-                        index.apply(&mut ledger, row).unwrap();
-                        f.basis = ledger.current_basis();
-                        done += 1;
-                    }
-                    sequence += 1;
-                    let patch = match kind {
-                        ProjectionKind::Notes => {
-                            runtime_note_patch(sequence, f.basis.clone(), "leaf", "green")
-                        }
-                        ProjectionKind::Graph => runtime_graph_patch(sequence, f.basis.clone()),
-                    };
-                    if i == 2 {
-                        starts = snapshot();
-                    }
-                    let start = std::time::Instant::now();
-                    let result = f.apply_patch(patch).unwrap();
-                    let elapsed = start.elapsed().as_micros();
-                    assert!(result.materialized_snapshot_saved);
-                    if i >= 2 {
-                        samples.push(elapsed);
-                    }
+        let mut reader = Some(reader);
+        for with_reader in [true, false] {
+            if !with_reader {
+                if !profile {
+                    break;
                 }
-                let ends = snapshot();
-                let [
-                    transcripts,
-                    transcript_refused,
-                    projections,
-                    projection_refused,
-                ] = std::array::from_fn(|i| ends[i] - starts[i]);
-                samples.sort_unstable();
-                println!(
-                    "projection_latency kind={kind:?} starting_revisions={depth} projection_depth={projection_depth} changing_basis={changing} prep_ms={preparation} samples=50 p50_us={} p95_us={} transcript_completed={transcripts} transcript_refused={transcript_refused} projection_completed={projections} projection_refused={projection_refused}",
-                    samples[24], samples[47]
-                );
+                stop.store(true, Ordering::Release);
+                reader.take().unwrap().join().unwrap();
             }
+            for kind in [ProjectionKind::Notes, ProjectionKind::Graph] {
+                let mut sequence = first_sequence;
+                for changing in [false, true] {
+                    let mut samples = Vec::new();
+                    let mut starts = snapshot();
+                    for i in 0..52 {
+                        if changing {
+                            let mut row =
+                                projection_transcript_event(&format!("later-{done}"), 1, "reed");
+                            row.start_time = done as f64;
+                            row.end_time = row.start_time + 1.;
+                            storage.commit_after(&row, Some(done as u64)).unwrap();
+                            let mut ledger = f.runtime.transcript_ledger.lock().unwrap();
+                            index.apply(&mut ledger, row).unwrap();
+                            f.basis = ledger.current_basis();
+                            done += 1;
+                        }
+                        sequence += 1;
+                        let patch = match kind {
+                            ProjectionKind::Notes => {
+                                runtime_note_patch(sequence, f.basis.clone(), "leaf", "green")
+                            }
+                            ProjectionKind::Graph => runtime_graph_patch(sequence, f.basis.clone()),
+                        };
+                        if i == 2 {
+                            starts = snapshot();
+                        }
+                        let start = std::time::Instant::now();
+                        let counters = profile_projection_apply(&f, patch);
+                        let elapsed = start.elapsed().as_micros();
+                        if i >= 2 {
+                            samples.push((elapsed, counters));
+                        }
+                    }
+                    let ends = snapshot();
+                    let [
+                        transcripts,
+                        transcript_refused,
+                        projections,
+                        projection_refused,
+                    ] = std::array::from_fn(|i| ends[i] - starts[i]);
+                    samples.sort_unstable_by_key(|(elapsed, _)| *elapsed);
+                    let (p95, at_p95) = &samples[47];
+                    let retries: usize = samples.iter().map(|(_, c)| c.retries).sum();
+                    let contended = samples.iter().filter(|(_, c)| c.retries > 0).count();
+                    println!(
+                        "projection_lock_profile kind={kind:?} moving={changing} reader={with_reader} contended={contended} retries={retries} p95_us={p95} basis_us={} commit_us={} snapshot_us={} shared_wait_us={} exclusive_wait_us={} p95_retries={} intent_publish_us={} frame_write_sync_us={} intent_retire_us={}",
+                        at_p95.basis.as_micros(),
+                        at_p95.commit.as_micros(),
+                        at_p95.snapshot.as_micros(),
+                        at_p95.shared_wait.as_micros(),
+                        at_p95.exclusive_wait.as_micros(),
+                        at_p95.retries,
+                        at_p95.intent_publish.as_micros(),
+                        at_p95.frame_write_sync.as_micros(),
+                        at_p95.intent_retire.as_micros(),
+                    );
+                    println!(
+                        "projection_latency kind={kind:?} starting_revisions={depth} projection_depth={projection_depth} changing_basis={changing} prep_ms={preparation} samples=50 p50_us={} p95_us={} transcript_completed={transcripts} transcript_refused={transcript_refused} projection_completed={projections} projection_refused={projection_refused}",
+                        samples[24].0, p95
+                    );
+                }
+            }
+            first_sequence += 104; // Two runs of 52 patches on each lane.
         }
         stop.store(true, Ordering::Release);
-        reader.join().unwrap();
+        if let Some(reader) = reader {
+            reader.join().unwrap();
+        }
         let [completed, refused, projection_completed, projection_refused] = snapshot();
         println!(
             "projection_reader starting_revisions={depth} projection_depth={projection_depth} transcript_completed={completed} transcript_refused={refused} projection_completed={projection_completed} projection_refused={projection_refused}"
