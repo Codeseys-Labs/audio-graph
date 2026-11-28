@@ -6,6 +6,7 @@
 //! `TranscriptSegment`s.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use audio_graph_ipc_contract::credential_contract::{
@@ -50,6 +51,49 @@ pub mod speechmatics;
 mod transport;
 #[cfg(test)]
 mod ws_fixture;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(u8)]
+enum AsrStopReason {
+    UserRequested = 1,
+    BacklogTimeout = 2,
+}
+
+/// The first stop reason survives caller cleanup after a failed audio send.
+#[derive(Default)]
+struct AsrSessionStop(AtomicU8);
+
+impl AsrSessionStop {
+    fn reason(&self) -> Option<AsrStopReason> {
+        match self.0.load(Ordering::SeqCst) {
+            0 => None,
+            1 => Some(AsrStopReason::UserRequested),
+            2 => Some(AsrStopReason::BacklogTimeout),
+            _ => unreachable!("invalid ASR stop reason"),
+        }
+    }
+
+    fn request(&self, reason: AsrStopReason) {
+        let _ = self
+            .0
+            .compare_exchange(0, reason as u8, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    fn reset(&self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+
+    async fn wait_for_backoff(&self, delay: Duration) {
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        while self.reason().is_none() {
+            tokio::select! {
+                _ = &mut sleep => break,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+    }
+}
 
 /// Convert a structural ASR failure before it can reach an event or log.
 fn websocket_diagnostic(code: RuntimeErrorCode) -> RuntimeDiagnostic {
@@ -144,8 +188,11 @@ fn websocket_upgrade_error(error: &tungstenite::Error, credential_sent: bool) ->
         Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => Code::Timeout,
         Error::Io(_) | Error::ConnectionClosed | Error::AlreadyClosed => Code::NetworkUnreachable,
         // A failed TLS handshake can indicate a certificate or protocol problem.
-        Error::Protocol(_) | Error::Utf8(_) | Error::Tls(_) => Code::ProtocolError,
-        Error::Capacity(_) | Error::WriteBufferFull(_) => Code::CapacityExhausted,
+        Error::Protocol(_) | Error::Utf8(_) | Error::Tls(_) | Error::Capacity(_) => {
+            Code::ProtocolError
+        }
+        // The local writer has no room to queue this frame.
+        Error::WriteBufferFull(_) => Code::Internal,
         Error::Url(_) => Code::RequestRejected,
         _ => Code::Internal,
     };
@@ -173,11 +220,10 @@ fn websocket_close(frame: Option<&CloseFrame>) -> RuntimeDiagnostic {
             | CloseCode::Error
             | CloseCode::Restart,
         ) => Code::ProviderUnavailable,
-        Some(CloseCode::Protocol | CloseCode::Unsupported | CloseCode::Invalid) => {
-            Code::ProtocolError
-        }
+        Some(
+            CloseCode::Protocol | CloseCode::Unsupported | CloseCode::Invalid | CloseCode::Size,
+        ) => Code::ProtocolError,
         Some(CloseCode::Policy) => Code::PolicyBlocked,
-        Some(CloseCode::Size) => Code::CapacityExhausted,
         Some(CloseCode::Again) => Code::RateLimited,
         _ => Code::Internal,
     };
@@ -321,20 +367,24 @@ mod diagnostic_tests {
         pub(super) rejections: tokio::task::JoinHandle<()>,
     }
 
-    pub(super) async fn close_before_readiness(
-        expect_config: bool,
+    pub(super) fn session_clock(step: Duration) -> impl Fn() -> tokio::time::Instant {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let start = tokio::time::Instant::now();
+        let ticks = AtomicU32::new(0);
+        move || start + step * ticks.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(super) async fn close_each_attempt(
+        mut steps: Vec<ws_fixture::ServerStep>,
     ) -> Vec<(
         String,
         tokio::task::JoinHandle<Vec<ws_fixture::ClientFrame>>,
     )> {
+        steps.push(ws_fixture::ServerStep::send_close());
         let mut servers = Vec::new();
         for _ in crate::reconnect::DEFAULT_BACKOFF_SECONDS {
-            let mut steps = Vec::new();
-            if expect_config {
-                steps.push(ws_fixture::ServerStep::expect_any_text());
-            }
-            steps.push(ws_fixture::ServerStep::send_close());
-            servers.push(ws_fixture::spawn_scripted_server(steps).await);
+            servers.push(ws_fixture::spawn_scripted_server(steps.clone()).await);
         }
         servers
     }
@@ -344,13 +394,13 @@ mod diagnostic_tests {
         credential_sent: bool,
     ) -> FreshOutage {
         let budget = crate::reconnect::DEFAULT_BACKOFF_SECONDS.len();
-        let mut statuses = vec![(429, None)];
+        let mut statuses = vec![(503, None), (429, None)];
         statuses.extend(std::iter::repeat_n((503, None), budget - 1));
         statuses.push((408, None));
         let (reject_url, rejections) = reject_upgrades(statuses, credential_sent).await;
         let (recovery_url, recovery) = ws_fixture::spawn_scripted_server(recovery_steps).await;
-        let mut endpoints = vec![reject_url; budget + 2];
-        endpoints[1] = recovery_url;
+        let mut endpoints = vec![reject_url; budget + 3];
+        endpoints[2] = recovery_url;
         FreshOutage {
             endpoints,
             recovery,
@@ -367,7 +417,7 @@ mod diagnostic_tests {
         use RuntimeErrorCode as Code;
         use RuntimeSafeRecoveryAction as Action;
         let (prior, recovered) = events.split_at(events.iter().position(reconnected).unwrap());
-        assert!(prior.iter().filter_map(&attempt).eq([1, 2]));
+        assert!(prior.iter().filter_map(&attempt).eq([1, 2, 3]));
         assert_outcome(
             prior.iter().filter_map(&error).next_back().unwrap(),
             (
@@ -492,16 +542,16 @@ mod diagnostic_tests {
                 Some(wire_prose()),
                 64,
                 Duration::from_secs(10),
-                Code::CapacityExhausted,
-                "failed to send audio: runtime/capacity_exhausted",
+                Code::Internal,
+                "failed to send audio: runtime/internal",
             ),
             (
                 Vec::new(),
                 None,
                 1,
                 Duration::from_millis(5),
-                Code::CapacityExhausted,
-                "failed to send keepalive: runtime/capacity_exhausted",
+                Code::Internal,
+                "failed to send keepalive: runtime/internal",
             ),
         ] {
             let (release, wait) = tokio::sync::oneshot::channel::<()>();
@@ -653,6 +703,11 @@ mod diagnostic_tests {
         let diagnostic = websocket_close(Some(&close));
         assert_diagnostic(&diagnostic, Code::Internal);
         assert!(!format!("{diagnostic:?}").contains("4763"));
+        let size_close = CloseFrame {
+            code: CloseCode::Size,
+            reason: close.reason,
+        };
+        assert_diagnostic(&websocket_close(Some(&size_close)), Code::ProtocolError);
         assert_diagnostic(&websocket_close(None), Code::Internal);
     }
 

@@ -1216,7 +1216,10 @@
     "inputPlaceholder": "Ask about the conversation...",
     "inputLabel": "Ask about the conversation",
     "send": "Send message",
-    "reviewSendBlocked": "Chat is unavailable while reviewing a past session because sending would target the live workspace. Start a new session to chat safely."
+    "reviewSendBlocked": "Chat is unavailable while reviewing a past session because sending would target the live workspace. Start a new session to chat safely.",
+    "failed": "The reply failed.",
+    "partialReply": "Partial reply, not kept in the chat history:",
+    "rateLimitedHint": "Free-tier models may be capped. Switch to another model or add credits, then try again."
   },
   "notes": {
     "title": "Notes",
@@ -1298,6 +1301,7 @@
     "duplicateCount": "×{{count}}",
     "answerFailedGeneric": "The answer failed.",
     "answerRetry": "Retry",
+    "answerPartial": "Partial answer:",
     "answerInterrupted": "Interrupted",
     "answerTruncatedMarker": "…",
     "answerTruncatedHint": "Answer truncated at the length limit",
@@ -1437,6 +1441,13 @@
     "stageCapture": "Capture",
     "stageResample": "Resample",
     "stageAsr": "ASR",
+    "transcriptCrashSafetyUnverified": "Transcript saved. Crash recovery is unverified on this storage.",
+    "transcriptNotSaving": {
+      "confirmation_delayed": "Waiting for confirmation that the transcript was saved",
+      "writer_absent": "Transcript is not being saved",
+      "storage_full": "Transcript is not being saved because storage is full",
+      "write_failed": "Transcript is not being saved because the write failed"
+    },
     "stageDiarization": "Diarization",
     "stageExtraction": "Extraction",
     "stageGraph": "Graph",
@@ -1611,7 +1622,7 @@
       "credential_expired": "The provider credential expired. Refresh it before trying again.",
       "permission_denied": "The provider denied access to this operation. Check your account permissions or plan.",
       "invalid_configuration": "The provider configuration is invalid. Check the model, region, or endpoint in Settings.",
-      "capacity_exhausted": "The provider is at capacity, or your account's quota or balance is used up. Check your plan and balance, or try again later.",
+      "capacity_exhausted": "Your account has reached a quota or concurrency limit, or its balance is depleted. Check your plan and balance, or try again later.",
       "policy_blocked": "The current policy blocks this operation.",
       "unsupported": "The provider does not support this operation.",
       "cancelled": "The operation was cancelled.",
@@ -1665,6 +1676,8 @@
     "handoffDismissLabel": "Dismiss getting-started hint",
     "fallbackTitle": "Let's get you started",
     "fallbackBody": "We couldn't check your saved setup just yet. You can preview a sample session to see how notes and the graph work, try again, or open settings to add a provider.",
+    "credentialSavedCleanupWarning": "Credential saved. An old value in the legacy credential file may override it. Remove the old entry before using this credential.",
+    "legacyFileWarning": "Your system keychain is available. AudioGraph could not read the legacy credential file. {{reason}}",
     "unreadableTitle": "We couldn't read your credentials",
     "unreadableBody": "We couldn't read your credential store just now — it may be temporarily unavailable, or a saved credential file may need attention. Retry first in case it's temporary. If you've saved keys before, they may still be recoverable, so open settings to review them before re-entering.",
     "fallbackPreviewSample": "Preview sample session",

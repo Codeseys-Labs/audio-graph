@@ -29,6 +29,7 @@ pub enum RedactedPanicOp {
     CredentialBoundary,
     LlmClientBuild,
     LlmModelLoad,
+    LlmExecutorJob,
 }
 
 impl RedactedPanicOp {
@@ -43,6 +44,7 @@ impl RedactedPanicOp {
             Self::CredentialBoundary => "credential.boundary",
             Self::LlmClientBuild => "llm.client_build",
             Self::LlmModelLoad => "llm.model_load",
+            Self::LlmExecutorJob => "llm.executor_job",
         }
     }
 }
@@ -376,7 +378,7 @@ mod tests {
             format!("native-target-{nonce}"),
             format!("platform diagnostic {nonce}"),
             format!("exact-length={}", secret.len()),
-            crate::credentials::secret_fingerprint(Some(&secret)),
+            format!("fingerprint-canary-{nonce}"),
             secret,
         ]
     }

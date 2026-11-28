@@ -1216,7 +1216,10 @@
     "inputPlaceholder": "Pergunte sobre a conversa...",
     "inputLabel": "Pergunte sobre a conversa",
     "send": "Enviar mensagem",
-    "reviewSendBlocked": "O chat não está disponível durante a revisão de uma sessão anterior, pois o envio usaria o espaço de trabalho ao vivo. Inicie uma nova sessão para conversar com segurança."
+    "reviewSendBlocked": "O chat não está disponível durante a revisão de uma sessão anterior, pois o envio usaria o espaço de trabalho ao vivo. Inicie uma nova sessão para conversar com segurança.",
+    "failed": "A resposta falhou.",
+    "partialReply": "Resposta parcial, não mantida no histórico do chat:",
+    "rateLimitedHint": "Modelos gratuitos podem ter limite de uso. Troque de modelo ou adicione créditos e tente novamente."
   },
   "notes": {
     "title": "Notas",
@@ -1298,6 +1301,7 @@
     "duplicateCount": "×{{count}}",
     "answerFailedGeneric": "A resposta falhou.",
     "answerRetry": "Tentar novamente",
+    "answerPartial": "Resposta parcial:",
     "answerInterrupted": "Interrompida",
     "answerTruncatedMarker": "…",
     "answerTruncatedHint": "Resposta truncada no limite de tamanho",
@@ -1437,6 +1441,13 @@
     "stageCapture": "Captura",
     "stageResample": "Reamostragem",
     "stageAsr": "ASR",
+    "transcriptCrashSafetyUnverified": "Transcrição salva. A recuperação após uma falha não foi verificada neste armazenamento.",
+    "transcriptNotSaving": {
+      "confirmation_delayed": "Aguardando confirmação de que a transcrição foi salva",
+      "writer_absent": "A transcrição não está sendo salva",
+      "storage_full": "A transcrição não está sendo salva porque o armazenamento está cheio",
+      "write_failed": "A transcrição não está sendo salva porque houve uma falha na gravação"
+    },
     "stageDiarization": "Diarização",
     "stageExtraction": "Extração",
     "stageGraph": "Grafo",
@@ -1611,7 +1622,7 @@
       "credential_expired": "A credencial do provedor expirou. Renove-a antes de tentar novamente.",
       "permission_denied": "O provedor negou o acesso a esta operação. Verifique as permissões ou o plano da sua conta.",
       "invalid_configuration": "A configuração do provedor é inválida. Verifique o modelo, a região ou o endpoint em Configurações.",
-      "capacity_exhausted": "O provedor atingiu seu limite de capacidade, ou a cota ou o saldo da sua conta se esgotou. Verifique seu plano e saldo, ou tente novamente mais tarde.",
+      "capacity_exhausted": "Sua conta atingiu um limite de cota ou de uso simultâneo, ou o saldo se esgotou. Verifique seu plano e saldo, ou tente novamente mais tarde.",
       "policy_blocked": "A política atual bloqueia esta operação.",
       "unsupported": "O provedor não oferece suporte a esta operação.",
       "cancelled": "A operação foi cancelada.",
@@ -1665,6 +1676,8 @@
     "handoffDismissLabel": "Dispensar a dica de primeiros passos",
     "fallbackTitle": "Vamos começar",
     "fallbackBody": "Ainda não conseguimos verificar sua configuração salva. Você pode visualizar uma sessão de exemplo para ver como as notas e o grafo funcionam, tentar novamente ou abrir as configurações para adicionar um provedor.",
+    "credentialSavedCleanupWarning": "Credencial salva. Um valor antigo no arquivo de credenciais legado pode substituí-la. Remova a entrada antiga antes de usar esta credencial.",
+    "legacyFileWarning": "O chaveiro do sistema está disponível. O AudioGraph não conseguiu ler o arquivo de credenciais legado. {{reason}}",
     "unreadableTitle": "Não conseguimos ler suas credenciais",
     "unreadableBody": "Não conseguimos ler seu armazenamento de credenciais agora — ele pode estar temporariamente indisponível ou um arquivo de credenciais salvo pode precisar de atenção. Tente novamente primeiro, caso seja temporário. Se você já salvou chaves antes, elas ainda podem ser recuperáveis, então abra as configurações para revisá-las antes de inseri-las novamente.",
     "fallbackPreviewSample": "Visualizar sessão de exemplo",

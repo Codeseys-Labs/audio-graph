@@ -1176,39 +1176,19 @@ impl TranscriptLedger {
     }
 
     pub fn apply_event(&mut self, event: TranscriptEvent) -> Result<(), TranscriptLedgerError> {
-        match self
+        if let Some(current) = self
             .latest_spans
             .iter_mut()
             .find(|span| span.span_id == event.span_id)
         {
-            Some(current) if event.revision_number < current.revision_number => {
-                Err(TranscriptLedgerError::StaleTranscriptRevision {
-                    span_id: event.span_id,
-                    current_revision: current.revision_number,
-                    incoming_revision: event.revision_number,
-                })
-            }
-            Some(current)
-                if event.revision_number == current.revision_number && event != *current =>
-            {
-                Err(TranscriptLedgerError::ConflictingTranscriptRevision {
-                    span_id: event.span_id,
-                    revision_number: event.revision_number,
-                })
-            }
-            Some(current) => {
-                *current = event;
-                self.accepted_event_count += 1;
-                self.sort_latest_spans();
-                Ok(())
-            }
-            None => {
-                self.latest_spans.push(event);
-                self.accepted_event_count += 1;
-                self.sort_latest_spans();
-                Ok(())
-            }
+            validate_transcript_replacement(current, &event)?;
+            *current = event;
+        } else {
+            self.latest_spans.push(event);
         }
+        self.accepted_event_count += 1;
+        self.sort_latest_spans();
+        Ok(())
     }
 
     pub fn current_basis(&self) -> ProjectionBasis {
@@ -1570,12 +1550,96 @@ impl TranscriptLedger {
     }
 
     fn sort_latest_spans(&mut self) {
-        self.latest_spans.sort_by(|a, b| {
-            millis(a.start_time)
-                .cmp(&millis(b.start_time))
-                .then(millis(a.end_time).cmp(&millis(b.end_time)))
-                .then(a.span_id.cmp(&b.span_id))
+        self.latest_spans.sort_by(transcript_span_order);
+    }
+}
+
+fn transcript_span_order(a: &TranscriptEvent, b: &TranscriptEvent) -> std::cmp::Ordering {
+    millis(a.start_time)
+        .cmp(&millis(b.start_time))
+        .then(millis(a.end_time).cmp(&millis(b.end_time)))
+        .then(a.span_id.cmp(&b.span_id))
+}
+
+fn validate_transcript_replacement(
+    current: &TranscriptEvent,
+    event: &TranscriptEvent,
+) -> Result<(), TranscriptLedgerError> {
+    if event.revision_number < current.revision_number {
+        return Err(TranscriptLedgerError::StaleTranscriptRevision {
+            span_id: event.span_id.clone(),
+            current_revision: current.revision_number,
+            incoming_revision: event.revision_number,
         });
+    }
+    if event.revision_number == current.revision_number && event != current {
+        return Err(TranscriptLedgerError::ConflictingTranscriptRevision {
+            span_id: event.span_id.clone(),
+            revision_number: event.revision_number,
+        });
+    }
+    Ok(())
+}
+
+/// The single committing worker owns this index. The serializable ledger stays
+/// in timeline order; chronological appends and in-place revisions avoid a scan.
+#[derive(Default)]
+pub(crate) struct TranscriptLiveIndex {
+    session: String,
+    sequence: u64,
+    positions: std::collections::HashMap<String, usize>,
+}
+
+impl TranscriptLiveIndex {
+    pub(crate) fn apply(
+        &mut self,
+        ledger: &mut TranscriptLedger,
+        event: TranscriptEvent,
+    ) -> Result<(), TranscriptLedgerError> {
+        if self.session != ledger.session_id || self.sequence != ledger.accepted_event_count {
+            self.session.clone_from(&ledger.session_id);
+            self.positions.clear();
+            self.reindex(&ledger.latest_spans, 0);
+        }
+        let spans = &mut ledger.latest_spans;
+        let mut changed_from = spans.len();
+        let old = self.positions.get(&event.span_id).copied();
+        if let Some(i) = old {
+            validate_transcript_replacement(&spans[i], &event)?;
+            changed_from = i;
+            let fits = i
+                .checked_sub(1)
+                .is_none_or(|j| !transcript_span_order(&spans[j], &event).is_gt())
+                && spans
+                    .get(i + 1)
+                    .is_none_or(|next| !transcript_span_order(&event, next).is_gt());
+            if fits {
+                spans[i] = event;
+                ledger.accepted_event_count += 1;
+                self.sequence = ledger.accepted_event_count;
+                return Ok(());
+            }
+            spans.remove(i);
+        }
+        let at = if spans
+            .last()
+            .is_none_or(|last| !transcript_span_order(last, &event).is_gt())
+        {
+            spans.len()
+        } else {
+            spans.partition_point(|row| transcript_span_order(row, &event).is_lt())
+        };
+        spans.insert(at, event);
+        self.reindex(spans, changed_from.min(at));
+        ledger.accepted_event_count += 1;
+        self.sequence = ledger.accepted_event_count;
+        Ok(())
+    }
+
+    fn reindex(&mut self, spans: &[TranscriptEvent], from: usize) {
+        for (i, span) in spans.iter().enumerate().skip(from) {
+            self.positions.insert(span.span_id.clone(), i);
+        }
     }
 }
 
@@ -4948,6 +5012,36 @@ mod tests {
             capture_latency_ms: None,
             asr_latency_ms: None,
             received_at_ms: 1_700_000_000_000 + revision_number,
+        }
+    }
+
+    #[test]
+    fn indexed_live_delivery_matches_replay_across_moves_and_session_rotation() {
+        let mut index = TranscriptLiveIndex::default();
+        for session in ["first", "next"] {
+            let mut live = TranscriptLedger::new(session);
+            let mut replay = live.clone();
+            for (span, revision, start) in [
+                ("reed", 1, 1.0),
+                ("pond", 1, 3.0),
+                ("tree", 1, 2.0),
+                ("pond", 2, 0.0),
+                ("pond", 3, 4.0),
+                ("tree", 2, 2.0),
+                ("tree", 2, 2.0),
+                ("tree", 1, 2.0),
+                ("tree", 2, 3.0),
+            ] {
+                let mut payload = asr_payload(span, revision, "leaf");
+                payload.start_time = start;
+                payload.end_time = start + 0.5;
+                let event: TranscriptEvent = payload.into();
+                assert_eq!(
+                    index.apply(&mut live, event.clone()),
+                    replay.apply_event(event),
+                );
+                assert_eq!(live, replay);
+            }
         }
     }
 

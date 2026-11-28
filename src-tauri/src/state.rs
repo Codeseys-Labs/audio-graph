@@ -69,6 +69,66 @@ pub struct SpeakerInfo {
     pub segment_count: u32,
 }
 
+/// Most chat messages kept in memory. History is cloned whole into every chat
+/// request, so it is capped to bound memory and prompt-build cost; the oldest
+/// messages are dropped first.
+pub const MAX_CHAT_HISTORY: usize = 200;
+
+/// Trim `messages` to the newest [`MAX_CHAT_HISTORY`].
+pub fn cap_chat_messages(messages: &mut Vec<ChatMessage>) {
+    if messages.len() > MAX_CHAT_HISTORY {
+        let drop = messages.len() - MAX_CHAT_HISTORY;
+        messages.drain(0..drop);
+    }
+}
+
+/// The sidebar's chat turns, plus a generation that every [`Self::clear`]
+/// bumps. A chat request reads the generation together with the history it
+/// sends and records its turns through [`Self::append_if_current`], so a
+/// request that finishes after the chat was cleared, or after a session
+/// rotation (which clears it), records nothing and cannot bring a cleared
+/// message back.
+#[derive(Debug, Default)]
+pub struct ChatHistory {
+    messages: Vec<ChatMessage>,
+    generation: u64,
+}
+
+impl ChatHistory {
+    pub fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn clear(&mut self) {
+        self.messages.clear();
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Append `turns`, keeping the newest [`MAX_CHAT_HISTORY`] messages.
+    fn append(&mut self, turns: impl IntoIterator<Item = ChatMessage>) {
+        self.messages.extend(turns);
+        cap_chat_messages(&mut self.messages);
+    }
+
+    /// Append `turns` only if nothing cleared the history since `generation`
+    /// was read. Returns whether they were appended.
+    pub fn append_if_current(
+        &mut self,
+        generation: u64,
+        turns: impl IntoIterator<Item = ChatMessage>,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.append(turns);
+        true
+    }
+}
+
 /// Live projection job thread handles, keyed by `(kind, job_id)`
 /// (audio-graph-9cc1 / ADR-0045 decision 4, drain half).
 ///
@@ -134,7 +194,7 @@ pub struct AppState {
     /// session's writer) is not detected here at all.
     pub display_transcript_write_misses: Arc<AtomicU64>,
 
-    /// Async transcript event writer (appends immutable span revisions to JSONL).
+    /// Writes framed span revisions and returns a receipt after synchronization.
     pub transcript_event_writer: Arc<Mutex<Option<TranscriptEventWriter>>>,
 
     /// Canonical transcript span ledger for projection-basis checks.
@@ -236,7 +296,7 @@ pub struct AppState {
     pub audio_player: crate::playback::AudioPlayer,
 
     /// Chat message history for the sidebar.
-    pub chat_history: Arc<RwLock<Vec<ChatMessage>>>,
+    pub chat_history: Arc<RwLock<ChatHistory>>,
 
     /// Agent/react proposals that are awaiting user approval.
     pub pending_agent_proposals: Arc<Mutex<HashMap<String, crate::events::AgentProposalPayload>>>,
@@ -258,6 +318,12 @@ pub struct AppState {
     /// "no auto-dispatch yet this session". Backs the `min_interval_secs`
     /// gate. Reset to 0 on session rotation.
     pub agent_auto_answer_last_dispatch_ms: Arc<AtomicU64>,
+    /// Set while a live-assist card answer streams or is being persisted.
+    /// The answer gate refuses a new dispatch as `Busy` while it is set, so a
+    /// retry cannot start before the previous attempt's terminal ledger row
+    /// and card write land. Unlike a `stream_registry` entry, cancelling the
+    /// stream does not clear it; the answer task does, once it has finished.
+    pub card_answer_in_flight: Arc<AtomicBool>,
 
     // ── Audio capture infrastructure ────────────────────────────────────
     /// The capture manager (behind Mutex because AudioCaptureManager has &mut self methods).
@@ -860,6 +926,15 @@ impl AppState {
         // Spawn transcript writers (best-effort — if base dir is unavailable, None)
         let transcript_writer = TranscriptWriter::spawn(&session_id);
         let transcript_event_writer = TranscriptEventWriter::spawn(&session_id);
+        let pipeline_status = PipelineStatus {
+            transcript_crash_safety_unverified: transcript_event_writer
+                .as_ref()
+                .is_some_and(TranscriptEventWriter::is_unqualified),
+            transcript_not_saving: transcript_event_writer
+                .is_none()
+                .then_some(crate::events::TranscriptSavingFailure::WriterAbsent),
+            ..Default::default()
+        };
         let projection_event_writer = ProjectionEventWriter::spawn(&session_id);
         let transcript_ledger = TranscriptLedger::new(session_id.clone());
         let speaker_timeline = SpeakerTimeline::new(session_id.clone());
@@ -914,7 +989,7 @@ impl AppState {
             projection_lane_stopping: Arc::new(AtomicBool::new(false)),
             graph_snapshot: Arc::new(RwLock::new(GraphSnapshot::default())),
             graph_autosave_thread: Arc::new(Mutex::new(None)),
-            pipeline_status: Arc::new(RwLock::new(PipelineStatus::default())),
+            pipeline_status: Arc::new(RwLock::new(pipeline_status)),
             is_capturing: Arc::new(RwLock::new(false)),
             is_transcribing,
             knowledge_graph: Arc::new(Mutex::new(TemporalKnowledgeGraph::new())),
@@ -926,11 +1001,12 @@ impl AppState {
             llm_executor,
             stream_registry: StreamRegistry::new(),
             audio_player: crate::playback::AudioPlayer::new(),
-            chat_history: Arc::new(RwLock::new(Vec::new())),
+            chat_history: Arc::new(RwLock::new(ChatHistory::default())),
             pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
             decision_shadow,
             agent_auto_answer_session_count: Arc::new(AtomicU64::new(0)),
             agent_auto_answer_last_dispatch_ms: Arc::new(AtomicU64::new(0)),
+            card_answer_in_flight: Arc::new(AtomicBool::new(false)),
             capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),
             pipeline_tx,
             pipeline_rx,
@@ -1204,7 +1280,10 @@ impl AppState {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            *status = PipelineStatus::default();
+            *status = PipelineStatus {
+                transcript_crash_safety_unverified: new_transcript_event_writer.is_unqualified(),
+                ..PipelineStatus::default()
+            };
         }
 
         // No producer can enter while `session_lifecycle` is held by the
@@ -1214,87 +1293,37 @@ impl AppState {
         while self.processed_rx.try_recv().is_ok() {}
         while self.speech_audio_rx.try_recv().is_ok() {}
 
-        // Respawn transcript writers for the new session. The old writers are
-        // asked to shut down gracefully; their joins are bounded by
-        // TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT so a stuck disk cannot block the
-        // IPC caller. If a new writer fails to spawn (e.g. base dir not
-        // resolvable), we leave its slot empty — transcript persistence is
-        // best-effort and already handles None elsewhere.
-        let mut writer_slot = match self.transcript_writer.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(old) = writer_slot.take()
+        // Swap each prepared writer before draining its predecessor. Readers
+        // can still acquire a writer slot while shutdown waits for storage.
+        let old_display = self
+            .transcript_writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(new_transcript_writer);
+        let old_events = self
+            .transcript_event_writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(new_transcript_event_writer);
+        let old_projections = self
+            .projection_event_writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(new_projection_event_writer);
+        if let Some(old) = old_display
             && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
         {
-            log::warn!(
-                "Transcript writer for session {} did not finish flush within {:?}; \
-                     dropping JoinHandle and proceeding with new writer",
-                prev,
-                TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
-            );
+            log::warn!("Previous transcript display writer has not finished shutdown");
         }
-        *writer_slot = Some(new_transcript_writer);
-
-        let mut event_writer_slot = match self.transcript_event_writer.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(old) = event_writer_slot.take()
+        if let Some(old) = old_events
             && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
         {
-            log::warn!(
-                "Transcript event writer for session {} did not finish flush within {:?}; \
-                     dropping JoinHandle and proceeding with new writer",
-                prev,
-                TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
-            );
+            log::warn!("Previous transcript event writer has not finished shutdown");
         }
-        *event_writer_slot = Some(new_transcript_event_writer);
-        let mut projection_writer_slot = match self.projection_event_writer.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(old) = projection_writer_slot.take()
+        if let Some(old) = old_projections
             && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
         {
-            log::warn!(
-                "Projection event writer for session {} did not finish flush within {:?}; \
-                     dropping JoinHandle and proceeding with new writer",
-                prev,
-                TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
-            );
-        }
-        *projection_writer_slot = Some(new_projection_event_writer);
-        if writer_slot.is_some() {
-            log::info!("Rotated transcript writer to session {}", new_session_id);
-        } else {
-            log::warn!(
-                "Failed to spawn transcript writer for rotated session {}",
-                new_session_id
-            );
-        }
-        if event_writer_slot.is_some() {
-            log::info!(
-                "Rotated transcript event writer to session {}",
-                new_session_id
-            );
-        } else {
-            log::warn!(
-                "Failed to spawn transcript event writer for rotated session {}",
-                new_session_id
-            );
-        }
-        if projection_writer_slot.is_some() {
-            log::info!(
-                "Rotated projection event writer to session {}",
-                new_session_id
-            );
-        } else {
-            log::warn!(
-                "Failed to spawn projection event writer for rotated session {}",
-                new_session_id
-            );
+            log::warn!("Previous projection event writer has not finished shutdown");
         }
 
         // Publish the new ownership epoch last. Readers can observe either the
@@ -2220,6 +2249,11 @@ mod rotation_tests {
 
     #[test]
     fn rotate_session_resets_projection_schedulers() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("scheduler-rotation");
+        let _home = HomeGuard::set(&dir);
         let app = AppState::new();
         {
             let mut ledger = app.transcript_ledger.lock().unwrap();
@@ -2260,6 +2294,7 @@ mod rotation_tests {
         }
 
         drain_writers(&app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
