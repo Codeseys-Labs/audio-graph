@@ -1412,6 +1412,209 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_budget_survives_setup_timeouts_and_rapid_expirations() {
+        use super::super::diagnostic_tests::reject_upgrade;
+        use std::sync::atomic::AtomicUsize;
+
+        for expires in [false, true] {
+            let budget = crate::reconnect::DEFAULT_BACKOFF_SECONDS.len();
+            let (initial_url, initial) =
+                ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
+            let (writer, reader) = ws_fixture::connect_client(&initial_url).await.split();
+            let mut endpoints = Vec::new();
+            let mut servers = Vec::new();
+            let rejection = if expires {
+                None
+            } else {
+                let (url, server) = reject_upgrade(429, true).await;
+                endpoints.push(url);
+                Some(server)
+            };
+            while endpoints.len() < budget {
+                let mut steps = vec![ws_fixture::ServerStep::expect_any_text()];
+                if expires {
+                    steps.extend([
+                        ws_fixture::ServerStep::send_text(r#"{"type":"session.updated"}"#),
+                        ws_fixture::ServerStep::send_text(
+                            r#"{"type":"error","error":{"code":"session_expired"}}"#,
+                        ),
+                    ]);
+                }
+                steps.push(ws_fixture::ServerStep::expect_close());
+                let (url, server) = ws_fixture::spawn_scripted_server(steps).await;
+                endpoints.push(url);
+                servers.push(server);
+            }
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&attempts);
+            let opener: ReconnectOpener = Arc::new(move |config| {
+                let url = endpoints[count.fetch_add(1, Ordering::SeqCst)].clone();
+                Box::pin(async move { open_ws_url(&config, &url).await })
+            });
+            let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+            let pending_chunks = Arc::new(AtomicUsize::new(usize::from(!expires)));
+            if !expires {
+                audio_tx
+                    .send(AudioCmd::Chunk("sample audio".into()))
+                    .unwrap();
+            }
+            let (event_tx, event_rx) = crossbeam_channel::unbounded();
+            tokio::time::timeout(
+                Duration::from_secs(8),
+                session_task_with_timing(
+                    OpenAiRealtimeSessionCtx {
+                        writer,
+                        reader,
+                        config: test_config(),
+                        audio_rx,
+                        event_tx,
+                        connected: Arc::new(AtomicBool::new(false)),
+                        user_disconnected: Arc::new(AtomicBool::new(false)),
+                        disconnected_emitted: Arc::new(AtomicBool::new(false)),
+                        pending_chunks: Arc::clone(&pending_chunks),
+                        reconnect_opener: Some(opener),
+                        run_io_entries: None,
+                    },
+                    |_| Duration::ZERO,
+                    if expires {
+                        SESSION_SETUP_TIMEOUT
+                    } else {
+                        Duration::ZERO
+                    },
+                ),
+            )
+            .await
+            .expect("unhealthy connections must exhaust the reconnect budget");
+            assert_eq!(attempts.load(Ordering::SeqCst), budget);
+            initial.await.unwrap();
+            if let Some(server) = rejection {
+                server.await.unwrap();
+                assert_eq!(
+                    pending_chunks.load(Ordering::SeqCst),
+                    1,
+                    "audio must remain queued during setup"
+                );
+            }
+            for server in servers {
+                let frames = server.await.unwrap();
+                assert!(matches!(
+                    frames.as_slice(),
+                    [
+                        ws_fixture::ClientFrame::Text(_),
+                        ws_fixture::ClientFrame::Close,
+                    ]
+                ));
+            }
+            let events: Vec<_> = event_rx.try_iter().collect();
+            assert!(
+                events
+                    .iter()
+                    .filter_map(|event| match event {
+                        OpenAiRealtimeEvent::Reconnecting { attempt, .. } => Some(*attempt),
+                        _ => None,
+                    })
+                    .eq(1..=budget as u32)
+            );
+            let ready_events = events
+                .iter()
+                .filter(|event| matches!(event, OpenAiRealtimeEvent::Reconnected))
+                .count();
+            assert_eq!(ready_events, if expires { budget } else { 0 });
+            assert!(
+                matches!(
+                    events.last(),
+                    Some(OpenAiRealtimeEvent::Error { message })
+                        if *message == websocket_diagnostic(Code::ProviderUnavailable)
+                ),
+                "exhaustion after a successful upgrade must not report stale 429"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_expiry_reaches_ready_and_exhausts_fresh_budget_with_last_diagnostic() {
+        use super::super::diagnostic_tests::{assert_fresh_outage, fresh_outage};
+        use std::sync::atomic::AtomicUsize;
+
+        let (initial_url, initial) = ws_fixture::spawn_scripted_server(vec![
+            ws_fixture::ServerStep::expect_any_text(),
+            ws_fixture::ServerStep::send_text(r#"{"type":"session.updated"}"#),
+            ws_fixture::ServerStep::send_text(
+                r#"{"type":"error","error":{"code":"session_expired"}}"#,
+            ),
+            ws_fixture::ServerStep::expect_close(),
+        ])
+        .await;
+        let config = test_config();
+        let (writer, reader) = open_ws_url(&config, &initial_url).await.unwrap();
+        let script = fresh_outage(
+            vec![
+                ws_fixture::ServerStep::expect_any_text(),
+                ws_fixture::ServerStep::send_text(r#"{"type":"session.updated"}"#),
+                ws_fixture::ServerStep::send_close(),
+            ],
+            true,
+        )
+        .await;
+        let (recovery, rejections) = (script.recovery, script.rejections);
+        let endpoints = script.endpoints;
+        let expected_attempts = endpoints.len();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        let opener: ReconnectOpener = Arc::new(move |config| {
+            let url = endpoints[count.fetch_add(1, Ordering::SeqCst)].clone();
+            Box::pin(async move { open_ws_url(&config, &url).await })
+        });
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            session_task_with_timing(
+                OpenAiRealtimeSessionCtx {
+                    writer,
+                    reader,
+                    config,
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(false)),
+                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    disconnected_emitted: Arc::new(AtomicBool::new(false)),
+                    pending_chunks: Arc::new(AtomicUsize::new(0)),
+                    reconnect_opener: Some(opener),
+                    run_io_entries: None,
+                },
+                |_| Duration::ZERO,
+                SESSION_SETUP_TIMEOUT,
+            ),
+        )
+        .await
+        .expect("second outage must exhaust the budget");
+        assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
+        initial.await.unwrap();
+        recovery.await.unwrap();
+        rejections.await.unwrap();
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert!(matches!(events.as_slice(), [
+            OpenAiRealtimeEvent::Connected,
+            OpenAiRealtimeEvent::Error { message },
+            OpenAiRealtimeEvent::Disconnected,
+            ..,
+        ] if *message == websocket_diagnostic(Code::Timeout)));
+        assert_fresh_outage(
+            &events,
+            |event| matches!(event, OpenAiRealtimeEvent::Reconnected),
+            |event| match event {
+                OpenAiRealtimeEvent::Reconnecting { attempt, .. } => Some(*attempt),
+                _ => None,
+            },
+            |event| match event {
+                OpenAiRealtimeEvent::Error { message } => Some(message),
+                _ => None,
+            },
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn session_expiry_reconnects_and_configuration_rejection_stops() {
         use std::sync::atomic::AtomicUsize;
 

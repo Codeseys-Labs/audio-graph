@@ -1243,21 +1243,98 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_exhausts_fresh_budget_with_last_diagnostic() {
+        use super::super::diagnostic_tests::{assert_fresh_outage, fresh_outage};
+        use std::sync::atomic::AtomicUsize;
+
+        let (initial_url, initial) =
+            ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
+        let config = test_config();
+        let (writer, reader) = ws_fixture::connect_client(&initial_url).await.split();
+        let script = fresh_outage(
+            vec![
+                ws_fixture::ServerStep::expect_any_text(),
+                ws_fixture::ServerStep::send_text(r#"{"tokens":[],"total_audio_proc_ms":0}"#),
+                ws_fixture::ServerStep::send_close(),
+            ],
+            false,
+        )
+        .await;
+        let (recovery, rejections) = (script.recovery, script.rejections);
+        let endpoints = script.endpoints;
+        let expected_attempts = endpoints.len();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        let opener: ReconnectOpener = Arc::new(move |config| {
+            let url = endpoints[count.fetch_add(1, Ordering::SeqCst)].clone();
+            Box::pin(async move { open_ws_url(&config, &url).await })
+        });
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            session_task_with_backoff(
+                SonioxSessionCtx {
+                    writer,
+                    reader,
+                    config,
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(true)),
+                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    pending_chunks: Arc::new(AtomicUsize::new(0)),
+                    reconnect_opener: Some(opener),
+                    run_io_entries: None,
+                },
+                |_| Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("second outage must exhaust the budget");
+        assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
+        initial.await.unwrap();
+        recovery.await.unwrap();
+        rejections.await.unwrap();
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert_fresh_outage(
+            &events,
+            |event| matches!(event, SonioxEvent::Reconnected),
+            |event| match event {
+                SonioxEvent::Reconnecting { attempt, .. } => Some(*attempt),
+                _ => None,
+            },
+            |event| match event {
+                SonioxEvent::Error { message } => Some(message),
+                _ => None,
+            },
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn terminal_provider_frame_ends_session_without_another_reconnect() {
         use std::sync::atomic::AtomicUsize;
 
-        for (wire_type, code) in [
-            ("unauthenticated", Code::CredentialRejected),
-            ("permission_denied", Code::PermissionDenied),
-            ("temp_api_key_session_expired", Code::CredentialExpired),
-            ("invalid_request", Code::InvalidConfiguration),
-            ("model_not_available", Code::InvalidConfiguration),
-            ("organization_balance_exhausted", Code::CapacityExhausted),
+        for (status, wire_type, code) in [
+            (401, "unauthenticated", Code::CredentialRejected),
+            (403, "permission_denied", Code::PermissionDenied),
+            (403, "temp_api_key_session_expired", Code::CredentialExpired),
+            (400, "invalid_request", Code::InvalidConfiguration),
+            (400, "model_not_available", Code::InvalidConfiguration),
             (
+                402,
+                "organization_balance_exhausted",
+                Code::CapacityExhausted,
+            ),
+            (
+                402,
                 "organization_monthly_budget_exhausted",
                 Code::CapacityExhausted,
             ),
-            ("project_monthly_budget_exhausted", Code::CapacityExhausted),
+            (
+                402,
+                "project_monthly_budget_exhausted",
+                Code::CapacityExhausted,
+            ),
         ] {
             let (initial_url, initial_server) =
                 ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
@@ -1265,7 +1342,7 @@ mod tests {
             let (reconnect_url, server) = ws_fixture::spawn_server(move |mut socket| async move {
                 assert!(matches!(socket.next().await, Some(Ok(Message::Text(_)))));
                 let frame =
-                    json!({"error_type": wire_type, "error_message": "private provider note"});
+                    json!({"error_code":status,"error_type":wire_type,"error_message":"private provider note"});
                 socket
                     .send(Message::Text(frame.to_string().into()))
                     .await
@@ -1287,18 +1364,21 @@ mod tests {
             let (event_tx, event_rx) = crossbeam_channel::bounded(16);
             tokio::time::timeout(
                 Duration::from_secs(5),
-                session_task(SonioxSessionCtx {
-                    writer,
-                    reader,
-                    config: test_config(),
-                    audio_rx,
-                    event_tx,
-                    connected: Arc::new(AtomicBool::new(true)),
-                    user_disconnected: Arc::new(AtomicBool::new(false)),
-                    pending_chunks: Arc::new(AtomicUsize::new(0)),
-                    reconnect_opener: Some(opener),
-                    run_io_entries: None,
-                }),
+                session_task_with_backoff(
+                    SonioxSessionCtx {
+                        writer,
+                        reader,
+                        config: test_config(),
+                        audio_rx,
+                        event_tx,
+                        connected: Arc::new(AtomicBool::new(true)),
+                        user_disconnected: Arc::new(AtomicBool::new(false)),
+                        pending_chunks: Arc::new(AtomicUsize::new(0)),
+                        reconnect_opener: Some(opener),
+                        run_io_entries: None,
+                    },
+                    |_| Duration::ZERO,
+                ),
             )
             .await
             .expect("terminal frame must end the session");

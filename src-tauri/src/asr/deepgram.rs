@@ -2112,6 +2112,27 @@ fn f32_to_i16_le_bytes(samples: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn exact_credit_exhaustion_is_terminal() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let terminal = process_server_message(
+            r#"{"type":"Error","code":"ASR_PAYMENT_REQUIRED","description":"sample billing note"}"#,
+            &tx,
+        );
+        assert_eq!(
+            terminal,
+            Some(websocket_diagnostic(Code::CapacityExhausted))
+        );
+        assert!(rx.is_empty());
+        assert!(
+            process_server_message(
+                r#"{"type":"Error","code":"ASR_PAYMENT_REQUIRED extra"}"#,
+                &tx,
+            )
+            .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn upgrade_reads_only_the_allowlisted_deepgram_auth_code() {
         use super::super::diagnostic_tests::{assert_outcome, reject_upgrades, wire_prose};

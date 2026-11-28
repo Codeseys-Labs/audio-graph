@@ -1350,6 +1350,75 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_exhausts_fresh_budget_with_last_diagnostic() {
+        use super::super::diagnostic_tests::{assert_fresh_outage, fresh_outage};
+        use std::sync::atomic::AtomicUsize;
+
+        let (initial_url, initial) =
+            ws_fixture::spawn_scripted_server(vec![ws_fixture::ServerStep::send_close()]).await;
+        let config = test_config();
+        let (writer, reader) = ws_fixture::connect_client(&initial_url).await.split();
+        let script = fresh_outage(
+            vec![
+                ws_fixture::ServerStep::send_text(
+                    r#"{"type":"Begin","id":"sample session","expires_at":1800000000}"#,
+                ),
+                ws_fixture::ServerStep::send_close(),
+            ],
+            true,
+        )
+        .await;
+        let (recovery, rejections) = (script.recovery, script.rejections);
+        let endpoints = script.endpoints;
+        let expected_attempts = endpoints.len();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        let opener: ReconnectOpener = Arc::new(move |config| {
+            let url = endpoints[count.fetch_add(1, Ordering::SeqCst)].clone();
+            Box::pin(async move { open_ws_url(&config, &url).await })
+        });
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            session_task_with_backoff(
+                AssemblyAISessionCtx {
+                    writer,
+                    reader,
+                    config,
+                    audio_rx,
+                    event_tx,
+                    connected: Arc::new(AtomicBool::new(true)),
+                    user_disconnected: Arc::new(AtomicBool::new(false)),
+                    pending_chunks: Arc::new(AtomicUsize::new(0)),
+                    reconnect_opener: Some(opener),
+                    run_io_entries: None,
+                },
+                |_| Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("second outage must exhaust the budget");
+        assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
+        initial.await.unwrap();
+        recovery.await.unwrap();
+        rejections.await.unwrap();
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert_fresh_outage(
+            &events,
+            |event| matches!(event, AssemblyAIEvent::Reconnected),
+            |event| match event {
+                AssemblyAIEvent::Reconnecting { attempt, .. } => Some(*attempt),
+                _ => None,
+            },
+            |event| match event {
+                AssemblyAIEvent::Error { message } => Some(message),
+                _ => None,
+            },
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn reconnect_stops_on_terminal_upgrade_error() {
         use super::super::diagnostic_tests::{assert_outcome, reject_upgrades};
         use audio_graph_ipc_contract::runtime_diagnostic::{

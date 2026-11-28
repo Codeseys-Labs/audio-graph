@@ -315,6 +315,66 @@ mod diagnostic_tests {
         reject_upgrades(vec![(status, Some(wire_prose()))], credential_sent).await
     }
 
+    pub(super) struct FreshOutage {
+        pub(super) endpoints: Vec<String>,
+        pub(super) recovery: tokio::task::JoinHandle<Vec<ws_fixture::ClientFrame>>,
+        pub(super) rejections: tokio::task::JoinHandle<()>,
+    }
+
+    pub(super) async fn fresh_outage(
+        recovery_steps: Vec<ws_fixture::ServerStep>,
+        credential_sent: bool,
+    ) -> FreshOutage {
+        let budget = crate::reconnect::DEFAULT_BACKOFF_SECONDS.len();
+        let mut statuses = vec![(429, None)];
+        statuses.extend(std::iter::repeat_n((503, None), budget - 1));
+        statuses.push((408, None));
+        let (reject_url, rejections) = reject_upgrades(statuses, credential_sent).await;
+        let (recovery_url, recovery) = ws_fixture::spawn_scripted_server(recovery_steps).await;
+        let mut endpoints = vec![reject_url; budget + 2];
+        endpoints[1] = recovery_url;
+        FreshOutage {
+            endpoints,
+            recovery,
+            rejections,
+        }
+    }
+
+    pub(super) fn assert_fresh_outage<T>(
+        events: &[T],
+        reconnected: impl Fn(&T) -> bool,
+        attempt: impl Fn(&T) -> Option<u32>,
+        error: impl Fn(&T) -> Option<&RuntimeDiagnostic>,
+    ) {
+        use RuntimeErrorCode as Code;
+        use RuntimeSafeRecoveryAction as Action;
+        let (prior, recovered) = events.split_at(events.iter().position(reconnected).unwrap());
+        assert!(prior.iter().filter_map(&attempt).eq([1, 2]));
+        assert_outcome(
+            prior.iter().filter_map(&error).next_back().unwrap(),
+            (
+                Code::RateLimited,
+                true,
+                Action::RetryAfterDelay,
+                Some(RuntimeStatusClass::ClientError),
+            ),
+        );
+        let budget = crate::reconnect::DEFAULT_BACKOFF_SECONDS.len() as u32;
+        assert!(recovered.iter().filter_map(attempt).eq(1..=budget));
+        let mut errors = recovered.iter().filter_map(error).rev();
+        let exhausted = errors.next().unwrap();
+        assert_eq!(Some(exhausted), errors.next());
+        assert_outcome(
+            exhausted,
+            (
+                Code::Timeout,
+                true,
+                Action::Retry,
+                Some(RuntimeStatusClass::ClientError),
+            ),
+        );
+    }
+
     #[allow(
         clippy::result_large_err,
         reason = "tungstenite's upgrade callback requires an HTTP response as its error"
