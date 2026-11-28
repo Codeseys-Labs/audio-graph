@@ -4,6 +4,10 @@
 
 proposed
 
+[ADR-0052](0052-credential-runtime-worker-and-v2-cutover.md) narrows the
+credential runtime, fallback, and migration decisions below for v2. The
+separate `ConfigCodec` proposal and the existing v1 behavior are unchanged.
+
 ## Context
 
 AudioGraph already separates most secrets from non-secret settings:
