@@ -28,6 +28,7 @@ enum Behavior {
     PromptNeverSettles,
     PromptChangedState,
     PromptCompleted,
+    PromptCompletedPrior,
     LostCommitted,
     LostUnchanged,
     LostReadFails,
@@ -198,6 +199,7 @@ impl Store {
                         | Behavior::PromptNeverSettles
                         | Behavior::PromptChangedState
                         | Behavior::PromptCompleted
+                        | Behavior::PromptCompletedPrior
                 ));
                 if self.behavior != Behavior::PromptNeverSettles {
                     // Emit before replying. A client that subscribes after
@@ -209,7 +211,10 @@ impl Store {
                             PROMPT_INTERFACE,
                             "Completed",
                             &(
-                                self.behavior != Behavior::PromptCompleted,
+                                !matches!(
+                                    self.behavior,
+                                    Behavior::PromptCompleted | Behavior::PromptCompletedPrior
+                                ),
                                 Variant::from("/"),
                             ),
                         )
@@ -297,7 +302,8 @@ impl Store {
             Behavior::Prompt
             | Behavior::PromptNeverSettles
             | Behavior::PromptChangedState
-            | Behavior::PromptCompleted => {
+            | Behavior::PromptCompleted
+            | Behavior::PromptCompletedPrior => {
                 if matches!(
                     self.behavior,
                     Behavior::PromptChangedState | Behavior::PromptCompleted
@@ -444,6 +450,13 @@ fn run(
                 None,
             ),
             Err(Failure::StalledWorker.into())
+        );
+    }
+    drop(lease);
+    if behavior == Behavior::ExpireBeforeSend {
+        assert!(
+            gate.acquire().is_ok(),
+            "pre-send expiration must leave the gate healthy"
         );
     }
     let _ = stop.send(());
@@ -776,4 +789,17 @@ fn completed_prompt_is_verified_and_disconnect_of_only_the_client_can_commit() {
             .iter()
             .any(|step| step.client == 1 && step.call == Call::Close)
     );
+}
+
+#[test]
+fn non_dismissed_completion_with_prior_state_requires_interaction() {
+    let calls = run(
+        Initial::Absent,
+        Behavior::PromptCompletedPrior,
+        put(),
+        Ok(MutationOutcome::InteractionRequired),
+    );
+    assert_eq!(mutation_calls(&calls), [Call::Create]);
+    assert!(calls.iter().any(|step| step.call == Call::Dismiss));
+    assert_readback(&calls);
 }
