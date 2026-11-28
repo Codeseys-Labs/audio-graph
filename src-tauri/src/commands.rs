@@ -24206,6 +24206,71 @@ mod tests {
         assert!(controls.exit_requests.try_recv().is_err());
     }
 
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn a_source_lost_between_ready_and_commit_stops_the_already_released_ones() {
+        let manager = Mutex::new(crate::audio::AudioCaptureManager::new());
+        let (pipeline_tx, _pipeline_rx) = crossbeam_channel::bounded(4);
+        let (hooks, controls) = scripted_hooks(
+            vec![ScriptedStart::Ready, ScriptedStart::ReadyThenExit],
+            SCRIPTED_BOUND,
+            SCRIPTED_BOUND,
+        );
+        manager.lock().unwrap().set_worker_hooks(hooks);
+        let ticket = manager
+            .lock()
+            .unwrap()
+            .register_capture_start(vec!["system".into(), "device:mic".into()])
+            .unwrap();
+        let requests = ["system", "device:mic"]
+            .into_iter()
+            .map(|source_id| crate::audio::capture::CaptureSourceStart {
+                source_id: source_id.to_string(),
+                target: parse_capture_target(source_id).unwrap(),
+                descriptor: None,
+            })
+            .collect();
+        let prepared = crate::audio::capture::prepare_capture_sources(
+            &ticket,
+            requests,
+            pipeline_tx,
+            crate::speech::shared_test_app_handle(),
+            48_000,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("both sources become ready"));
+
+        // Both reported Ready; the second dies before its commit. Commit
+        // releases the first, then must stop it again with the second.
+        controls.workers.recv().unwrap();
+        controls.workers.recv().unwrap().lose_stream();
+        let mut manager = manager.lock().unwrap();
+        let failure = manager
+            .commit_prepared_captures(ticket.attempt, prepared)
+            .unwrap_err();
+        assert_eq!(failure.reason, CaptureFailureReason::WorkerExited);
+        assert_eq!(failure.source_index, Some(1));
+        assert_eq!(
+            failure.sources,
+            [
+                CaptureSourceOutcome::RolledBack,
+                CaptureSourceOutcome::Failed {
+                    reason: CaptureFailureReason::WorkerExited
+                },
+            ]
+        );
+        assert_eq!(manager.owned_capture_count(), 0);
+        assert!(manager.acknowledged_capture().is_none());
+        assert_eq!(manager.retired_worker_count(), 0, "both workers joined");
+        assert!(
+            controls.exit_requests.try_recv().is_err(),
+            "a stopped worker is not a lost stream"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(
         target_os = "macos",

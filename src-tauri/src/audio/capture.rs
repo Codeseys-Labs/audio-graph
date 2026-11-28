@@ -2666,6 +2666,9 @@ pub(crate) mod scripted {
         /// Block as in a stuck OS call, ignoring Stop, until released; then
         /// try to report Ready.
         Hang,
+        /// Report Ready, then die on `lose_stream()` without taking the
+        /// commit: the worker gone between Ready and commit.
+        ReadyThenExit,
     }
 
     /// Controls for one spawned scripted worker.
@@ -2718,6 +2721,14 @@ pub(crate) mod scripted {
                 ScriptedStart::Hang => {
                     let _ = release_rx.recv();
                     startup_handshake(&context, Ok(None));
+                    false
+                }
+                ScriptedStart::ReadyThenExit => {
+                    if context.startup_tx.send(Ok(None)).is_ok() {
+                        let _ = lose_rx.recv();
+                    }
+                    // Returning drops the commit gate's receiver, so the
+                    // command's commit send fails.
                     false
                 }
                 ScriptedStart::Ready => {
