@@ -15,13 +15,18 @@
 //!
 //! ## Serialization shape
 //!
-//! `#[serde(tag = "code", content = "message", rename_all = "snake_case")]`
-//! produces:
+//! Legacy variants retain their established adjacent-tag shape:
 //!
 //! ```json
 //! {"code": "io", "message": "file not found"}
 //! {"code": "credential_missing", "message": {"key": "aws_secret_key"}}
-//! {"code": "aws_credential_expired", "message": null}
+//! {"code": "aws_credential_expired"}
+//! ```
+//!
+//! The typed diagnostic variant deliberately uses a distinct top-level key:
+//!
+//! ```json
+//! {"code": "runtime_diagnostic", "diagnostic": {"kind": "runtime", "detail": {"code": "internal", "retryable": false, "recovery_action": "none", "context": {"operation": "provider_request"}}}}
 //! ```
 //!
 //! Tauri's serde integration automatically serializes `Err(AppError)` into
@@ -29,6 +34,10 @@
 
 use std::{fmt, sync::OnceLock};
 
+use audio_graph_ipc_contract::{
+    credential_contract::CredentialError,
+    runtime_diagnostic::{RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorDiagnostic},
+};
 use regex::{Captures, Regex};
 
 const REDACTED_SECRET: &str = "<redacted>";
@@ -66,11 +75,13 @@ pub fn classify_credential_rejected_message(status: reqwest::StatusCode, detail:
     }
 }
 
-/// Structured application error with a stable machine-readable `code` and a
-/// variant-specific `message` payload. See module docs for serialization shape.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "code", content = "message", rename_all = "snake_case")]
+/// Structured application error with a stable machine-readable `code`.
+/// Legacy variants retain their existing `message` payload; the typed runtime
+/// variant exposes its closed envelope under `diagnostic` instead.
+#[derive(Debug, Clone)]
 pub enum AppError {
+    /// Closed, content-free credential or provider/runtime diagnostic.
+    RuntimeDiagnostic(RuntimeDiagnostic),
     /// Generic I/O failure. Message is the underlying `io::Error` display.
     Io(String),
     /// A credential required for the current operation is not stored.
@@ -130,9 +141,135 @@ pub enum AppError {
     Unknown(String),
 }
 
+/// Borrowed mirror of the pre-ec13 wire contract. Keeping the legacy mapping
+/// separate lets [`AppError::RuntimeDiagnostic`] use `diagnostic` without
+/// changing any unit, tuple, or struct variant already consumed by the UI.
+#[derive(serde::Serialize)]
+#[serde(tag = "code", content = "message", rename_all = "snake_case")]
+enum LegacyAppErrorWire<'a> {
+    Io(&'a str),
+    CredentialMissing {
+        key: &'a str,
+    },
+    CredentialFileError {
+        reason: &'a str,
+    },
+    AwsCredentialExpired,
+    AwsRegionInvalid {
+        region: &'a str,
+    },
+    GeminiRateLimited,
+    ModelNotFound {
+        name: &'a str,
+    },
+    ProviderUnavailable {
+        provider: &'a str,
+        required_feature: &'a str,
+    },
+    ProviderDeferred {
+        provider_id: &'a str,
+        display_name: &'a str,
+    },
+    ArtifactTooLarge {
+        artifact_class: &'a str,
+        size_bytes: u64,
+        ceiling_bytes: u64,
+    },
+    PrivacyPolicyBlocked {
+        mode: &'a str,
+        action: &'a str,
+        provider: &'a str,
+        data_classes: &'a [String],
+        reason: &'a str,
+    },
+    SessionInvalid {
+        reason: &'a str,
+    },
+    NetworkTimeout {
+        service: &'a str,
+    },
+    Unknown(&'a str),
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeDiagnosticAppErrorWire<'a> {
+    code: &'static str,
+    diagnostic: &'a RuntimeDiagnostic,
+}
+
+impl serde::Serialize for AppError {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let legacy = match self {
+            Self::RuntimeDiagnostic(diagnostic) => {
+                return serde::Serialize::serialize(
+                    &RuntimeDiagnosticAppErrorWire {
+                        code: "runtime_diagnostic",
+                        diagnostic,
+                    },
+                    serializer,
+                );
+            }
+            Self::Io(message) => LegacyAppErrorWire::Io(message),
+            Self::CredentialMissing { key } => LegacyAppErrorWire::CredentialMissing { key },
+            Self::CredentialFileError { reason } => {
+                LegacyAppErrorWire::CredentialFileError { reason }
+            }
+            Self::AwsCredentialExpired => LegacyAppErrorWire::AwsCredentialExpired,
+            Self::AwsRegionInvalid { region } => LegacyAppErrorWire::AwsRegionInvalid { region },
+            Self::GeminiRateLimited => LegacyAppErrorWire::GeminiRateLimited,
+            Self::ModelNotFound { name } => LegacyAppErrorWire::ModelNotFound { name },
+            Self::ProviderUnavailable {
+                provider,
+                required_feature,
+            } => LegacyAppErrorWire::ProviderUnavailable {
+                provider,
+                required_feature,
+            },
+            Self::ProviderDeferred {
+                provider_id,
+                display_name,
+            } => LegacyAppErrorWire::ProviderDeferred {
+                provider_id,
+                display_name,
+            },
+            Self::ArtifactTooLarge {
+                artifact_class,
+                size_bytes,
+                ceiling_bytes,
+            } => LegacyAppErrorWire::ArtifactTooLarge {
+                artifact_class,
+                size_bytes: *size_bytes,
+                ceiling_bytes: *ceiling_bytes,
+            },
+            Self::PrivacyPolicyBlocked {
+                mode,
+                action,
+                provider,
+                data_classes,
+                reason,
+            } => LegacyAppErrorWire::PrivacyPolicyBlocked {
+                mode,
+                action,
+                provider,
+                data_classes,
+                reason,
+            },
+            Self::SessionInvalid { reason } => LegacyAppErrorWire::SessionInvalid { reason },
+            Self::NetworkTimeout { service } => LegacyAppErrorWire::NetworkTimeout { service },
+            Self::Unknown(message) => LegacyAppErrorWire::Unknown(message),
+        };
+
+        serde::Serialize::serialize(&legacy, serializer)
+    }
+}
+
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            AppError::RuntimeDiagnostic(diagnostic) => fmt::Display::fmt(diagnostic, f),
             AppError::Io(msg) => write!(f, "I/O error: {}", msg),
             AppError::CredentialMissing { key } => {
                 write!(f, "Credential missing: {}", key)
@@ -198,6 +335,36 @@ impl fmt::Display for AppError {
 }
 
 impl std::error::Error for AppError {}
+
+impl AppError {
+    /// Convert an unclassified provider/native failure without retaining or
+    /// formatting its source. Callers should prefer a structural category when
+    /// one is available; genuinely unknown input fails closed as `internal`.
+    pub fn from_unclassified_runtime_error<T: ?Sized>(
+        _source: &T,
+        context: RuntimeDiagnosticContext,
+    ) -> Self {
+        RuntimeDiagnostic::internal(context).into()
+    }
+}
+
+impl From<RuntimeDiagnostic> for AppError {
+    fn from(diagnostic: RuntimeDiagnostic) -> Self {
+        Self::RuntimeDiagnostic(diagnostic)
+    }
+}
+
+impl From<RuntimeErrorDiagnostic> for AppError {
+    fn from(error: RuntimeErrorDiagnostic) -> Self {
+        RuntimeDiagnostic::from(error).into()
+    }
+}
+
+impl From<CredentialError> for AppError {
+    fn from(error: CredentialError) -> Self {
+        RuntimeDiagnostic::from(error).into()
+    }
+}
 
 impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
@@ -362,115 +529,308 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use audio_graph_ipc_contract::{
+        credential_contract::{
+            BuiltInCredentialSetId, CredentialErrorCode, CredentialSafeRecoveryAction,
+            CredentialSetId,
+        },
+        runtime_diagnostic::{
+            RuntimeErrorCode, RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeTransport,
+        },
+    };
 
     #[test]
-    fn serializes_unit_variant_with_code_only() {
-        // serde's internally-tagged enum with `content` omits the content key
-        // for unit variants rather than emitting `"message": null`. The
-        // frontend's `AppErrorPayload` treats the `message` field as optional
-        // for these variants.
-        let err = AppError::AwsCredentialExpired;
-        let json = serde_json::to_value(&err).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "code": "aws_credential_expired",
-            })
-        );
-    }
-
-    #[test]
-    fn serializes_rate_limited_unit_variant() {
-        let err = AppError::GeminiRateLimited;
-        let json = serde_json::to_value(&err).unwrap();
-        assert_eq!(json, serde_json::json!({"code": "gemini_rate_limited"}));
-    }
-
-    #[test]
-    fn serializes_struct_variant_with_object_message() {
-        let err = AppError::CredentialMissing {
-            key: "aws_secret_key".to_string(),
+    fn typed_credential_error_converts_without_altering_the_e11c_tuple() {
+        let credential = CredentialError {
+            code: CredentialErrorCode::AccessDenied,
+            retryable: false,
+            recovery_action: CredentialSafeRecoveryAction::ReenterCredential,
+            set_id: Some(CredentialSetId::BuiltIn(BuiltInCredentialSetId::Openai)),
         };
-        let json = serde_json::to_value(&err).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "code": "credential_missing",
-                "message": { "key": "aws_secret_key" },
-            })
-        );
-    }
+        let app_error = AppError::from(credential.clone());
 
-    #[test]
-    fn serializes_provider_unavailable_with_recovery_feature() {
-        let err = AppError::ProviderUnavailable {
-            provider: "LocalWhisper".to_string(),
-            required_feature: "local-ml or asr-whisper".to_string(),
-        };
-        let json = serde_json::to_value(&err).unwrap();
         assert_eq!(
-            json,
+            serde_json::to_value(&app_error).expect("typed AppError JSON"),
             serde_json::json!({
-                "code": "provider_unavailable",
-                "message": {
-                    "provider": "LocalWhisper",
-                    "required_feature": "local-ml or asr-whisper",
+                "code": "runtime_diagnostic",
+                "diagnostic": {
+                    "kind": "credential",
+                    "detail": {
+                        "code": "access_denied",
+                        "retryable": false,
+                        "recovery_action": "reenter_credential",
+                        "set_id": "openai",
+                    },
                 },
             })
         );
+        assert!(
+            !serde_json::to_value(&app_error)
+                .expect("typed AppError JSON")
+                .as_object()
+                .expect("typed AppError object")
+                .contains_key("message")
+        );
+        match app_error {
+            AppError::RuntimeDiagnostic(RuntimeDiagnostic::Credential(actual)) => {
+                assert_eq!(actual, credential);
+            }
+            other => panic!("expected typed credential diagnostic, got {other:?}"),
+        }
     }
 
     #[test]
-    fn serializes_provider_deferred_with_only_registry_identity() {
-        let err = AppError::ProviderDeferred {
-            provider_id: "asr.local_whisper".to_string(),
-            display_name: "Local Whisper".to_string(),
-        };
-        let json = serde_json::to_value(&err).unwrap();
+    fn typed_runtime_error_converts_structurally() {
+        let runtime = RuntimeErrorDiagnostic::new(
+            RuntimeErrorCode::NetworkUnreachable,
+            true,
+            RuntimeSafeRecoveryAction::CheckNetwork,
+            RuntimeDiagnosticContext::new(RuntimeOperation::ProviderReadiness)
+                .with_transport(RuntimeTransport::Http),
+        );
+        let app_error = AppError::from(runtime);
+
         assert_eq!(
-            json,
+            serde_json::to_value(&app_error).expect("typed AppError JSON"),
             serde_json::json!({
-                "code": "provider_deferred",
-                "message": {
-                    "provider_id": "asr.local_whisper",
-                    "display_name": "Local Whisper",
+                "code": "runtime_diagnostic",
+                "diagnostic": {
+                    "kind": "runtime",
+                    "detail": {
+                        "code": "network_unreachable",
+                        "retryable": true,
+                        "recovery_action": "check_network",
+                        "context": {
+                            "operation": "provider_readiness",
+                            "transport": "http",
+                        },
+                    },
                 },
             })
         );
+        assert!(
+            !serde_json::to_value(&app_error)
+                .expect("typed AppError JSON")
+                .as_object()
+                .expect("typed AppError object")
+                .contains_key("message")
+        );
+        assert_eq!(app_error.to_string(), "runtime/network_unreachable");
     }
 
     #[test]
-    fn serializes_artifact_too_large_with_size_and_ceiling() {
-        let err = AppError::ArtifactTooLarge {
-            artifact_class: "materialized_graph".to_string(),
-            size_bytes: 156_579_416,
-            ceiling_bytes: 24 * 1024 * 1024,
+    fn unknown_native_provider_input_maps_to_internal_without_text_or_dimensions() {
+        #[allow(dead_code)]
+        struct UnclassifiedSource {
+            secret: String,
+            response_body: String,
+            private_path: String,
+            native_prose: String,
+            request_id: String,
+            fingerprint: String,
+            exact_secret_length: usize,
+            exact_body_length: usize,
+        }
+
+        let source = UnclassifiedSource {
+            secret: "EC13_SECRET_VALUE_CANARY_ALPHA".into(),
+            response_body: "EC13_PROVIDER_BODY_CANARY_BRAVO".into(),
+            private_path: "/home/private-user/.config/ec13/credential-store".into(),
+            native_prose: "EC13 native adapter denied the private item".into(),
+            request_id: "req_ec13_charlie_7f2a".into(),
+            fingerprint: "sha256:ec13-delta-deterministic".into(),
+            exact_secret_length: 4_096_731,
+            exact_body_length: 7_919_977,
         };
-        let json = serde_json::to_value(&err).unwrap();
+        let app_error = AppError::from_unclassified_runtime_error(
+            &source,
+            RuntimeDiagnosticContext::new(RuntimeOperation::ProviderRequest)
+                .with_transport(RuntimeTransport::Sdk),
+        );
+        let serialized = serde_json::to_string(&app_error).expect("typed AppError JSON");
+
         assert_eq!(
-            json,
+            serde_json::from_str::<serde_json::Value>(&serialized).expect("valid JSON"),
             serde_json::json!({
-                "code": "artifact_too_large",
-                "message": {
-                    "artifact_class": "materialized_graph",
-                    "size_bytes": 156_579_416,
-                    "ceiling_bytes": 24 * 1024 * 1024,
+                "code": "runtime_diagnostic",
+                "diagnostic": {
+                    "kind": "runtime",
+                    "detail": {
+                        "code": "internal",
+                        "retryable": false,
+                        "recovery_action": "none",
+                        "context": {
+                            "operation": "provider_request",
+                            "transport": "sdk",
+                        },
+                    },
                 },
             })
         );
+        assert!(
+            !serde_json::from_str::<serde_json::Value>(&serialized)
+                .expect("valid JSON")
+                .as_object()
+                .expect("typed AppError object")
+                .contains_key("message")
+        );
+        for forbidden in [
+            source.secret.as_str(),
+            source.response_body.as_str(),
+            source.private_path.as_str(),
+            source.native_prose.as_str(),
+            source.request_id.as_str(),
+            source.fingerprint.as_str(),
+            "4096731",
+            "7919977",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "unclassified source escaped typed boundary: {forbidden}"
+            );
+        }
+        assert_eq!(app_error.to_string(), "runtime/internal");
     }
 
     #[test]
-    fn serializes_newtype_variant_with_string_message() {
-        let err = AppError::Io("disk full".to_string());
-        let json = serde_json::to_value(&err).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "code": "io",
-                "message": "disk full",
-            })
-        );
+    fn legacy_wire_shapes_are_exhaustively_unchanged() {
+        let cases = [
+            (
+                AppError::Io("disk full".into()),
+                serde_json::json!({"code": "io", "message": "disk full"}),
+            ),
+            (
+                AppError::CredentialMissing {
+                    key: "aws_secret_key".into(),
+                },
+                serde_json::json!({
+                    "code": "credential_missing",
+                    "message": {"key": "aws_secret_key"},
+                }),
+            ),
+            (
+                AppError::CredentialFileError {
+                    reason: "legacy parse failure".into(),
+                },
+                serde_json::json!({
+                    "code": "credential_file_error",
+                    "message": {"reason": "legacy parse failure"},
+                }),
+            ),
+            (
+                AppError::AwsCredentialExpired,
+                serde_json::json!({"code": "aws_credential_expired"}),
+            ),
+            (
+                AppError::AwsRegionInvalid {
+                    region: "xx-fake-1".into(),
+                },
+                serde_json::json!({
+                    "code": "aws_region_invalid",
+                    "message": {"region": "xx-fake-1"},
+                }),
+            ),
+            (
+                AppError::GeminiRateLimited,
+                serde_json::json!({"code": "gemini_rate_limited"}),
+            ),
+            (
+                AppError::ModelNotFound {
+                    name: "missing-model.bin".into(),
+                },
+                serde_json::json!({
+                    "code": "model_not_found",
+                    "message": {"name": "missing-model.bin"},
+                }),
+            ),
+            (
+                AppError::ProviderUnavailable {
+                    provider: "LocalWhisper".into(),
+                    required_feature: "asr-whisper".into(),
+                },
+                serde_json::json!({
+                    "code": "provider_unavailable",
+                    "message": {
+                        "provider": "LocalWhisper",
+                        "required_feature": "asr-whisper",
+                    },
+                }),
+            ),
+            (
+                AppError::ProviderDeferred {
+                    provider_id: "asr.local_whisper".into(),
+                    display_name: "Local Whisper".into(),
+                },
+                serde_json::json!({
+                    "code": "provider_deferred",
+                    "message": {"provider_id": "asr.local_whisper", "display_name": "Local Whisper"},
+                }),
+            ),
+            (
+                AppError::ArtifactTooLarge {
+                    artifact_class: "materialized_graph".into(),
+                    size_bytes: 156_579_416,
+                    ceiling_bytes: 24 * 1024 * 1024,
+                },
+                serde_json::json!({
+                    "code": "artifact_too_large",
+                    "message": {
+                        "artifact_class": "materialized_graph",
+                        "size_bytes": 156_579_416,
+                        "ceiling_bytes": 24 * 1024 * 1024,
+                    },
+                }),
+            ),
+            (
+                AppError::PrivacyPolicyBlocked {
+                    mode: "local_only".into(),
+                    action: "transcription".into(),
+                    provider: "remote".into(),
+                    data_classes: vec!["audio".into(), "transcript".into()],
+                    reason: "cloud transfer disabled".into(),
+                },
+                serde_json::json!({
+                    "code": "privacy_policy_blocked",
+                    "message": {
+                        "mode": "local_only",
+                        "action": "transcription",
+                        "provider": "remote",
+                        "data_classes": ["audio", "transcript"],
+                        "reason": "cloud transfer disabled",
+                    },
+                }),
+            ),
+            (
+                AppError::SessionInvalid {
+                    reason: "capture not running".into(),
+                },
+                serde_json::json!({
+                    "code": "session_invalid",
+                    "message": {"reason": "capture not running"},
+                }),
+            ),
+            (
+                AppError::NetworkTimeout {
+                    service: "provider readiness".into(),
+                },
+                serde_json::json!({
+                    "code": "network_timeout",
+                    "message": {"service": "provider readiness"},
+                }),
+            ),
+            (
+                AppError::Unknown("legacy failure".into()),
+                serde_json::json!({"code": "unknown", "message": "legacy failure"}),
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(&error).expect("legacy AppError JSON"),
+                expected,
+                "legacy AppError wire drifted for {error:?}"
+            );
+        }
     }
 
     #[test]

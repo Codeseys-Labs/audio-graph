@@ -1551,6 +1551,48 @@
     "details": "Detalhes",
     "hideDetails": "Ocultar detalhes"
   },
+  "runtimeDiagnostics": {
+    "credential": {
+      "missing": "A credencial necessária não foi encontrada.",
+      "locked": "Desbloqueie o armazenamento de credenciais e tente novamente.",
+      "access_denied": "O acesso à credencial foi negado.",
+      "cancelled": "A operação com a credencial foi cancelada.",
+      "store_unavailable": "O armazenamento de credenciais está indisponível.",
+      "store_unsupported": "Este armazenamento de credenciais não é compatível.",
+      "corrupt_record": "O registro da credencial salva está corrompido.",
+      "unsupported_schema": "Esta versão do aplicativo não consegue ler o registro da credencial salva.",
+      "payload_too_large": "O conjunto de credenciais ultrapassa o limite de armazenamento.",
+      "ambiguous_match": "Mais de uma credencial corresponde a esta solicitação.",
+      "conflict": "A operação com a credencial está em conflito com os dados salvos.",
+      "migration_required": "Migre as credenciais salvas antes de usá-las.",
+      "migration_conflict": "Resolva o conflito entre as credenciais antes de migrar.",
+      "recovery_required": "O armazenamento de credenciais precisa ser recuperado.",
+      "legacy_cleanup_required": "Remova as credenciais antigas restantes antes de continuar.",
+      "permission_hardening_failed": "O aplicativo não conseguiu restringir as permissões do armazenamento de credenciais.",
+      "invalid_credential_set": "O conjunto de credenciais selecionado é inválido.",
+      "audience_not_allowed": "A credencial não está autorizada para este destino.",
+      "insecure_transport": "A credencial exige uma conexão segura.",
+      "revision_conflict": "A credencial foi alterada. Recarregue seu status antes de tentar novamente.",
+      "operation_in_progress": "Já há uma operação com credenciais em andamento.",
+      "stalled_worker": "O armazenamento de credenciais parou de responder.",
+      "commit_unknown": "O aplicativo não conseguiu confirmar se a alteração na credencial foi salva.",
+      "internal": "A operação com a credencial falhou inesperadamente."
+    },
+    "runtime": {
+      "rate_limited": "O provedor está limitando as solicitações. Tente novamente mais tarde.",
+      "network_unreachable": "O aplicativo não conseguiu acessar o provedor. Verifique sua conexão.",
+      "timeout": "O provedor não respondeu a tempo.",
+      "provider_unavailable": "O provedor está indisponível.",
+      "protocol_error": "O aplicativo não conseguiu se comunicar com o provedor.",
+      "invalid_response": "O provedor retornou uma resposta inválida.",
+      "request_rejected": "O provedor rejeitou a solicitação.",
+      "capacity_exhausted": "O provedor atingiu seu limite de capacidade. Tente novamente mais tarde.",
+      "policy_blocked": "A política atual bloqueia esta operação.",
+      "unsupported": "O provedor não oferece suporte a esta operação.",
+      "cancelled": "A operação foi cancelada.",
+      "internal": "A operação falhou inesperadamente."
+    }
+  },
   "errors": {
     "providerDeferred": "{{provider}} não está disponível para novas sessões no MVP atual. Suas configurações salvas permanecem inalteradas.",
     "providerSettingsLoading": "As configurações dos provedores ainda estão carregando. Tente novamente em instantes.",

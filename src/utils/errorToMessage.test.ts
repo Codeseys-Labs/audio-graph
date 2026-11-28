@@ -7,6 +7,56 @@ describe("errorToMessage", () => {
     await i18n.changeLanguage("en");
   });
 
+  it("localizes typed diagnostics without displaying untrusted fields", async () => {
+    const error = {
+      code: "runtime_diagnostic",
+      message: "private provider response",
+      diagnostic: {
+        kind: "runtime",
+        detail: {
+          code: "rate_limited",
+          retryable: true,
+          recovery_action: "retry",
+          context: { operation: "transcription", path: "/private/store" },
+        },
+      },
+    };
+    expect(errorToMessage(error)).toBe(
+      "The provider is rate limiting requests. Try again later.",
+    );
+
+    await i18n.changeLanguage("pt");
+    expect(errorToMessage(error)).toBe(
+      "O provedor está limitando as solicitações. Tente novamente mais tarde.",
+    );
+  });
+
+  it("localizes a typed credential failure without displaying its set ID", () => {
+    expect(
+      errorToMessage({
+        code: "runtime_diagnostic",
+        diagnostic: {
+          kind: "credential",
+          detail: {
+            code: "access_denied",
+            retryable: false,
+            recovery_action: "reenter_credential",
+            set_id: "openai",
+          },
+        },
+      }),
+    ).toBe("Access to the credential was denied.");
+  });
+
+  it("does not fall back to the message field of a malformed diagnostic", () => {
+    expect(
+      errorToMessage({
+        code: "runtime_diagnostic",
+        message: "untrusted adapter error",
+      }),
+    ).toBe("The operation failed unexpectedly.");
+  });
+
   it("formats a credential_missing AppError with the key in the message", () => {
     // Matches the JSON shape from the Rust backend:
     //   { "code": "credential_missing", "message": { "key": "aws_secret_key" } }
