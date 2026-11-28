@@ -9,6 +9,8 @@ import {
   type RuntimeSafeRecoveryAction,
 } from "../generated/runtimeDiagnostic";
 import i18n from "../i18n";
+import en from "../i18n/locales/en.json";
+import pt from "../i18n/locales/pt.json";
 import { useAudioGraphStore } from "../store";
 import type { AwsErrorPayload } from "../types";
 import {
@@ -812,6 +814,50 @@ describe("useTauriEvents", () => {
     );
 
     errSpy.mockRestore();
+  });
+
+  // Issue #517 — the `unknown` category must never show a raw
+  // `runtime/<code>` token or provider text in the banner.
+  it("localizes closed diagnostic tokens in unknown aws-error payloads and drops anything else", () => {
+    const unknown = (message: string): AwsErrorPayload => ({
+      error: { category: "unknown", message },
+      raw_message: message,
+    });
+
+    const rateLimited = awsErrorToMessage(unknown("runtime/rate_limited"));
+    expect(rateLimited).toBe(
+      i18n.t("aws.error.unknown", {
+        message: i18n.t("runtimeDiagnostics.runtime.rate_limited"),
+      }),
+    );
+    expect(rateLimited).not.toContain("runtime/");
+
+    const locked = awsErrorToMessage(unknown("credential/locked"));
+    expect(locked).toBe(
+      i18n.t("aws.error.unknown", {
+        message: i18n.t("runtimeDiagnostics.credential.locked"),
+      }),
+    );
+    expect(locked).not.toContain("credential/");
+
+    // Not a closed token: provider prose, a code outside the contract
+    // vocabulary, or a token with trailing text. None of it is rendered.
+    const generic = i18n.t("aws.error.unknownGeneric");
+    for (const untrusted of [
+      "sts canary provider prose arn:aws:iam::canary-account",
+      "runtime/not_a_real_code",
+      "runtime/rate_limited trailing canary prose",
+      "",
+    ]) {
+      const rendered = awsErrorToMessage(unknown(untrusted));
+      expect(rendered).toBe(generic);
+      expect(rendered).not.toContain("canary");
+    }
+
+    // Both locales carry the fixed fallback, without an interpolation slot.
+    for (const locale of [en, pt]) {
+      expect(locale.aws.error.unknownGeneric).not.toContain("{{");
+    }
   });
 
   // ------------------------------------------------------------------

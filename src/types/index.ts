@@ -785,8 +785,11 @@ export type UiAwsError =
 
 /**
  * Payload for the `aws-error` event (ag#13). `error` is the structured
- * classification; `raw_message` is the original aws-sdk error string,
- * retained for debugging / disclosure when the category is `unknown`.
+ * classification. `raw_message` is NOT provider text on the Transcribe path:
+ * it is the `Display` of a closed diagnostic (`runtime/<code>` or
+ * `credential/<code>`), and `UiAwsError`'s `unknown.message` carries the same
+ * token. An older producer can still send provider text in either field
+ * (#148), so the UI never renders them verbatim — see `awsErrorToMessage`.
  */
 export interface AwsErrorPayload {
   error: UiAwsError;
