@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{Emitter, Manager, State};
@@ -1471,20 +1471,50 @@ fn api_config_from_runtime_settings(settings: &crate::settings::AppSettings) -> 
     })
 }
 
-pub(crate) fn sync_llm_api_client_from_settings_cache(state: &AppState) -> Result<(), String> {
-    let settings = state
-        .app_settings
-        .read()
-        .map_err(|e| format!("Lock error: {}", e))?
-        .clone();
-    let next_config = api_config_from_runtime_settings(&settings);
-    let content_egress_policy = provider_content_egress_policy_from_settings(
-        &settings,
-        settings.llm_provider.requires_cloud_content_transfer(),
-    );
+fn sync_llm_clients_from_settings_cache(
+    settings_cache: &RwLock<crate::settings::AppSettings>,
+    api_client: &Mutex<Option<ApiClient>>,
+    openrouter_client: &Mutex<Option<OpenRouterClient>>,
+) -> Result<(), String> {
+    let (api_config, api_policy, openrouter_config, openrouter_policy) = {
+        let settings = settings_cache
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        (
+            api_config_from_runtime_settings(&settings),
+            provider_content_egress_policy_from_settings(
+                &settings,
+                settings.llm_provider.requires_cloud_content_transfer(),
+            ),
+            openrouter_config_from_runtime_settings(&settings),
+            provider_content_egress_policy_from_settings(&settings, true),
+        )
+    };
 
-    let mut guard = state
-        .api_client
+    sync_api_client(api_client, api_config, api_policy)?;
+    sync_openrouter_client(openrouter_client, openrouter_config, openrouter_policy)
+}
+
+async fn sync_llm_clients(state: &AppState) -> AppResult<()> {
+    let settings = state.app_settings.clone();
+    let api_client = state.api_client.clone();
+    let openrouter_client = state.openrouter_client.clone();
+    // Both caches own reqwest blocking clients. Keep construction and the
+    // destruction of replaced or cleared clients on the blocking pool.
+    tokio::task::spawn_blocking(move || {
+        sync_llm_clients_from_settings_cache(&settings, &api_client, &openrouter_client)
+    })
+    .await
+    .map_err(|error| AppError::Unknown(format!("LLM client sync task failed: {error}")))?
+    .map_err(AppError::Unknown)
+}
+
+fn sync_api_client(
+    api_client: &Mutex<Option<ApiClient>>,
+    next_config: Option<ApiConfig>,
+    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
+) -> Result<(), String> {
+    let mut guard = api_client
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
 
@@ -1552,17 +1582,12 @@ fn openrouter_config_from_runtime_settings(
     })
 }
 
-pub(crate) fn sync_openrouter_client_from_settings_cache(state: &AppState) -> Result<(), String> {
-    let settings = state
-        .app_settings
-        .read()
-        .map_err(|e| format!("Lock error: {}", e))?
-        .clone();
-    let next_config = openrouter_config_from_runtime_settings(&settings);
-    let content_egress_policy = provider_content_egress_policy_from_settings(&settings, true);
-
-    let mut guard = state
-        .openrouter_client
+fn sync_openrouter_client(
+    openrouter_client: &Mutex<Option<OpenRouterClient>>,
+    next_config: Option<OpenRouterConfig>,
+    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
+) -> Result<(), String> {
+    let mut guard = openrouter_client
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
 
@@ -2330,6 +2355,28 @@ async fn aws_preflight_probe(
     Ok(())
 }
 
+fn acknowledged_transcription_sources(state: &AppState) -> AppResult<Vec<String>> {
+    // The caller holds session_lifecycle. A prepared capture cannot appear
+    // here: start_capture commits it (or rolls it back) under the same lock.
+    let capturing = *state
+        .is_capturing
+        .read()
+        .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?;
+    if capturing {
+        let sources = state
+            .capture_manager
+            .lock()
+            .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?
+            .active_captures();
+        if !sources.is_empty() {
+            return Ok(sources);
+        }
+    }
+    Err(AppError::SessionInvalid {
+        reason: "Cannot start transcription: capture is not running".to_string(),
+    })
+}
+
 /// Start transcription (streaming processed audio → ASR).
 ///
 /// Requires capture to already be running. Spawns a speech processor thread
@@ -2347,18 +2394,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     let settings = read_settings_for_session_content(state.inner(), "asr_session")?;
     enforce_transcribe_provider_start(&settings)?;
 
-    // Guard: capture must be running
-    {
-        let capturing = state
-            .is_capturing
-            .read()
-            .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?;
-        if !*capturing {
-            return Err(AppError::SessionInvalid {
-                reason: "Cannot start transcription: capture is not running".to_string(),
-            });
-        }
-    }
+    let active_sources = acknowledged_transcription_sources(state.inner())?;
 
     // Guard: don't double-start
     if state.is_transcribing.load(Ordering::SeqCst) {
@@ -2366,9 +2402,6 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             reason: "Transcription is already running".to_string(),
         });
     }
-
-    sync_llm_api_client_from_settings_cache(state.inner()).map_err(AppError::Unknown)?;
-    sync_openrouter_client_from_settings_cache(state.inner()).map_err(AppError::Unknown)?;
 
     // Pre-flight validation: verify the selected providers are ready before
     // spawning the speech processor. Without these checks the processor thread
@@ -2404,11 +2437,6 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             llm_provider.requires_cloud_content_transfer(),
         )?;
 
-        let active_sources = state
-            .capture_manager
-            .lock()
-            .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?
-            .active_captures();
         validate_asr_capture_selection(&asr_provider, &active_sources, None)
             .map_err(AppError::Unknown)?;
 
@@ -2592,6 +2620,11 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             }
         }
     }
+
+    sync_llm_clients(state.inner()).await?;
+    // A capture worker can finish during preflight even though its lifecycle
+    // reconciliation is still waiting for this command to release the lock.
+    acknowledged_transcription_sources(state.inner())?;
 
     // ADR-0045 decision 6 (audio-graph-5fd1): reseed each projection lane's
     // coverage head from this session's accepted `projection_patches` log
@@ -3080,8 +3113,7 @@ pub async fn configure_api_endpoint(
         });
     }
 
-    sync_llm_api_client_from_settings_cache(state.inner())?;
-    sync_openrouter_client_from_settings_cache(state.inner())?;
+    sync_llm_clients(state.inner()).await?;
 
     log::info!("API endpoint configured successfully");
     Ok(())
@@ -3102,9 +3134,6 @@ fn prepare_chat_request(
     state: &AppState,
     message: String,
 ) -> Result<(Vec<ChatMessage>, String), String> {
-    sync_llm_api_client_from_settings_cache(state)?;
-    sync_openrouter_client_from_settings_cache(state)?;
-
     let snapshot = {
         let kg = state
             .knowledge_graph
@@ -3567,6 +3596,7 @@ pub async fn start_streaming_chat(
         )));
     }
 
+    sync_llm_clients(state.inner()).await?;
     let (messages, graph_context) = prepare_chat_request(state.inner(), message)?;
     let request_id = uuid::Uuid::new_v4().to_string();
     spawn_stream_task(
@@ -3645,6 +3675,7 @@ pub async fn send_chat_message(
         return Err(err);
     }
 
+    sync_llm_clients(state.inner()).await?;
     let (messages, graph_context) = prepare_chat_request(state.inner(), message)?;
 
     // Streaming path — accumulate to full text via the same producer the
@@ -3790,9 +3821,6 @@ pub async fn synthesize_notes(
     let settings = read_settings_for_session_content(state.inner(), "notes_synthesis")?;
     crate::provider_registry::ensure_llm_provider_start_enabled(&settings.llm_provider)?;
 
-    sync_llm_api_client_from_settings_cache(state.inner())?;
-    sync_openrouter_client_from_settings_cache(state.inner())?;
-
     let llm_provider = settings.llm_provider.clone();
 
     enforce_session_content_policy(
@@ -3804,6 +3832,7 @@ pub async fn synthesize_notes(
         &["transcript", "graph_context", "prompt"],
         llm_provider.requires_cloud_content_transfer(),
     )?;
+    sync_llm_clients(state.inner()).await?;
 
     let snapshot = {
         let kg = state
@@ -5191,9 +5220,6 @@ fn prepare_card_answer_request(
     source_span_ids: &[String],
     question_text: &str,
 ) -> Result<CardAnswerMaterials, String> {
-    sync_llm_api_client_from_settings_cache(state)?;
-    sync_openrouter_client_from_settings_cache(state)?;
-
     let snapshot = {
         let kg = state
             .knowledge_graph
@@ -5951,6 +5977,7 @@ async fn answer_question_card_impl(
     let route = crate::llm::route::resolve_route(&llm_provider);
     let route_id = route.id.to_string();
 
+    sync_llm_clients(state).await?;
     let question_text = question_text_from_body(&card.proposal.body);
     let materials = prepare_card_answer_request(state, &card.source_span_ids, &question_text)?;
 
@@ -6528,17 +6555,12 @@ pub fn load_settings_cmd(
     if let Ok(mut cached) = state.app_settings.write() {
         *cached = runtime_settings;
     }
-    if let Err(e) = sync_llm_api_client_from_settings_cache(state.inner()) {
-        log::warn!(
-            "Failed to sync LLM API client after loading settings: {}",
-            e
-        );
-    }
-    if let Err(e) = sync_openrouter_client_from_settings_cache(state.inner()) {
-        log::warn!(
-            "Failed to sync OpenRouter client after loading settings: {}",
-            e
-        );
+    if let Err(e) = sync_llm_clients_from_settings_cache(
+        &state.app_settings,
+        &state.api_client,
+        &state.openrouter_client,
+    ) {
+        log::warn!("Failed to sync LLM clients after loading settings: {}", e);
     }
     settings_for_ipc
 }
@@ -6559,8 +6581,11 @@ pub fn save_settings_cmd(
     if let Ok(mut cached) = state.app_settings.write() {
         *cached = runtime_settings;
     }
-    sync_llm_api_client_from_settings_cache(state.inner())?;
-    sync_openrouter_client_from_settings_cache(state.inner())?;
+    sync_llm_clients_from_settings_cache(
+        &state.app_settings,
+        &state.api_client,
+        &state.openrouter_client,
+    )?;
     Ok(())
 }
 
@@ -9070,7 +9095,7 @@ fn projection_replay_latency_metrics(
             }
         });
         let asr_to_queue_ms = latest_basis_timing
-            .and_then(|timing| patch.queued_at_ms.map(|queued| (timing, queued)))
+            .zip(patch.queued_at_ms)
             .map(|(timing, queued)| queued.saturating_sub(timing.received_at_ms));
         let projection_queue_ms = patch
             .queued_at_ms
@@ -18328,6 +18353,321 @@ mod tests {
         assert!(enforce_chat_provider_start(&settings).is_ok());
     }
 
+    fn deepgram_without_credentials() -> crate::settings::AsrProvider {
+        crate::settings::AsrProvider::DeepgramStreaming {
+            api_key: String::new(),
+            model: "nova-3".into(),
+            enable_diarization: true,
+            endpointing_ms: 300,
+            utterance_end_ms: 1000,
+            vad_events: true,
+            eot_threshold: 0.5,
+            eager_eot_threshold: 0.0,
+            eot_timeout_ms: 0,
+            max_speakers: 0,
+            keyterms: vec![],
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    #[allow(clippy::await_holding_lock)]
+    async fn start_transcribe_rejects_phantom_and_finished_capture_sources() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let dir = unique_tempdir("phantom-capture");
+        let _guard = HomeGuard::set(&dir);
+        let manager = tauri::test::mock_app();
+        manager.manage(AppState::new());
+        let state = manager.state::<AppState>();
+        let app = crate::speech::shared_test_app_handle();
+        *state.is_capturing.write().unwrap() = true;
+        state.projection_lane_stopping.store(true, Ordering::SeqCst);
+        *state.app_settings.write().unwrap() = crate::settings::AppSettings {
+            asr_provider: deepgram_without_credentials(),
+            llm_provider: crate::settings::LlmProvider::Api {
+                endpoint: crate::settings::CEREBRAS_BASE_URL.into(),
+                api_key: String::new(),
+                model: audio_graph_provider_registry::CEREBRAS_DEFAULT_MODEL.into(),
+            },
+            ..Default::default()
+        };
+
+        for has_finished_handle in [false, true] {
+            if has_finished_handle {
+                state
+                    .capture_manager
+                    .lock()
+                    .unwrap()
+                    .insert_synthetic_handle("system", true);
+            }
+            let err = start_transcribe(manager.state(), app.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, AppError::SessionInvalid { ref reason } if reason == "Cannot start transcription: capture is not running"),
+                "finished handle present: {has_finished_handle}; got {err:?}"
+            );
+            assert!(!state.is_transcribing.load(Ordering::SeqCst));
+            assert!(state.projection_lane_stopping.load(Ordering::SeqCst));
+            assert!(state.api_client.lock().unwrap().is_none());
+            assert!(state.speech_processor_thread.lock().unwrap().is_none());
+            assert!(state.asr_worker_thread.lock().unwrap().is_none());
+            assert!(state.projection_job_workers.lock().unwrap().is_empty());
+        }
+
+        drain_test_writers(&state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn provider_deferred_registered_ipc_matrix() {
+        use crate::settings::{AppSettings, LlmProvider, PrivacyMode, TtsProvider};
+        use serde_json::{Value, json};
+        use tauri::ipc::{CallbackFn, InvokeBody, InvokeError, InvokeResponse};
+
+        const IPC_DIR: &str = "AUDIOGRAPH_TEST_IPC_DIR";
+        let Some(dir) = std::env::var_os(IPC_DIR).map(std::path::PathBuf::from) else {
+            // The real handler takes AppHandle<Wry>, not MockRuntime. Isolate
+            // its event loop from the shared Wry app used by other tests.
+            let dir = unique_tempdir("provider-ipc");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::tests::provider_deferred_registered_ipc_matrix",
+                    "--nocapture",
+                ])
+                .env(IPC_DIR, &dir)
+                .env(crate::user_data::DATA_DIR_ENV, &dir)
+                .env("XDG_CONFIG_HOME", &dir)
+                .status()
+                .expect("launch isolated Wry IPC test");
+            let _ = std::fs::remove_dir_all(dir);
+            assert!(status.success(), "Wry IPC test failed: {status}");
+            return;
+        };
+
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        context.config_mut().identifier =
+            format!("com.audiograph.ipc-test-{}", uuid::Uuid::new_v4());
+        let builder = tauri::Builder::default();
+        #[cfg(not(target_os = "macos"))]
+        let builder = builder.any_thread();
+        let app = builder
+            .manage(AppState::new())
+            .invoke_handler(crate::app_invoke_handler())
+            .build(context)
+            .expect("build Wry IPC test app");
+        let window = tauri::WebviewWindowBuilder::new(
+            &app,
+            "main",
+            tauri::WebviewUrl::External("about:blank".parse().unwrap()),
+        )
+        .visible(false)
+        .data_directory(dir.join("webview"))
+        .build()
+        .expect("build Wry IPC test webview");
+        let state = app.state::<AppState>();
+        let invoke = |command: &str, payload: Value| -> Result<Value, Value> {
+            // get_ipc_response is restricted to MockRuntime. Drive the same
+            // on_message boundary with the production Wry handler.
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            window.clone().on_message(
+                tauri::webview::InvokeRequest {
+                    cmd: command.into(),
+                    callback: CallbackFn(0),
+                    error: CallbackFn(1),
+                    url: if cfg!(windows) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
+                    body: InvokeBody::Json(payload),
+                    headers: Default::default(),
+                    invoke_key: app.invoke_key().into(),
+                },
+                Box::new(move |_webview, _cmd, response, _callback, _error| {
+                    let _ = tx.send(response);
+                }),
+            );
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(InvokeResponse::Ok(value)) => Ok(value.deserialize().unwrap()),
+                Ok(InvokeResponse::Err(InvokeError(err))) => Err(err),
+                Err(err) => panic!("{command} did not return an IPC response: {err}"),
+            }
+        };
+        let persist = |settings: &AppSettings| {
+            crate::settings::save_settings(app.handle(), settings).unwrap();
+            let loaded = crate::settings::load_settings_with_status(app.handle());
+            assert_eq!(
+                loaded.status,
+                crate::settings::SettingsLoadStatus::CanonicalOk
+            );
+            *state.app_settings.write().unwrap() = loaded.settings;
+        };
+
+        *state.is_capturing.write().unwrap() = true;
+        state
+            .capture_manager
+            .lock()
+            .unwrap()
+            .insert_synthetic_handle("system", false);
+        let mut settings = AppSettings {
+            asr_provider: crate::settings::AsrProvider::LocalWhisper,
+            llm_provider: LlmProvider::Api {
+                endpoint: crate::settings::CEREBRAS_BASE_URL.into(),
+                api_key: String::new(),
+                model: audio_graph_provider_registry::CEREBRAS_DEFAULT_MODEL.into(),
+            },
+            ..Default::default()
+        };
+        persist(&settings);
+        for (command, provider_id, display_name) in [
+            ("start_transcribe", "asr.local_whisper", "Local Whisper"),
+            ("start_gemini", "realtime_agent.gemini_live", "Gemini Live"),
+            (
+                "start_converse",
+                "realtime_agent.gemini_live",
+                "Gemini Live",
+            ),
+            (
+                "start_openai_realtime",
+                "realtime_agent.openai_realtime",
+                "OpenAI Realtime voice agent",
+            ),
+        ] {
+            assert_eq!(
+                invoke(command, json!({})),
+                Err(json!({
+                    "code": "provider_deferred",
+                    "message": { "provider_id": provider_id, "display_name": display_name }
+                })),
+                "{command}"
+            );
+        }
+        assert!(state.api_client.lock().unwrap().is_none());
+        assert!(state.openrouter_client.lock().unwrap().is_none());
+        assert!(state.gemini_client.lock().unwrap().is_none());
+        assert!(state.openai_realtime_client.lock().unwrap().is_none());
+        assert!(!*state.is_gemini_active.read().unwrap());
+        assert!(!*state.is_converse_active.read().unwrap());
+        assert!(!*state.is_openai_realtime_active.read().unwrap());
+        assert!(!state.is_transcribing.load(Ordering::SeqCst));
+        assert!(state.speech_processor_thread.lock().unwrap().is_none());
+        assert!(state.chat_history.read().unwrap().is_empty());
+        assert!(*state.is_capturing.read().unwrap());
+        assert_eq!(
+            state.capture_manager.lock().unwrap().active_captures(),
+            ["system"]
+        );
+
+        for command in [
+            "stop_transcribe",
+            "stop_gemini",
+            "stop_converse",
+            "stop_openai_realtime",
+        ] {
+            assert_eq!(invoke(command, json!({})), Ok(Value::Null), "{command}");
+        }
+        let cancellation = CancellationToken::new();
+        state
+            .stream_registry
+            .register("ipc-stream".into(), cancellation.clone());
+        assert_eq!(
+            invoke(
+                "cancel_streaming_chat",
+                json!({ "requestId": "ipc-stream" })
+            ),
+            Ok(Value::Null)
+        );
+        assert!(cancellation.is_cancelled());
+
+        // Every persisted LlmProvider and TtsProvider variant is selectable at
+        // this revision. Exercise their next boundary instead of inventing a
+        // deferred route or bypassing the production registry.
+        settings.asr_provider = deepgram_without_credentials();
+        for provider in [
+            settings.llm_provider.clone(),
+            LlmProvider::OpenRouter {
+                model: "openai/gpt-4.1-mini".into(),
+                base_url: openrouter::DEFAULT_BASE_URL.into(),
+                provider_order: None,
+                include_usage_in_stream: true,
+                api_key: String::new(),
+            },
+        ] {
+            settings.llm_provider = provider;
+            settings.privacy_mode = PrivacyMode::ByokCloud;
+            persist(&settings);
+            assert_eq!(
+                invoke("start_transcribe", json!({})),
+                Err(json!({
+                    "code": "credential_missing",
+                    "message": { "key": "deepgram_api_key" }
+                }))
+            );
+
+            settings.privacy_mode = PrivacyMode::LocalOnly;
+            persist(&settings);
+            for (command, payload, action) in [
+                (
+                    "start_streaming_chat",
+                    json!({ "message": "test prompt", "channel": "__CHANNEL__:42" }),
+                    "llm_chat",
+                ),
+                (
+                    "send_chat_message",
+                    json!({ "message": "test prompt" }),
+                    "llm_chat",
+                ),
+                ("synthesize_notes", json!({}), "notes_synthesis"),
+            ] {
+                let err = invoke(command, payload).unwrap_err();
+                assert_eq!(err["code"], "privacy_policy_blocked", "{command}: {err}");
+                assert_eq!(err["message"]["action"], action, "{command}: {err}");
+            }
+        }
+
+        settings.llm_provider = LlmProvider::Api {
+            endpoint: "http://127.0.0.1:0/v1".into(),
+            api_key: String::new(),
+            model: "local-fixture".into(),
+        };
+        settings.speak_aloud = true;
+        settings.tts_provider = TtsProvider::DeepgramAura {
+            voice: "aura-asteria-en".into(),
+            sample_rate: 24_000,
+            speed: 1.0,
+        };
+        persist(&settings);
+        let err = invoke(
+            "start_streaming_chat",
+            json!({ "message": "test prompt", "channel": "__CHANNEL__:42" }),
+        )
+        .unwrap_err();
+        assert_eq!(err["code"], "privacy_policy_blocked");
+        assert_eq!(err["message"]["action"], "tts_speak_aloud");
+        assert_eq!(err["message"]["provider"], "tts.deepgram_aura");
+        assert!(state.chat_history.read().unwrap().is_empty());
+        assert!(state.api_client.lock().unwrap().is_none());
+        assert!(state.openrouter_client.lock().unwrap().is_none());
+
+        drain_test_writers(&state);
+        let path = crate::settings::get_settings_path(app.handle()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
     #[test]
     fn readiness_request_set_is_explicit_and_preserves_deferred_diagnostics() {
         let settings = crate::settings::AppSettings::default();
@@ -21405,7 +21745,12 @@ mod tests {
         };
 
         *state.app_settings.write().expect("lock poisoned") = settings.clone();
-        sync_llm_api_client_from_settings_cache(&state).expect("initial sync must succeed");
+        sync_llm_clients_from_settings_cache(
+            &state.app_settings,
+            &state.api_client,
+            &state.openrouter_client,
+        )
+        .expect("initial sync must succeed");
 
         settings.llm_provider = crate::settings::LlmProvider::Api {
             endpoint: "https://api.openai.com/v1".to_string(),
@@ -21420,7 +21765,12 @@ mod tests {
             temperature: 0.2,
         });
         *state.app_settings.write().expect("lock poisoned") = settings;
-        sync_llm_api_client_from_settings_cache(&state).expect("resync must succeed");
+        sync_llm_clients_from_settings_cache(
+            &state.app_settings,
+            &state.api_client,
+            &state.openrouter_client,
+        )
+        .expect("resync must succeed");
 
         let guard = state.api_client.lock().expect("lock poisoned");
         let config = guard.as_ref().expect("client configured").config();
@@ -21442,16 +21792,80 @@ mod tests {
             },
             ..Default::default()
         };
-        sync_llm_api_client_from_settings_cache(&state).expect("initial sync must succeed");
+        sync_llm_clients_from_settings_cache(
+            &state.app_settings,
+            &state.api_client,
+            &state.openrouter_client,
+        )
+        .expect("initial sync must succeed");
         assert!(state.api_client.lock().expect("lock poisoned").is_some());
 
         *state.app_settings.write().expect("lock poisoned") = crate::settings::AppSettings {
             llm_provider: crate::settings::LlmProvider::LocalLlama,
             ..Default::default()
         };
-        sync_llm_api_client_from_settings_cache(&state).expect("clear sync must succeed");
+        sync_llm_clients_from_settings_cache(
+            &state.app_settings,
+            &state.api_client,
+            &state.openrouter_client,
+        )
+        .expect("clear sync must succeed");
 
         assert!(state.api_client.lock().expect("lock poisoned").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn cold_api_client_sync_and_reconfiguration_on_current_thread() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("cold-api-client");
+        let _guard = HomeGuard::set(&dir);
+        let app = tauri::test::mock_app();
+        app.manage(AppState::new());
+        let state = app.state::<AppState>();
+        assert!(state.api_client.lock().unwrap().is_none());
+
+        for model in ["initial-model", "replacement-model"] {
+            configure_api_endpoint(
+                "http://localhost:11434/v1".into(),
+                None,
+                model.into(),
+                app.state::<AppState>(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                state
+                    .api_client
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .config()
+                    .model,
+                model
+            );
+        }
+
+        state.app_settings.write().unwrap().llm_provider =
+            crate::settings::LlmProvider::OpenRouter {
+                model: "fixture-model".into(),
+                base_url: crate::llm::openrouter::DEFAULT_BASE_URL.into(),
+                provider_order: None,
+                include_usage_in_stream: true,
+                api_key: "fixture".into(),
+            };
+        sync_llm_clients(&state).await.unwrap();
+        assert!(state.api_client.lock().unwrap().is_none());
+        assert!(state.openrouter_client.lock().unwrap().is_some());
+
+        state.app_settings.write().unwrap().llm_provider = crate::settings::LlmProvider::LocalLlama;
+        sync_llm_clients(&state).await.unwrap();
+        assert!(state.openrouter_client.lock().unwrap().is_none());
+        drain_test_writers(&state);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -22325,8 +22739,12 @@ mod tests {
         let app = crate::speech::shared_test_app_handle();
         let session = state.current_session_id();
         *state.is_capturing.write().unwrap() = true;
+        state
+            .capture_manager
+            .lock()
+            .unwrap()
+            .insert_synthetic_handle("system", false);
         state.is_transcribing.store(true, Ordering::SeqCst);
-        // A same-session restart begins with an already configured client.
         {
             let mut settings = state.app_settings.write().unwrap();
             settings.privacy_mode = crate::settings::PrivacyMode::ByokCloud;
@@ -22349,13 +22767,6 @@ mod tests {
                 model: audio_graph_provider_registry::CEREBRAS_DEFAULT_MODEL.into(),
             };
         }
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| sync_llm_api_client_from_settings_cache(&state))
-                .join()
-                .unwrap()
-                .unwrap();
-        });
         let (notes, graph) = {
             let mut ledger = state.transcript_ledger.lock().unwrap();
             ledger
@@ -24595,45 +25006,6 @@ mod tests {
         };
     }
 
-    /// Pre-warm `state.api_client` on a PLAIN std thread, before any async
-    /// dispatch runs. `reqwest::blocking::Client` (which `ApiClient` wraps)
-    /// asserts, in debug builds, that it is never constructed from within an
-    /// active tokio context (`reqwest::blocking::wait::enter`'s debug-only
-    /// shell-runtime probe) — exactly the context `answer_question_card_impl`
-    /// runs in here, inside `rt.block_on(async { .. })` (this crate's callers
-    /// are plain `#[test]` functions, not `#[tokio::test]`, specifically so
-    /// `TEST_HOME_LOCK`'s guard can be held across the whole call without
-    /// tripping `clippy::await_holding_lock` — see the two call sites'
-    /// comments — but `block_on` itself still counts as "an active tokio
-    /// context" for this hazard). `prepare_card_answer_request`
-    /// unconditionally calls `sync_llm_api_client_from_settings_cache`
-    /// (pre-existing T3 code, unchanged here), but that function only
-    /// constructs a NEW `ApiClient` when the cached one's config/policy is
-    /// stale (`already_current`, `commands.rs`) — so constructing the
-    /// identical config+policy here, off-thread, first, makes the later
-    /// in-flight call a same-config no-op. This is a TEST-ONLY workaround
-    /// for a pre-existing reqwest/tokio interaction; it changes no
-    /// production code path.
-    fn prewarm_api_client_off_the_async_context(state: &AppState) {
-        let settings = state
-            .app_settings
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let Some(config) = api_config_from_runtime_settings(&settings) else {
-            return;
-        };
-        let policy = provider_content_egress_policy_from_settings(
-            &settings,
-            settings.llm_provider.requires_cloud_content_transfer(),
-        );
-        let client =
-            std::thread::spawn(move || ApiClient::new(config).with_content_egress_policy(policy))
-                .join()
-                .expect("construct ApiClient on a plain thread");
-        *state.api_client.lock().unwrap_or_else(|e| e.into_inner()) = Some(client);
-    }
-
     /// Poll the durable card store until `proposal_id`'s card carries an
     /// `answer` (the background `spawn_card_answer_stream_task` task
     /// finalizes asynchronously — `answer_question_card_impl` itself returns
@@ -24656,53 +25028,7 @@ mod tests {
         panic!("card {proposal_id} did not receive an answer within the test timeout");
     }
 
-    /// `ApiClient` (`llm::api_client`) wraps a `reqwest::blocking::Client`,
-    /// which owns its own internal tokio `Runtime` — dropping it from within
-    /// an ALREADY-running tokio runtime (e.g. from inside `rt.block_on(async
-    /// { .. })`) panics ("Cannot drop a runtime in a context where blocking
-    /// is not allowed"). This helper is called from the PLAIN, non-async
-    /// call frame that surrounds `block_on` at each of its two call sites
-    /// (after `block_on` has already returned), where no such context is
-    /// active — belt-and-suspenders with its own off-thread drop below, in
-    /// case a future edit moves the call. `prepare_card_answer_request`
-    /// unconditionally calls `sync_llm_api_client_from_settings_cache`, which
-    /// populates `state.api_client` whenever `settings.llm_provider` is the
-    /// `Api` variant — exactly what these end-to-end tests point at the mock
-    /// server, and exactly the ONLY thing `AppState::new()` in this test file
-    /// constructs that owns a nested runtime. Taking the client out and
-    /// dropping it on a plain OS thread (the same idiom
-    /// `llm::api_client::tests::run_blocking` uses for the SAME hazard class,
-    /// on the call side rather than the drop side) sidesteps the panic
-    /// without touching any production code path.
-    fn drop_cached_api_client_off_the_async_context(state: &AppState) {
-        let leftover = state
-            .api_client
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if leftover.is_some() {
-            std::thread::spawn(move || drop(leftover))
-                .join()
-                .expect("drop api client on a plain thread");
-        }
-    }
-
-    // Plain `#[test]` + a manually-driven `Runtime::block_on` (NOT
-    // `#[tokio::test]`): `TEST_HOME_LOCK` is a plain `std::sync::Mutex`, and
-    // holding its guard across an `.await` point trips
-    // `clippy::await_holding_lock` — the guard must be held for this test's
-    // ENTIRE body (it serializes against every other test in this binary
-    // that mutates the process-wide home/data-dir env vars), so the fix is
-    // to keep the guard in a non-async function and drive the async body
-    // through `block_on` instead of `async fn` + `#[tokio::test]`. This also
-    // sidesteps `ApiClient::new`'s nested-runtime-construction hazard the
-    // SAME way `prewarm_api_client_off_the_async_context` does elsewhere:
-    // `reqwest::blocking::Client` asserts, in debug builds, that it is never
-    // built from within an active tokio context, and `block_on` itself
-    // establishes exactly that context for everything inside it — which is
-    // why `prewarm_api_client_off_the_async_context` still runs its
-    // construction on a SEPARATE plain thread rather than relying on this
-    // function's own (non-async) call frame.
+    // Keep the process-wide test home lock outside the async body.
     #[test]
     #[cfg_attr(
         target_os = "macos",
@@ -24740,7 +25066,6 @@ mod tests {
                             data: [DONE]\n\n";
             let base = spawn_answer_engine_sse_mock(sse_body).await;
             point_state_at_mock_llm_provider(&state, base);
-            prewarm_api_client_off_the_async_context(&state);
 
             // --- Mint-and-ask, through the REAL wrapper assembly (fix-round:
             // this now calls `dispatch_ask_question_card` itself rather than
@@ -24843,8 +25168,6 @@ mod tests {
                 assert!(!serialized.contains("deadline moved"));
             }
         });
-
-        drop_cached_api_client_off_the_async_context(&state);
     }
 
     /// audio-graph-83cc-ba04 (T3G2, completing ratified Q4): the same
@@ -24880,7 +25203,6 @@ mod tests {
                             data: [DONE]\n\n";
             let base = spawn_answer_engine_sse_mock(sse_body).await;
             point_state_at_mock_llm_provider(&state, base);
-            prewarm_api_client_off_the_async_context(&state);
 
             let dispatch = dispatch_ask_question_card(
                 "What's on the agenda today?".to_string(),
@@ -24970,14 +25292,9 @@ mod tests {
                 assert!(!serialized.contains("Nothing has been discussed"));
             }
         });
-
-        drop_cached_api_client_off_the_async_context(&state);
     }
 
-    // Plain `#[test]` + a manually-driven `Runtime::block_on` — see the
-    // previous test's comment for why (holding `TEST_HOME_LOCK`'s guard
-    // across `.await` trips `clippy::await_holding_lock`, and `ApiClient::new`
-    // cannot run inside an active tokio context either way).
+    // Keep the process-wide test home lock outside the async body.
     #[test]
     #[cfg_attr(
         target_os = "macos",
@@ -25037,7 +25354,6 @@ mod tests {
                             data: [DONE]\n\n";
             let base = spawn_answer_engine_sse_mock(sse_body).await;
             point_state_at_mock_llm_provider(&state, base);
-            prewarm_api_client_off_the_async_context(&state);
 
             let manual_dispatch = answer_question_card_impl(
                 card_id.to_string(),
@@ -25058,8 +25374,6 @@ mod tests {
             assert_eq!(answer.status, events::CardAnswerStatus::Answered);
             assert_eq!(answer.text, "Manual retry answer.");
         });
-
-        drop_cached_api_client_off_the_async_context(&state);
     }
 
     #[test]
