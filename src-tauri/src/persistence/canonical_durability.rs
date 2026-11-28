@@ -114,6 +114,8 @@ impl CanonicalFilesystemQualification {
         Ok((qualification, durability))
     }
 
+    /// Bind real directory identity (Unix device/inode or Windows volume/file ID).
+    /// Test evidence skips the live production filesystem capability probe.
     #[cfg(test)]
     pub(crate) fn for_test_root(root: &Path) -> Result<Self, CanonicalCoordinationError> {
         let namespace =
@@ -384,16 +386,10 @@ pub enum CanonicalDurabilityBarrier {
     /// Only the qualified parent-directory namespace barrier was crossed. A
     /// removal claims no file barrier: the object is gone.
     ParentNamespace,
-    /// Flushed file data and verified name on fixed local NTFS. NTFS journals
-    /// namespace changes in $LogFile. No directory flush or move was issued.
-    FileAndWindowsNtfsObservedNamespace,
-    /// Flushed file, same-volume MoveFileExW with MOVEFILE_WRITE_THROUGH,
-    /// then destination identity readback. These Windows levels describe
-    /// process-crash recovery. Abrupt power-loss evidence is tracked in #139.
-    FileAndWindowsNtfsWriteThroughNamespace,
-    /// Verified absence under the cooperative lock on qualified NTFS.
-    /// This does not provide the Unix fsync(dir_fd) persistence guarantee.
-    WindowsNtfsUnlinkNamespace,
+    /// The file was flushed, its name verified, and the held NTFS parent flushed.
+    FileAndWindowsNtfsParentFlush,
+    /// The name was absent under the cooperative lock and the NTFS parent was flushed.
+    WindowsNtfsParentFlush,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -581,6 +577,13 @@ enum VolumeIdentity {
     UnixDevice(u64),
     #[cfg(test)]
     SyntheticAlgorithmNamespace(u64),
+}
+
+#[cfg(test)]
+impl fmt::Debug for VolumeIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VolumeIdentity(..)")
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -782,8 +785,7 @@ impl ParentDurabilityBarrier {
         self.native.is_some()
     }
 
-    /// Cross the platform's parent barrier. On Windows the held handle
-    /// supplies identity evidence only; the receipt names the namespace check.
+    /// Flush the directory whose identity was validated during parent binding.
     fn sync_all(&self) -> io::Result<()> {
         #[cfg(test)]
         if self.algorithm_test {
@@ -793,14 +795,7 @@ impl ParentDurabilityBarrier {
             .native
             .as_ref()
             .ok_or_else(|| io::Error::other("parent durability barrier unavailable"))?;
-        #[cfg(not(windows))]
-        {
-            directory.sync_all()
-        }
-        #[cfg(windows)]
-        {
-            windows_ntfs::identity(directory).map(|_| ())
-        }
+        directory.sync_all()
     }
 }
 
@@ -809,7 +804,11 @@ fn open_parent_directory(
     _platform: CanonicalPlatform,
     path: &Path,
 ) -> Result<Option<File>, CanonicalDurabilityRejection> {
-    windows_ntfs::open_attributes(path)
+    // Existing-file appends require no namespace flush and may live beneath
+    // a parent where GENERIC_WRITE is denied. Keep an identity handle then;
+    // any operation that needs a flush must still succeed at sync_all().
+    windows_ntfs::open_directory_for_flush(path)
+        .or_else(|_| windows_ntfs::open_attributes(path))
         .map(Some)
         .map_err(|error| durability_io(CanonicalDurabilityStage::OpenParent, &error))
 }
@@ -1422,7 +1421,7 @@ impl CanonicalExclusiveGuard {
         }
         CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
             mutation: CanonicalMutation::Rename,
-            barrier: self.file_namespace_barrier(false),
+            barrier: self.file_namespace_barrier(),
         })
     }
 
@@ -2021,7 +2020,7 @@ impl CanonicalExclusiveGuard {
         };
 
         #[cfg(windows)]
-        if let Err(error) = windows_ntfs::protect_private_file(path, &file) {
+        if let Err(error) = crate::fs_util::try_set_owner_only_file(&file) {
             return indeterminate(CanonicalDurabilityStage::ProtectTemp, &error, recovery_key);
         }
         let remaining = &expected[observed_len..];
@@ -2091,7 +2090,7 @@ impl CanonicalExclusiveGuard {
 
         CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
             mutation,
-            barrier: self.file_namespace_barrier(false),
+            barrier: self.file_namespace_barrier(),
         })
     }
 
@@ -2352,7 +2351,7 @@ impl CanonicalExclusiveGuard {
 
         CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
             mutation: CanonicalMutation::Rename,
-            barrier: self.file_namespace_barrier(true),
+            barrier: self.file_namespace_barrier(),
         })
     }
 
@@ -2599,7 +2598,7 @@ impl CanonicalExclusiveGuard {
             );
         }
         #[cfg(windows)]
-        if let Err(error) = windows_ntfs::protect_private_file(temporary, &temporary_file) {
+        if let Err(error) = crate::fs_util::try_set_owner_only_file(&temporary_file) {
             return indeterminate(CanonicalDurabilityStage::ProtectTemp, &error, recovery_key);
         }
         let mut writer = BufWriter::new(&mut temporary_file);
@@ -2670,7 +2669,7 @@ impl CanonicalExclusiveGuard {
             }
             return CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
                 mutation: CanonicalMutation::SnapshotIntentStage,
-                barrier: self.file_namespace_barrier(false),
+                barrier: self.file_namespace_barrier(),
             });
         }
         // After final revalidation the cooperative lock protects the names.
@@ -2700,7 +2699,7 @@ impl CanonicalExclusiveGuard {
 
         CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
             mutation,
-            barrier: self.file_namespace_barrier(true),
+            barrier: self.file_namespace_barrier(),
         })
     }
 
@@ -2832,21 +2831,17 @@ impl CanonicalExclusiveGuard {
         Ok(())
     }
 
-    fn file_namespace_barrier(&self, moved: bool) -> CanonicalDurabilityBarrier {
-        match (self.platform, moved) {
-            (CanonicalPlatform::Windows, true) => {
-                CanonicalDurabilityBarrier::FileAndWindowsNtfsWriteThroughNamespace
-            }
-            (CanonicalPlatform::Windows, false) => {
-                CanonicalDurabilityBarrier::FileAndWindowsNtfsObservedNamespace
-            }
-            _ => CanonicalDurabilityBarrier::FileAndParentNamespace,
+    fn file_namespace_barrier(&self) -> CanonicalDurabilityBarrier {
+        if self.platform == CanonicalPlatform::Windows {
+            CanonicalDurabilityBarrier::FileAndWindowsNtfsParentFlush
+        } else {
+            CanonicalDurabilityBarrier::FileAndParentNamespace
         }
     }
 
     fn unlink_barrier(&self) -> CanonicalDurabilityBarrier {
         if self.platform == CanonicalPlatform::Windows {
-            CanonicalDurabilityBarrier::WindowsNtfsUnlinkNamespace
+            CanonicalDurabilityBarrier::WindowsNtfsParentFlush
         } else {
             CanonicalDurabilityBarrier::ParentNamespace
         }
@@ -2950,7 +2945,7 @@ impl CanonicalExclusiveGuard {
             );
             return CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
                 mutation,
-                barrier: self.file_namespace_barrier(false),
+                barrier: self.file_namespace_barrier(),
             });
         }
 
@@ -4001,15 +3996,6 @@ mod windows_ntfs {
         }
     }
 
-    pub(super) fn protect_private_file(path: &Path, file: &File) -> io::Result<()> {
-        let expected = identity(file)?;
-        if identity(&open_attributes(path)?)? != expected {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        crate::fs_util::try_set_owner_only(path).map_err(|_| io::ErrorKind::PermissionDenied)?;
-        Ok(())
-    }
-
     pub(super) fn check_managed_root(path: &Path) -> io::Result<()> {
         let absolute = std::path::absolute(path)?;
         let drive = match absolute.components().next() {
@@ -4049,9 +4035,20 @@ mod windows_ntfs {
         Ok(())
     }
 
+    pub(super) fn open_directory_for_flush(path: &Path) -> io::Result<File> {
+        open_plain_handle(
+            path,
+            FILE_READ_ATTRIBUTES.0 | windows::Win32::Foundation::GENERIC_WRITE.0,
+        )
+    }
+
     pub(super) fn open_attributes(path: &Path) -> io::Result<File> {
+        open_plain_handle(path, FILE_READ_ATTRIBUTES.0)
+    }
+
+    fn open_plain_handle(path: &Path, access: u32) -> io::Result<File> {
         let file = OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES.0)
+            .access_mode(access)
             .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
             .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
             .open(path)?;
@@ -4096,6 +4093,15 @@ mod windows_ntfs {
             volume: Some(VolumeIdentity::WindowsVolume(volume)),
             object: Some(ObjectIdentity::WindowsFileId(object)),
         })
+    }
+
+    pub(super) fn has_required_ntfs_features(flags: u32) -> bool {
+        use windows::Win32::System::SystemServices::{
+            FILE_SUPPORTS_OPEN_BY_FILE_ID, FILE_SUPPORTS_USN_JOURNAL,
+        };
+        let required =
+            FILE_PERSISTENT_ACLS | FILE_SUPPORTS_OPEN_BY_FILE_ID | FILE_SUPPORTS_USN_JOURNAL;
+        flags & required == required
     }
 
     fn inspect(
@@ -4153,15 +4159,29 @@ mod windows_ntfs {
         // SAFETY: GetVolumePathNameW returned a NUL-terminated volume root.
         let drive = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
         if !matches!(drive, DRIVE_FIXED | DRIVE_REMOTE | DRIVE_REMOVABLE) {
-            return Err(CanonicalFilesystemQualificationError::IdentityUnavailable);
+            return Err(
+                CanonicalFilesystemQualificationError::FilesystemUnsupported {
+                    platform: CanonicalPlatform::Windows,
+                    class: CanonicalFilesystemClass::Other,
+                },
+            );
         }
         qualify_ntfs(
             class,
             drive == DRIVE_FIXED,
             drive == DRIVE_REMOTE,
             flags & FILE_READ_ONLY_VOLUME != 0,
-            flags & FILE_PERSISTENT_ACLS != 0,
+            has_required_ntfs_features(flags),
         )?;
+        let mut volume_guid = [0; 64];
+        // SAFETY: root is NUL-terminated and the buffer fits a volume GUID path.
+        unsafe {
+            windows::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW(
+                PCWSTR(root.as_ptr()),
+                &mut volume_guid,
+            )
+        }
+        .map_err(|error| fail(native_error(error)))?;
         Ok(QualifiedFilesystemMount {
             mount_point: PathBuf::from(OsString::from_wide(&root[..end])),
             class,
@@ -4219,10 +4239,10 @@ fn qualify_ntfs(
     fixed: bool,
     remote: bool,
     read_only: bool,
-    persistent_acls: bool,
+    required_features: bool,
 ) -> Result<(), CanonicalFilesystemQualificationError> {
     use CanonicalFilesystemQualificationError as Error;
-    if remote || class != CanonicalFilesystemClass::Ntfs || !persistent_acls {
+    if remote || class != CanonicalFilesystemClass::Ntfs || !required_features {
         return Err(Error::FilesystemUnsupported {
             platform: CanonicalPlatform::Windows,
             class: if remote {
@@ -4641,7 +4661,7 @@ mod tests {
             class: CanonicalFilesystemClass::Apfs,
             live_mount: Some(LiveMountIdentity::Synthetic(42)),
         };
-        assert!(system.volume == data.volume);
+        assert_eq!(system.volume, data.volume);
         assert_eq!(
             select_exact_macos_mount(&root_mount, &[system.clone(), data.clone()]),
             Ok(qualified)
@@ -6549,7 +6569,7 @@ mod tests {
             ),
             CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
                 mutation: CanonicalMutation::FirstCreate,
-                barrier: CanonicalDurabilityBarrier::FileAndWindowsNtfsObservedNamespace,
+                barrier: CanonicalDurabilityBarrier::FileAndWindowsNtfsParentFlush,
             })
         );
         drop(guard);
@@ -6591,7 +6611,7 @@ mod tests {
         };
         assert_eq!(
             guard.append(&entry, b"old", proof, key),
-            accepted(M::FirstCreate, B::FileAndWindowsNtfsObservedNamespace)
+            accepted(M::FirstCreate, B::FileAndWindowsNtfsParentFlush)
         );
         assert_eq!(
             guard.append(&entry, b" head", proof, key),
@@ -6600,7 +6620,7 @@ mod tests {
         let old = windows_ntfs::open_attributes(&entry).unwrap();
         assert_eq!(
             guard.rename(&entry, &head, proof, key),
-            accepted(M::Rename, B::FileAndWindowsNtfsWriteThroughNamespace)
+            accepted(M::Rename, B::FileAndWindowsNtfsParentFlush)
         );
         assert!(
             validate_snapshot_destination(&head, CanonicalSnapshotExpectation::Existing(&old))
@@ -6615,22 +6635,19 @@ mod tests {
                 proof,
                 key
             ),
-            accepted(
-                M::SnapshotReplacement,
-                B::FileAndWindowsNtfsWriteThroughNamespace
-            )
+            accepted(M::SnapshotReplacement, B::FileAndWindowsNtfsParentFlush)
         );
         assert_eq!(fs::read(&head).unwrap(), b"new head");
         assert_eq!(
             guard.unlink_canonical_entry(&head, proof, key),
             CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
                 mutation: M::Unlink,
-                barrier: B::WindowsNtfsUnlinkNamespace
+                barrier: B::WindowsNtfsParentFlush
             })
         );
         assert_eq!(
             guard.unlink_canonical_entry(&head, proof, key),
-            CanonicalUnlinkOutcome::AlreadyAbsent(B::WindowsNtfsUnlinkNamespace)
+            CanonicalUnlinkOutcome::AlreadyAbsent(B::WindowsNtfsParentFlush)
         );
         assert_eq!(
             guard.stage_snapshot_temporary(
@@ -6641,10 +6658,7 @@ mod tests {
                 proof,
                 key
             ),
-            accepted(
-                M::SnapshotIntentStage,
-                B::FileAndWindowsNtfsObservedNamespace
-            )
+            accepted(M::SnapshotIntentStage, B::FileAndWindowsNtfsParentFlush)
         );
         assert_eq!(
             guard.install_manifest_snapshot(
@@ -6657,19 +6671,13 @@ mod tests {
                 true,
                 None
             ),
-            accepted(
-                M::InitialSnapshotInstall,
-                B::FileAndWindowsNtfsWriteThroughNamespace
-            )
+            accepted(M::InitialSnapshotInstall, B::FileAndWindowsNtfsParentFlush)
         );
         assert_eq!(
             guard.create_or_reconcile_immutable_exact_with_identity_prefix(
                 &entry, b"record", 1, proof, key
             ),
-            accepted(
-                M::ImmutableExactCreate,
-                B::FileAndWindowsNtfsObservedNamespace
-            )
+            accepted(M::ImmutableExactCreate, B::FileAndWindowsNtfsParentFlush)
         );
         drop(guard);
         fs::remove_dir_all(root).unwrap();
@@ -6699,6 +6707,21 @@ mod tests {
 
     #[test]
     fn windows_requires_writable_fixed_local_ntfs_with_acls() {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::SystemServices::{
+                FILE_PERSISTENT_ACLS, FILE_SUPPORTS_OPEN_BY_FILE_ID, FILE_SUPPORTS_USN_JOURNAL,
+            };
+            for missing in [
+                FILE_PERSISTENT_ACLS,
+                FILE_SUPPORTS_OPEN_BY_FILE_ID,
+                FILE_SUPPORTS_USN_JOURNAL,
+            ] {
+                assert!(!windows_ntfs::has_required_ntfs_features(
+                    u32::MAX ^ missing
+                ));
+            }
+        }
         let ntfs = classify_filesystem(OsStr::new("NTFS"));
         assert_eq!(qualify_ntfs(ntfs, true, false, false, true), Ok(()));
         for name in ["ReFS", "FAT", "FAT32", "exFAT", "smb", "cifs", "webdav"] {

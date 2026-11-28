@@ -29,11 +29,11 @@ root-wide manifest and temporary name even though the qualified application
 data root contains artifacts for many Sessions. Activating that shape would
 let one Session overwrite or be mistaken for another.
 
-The existing durability substrate already coordinates the qualified data root
-through one stable global lock. It supports shared strict readers and exclusive
-mutators, and qualified Linux/ext4 and macOS/APFS namespace mutation can cross
-the required file and parent-directory barriers. Windows can perform strict
-non-mutating reads, but its namespace-changing manifest snapshot operation is
+At the original decision date, the durability substrate coordinated the qualified data root
+through one stable global lock. It supported shared strict readers and exclusive
+mutators, and qualified Linux/ext4 and macOS/APFS namespace mutation could cross
+the required file and parent-directory barriers. Windows could perform strict
+non-mutating reads, but its namespace-changing manifest snapshot operation was
 deliberately unsupported. A new layout must retain those proven boundaries
 rather than introduce a second directory-provisioning protocol.
 
@@ -71,7 +71,7 @@ change.
   absent-manifest preflight race.
 - Bootstrap historical Original Session Audio from observed bytes without
   fabricating a retention or capture reason.
-- Let Windows read compatible Sessions while refusing v2 mutation before any
+- Let unqualified Windows roots read compatible Sessions while refusing v2 mutation before any
   manifest, proof, temporary, or coordination side effect.
 - Give inventory, export, delete, and recovery one explicit ownership rule for
   Session control artifacts without deleting the store-owned global lock.
@@ -210,8 +210,8 @@ qualified flat artifact root and retain the one store-wide coordination lock.
    `retention_disabled`, `never_captured`, expiry, or user deletion. If the v1
    manifest wire cannot represent that distinction, implementation stops for
    a reviewed schema refinement rather than choosing a plausible reason.
-9. Windows may perform strict v1 reads and may read a present compatible
-   manifest/proof under the shared guard. It refuses v2 advancement before
+9. Unqualified Windows roots may perform strict v1 reads and may read a present compatible
+   manifest/proof under the shared guard. They refuse v2 advancement before
    creating or changing the global lock, provenance proof, manifest temporary,
    or manifest. A Windows read never upgrades the floor, synthesizes proof
    bytes, or converts a namespace-durability refusal into Accepted.
@@ -250,8 +250,8 @@ qualified flat artifact root and retain the one store-wide coordination lock.
 - **Negative:** The historical-unknown Original Audio state requires an
   explicit wire representation before broad bootstrap; current unavailable
   reasons are not sufficient.
-- **Negative:** Windows cannot advance a Session to v2 under the present
-  namespace policy even though it can read v1 and compatible persisted state.
+- **Negative:** Unqualified Windows roots cannot advance a Session to v2 under the present
+  namespace policy even though they can read v1 and compatible persisted state.
 - **Negative:** Rich lifecycle provenance remains incomplete; this record
   proves only one compatibility transition.
 
@@ -300,6 +300,28 @@ base-range footprint checks. Confirmation is conformance evidence only.
 This record supersedes no ADR. ADR-0027 and ADR-0041 remain accepted in all
 other respects.
 
+### Windows NTFS amendment (2026-11-27)
+
+Qualified writable fixed local NTFS roots may advance v2, recover canonical
+artifacts and retire Session control entries. Qualification requires persistent
+ACLs, USN journal and open-by-file-ID capabilities, and a volume GUID lookup.
+These are driver-reported capabilities. A RAM-backed NTFS volume reported as
+fixed may qualify.
+
+Create and replacement return `FileAndWindowsNtfsParentFlush` after the file
+flush, verified name and successful flush of the bound parent directory.
+Replacement also performs a same-volume move. Unlink and already-absent retries
+return `WindowsNtfsParentFlush` after checking absence and flushing the parent.
+A failed required flush yields an indeterminate result. Physical power-loss
+evidence remains a release gate under #139.
+
+A read-only alias through a junction or SUBST can name a directory that another
+process can write through its qualified path. A present manifest requires the
+existing shared lock, including through that alias. A reparse-point or cloud
+placeholder lock cannot serve as the plain coordination file. ADR-0040's
+before-and-after absence checks cannot detect an intervening appearance and
+disappearance through the other path. Its activation boundary still applies.
+
 ## Compliance
 
 - Only an id accepted by `sessions::session_id_is_valid` may enter production
@@ -330,7 +352,7 @@ other respects.
   manifest-and-lock absence around the unreleased content snapshot.
 - Historical Original Session Audio reflects observed bytes or explicit
   historical unknown; it never fabricates a reason.
-- Windows v2 mutation refuses before every coordination, proof, temporary, or
+- On unqualified Windows roots, v2 mutation refuses before every coordination, proof, temporary, or
   manifest side effect while compatible reads remain available.
 - Inventory, export, delete, and recovery treat all three per-Session control
   identities consistently and exclude the global lock.

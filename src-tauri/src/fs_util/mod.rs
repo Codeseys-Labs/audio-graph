@@ -29,6 +29,12 @@ pub fn try_set_owner_only(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Apply the current user's protected DACL to the open file object.
+#[cfg(windows)]
+pub(crate) fn try_set_owner_only_file(file: &std::fs::File) -> std::io::Result<()> {
+    windows_owner_only_acl::set_file_dacl(file)
+}
+
 /// Set owner-only permissions on paths whose callers can tolerate best-effort hardening.
 pub fn set_owner_only(path: &Path) {
     if let Err(e) = try_set_owner_only(path) {
@@ -201,7 +207,15 @@ mod windows_owner_only_acl {
     /// admin can still take ownership if genuinely needed. `PAI` marks the DACL
     /// Protected (no inherited ACEs, mirroring `/inheritance:r`) + auto-inherit
     /// resolved.
-    pub fn set_owner_only_dacl(path: &Path) -> Result<(), String> {
+    fn build_owner_only_dacl(
+        path: &Path,
+    ) -> Result<
+        (
+            LocalSecurityDescriptor,
+            *const windows::Win32::Security::ACL,
+        ),
+        String,
+    > {
         let sid = current_token_sid_string(path)?;
         // D:PAI(A;;FA;;;<SID>) — Protected, Auto-inherited, one Allow ACE of
         // Full Access (FA) for the resolved current-user SID and nothing else.
@@ -262,6 +276,51 @@ mod windows_owner_only_acl {
             ));
         }
 
+        Ok((sd_guard, dacl_ptr))
+    }
+
+    pub(super) fn set_file_dacl(file: &std::fs::File) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Security::Authorization::SetSecurityInfo;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            ReOpenFile, WRITE_DAC,
+        };
+        let (_descriptor, dacl) =
+            build_owner_only_dacl(Path::new("open file")).map_err(std::io::Error::other)?;
+        // SAFETY: file owns the original handle. ReOpenFile requests READ_CONTROL and WRITE_DAC
+        // on that same object; OwnedHandle closes the new handle exactly once.
+        let handle = OwnedHandle(
+            unsafe {
+                ReOpenFile(
+                    HANDLE(file.as_raw_handle()),
+                    WRITE_DAC.0 | windows::Win32::Storage::FileSystem::READ_CONTROL.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_FLAGS_AND_ATTRIBUTES(0),
+                )
+            }
+            .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))?,
+        );
+        // SAFETY: the descriptor backing dacl and the file handle remain alive.
+        let result = unsafe {
+            SetSecurityInfo(
+                handle.0,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(dacl),
+                None,
+            )
+        };
+        if result != NO_ERROR {
+            return Err(std::io::Error::from_raw_os_error(result.0 as i32));
+        }
+        Ok(())
+    }
+
+    pub fn set_owner_only_dacl(path: &Path) -> Result<(), String> {
+        let (_descriptor, dacl_ptr) = build_owner_only_dacl(path)?;
         // Encode the path as a NUL-terminated wide string for the W API.
         let path_wide: Vec<u16> = path
             .as_os_str()
@@ -283,7 +342,7 @@ mod windows_owner_only_acl {
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 None,
                 None,
-                Some(dacl_ptr as *const _),
+                Some(dacl_ptr),
                 None,
             )
         };
@@ -348,6 +407,52 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn try_set_owner_only_sets_current_sid_dacl() {
+        let path = std::env::temp_dir().join(format!(
+            "audio-graph-owner-only-dacl-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "fixture").expect("write fixture");
+
+        try_set_owner_only(&path).expect("harden existing file");
+
+        assert_current_sid_dacl(&path);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn handle_dacl_targets_the_open_file_after_a_junction_swap() {
+        let base =
+            std::env::temp_dir().join(format!("audio-graph-handle-dacl-{}", uuid::Uuid::new_v4()));
+        let named = base.join("named");
+        let held = base.join("held");
+        let decoy = base.join("decoy");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::create_dir(&decoy).unwrap();
+        let link_named_to = |target| {
+            let result = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/j", "named", target])
+                .current_dir(&base)
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{result:?}");
+        };
+        link_named_to("held");
+        let file = std::fs::File::create_new(named.join("entry")).unwrap();
+        std::fs::remove_dir(&named).unwrap();
+        link_named_to("decoy");
+        // There is deliberately no entry in the junction target. A pathname
+        // DACL write here must fail; the held file must receive the exact ACL.
+        super::try_set_owner_only_file(&file).unwrap();
+        assert_current_sid_dacl(&held.join("entry"));
+        assert!(!decoy.join("entry").exists());
+        drop(file);
+        std::fs::remove_dir(named).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn assert_current_sid_dacl(path: &std::path::Path) {
         use std::os::windows::ffi::OsStrExt;
         use windows::Win32::Foundation::{HLOCAL, LocalFree};
         use windows::Win32::Security::Authorization::{
@@ -370,14 +475,6 @@ mod tests {
             std::path::Path::new("test-sid-probe"),
         )
         .expect("resolve current token SID");
-
-        let path = std::env::temp_dir().join(format!(
-            "audio-graph-owner-only-dacl-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::write(&path, "fixture").expect("write fixture");
-
-        try_set_owner_only(&path).expect("harden existing file");
 
         // Read the DACL + security-descriptor control back.
         let path_wide: Vec<u16> = path
@@ -459,6 +556,5 @@ mod tests {
         unsafe {
             let _ = LocalFree(Some(HLOCAL(sd.0)));
         }
-        let _ = std::fs::remove_file(&path);
     }
 }

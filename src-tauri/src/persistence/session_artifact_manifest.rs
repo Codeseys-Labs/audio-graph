@@ -765,15 +765,9 @@ impl SessionArtifactManifestStore {
                     ..
                 }
         ) || (cfg!(windows)
-            && matches!(
+            && !matches!(
                 refusal,
-                Error::ReadOnlyFilesystem { .. }
-                    | Error::RemovableFilesystem { .. }
-                    | Error::Io {
-                        stage: super::canonical_durability::CanonicalCoordinationStage::ResolveRoot,
-                        kind: io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported,
-                        ..
-                    }
+                Error::ParentProvisioningRequired | Error::ManagedRootNotDirectory
             ));
         if !read_only {
             return Err(ManifestStoreError::Qualification(refusal));
@@ -1046,16 +1040,9 @@ impl SessionArtifactManifestStore {
 
     /// Qualify a live fixture root against real filesystem identity.
     ///
-    /// This fixture demands the substrate the durability layer supports: it
-    /// forwards to `CanonicalFilesystemQualification::for_test_root`, which
-    /// requires both a volume and a directory-object identity. Those come from
-    /// `unix` metadata, so every call site must be gated on `cfg(unix)` —
-    /// elsewhere this returns `ManifestStoreError::Coordination(IdentityUnavailable)`
-    /// and an ungated caller panics on its `expect`. Use it only when the
-    /// behaviour under test is the real-substrate binding itself; reach for
-    /// `qualified_for_algorithm_test` for platform-independent algorithm
-    /// behaviour. `real_filesystem_qualified_fixtures_stay_platform_gated`
-    /// enforces the gate.
+    /// This fixture uses real volume and directory identity. Its historical Unix fixtures
+    /// retain explicit platform gates. Native Windows tests use production NTFS
+    /// qualification. Portable algorithm tests use synthetic identity.
     #[cfg(test)]
     pub(crate) fn qualified_for_test(root: impl Into<PathBuf>) -> Result<Self, ManifestStoreError> {
         let root = root.into();
@@ -1094,8 +1081,8 @@ impl SessionArtifactManifestStore {
     /// temporary are real files; only volume/object identity is synthetic, and
     /// the durability layer substitutes an open-handle identity check for the
     /// inode comparison it cannot make. That substitution is portable, so this
-    /// fixture constructs on every target — including Windows, where the
-    /// namespace durability policy is unsupported and `for_test_root` refuses.
+    /// fixture constructs on every target — including Windows, independently of whether
+    /// the live fixture would qualify for namespace mutation.
     /// It is the right fixture whenever the subject is platform-independent
     /// store or CAS algorithm behaviour rather than the substrate binding.
     #[cfg(test)]
@@ -5746,12 +5733,28 @@ mod tests {
     #[test]
     fn cc9a_native_windows_manifest_requires_qualification_for_install_replacement_and_unlink() {
         let root = root("native-ntfs-qualified-manifest");
+        let sentinel = root.join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        let entries = || {
+            let mut names = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let before_entries = entries();
         let unqualified = SessionArtifactManifestStore::new(&root);
         assert!(matches!(
             unqualified.begin_write(),
             Err(ManifestStoreError::NamespaceQualificationRequired)
         ));
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let after_entries = entries();
+        assert_eq!(after_entries, before_entries);
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged");
+        assert!(!root.join(COORDINATION_FILE_NAME).exists());
+        assert!(!root.join(MANIFEST_TEMP_FILE_NAME).exists());
+        assert!(!unqualified.manifest_path().exists());
 
         let store = SessionArtifactManifestStore::qualified_existing_root(&root)
             .expect("fixture requires writable fixed local NTFS");
@@ -5784,7 +5787,7 @@ mod tests {
                 durability,
                 CanonicalDurabilityReceipt {
                     mutation,
-                    barrier: CanonicalDurabilityBarrier::FileAndWindowsNtfsWriteThroughNamespace,
+                    barrier: CanonicalDurabilityBarrier::FileAndWindowsNtfsParentFlush,
                 }
             );
         }
@@ -5794,7 +5797,7 @@ mod tests {
             transaction.abandon_staged_transition(),
             CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
                 mutation: CanonicalMutation::Unlink,
-                barrier: CanonicalDurabilityBarrier::WindowsNtfsUnlinkNamespace
+                barrier: CanonicalDurabilityBarrier::WindowsNtfsParentFlush
             })
         );
         assert!(!store.temporary_path().exists());
@@ -5858,13 +5861,8 @@ mod tests {
 
     /// Keep the substrate contract that seed audio-graph-a58b closed.
     ///
-    /// `qualified_for_test` and `qualified_for_test_session` demand real
-    /// volume and object identity, which `filesystem_identity` can only report
-    /// on `unix`. An ungated call site therefore compiles everywhere and
-    /// panics `Coordination(IdentityUnavailable)` on a host nobody ran here —
-    /// exactly how four tests reached a real Windows run before failing. This
-    /// converts that class back into a local failure by requiring an exact
-    /// platform gate on the enclosing test of every such call site.
+    /// Keep the historical Unix fixture gates explicit. Native Windows tests
+    /// must exercise production qualification on the actual filesystem.
     #[test]
     fn real_filesystem_qualified_fixtures_stay_platform_gated() {
         // Built at runtime so this test does not match its own source.
@@ -7107,7 +7105,7 @@ mod tests {
             CanonicalUnlinkOutcome::Unlinked(CanonicalDurabilityReceipt {
                 mutation: CanonicalMutation::Unlink,
                 barrier: if cfg!(windows) {
-                    CanonicalDurabilityBarrier::WindowsNtfsUnlinkNamespace
+                    CanonicalDurabilityBarrier::WindowsNtfsParentFlush
                 } else {
                     CanonicalDurabilityBarrier::ParentNamespace
                 },

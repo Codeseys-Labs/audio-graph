@@ -947,7 +947,9 @@ pub enum SessionControlPlaneRetirement {
     /// No Session-owned control identity was observed, so nothing was locked,
     /// opened, or removed. This is every Session's state at this base.
     Nothing,
-    /// Every Session-owned control identity is durably absent.
+    /// All three identities reached their qualified parent barrier. On NTFS
+    /// each absence was verified and its parent handle flushed successfully.
+    /// Abrupt-power-loss qualification is tracked separately in #139.
     Retired,
     /// At least one Session-owned control identity may still exist. `failures`
     /// names the reason for each one, and the fact of a recovery key without its
@@ -2795,6 +2797,137 @@ mod guarded_admission_tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_probe_refusals_allow_only_guarded_v1_reads_and_exports() {
+        use crate::persistence::canonical_durability::{
+            CanonicalCoordinationStage, CanonicalFilesystemClass as Class,
+            CanonicalFilesystemQualificationError as Error, CanonicalPlatform,
+        };
+        let root = root("windows-probe-refusals");
+        for error in [
+            Error::NamespaceDurabilityUnsupported {
+                platform: CanonicalPlatform::Windows,
+            },
+            Error::IdentityUnavailable,
+            Error::Io {
+                stage: CanonicalCoordinationStage::ResolveRoot,
+                kind: std::io::Error::from_raw_os_error(1).kind(),
+                raw_os_error: Some(1),
+            },
+            Error::Io {
+                stage: CanonicalCoordinationStage::ResolveRoot,
+                kind: std::io::ErrorKind::Unsupported,
+                raw_os_error: None,
+            },
+            Error::Io {
+                stage: CanonicalCoordinationStage::ResolveRoot,
+                kind: std::io::ErrorKind::PermissionDenied,
+                raw_os_error: Some(5),
+            },
+            Error::ReadOnlyFilesystem { class: Class::Ntfs },
+            Error::RemovableFilesystem { class: Class::Ntfs },
+            Error::FilesystemUnsupported {
+                platform: CanonicalPlatform::Windows,
+                class: Class::Other,
+            },
+        ] {
+            let store =
+                SessionArtifactManifestStore::after_qualification_refusal(&root, SESSION, error)
+                    .unwrap();
+            assert!(matches!(
+                store.begin_write(),
+                Err(super::ManifestStoreError::NamespaceQualificationRequired)
+            ));
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            let lock = store_coordination_path(&root, SESSION).unwrap();
+            write_fixture(&lock, b"");
+            let read = || {
+                super::guarded_session_open(&store, SessionSemanticsVersion::V1, |floor| {
+                    Ok::<_, ()>(floor.evidence)
+                })
+            };
+            assert_eq!(read().unwrap(), SessionFloorEvidence::GuardedAbsence);
+            persist_manifest(&root, SESSION, v1_candidate("historical"));
+            assert_eq!(read().unwrap(), SessionFloorEvidence::GuardedManifest);
+            let export = super::export_session_control_plane(&store).unwrap();
+            assert_eq!(
+                export.manifest.unwrap().transition.idempotency_id,
+                "historical"
+            );
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+            std::fs::remove_file(
+                session_control_plane_paths(&root, SESSION)
+                    .unwrap()
+                    .manifest,
+            )
+            .unwrap();
+            std::fs::remove_file(lock).unwrap();
+        }
+        for error in [
+            Error::ParentProvisioningRequired,
+            Error::ManagedRootNotDirectory,
+        ] {
+            assert!(
+                matches!(SessionArtifactManifestStore::after_qualification_refusal(&root, SESSION, error),
+                Err(super::ManifestStoreError::Qualification(actual)) if actual == error)
+            );
+        }
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn subst_refuses_qualification_and_preserves_v1_export() {
+        use std::process::Command;
+        struct Mapping(String);
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                assert!(
+                    Command::new("subst.exe")
+                        .args([&self.0, "/D"])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+        }
+        let real = root("subst-read");
+        let mapping = (b'D'..=b'Z')
+            .rev()
+            .find_map(|letter| {
+                let drive = format!("{}:", char::from(letter));
+                if Path::new(&format!("{drive}\\")).exists() {
+                    return None;
+                }
+                Command::new("subst.exe")
+                    .arg(&drive)
+                    .arg(&real)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+                    .then(|| Mapping(drive))
+            })
+            .expect("available drive letter for the temporary SUBST fixture");
+        let path = PathBuf::from(format!("{}\\", mapping.0));
+        assert!(matches!(SessionArtifactManifestStore::qualified_existing_session(&path, SESSION),
+            Err(super::ManifestStoreError::Qualification(crate::persistence::canonical_durability::CanonicalFilesystemQualificationError::Io {
+                kind: std::io::ErrorKind::Unsupported, .. }))));
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+        persist_manifest(&real, SESSION, v1_candidate("subst-history"));
+        write_fixture(&store_coordination_path(&real, SESSION).unwrap(), b"");
+        let export = super::open_v1_session_for_export(&path, SESSION, std::convert::identity, Ok)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            export.manifest.unwrap().transition.idempotency_id,
+            "subst-history"
+        );
+        drop(mapping);
+        std::fs::remove_dir_all(real).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn unqualified_windows_root_admits_v1_content_and_export_without_mutation() {
         let base = root("windows-history");
         // Ordinary CI uses fixed NTFS. When TEMP is itself on an unqualified
@@ -2843,8 +2976,19 @@ mod guarded_admission_tests {
         persist_manifest(&path, SESSION, v1_candidate("historical"));
         let paths = session_control_plane_paths(&path, SESSION).unwrap();
         let original = std::fs::read(&paths.manifest).unwrap();
-        assert!(read().is_err());
-        assert!(export().is_err());
+        let missing = super::ManifestLoadError::Coordination(
+            crate::persistence::canonical_durability::CanonicalCoordinationError::Missing,
+        );
+        assert_eq!(
+            read(),
+            Err(GuardedSessionOpenError::ControlPlaneUnreadable(
+                missing.clone()
+            ))
+        );
+        assert_eq!(
+            export(),
+            Err(GuardedSessionOpenError::ControlPlaneUnreadable(missing))
+        );
         let lock = store_coordination_path(&path, SESSION).unwrap();
         assert!(!lock.exists());
         write_fixture(&lock, b"");

@@ -2004,7 +2004,7 @@ mod tests {
             qualified.append(&first_create, b"created", proof, key),
             accepted(
                 CanonicalMutation::FirstCreate,
-                Barrier::FileAndWindowsNtfsObservedNamespace
+                Barrier::FileAndWindowsNtfsParentFlush
             )
         );
         qualified
@@ -2023,7 +2023,7 @@ mod tests {
                 outcome,
                 accepted(
                     CanonicalMutation::Rename,
-                    Barrier::FileAndWindowsNtfsWriteThroughNamespace
+                    Barrier::FileAndWindowsNtfsParentFlush
                 )
             );
         }
@@ -2038,7 +2038,7 @@ mod tests {
             ),
             accepted(
                 CanonicalMutation::SnapshotReplacement,
-                Barrier::FileAndWindowsNtfsWriteThroughNamespace
+                Barrier::FileAndWindowsNtfsParentFlush
             )
         );
         assert_eq!(fs::read(first_create).unwrap(), b"created");
@@ -2054,7 +2054,7 @@ mod tests {
         successor.wait_for(&handshake("exclusive_acquired_ok"));
         assert!(successor.wait().success());
         println!(
-            "AUDIO_GRAPH_67D3_WINDOWS_REFUSAL_V1 filesystem=ntfs qualification=unqualified first_create=refused rename=refused snapshot=refused recovery=refused mutation=none coordination_identity=stable advisory_lock=cooperating_processes_only"
+            "AUDIO_GRAPH_67D3_WINDOWS_REFUSAL_V1 unqualified_namespace_operations=refused unqualified_fixture_bytes=unchanged qualified_root_probe=accepted qualified_create_rename_recovery_snapshot=accepted qualified_file_and_parent_flush=completed coordination_identity=stable advisory_lock=cooperating_processes_only"
         );
     }
 }
