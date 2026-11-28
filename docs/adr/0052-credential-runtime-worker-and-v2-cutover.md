@@ -70,14 +70,17 @@ Every recovery-class refusal (`recovery_required`, `corrupt_record`,
 where the service produces it. A store-scoped refusal concerns the authority
 itself or cannot be attributed to one set: a rolled-back or overflowing
 journal, a failed authority read. It closes the runtime, and explicit
-diagnosis is the only route back. A set-scoped refusal is decided from one
-set's own state, in a journal adopted from the authority under the lock, or
-from that set's own records. It leaves the runtime ready for every other set,
-and the next request for that set reads the authoritative journal and record
-under the lock again, so it sees another process's recovery without a
-reopen. A refusal by another program holding the journal open, before any
-native change, is neither: it is a retryable `operation_in_progress` that
-closes nothing.
+diagnosis is the only route back; it stays store-scoped when the request
+that met it named a set, whose id it then carries. A set-scoped refusal is
+decided from one set's own state, in a journal adopted from the authority
+under the lock, or from that set's own records. It leaves the runtime ready
+for every other set, and the next request for that set reads the
+authoritative journal and record under the lock again, so it sees another
+process's recovery without a reopen. Contention before any native change
+(another program holding the journal without sharing its read or delete,
+another process holding the lock) is neither: it is a retryable
+`operation_in_progress` for that request alone. It closes nothing, and an
+open it refuses leaves the runtime in the state it had before the attempt.
 
 The store's file state is built against one adversary: another local
 principal who can create, rename or replace entries in the store's

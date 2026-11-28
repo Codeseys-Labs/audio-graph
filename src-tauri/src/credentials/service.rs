@@ -6178,12 +6178,16 @@ mod tests {
         );
 
         store.restore_journal(AuthorityJournal::new(CredentialBackendKind::Native));
+        let rolled_back = service
+            .resolve_for_use_scoped(deepgram_use_request())
+            .expect_err("the journal went back an epoch");
         assert_eq!(
-            scope_of(
-                service
-                    .resolve_for_use_scoped(deepgram_use_request())
-                    .expect_err("the journal went back an epoch")
-            ),
+            rolled_back.error.set_id,
+            Some(deepgram.clone()),
+            "the floor refusal names the requesting set"
+        );
+        assert_eq!(
+            scope_of(rolled_back),
             (
                 CredentialErrorCode::RecoveryRequired,
                 super::RefusalScope::Store

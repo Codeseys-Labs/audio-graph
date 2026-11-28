@@ -81,10 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dormant credential v2 runtime (#521): a recovery-required outcome that
   concerns only one set no longer closes the runtime; other sets stay usable
   and the next request for that set rereads the authority, so it sees another
-  process's recovery without a restart. Store-wide outcomes still need
-  explicit diagnosis. A commit observed from another process, including one
-  made while the runtime was closed and found on reopen, now emits a
-  content-free signal telling consumers to take a fresh snapshot.
+  process's recovery without a restart. Store-wide outcomes, a rolled-back
+  journal met by a request for one set included, still need explicit
+  diagnosis. An open refused by contention (another program holding the
+  journal, another process holding the lock) is a retryable
+  `operation_in_progress` and leaves the runtime as it was. A commit
+  observed from another process, including one made while the runtime was
+  closed and found on reopen, now emits a content-free signal telling
+  consumers to take a fresh snapshot.
 
 ### Fixed
 
