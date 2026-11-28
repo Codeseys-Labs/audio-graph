@@ -171,9 +171,13 @@ Amended 2026-11-27 (#139, #176).
 Writers emit shortest round-trip decimal spellings for finite floating-point
 values in framed JSON payloads. The payload digest commits to the parsed
 values as re-serialized by the `serde_json` version pinned in `Cargo.lock`;
-it does not hash the stored spelling. Any spelling that parses to the same
-IEEE value therefore verifies, and a change in that formatter's output is a
-format change. Readers must recover the exact IEEE value, including signed
+it does not hash the stored spelling. A different spelling therefore verifies
+only when it parses to the same value in the same JSON number category: two
+floating-point spellings of one IEEE value are equivalent, but an integer
+spelling and a floating-point spelling of the same number (`1` and `1.0`) are
+distinct, because integers are hashed as integers and are not re-read as
+floats. A change in that formatter's output is a format change. Readers must
+recover the exact IEEE value of every floating-point token, including signed
 zero, to verify the committed payload digest. This applies throughout nested
 payloads, including transcript start and end times and confidence. Readers
 preserve existing valid commitments and the original hash anchors of legacy
