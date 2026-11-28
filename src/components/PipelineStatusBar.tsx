@@ -504,6 +504,12 @@ function PipelineStatusBar() {
           )}
         </span>
       )}
+      {pipelineStatus.transcript_captions_lost && (
+        <span className={STAGE_BASE}>
+          <Icon name="warning" size={14} />
+          {t("pipeline.transcriptCaptionsLost")}
+        </span>
+      )}
       {!pipelineStatus.transcript_not_saving &&
         pipelineStatus.transcript_crash_safety_unverified && (
           <span className={STAGE_BASE}>
