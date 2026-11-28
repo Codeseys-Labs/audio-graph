@@ -1,16 +1,27 @@
-//! Resolve previous sessions before their first historical load, once the
-//! runtime is available to receive confirmations.
+//! Resolve historical sessions before the first window can request one.
 use super::canonical_log::{PreparedTranscriptStorage, TranscriptReceipt};
 use crate::projections::TranscriptEvent;
 use std::{fs, io, path::Path};
 
-pub(crate) fn recover_at_startup() {
+/// Registered after the single-instance guard. Tauri initializes plugins
+/// during build, before the event loop creates the configured windows.
+pub(crate) fn plugin<R: tauri::Runtime>(live_session: String) -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("historical-session-recovery")
+        .setup(move |_, _| {
+            recover_at_startup(&live_session);
+            Ok(())
+        })
+        .build()
+}
+
+fn recover_at_startup(live_session: &str) {
     let Ok(root) = crate::user_data::resolve_data_root() else {
         log::warn!("transcript recovery scan unavailable");
         return;
     };
     if let Err(error) = recover_in_directory(
         &root.join("transcripts"),
+        live_session,
         crate::speech::publish_recovered_transcript,
     ) {
         log::warn!("transcript recovery scan failed: {:?}", error.kind());
@@ -19,6 +30,7 @@ pub(crate) fn recover_at_startup() {
 
 pub(super) fn recover_in_directory(
     directory: &Path,
+    live_session: &str,
     mut publish: impl FnMut(&str, &TranscriptEvent, TranscriptReceipt),
 ) -> io::Result<()> {
     let entries = match fs::read_dir(directory) {
@@ -40,7 +52,7 @@ pub(super) fn recover_in_directory(
         else {
             continue;
         };
-        if crate::sessions::validate_session_id(session).is_err() {
+        if session == live_session || crate::sessions::validate_session_id(session).is_err() {
             continue;
         }
         let path = directory.join(format!("{session}.events.jsonl"));

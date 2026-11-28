@@ -25,7 +25,7 @@ const GROUP_WINDOW: Duration = Duration::from_millis(8);
 struct Recovery {
     ledger: Option<Arc<Mutex<TranscriptLedger>>>,
     outstanding: Vec<TranscriptEvent>,
-    confirmed: std::collections::VecDeque<(TranscriptEvent, TranscriptReceipt)>,
+    needs_resolution: bool,
 }
 
 impl Recovery {
@@ -37,8 +37,18 @@ impl Recovery {
     ) -> Error {
         notify_storage_full(&error);
         if storage.has_pending_attempt() {
+            self.needs_resolution = true;
+            if error == Error::FrameWriteStorageFull {
+                // The descriptor still needs its gap and retirement, but no
+                // source bytes were written and no publication remains owed.
+                return error;
+            }
             self.outstanding.extend_from_slice(events);
-            Error::ConfirmationPending
+            if error.is_storage_full() {
+                Error::StorageFullConfirmationPending
+            } else {
+                Error::ConfirmationPending
+            }
         } else {
             error
         }
@@ -51,26 +61,50 @@ impl Recovery {
         path: &Path,
         session: &str,
     ) -> Result<(), Error> {
-        if storage.has_pending_attempt() {
-            storage.resolve_pending()?;
-        }
-        self.confirmed.extend(
-            storage
-                .take_recovered()
-                .into_iter()
-                .map(|r| (r.event, r.receipt)),
-        );
-        while let Some((event, receipt)) = self.confirmed.front() {
-            if let Some(live) = &self.ledger {
-                install_recovered(live, index, path, session, event, receipt.sequence)?;
+        if storage.has_pending_attempt()
+            && let Err(error) = storage.resolve_pending()
+        {
+            if error.is_storage_full() {
+                notify_storage_full(&error);
+                for event in &self.outstanding {
+                    crate::speech::resolve_recovery_publication(
+                        session,
+                        event,
+                        Err(Error::StorageFullConfirmationPending),
+                    );
+                }
             }
-            self.outstanding.retain(|pending| pending != event);
-            crate::speech::publish_recovered_transcript(session, event, *receipt);
-            self.confirmed.pop_front();
+            return Err(error);
+        }
+        for kept in storage.take_recovered() {
+            self.outstanding.retain(|pending| pending != &kept.event);
+            if let Some(live) = &self.ledger
+                && install_recovered(
+                    live,
+                    index,
+                    path,
+                    session,
+                    &kept.event,
+                    kept.receipt.sequence,
+                )
+                .is_err()
+            {
+                // The canonical commit is complete. Leave the display update
+                // to the next ledger rebuild and release the publication owner.
+                log::warn!("transcript_recovery.live_install_deferred");
+                crate::speech::resolve_recovery_publication(
+                    session,
+                    &kept.event,
+                    Ok((false, kept.receipt)),
+                );
+                continue;
+            }
+            crate::speech::publish_recovered_transcript(session, &kept.event, kept.receipt);
         }
         for discarded in self.outstanding.drain(..) {
             crate::speech::discard_recovery_publication(session, &discarded);
         }
+        self.needs_resolution = false;
         Ok(())
     }
 }
@@ -164,7 +198,7 @@ impl LiveRequests {
     }
 
     fn commit(
-        self,
+        mut self,
         storage: &PreparedTranscriptStorage,
         index: &mut TranscriptLiveIndex,
         path: &Path,
@@ -177,6 +211,9 @@ impl LiveRequests {
                 reply.finish(Err(error.clone()));
             }
             return 0;
+        }
+        for reply in &mut self.replies {
+            reply.mark_started();
         }
         if self.events.len() > 1 {
             let before = {
@@ -313,7 +350,7 @@ pub(super) fn run(
             Ok(Message::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) if shutdown.load(Ordering::SeqCst) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if !recovery.outstanding.is_empty() && Instant::now() >= retry_at {
+                if recovery.needs_resolution && Instant::now() >= retry_at {
                     if recovery
                         .resolve(storage, &mut live_index, path, session)
                         .is_err()
@@ -327,7 +364,7 @@ pub(super) fn run(
             }
         }
     }
-    if !recovery.outstanding.is_empty() {
+    if recovery.needs_resolution {
         // One last resolution while the outgoing session still owns its sink.
         // A failed barrier leaves the descriptor for startup recovery.
         let _ = recovery.resolve(storage, &mut live_index, path, session);

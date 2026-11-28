@@ -120,6 +120,9 @@ impl Commit<'_> {
             verified.take();
             let recovered = self.recovered.borrow();
             let rows = &recovered[prior_receipts..];
+            // A direct storage caller retrying the very same group needs a
+            // return value. The live worker drains recovery before admission,
+            // so it publishes these rows only via Recovery::resolve.
             if rows.len() == events.len()
                 && rows
                     .first()
@@ -238,7 +241,7 @@ impl Commit<'_> {
                 wait_for_kill();
             }
         }
-        write_frame(file, bytes)?;
+        write_new_frame(file, bytes)?;
         let barrier = match self.guard {
             TranscriptGuard::Qualified(..) => CanonicalDurabilityBarrier::FileDataAndMetadata,
             TranscriptGuard::Unqualified(_) => CanonicalDurabilityBarrier::SyncedUnqualified,

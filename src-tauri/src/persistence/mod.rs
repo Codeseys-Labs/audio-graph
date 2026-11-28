@@ -1941,6 +1941,15 @@ pub(crate) enum TranscriptEventWriteMsg {
     Shutdown,
 }
 
+impl TranscriptEventWriteMsg {
+    fn suppress_unqueued_publication(&mut self) {
+        // A refused send is reported by its caller. No late receipt is owed.
+        if let Self::Live(_, _, reply) = self {
+            reply.suppress_unqueued_publication();
+        }
+    }
+}
+
 /// Messages sent to the projection event writer thread.
 // Channel message enum: boxing the large `Append` variant would ripple
 // through every send and match site for negligible benefit.
@@ -2487,7 +2496,8 @@ impl TranscriptCommitClient {
                 );
                 Ok(())
             }
-            Err(mpsc::TrySendError::Full(_)) => {
+            Err(mpsc::TrySendError::Full(mut message)) => {
+                message.suppress_unqueued_publication();
                 note_event_writer_queue_full(
                     "transcript_event",
                     EVENT_WRITER_QUEUE_CAPACITY,
@@ -2496,7 +2506,10 @@ impl TranscriptCommitClient {
                 );
                 Err(Error::QueueFull)
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => Err(Error::WriterAbsent),
+            Err(mpsc::TrySendError::Disconnected(mut message)) => {
+                message.suppress_unqueued_publication();
+                Err(Error::WriterAbsent)
+            }
         }
     }
 }
@@ -2634,7 +2647,7 @@ impl TranscriptEventWriter {
     }
 
     #[cfg(test)]
-    fn group_counts(&self) -> (usize, usize) {
+    pub(crate) fn group_counts(&self) -> (usize, usize) {
         self.client()
             .request(TranscriptEventWriteMsg::GroupCounts)
             .unwrap()
@@ -2645,6 +2658,13 @@ impl TranscriptEventWriter {
         &self,
     ) -> (mpsc::Sender<()>, mpsc::Receiver<()>, mpsc::Sender<()>) {
         self.pause_recovery_after_fault(canonical_log::simulate_failed_sync)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_next_recovery_sync_failure(
+        &self,
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        self.pause_recovery_after_fault(canonical_log::simulate_failed_recovery_sync)
     }
 
     #[cfg(test)]

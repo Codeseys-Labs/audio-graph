@@ -1858,7 +1858,9 @@ pub use transcript_commit::{
 };
 pub(super) use transcript_commit::{capture_committed, read_committed};
 #[cfg(test)]
-pub(super) use transcript_commit::{simulate_disk_full, simulate_failed_sync};
+pub(super) use transcript_commit::{
+    simulate_disk_full, simulate_failed_recovery_sync, simulate_failed_sync,
+};
 
 struct FrameBasis<'a> {
     session_id: &'a str,
