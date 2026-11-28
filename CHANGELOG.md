@@ -78,6 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   journal does not track, except the staging of every activation the
   service saw pending and has not seen settled. A reopen never adopts
   another authority or an older journal.
+- Dormant credential v2 runtime (#521): a recovery-required outcome that
+  concerns only one set no longer closes the runtime; other sets stay usable
+  and the next request for that set rereads the authority, so it sees another
+  process's recovery without a restart. Store-wide outcomes still need
+  explicit diagnosis. A commit observed from another process now emits a
+  content-free signal telling consumers to take a fresh snapshot.
 
 ### Fixed
 

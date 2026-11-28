@@ -4364,12 +4364,10 @@ mod tests {
     async fn windows_a_runtime_stays_ready_while_another_program_holds_the_journal_open() {
         use crate::credentials::runtime::{
             CredentialEventSinkFailure, CredentialReplaceDraft, CredentialRuntime,
-            CredentialRuntimeBackend, CredentialRuntimeEventSink, CredentialRuntimeLifecycle,
-            CredentialRuntimeOpen, CredentialRuntimeRecovery,
+            CredentialRuntimeBackend, CredentialRuntimeEvent, CredentialRuntimeEventSink,
+            CredentialRuntimeLifecycle, CredentialRuntimeOpen, CredentialRuntimeRecovery,
         };
-        use crate::credentials::service::{
-            CredentialChangeEvent, CredentialTokenSource, StoreOwnershipRepair,
-        };
+        use crate::credentials::service::{CredentialTokenSource, StoreOwnershipRepair};
         use ::windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
         use std::os::windows::fs::OpenOptionsExt;
         use std::time::Duration;
@@ -4450,7 +4448,7 @@ mod tests {
         impl CredentialRuntimeEventSink for DiscardingSink {
             fn emit(
                 &self,
-                _event: CredentialChangeEvent,
+                _event: CredentialRuntimeEvent,
             ) -> Result<(), CredentialEventSinkFailure> {
                 Ok(())
             }
