@@ -12,6 +12,7 @@ use audio_graph_ipc_contract::runtime_diagnostic::{
     RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode as Code, RuntimeOperation,
 };
 
+use crate::crash_handler::{RedactedPanicOp, catch_redacted_panic};
 use crate::error::AppError;
 use crate::graph::entities::ExtractionResult;
 use crate::llm::engine::{ChatMessage, ChatOutcome, engine_not_loaded};
@@ -131,14 +132,29 @@ pub enum LlmPriority {
 #[derive(Clone)]
 pub struct LlmExecutor {
     queue: Arc<(Mutex<QueueState>, Condvar)>,
-    /// False when the worker thread never started. Nothing would take a job,
-    /// so none is queued.
-    has_worker: bool,
+    run: JobRunner,
 }
+
+/// Runs one job to its reply. Shared, so a replacement worker runs the same one.
+type JobRunner = Arc<dyn Fn(LlmJob) + Send + Sync>;
 
 struct QueueState {
     interactive: VecDeque<LlmJob>,
     background: VecDeque<LlmJob>,
+    worker: Worker,
+}
+
+/// Who is taking jobs off the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Worker {
+    /// A thread is taking jobs.
+    Running,
+    /// No thread is taking jobs: none has started yet, or the last one ended
+    /// on a job's panic. The next job starts one.
+    Retired,
+    /// A thread could not be started. Nothing would take a job, so none is
+    /// queued.
+    Unavailable,
 }
 
 /// A queued unit of LLM work.
@@ -178,6 +194,16 @@ enum LlmJob {
     },
 }
 
+impl LlmJob {
+    fn response_tx(&self) -> &mpsc::Sender<LlmJobResult> {
+        match self {
+            Self::Extract { response_tx, .. }
+            | Self::Chat { response_tx, .. }
+            | Self::ProjectionPatch { response_tx, .. } => response_tx,
+        }
+    }
+}
+
 // Channel result enum: boxing the large `ProjectionPatch` variant would
 // ripple through every construction and match site for negligible benefit.
 #[allow(clippy::large_enum_variant)]
@@ -185,6 +211,8 @@ enum LlmJobResult {
     Extraction(Option<ExtractionResult>),
     Chat(Result<ChatOutcome, RuntimeDiagnostic>),
     ProjectionPatch(ProjectionPatchAttempt),
+    /// The worker ended on a job's panic before this job was answered.
+    WorkerEnded,
 }
 
 #[derive(Debug, Clone)]
@@ -232,31 +260,46 @@ impl LlmExecutor {
         openrouter_client: Arc<Mutex<Option<OpenRouterClient>>>,
         mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
     ) -> Self {
-        let queue = Arc::new((
-            Mutex::new(QueueState {
-                interactive: VecDeque::new(),
-                background: VecDeque::new(),
-            }),
-            Condvar::new(),
-        ));
-        let worker_queue = queue.clone();
         let handles = BackendHandles {
             llm_engine,
             api_client,
             openrouter_client,
             mistralrs_engine,
         };
+        Self::with_runner(Arc::new(move |job| run_job(&handles, job)))
+    }
 
+    fn with_runner(run: JobRunner) -> Self {
+        let executor = Self {
+            queue: Arc::new((
+                Mutex::new(QueueState {
+                    interactive: VecDeque::new(),
+                    background: VecDeque::new(),
+                    worker: Worker::Retired,
+                }),
+                Condvar::new(),
+            )),
+            run,
+        };
+        executor.start_worker(&mut executor.queue.0.lock().unwrap_or_else(|e| e.into_inner()));
+        executor
+    }
+
+    /// Start a worker thread. The caller holds the queue lock, so the queue
+    /// and the record of who serves it change together.
+    fn start_worker(&self, state: &mut QueueState) {
+        let queue = self.queue.clone();
+        let run = self.run.clone();
         // The spawn error is OS prose; the failure itself is the whole signal.
-        let has_worker = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("llm-executor".to_string())
-            .spawn(move || worker_loop(worker_queue, handles))
-            .is_ok();
-        if !has_worker {
+            .spawn(move || worker_loop(queue, run));
+        state.worker = if spawned.is_ok() {
+            Worker::Running
+        } else {
             log::error!("Failed to spawn LLM executor thread");
-        }
-
-        Self { queue, has_worker }
+            Worker::Unavailable
+        };
     }
 
     pub fn extract_entities(
@@ -287,6 +330,12 @@ impl LlmExecutor {
             }
             Ok(LlmJobResult::ProjectionPatch(_)) => {
                 log::warn!("LLM executor returned projection result for extraction request");
+                None
+            }
+            Ok(LlmJobResult::WorkerEnded) => {
+                log::warn!(
+                    "LLM extraction falling back: the executor worker ended on a job's panic"
+                );
                 None
             }
             Err(e) => {
@@ -323,7 +372,7 @@ impl LlmExecutor {
             Ok(LlmJobResult::Extraction(_) | LlmJobResult::ProjectionPatch(_)) => {
                 Err(executor_failure(Code::Internal))
             }
-            Err(_) => Err(no_worker_reply()),
+            Ok(LlmJobResult::WorkerEnded) | Err(_) => Err(no_worker_reply()),
         }
     }
 
@@ -362,8 +411,9 @@ impl LlmExecutor {
             },
         );
 
-        // The three mismatch/disconnect arms below never reached a route, so
-        // `attempted_route: None` here is honest, not a stale default.
+        // The two mismatch arms never reached a route. A job whose worker
+        // ended may have been dispatched before the panic; that stamp is lost
+        // with the reply.
         match response_rx.recv() {
             Ok(LlmJobResult::ProjectionPatch(attempt)) => attempt,
             Ok(LlmJobResult::Extraction(_)) => ProjectionPatchAttempt {
@@ -376,7 +426,7 @@ impl LlmExecutor {
                 outcome: Err("LLM executor returned chat result for projection request".to_string()),
                 attempted_route: None,
             },
-            Err(_) => ProjectionPatchAttempt {
+            Ok(LlmJobResult::WorkerEnded) | Err(_) => ProjectionPatchAttempt {
                 outcome: Err(no_worker_reply().to_string()),
                 attempted_route: None,
             },
@@ -384,15 +434,18 @@ impl LlmExecutor {
     }
 
     fn enqueue(&self, priority: LlmPriority, job: LlmJob) {
-        if !self.has_worker {
-            // Dropping the job drops its reply sender, so the caller's `recv`
-            // fails at once instead of waiting on a queue nobody drains.
-            return;
-        }
         let (lock, cvar) = &*self.queue;
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
-        push_job(&mut state, priority, job);
-        cvar.notify_one();
+        if state.worker == Worker::Retired {
+            self.start_worker(&mut state);
+        }
+        if state.worker == Worker::Running {
+            push_job(&mut state, priority, job);
+            cvar.notify_one();
+        }
+        // Otherwise the job is dropped on return, and its reply sender with
+        // it: the caller's `recv` fails at once instead of waiting on a queue
+        // nobody drains.
     }
 }
 
@@ -437,7 +490,29 @@ fn pop_next_job(state: &mut QueueState) -> Option<LlmJob> {
         .or_else(|| state.background.pop_front())
 }
 
-fn worker_loop(queue: Arc<(Mutex<QueueState>, Condvar)>, handles: BackendHandles) {
+/// Ends a worker's claim on the queue however its thread ends.
+struct RetireOnExit<'a>(&'a (Mutex<QueueState>, Condvar));
+
+impl Drop for RetireOnExit<'_> {
+    fn drop(&mut self) {
+        let queued = {
+            let mut state = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.worker = Worker::Retired;
+            (
+                std::mem::take(&mut state.interactive),
+                std::mem::take(&mut state.background),
+            )
+        };
+        // Outside the lock: a job can hold a whole ledger. Each caller is told
+        // why no result is coming, then its job is dropped.
+        for job in queued.0.into_iter().chain(queued.1) {
+            let _ = job.response_tx().send(LlmJobResult::WorkerEnded);
+        }
+    }
+}
+
+fn worker_loop(queue: Arc<(Mutex<QueueState>, Condvar)>, run: JobRunner) {
+    let _retire = RetireOnExit(&queue);
     loop {
         let job = {
             let (lock, cvar) = &*queue;
@@ -452,46 +527,60 @@ fn worker_loop(queue: Arc<(Mutex<QueueState>, Condvar)>, handles: BackendHandles
             continue;
         };
 
-        match job {
-            LlmJob::Extract {
-                text,
-                speaker,
-                context,
-                provider,
-                response_tx,
-            } => {
-                let result = run_extraction(&handles, &provider, &text, &speaker, &context);
-                let _ = response_tx.send(LlmJobResult::Extraction(result));
-            }
-            LlmJob::Chat {
-                messages,
-                graph_context,
-                provider,
-                response_tx,
-            } => {
-                let result = run_chat(&handles, &provider, &messages, &graph_context);
-                let _ = response_tx.send(LlmJobResult::Chat(result));
-            }
-            LlmJob::ProjectionPatch {
-                job,
-                ledger,
-                snapshots,
+        // A job that panics would otherwise end this thread with jobs still
+        // queued, and every caller behind it would wait forever. The unwind
+        // drops the job, so `reply` is kept outside it to tell its caller. The
+        // scope keeps the payload out of crash reports and stderr.
+        let reply = job.response_tx().clone();
+        if catch_redacted_panic(RedactedPanicOp::LlmExecutorJob, || run(job)).is_err() {
+            log::error!("LLM executor job panicked; retiring the worker and failing queued jobs");
+            let _ = reply.send(LlmJobResult::WorkerEnded);
+            // `_retire` tells the queued jobs. The next job starts a new worker.
+            return;
+        }
+    }
+}
+
+fn run_job(handles: &BackendHandles, job: LlmJob) {
+    match job {
+        LlmJob::Extract {
+            text,
+            speaker,
+            context,
+            provider,
+            response_tx,
+        } => {
+            let result = run_extraction(handles, &provider, &text, &speaker, &context);
+            let _ = response_tx.send(LlmJobResult::Extraction(result));
+        }
+        LlmJob::Chat {
+            messages,
+            graph_context,
+            provider,
+            response_tx,
+        } => {
+            let result = run_chat(handles, &provider, &messages, &graph_context);
+            let _ = response_tx.send(LlmJobResult::Chat(result));
+        }
+        LlmJob::ProjectionPatch {
+            job,
+            ledger,
+            snapshots,
+            sequence,
+            created_at_ms,
+            provider,
+            response_tx,
+        } => {
+            let result = run_projection_patch(
+                handles,
+                &provider,
+                &job,
+                &ledger,
+                snapshots.view(),
                 sequence,
                 created_at_ms,
-                provider,
-                response_tx,
-            } => {
-                let result = run_projection_patch(
-                    &handles,
-                    &provider,
-                    &job,
-                    &ledger,
-                    snapshots.view(),
-                    sequence,
-                    created_at_ms,
-                );
-                let _ = response_tx.send(LlmJobResult::ProjectionPatch(result));
-            }
+            );
+            let _ = response_tx.send(LlmJobResult::ProjectionPatch(result));
         }
     }
 }
@@ -1354,8 +1443,23 @@ fn prompt_tuples(messages: &[ChatMessage]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Lock a backend slot for extraction, refusing a poisoned one.
+///
+/// A panic that unwound through this lock left the backend in a state nobody
+/// inspected. Chat and projection refuse such a slot. Extraction falls back to
+/// the rule-based extractor rather than call a model in that state.
+fn extraction_slot<T>(slot: &Mutex<Option<T>>) -> Option<std::sync::MutexGuard<'_, Option<T>>> {
+    match slot.lock() {
+        Ok(guard) => Some(guard),
+        Err(_) => {
+            log::warn!("LLM extraction falling back: the backend slot is poisoned");
+            None
+        }
+    }
+}
+
 fn extract_native(handles: &BackendHandles, text: &str, speaker: &str) -> Option<ExtractionResult> {
-    let guard = handles.llm_engine.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = extraction_slot(&handles.llm_engine)?;
     let engine = guard.as_ref()?;
     match engine.extract_entities(text, speaker) {
         Ok(result) => Some(result),
@@ -1377,7 +1481,7 @@ fn extract_api(
     // a long-running extraction request never blocks interactive chat (which
     // needs the same client lock). See executor.rs lock-scope note.
     let client = {
-        let guard = handles.api_client.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = extraction_slot(&handles.api_client)?;
         guard.as_ref()?.clone()
     };
     if let Err(error) = api_route_for_client(route, &client) {
@@ -1403,10 +1507,7 @@ fn extract_openrouter(
 ) -> Option<ExtractionResult> {
     // Clone + drop the guard before the blocking HTTP request (see extract_api).
     let client = {
-        let guard = handles
-            .openrouter_client
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let guard = extraction_slot(&handles.openrouter_client)?;
         guard.as_ref()?.clone()
     };
     if let Err(error) = openrouter_route_for_client(route, &client) {
@@ -1428,10 +1529,7 @@ fn extract_mistralrs(
     text: &str,
     speaker: &str,
 ) -> Option<ExtractionResult> {
-    let guard = handles
-        .mistralrs_engine
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let guard = extraction_slot(&handles.mistralrs_engine)?;
     let engine = guard.as_ref()?;
     match engine.extract_entities(text, speaker) {
         Ok(result) => Some(result),
@@ -2279,6 +2377,7 @@ mod tests {
         QueueState {
             interactive: VecDeque::new(),
             background: VecDeque::new(),
+            worker: Worker::Running,
         }
     }
 
@@ -3239,16 +3338,16 @@ mod tests {
     }
 
     #[test]
-    fn an_executor_whose_worker_never_started_fails_at_once() {
+    fn an_executor_whose_worker_could_not_start_fails_at_once() {
         let executor = LlmExecutor {
             queue: Arc::new((
                 Mutex::new(QueueState {
-                    interactive: VecDeque::new(),
-                    background: VecDeque::new(),
+                    worker: Worker::Unavailable,
+                    ..new_state()
                 }),
                 Condvar::new(),
             )),
-            has_worker: false,
+            run: Arc::new(|_| unreachable!("no worker runs a job")),
         };
         // On its own thread: a regression would block here forever.
         let (done, outcome) = mpsc::channel();
@@ -3271,6 +3370,416 @@ mod tests {
             .expect("a job nobody will run must not wait for a reply");
         assert_eq!(chat, Err(executor_failure(Code::Internal)));
         assert_eq!(patch, Err("runtime/internal".to_string()));
+    }
+
+    /// What a native binding's panic can say.
+    const JOB_PANIC_CANARY: &str = "wombat-private-model-dir";
+
+    /// A stand-in for the backends. A chat whose graph context is `"panic"`
+    /// reports that it has started, waits to be released, then panics. Every
+    /// other job is answered as served.
+    fn panicking_runner(started: mpsc::Sender<()>, release: mpsc::Receiver<()>) -> JobRunner {
+        let started = StdMutex::new(started);
+        let release = StdMutex::new(release);
+        Arc::new(move |job| match job {
+            LlmJob::Chat {
+                graph_context,
+                response_tx,
+                ..
+            } if graph_context == "panic" => {
+                let _ = started.lock().unwrap().send(());
+                let _ = release.lock().unwrap().recv();
+                // Still owned here when the unwind starts, as in a real job.
+                let _response_tx = response_tx;
+                panic!("\"/home/{JOB_PANIC_CANARY}/model.gguf\" could not be read");
+            }
+            LlmJob::Chat { response_tx, .. } => {
+                let _ = response_tx.send(LlmJobResult::Chat(Ok(ChatOutcome {
+                    text: "served".to_string(),
+                    tokens_used: 0,
+                })));
+            }
+            LlmJob::Extract { response_tx, .. } => {
+                let _ = response_tx.send(LlmJobResult::Extraction(Some(ExtractionResult {
+                    entities: Vec::new(),
+                    relations: Vec::new(),
+                })));
+            }
+            LlmJob::ProjectionPatch { response_tx, .. } => {
+                let _ = response_tx.send(LlmJobResult::ProjectionPatch(ProjectionPatchAttempt {
+                    outcome: Err("served".to_string()),
+                    attempted_route: None,
+                }));
+            }
+        })
+    }
+
+    /// Run `call` on its own thread: a regression would block it forever.
+    fn spawn_caller<T: Send + 'static>(
+        call: impl FnOnce() -> T + Send + 'static,
+    ) -> mpsc::Receiver<T> {
+        let (done, outcome) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(call());
+        });
+        outcome
+    }
+
+    fn chat_caller(
+        executor: &LlmExecutor,
+        tag: &str,
+    ) -> mpsc::Receiver<Result<String, RuntimeDiagnostic>> {
+        let (executor, tag) = (executor.clone(), tag.to_string());
+        spawn_caller(move || {
+            executor
+                .chat_with_history(Vec::new(), tag, LlmProvider::LocalLlama)
+                .map(|outcome| outcome.text)
+        })
+    }
+
+    /// Run `work` on its own thread and fail if it has not returned in `limit`.
+    fn within<T: Send + 'static>(
+        limit: std::time::Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (done, outcome) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        match outcome.recv_timeout(limit) {
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("no result within {limit:?}"),
+            // The work panicked: surface that panic, not a closed channel.
+            Err(mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(()) => unreachable!("the work returned without a result"),
+            },
+        }
+    }
+
+    /// Each wait inside the scenario is bounded on its own; this bounds it whole.
+    const SCENARIO_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// One job panics with a chat, an extraction and a projection queued
+    /// behind it, and another chat arrives afterwards.
+    fn run_job_panic_scenario() {
+        let wait = std::time::Duration::from_secs(10);
+        let (started_tx, started) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let executor = LlmExecutor::with_runner(panicking_runner(started_tx, release_rx));
+
+        let in_flight = chat_caller(&executor, "panic");
+        started
+            .recv_timeout(wait)
+            .expect("the job that will panic starts");
+
+        let queued_chat = chat_caller(&executor, "queued");
+        let queued_extraction = spawn_caller({
+            let executor = executor.clone();
+            move || {
+                executor
+                    .extract_entities(
+                        "text".to_string(),
+                        "speaker".to_string(),
+                        String::new(),
+                        LlmProvider::LocalLlama,
+                        LlmPriority::Background,
+                    )
+                    .is_some()
+            }
+        });
+        let queued_patch = spawn_caller({
+            let executor = executor.clone();
+            move || {
+                let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+                executor
+                    .generate_projection_patch(
+                        job,
+                        ledger,
+                        None::<crate::projections::MaterializedNotes>,
+                        LlmProvider::LocalLlama,
+                        1,
+                        100,
+                    )
+                    .outcome
+                    .map(|_| ())
+            }
+        });
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let queued = {
+                let state = executor.queue.0.lock().unwrap();
+                state.interactive.len() + state.background.len()
+            };
+            if queued == 3 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the three callers must be queued behind the running job"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        release.send(()).expect("release the job into its panic");
+
+        let internal = Err(executor_failure(Code::Internal));
+        assert_eq!(
+            in_flight.recv_timeout(wait).expect("the in-flight caller"),
+            internal
+        );
+        assert_eq!(
+            queued_chat.recv_timeout(wait).expect("the queued chat"),
+            internal
+        );
+        assert!(
+            !queued_extraction
+                .recv_timeout(wait)
+                .expect("the queued extraction"),
+            "a queued extraction must fall back, not be served"
+        );
+        assert_eq!(
+            queued_patch
+                .recv_timeout(wait)
+                .expect("the queued projection"),
+            Err("runtime/internal".to_string())
+        );
+
+        // The worker that ran the panicking job is gone. This one is served,
+        // so the call started another.
+        assert_eq!(
+            chat_caller(&executor, "later")
+                .recv_timeout(wait)
+                .expect("a later caller"),
+            Ok("served".to_string())
+        );
+        assert_eq!(executor.queue.0.lock().unwrap().worker, Worker::Running);
+    }
+
+    #[test]
+    fn a_job_panic_fails_its_caller_and_the_queue_and_the_next_job_is_served() {
+        within(SCENARIO_LIMIT, run_job_panic_scenario);
+    }
+
+    const JOB_PANIC_CHILD: &str = "AUDIOGRAPH_TEST_LLM_EXECUTOR_PANIC";
+
+    #[test]
+    #[ignore = "invoked in isolation by a_job_panic_payload_reaches_no_log_or_crash_report"]
+    fn job_panic_child() {
+        use crate::test_log_capture::{assert_process_logs_exclude, install, process_records};
+
+        if std::env::var_os(JOB_PANIC_CHILD).is_none() {
+            return;
+        }
+        crate::crash_handler::install();
+        install();
+        within(SCENARIO_LIMIT, run_job_panic_scenario);
+
+        // This process ran nothing else, so the whole log is this scenario's.
+        let logged: Vec<String> = process_records()
+            .into_iter()
+            .map(|record| record.message)
+            .collect();
+        assert!(
+            logged.iter().any(|line| line
+                == "LLM executor job panicked; retiring the worker and failing queued jobs"),
+            "{logged:?}"
+        );
+        // The queued extraction says why it fell back, in its own words: not
+        // the line a job dropped for any other reason logs.
+        assert!(
+            logged.iter().any(|line| line
+                == "LLM extraction falling back: the executor worker ended on a job's panic"),
+            "{logged:?}"
+        );
+        assert!(
+            !logged
+                .iter()
+                .any(|line| line.starts_with("LLM executor extraction response failed")),
+            "{logged:?}"
+        );
+        assert_process_logs_exclude(&[JOB_PANIC_CANARY]);
+    }
+
+    /// Run `command` to its end and collect its output, killing it at `limit`.
+    fn output_within(
+        mut command: std::process::Command,
+        limit: std::time::Duration,
+    ) -> std::process::Output {
+        use std::io::Read;
+        use std::process::Stdio;
+
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the child test");
+        // Drain both pipes while waiting: a full pipe would stall the child.
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let stdout = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        });
+        let stderr = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            bytes
+        });
+        let deadline = std::time::Instant::now() + limit;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll the child test") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the child test did not finish within {limit:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.join().expect("read the child's stdout"),
+            stderr: stderr.join().expect("read the child's stderr"),
+        }
+    }
+
+    #[test]
+    fn a_job_panic_payload_reaches_no_log_or_crash_report() {
+        let root =
+            std::env::temp_dir().join(format!("audiograph-llm-executor-{}", uuid::Uuid::new_v4()));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "llm::executor::tests::job_panic_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(crate::user_data::DATA_DIR_ENV, &root)
+            .env(JOB_PANIC_CHILD, "1")
+            .env("RUST_BACKTRACE", "0");
+        // Twice the scenario's own bound, so a stuck scenario is reported by
+        // the child and only a stuck child is killed here.
+        let output = output_within(child, SCENARIO_LIMIT * 2);
+        assert!(output.status.success(), "child status {}", output.status);
+        let reports: Vec<_> = std::fs::read_dir(root.join("crashes"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        std::fs::remove_dir_all(root).unwrap();
+
+        // The hook ran once, and recorded the operation and nothing else.
+        assert_eq!(
+            reports,
+            ["AudioGraph crash report\n\nPayload:\n[redacted panic payload: llm.executor_job]\n"]
+        );
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !printed.contains(JOB_PANIC_CANARY),
+            "panic payload in child output"
+        );
+    }
+
+    /// Poison `slot` the way a backend call that panics under its lock does.
+    fn poison<T: Send + 'static>(slot: &Arc<Mutex<T>>) {
+        let held = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("poison the slot");
+        })
+        .join();
+        assert!(slot.is_poisoned());
+    }
+
+    #[test]
+    fn extraction_refuses_a_poisoned_backend_slot() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        // An endpoint that would answer, so a request would be counted.
+        let (base, requests) = rt.block_on(spawn_counting_mock(vec![
+            "{}".to_string(),
+            "{}".to_string(),
+        ]));
+        let allow = crate::asr::ProviderContentEgressPolicy::allow();
+
+        // Without the native engines the slots can hold their stand-ins, whose
+        // calls would log a failure line of their own.
+        #[cfg(not(feature = "llm-llama"))]
+        let llm_engine = Some(LlmEngine);
+        #[cfg(feature = "llm-llama")]
+        let llm_engine = None;
+        #[cfg(not(feature = "llm-mistralrs"))]
+        let mistralrs_engine = Some(MistralRsEngine);
+        #[cfg(feature = "llm-mistralrs")]
+        let mistralrs_engine = None;
+
+        let handles = BackendHandles {
+            llm_engine: Arc::new(Mutex::new(llm_engine)),
+            api_client: Arc::new(Mutex::new(Some(
+                ApiClient::new(crate::llm::ApiConfig {
+                    endpoint: base.clone(),
+                    api_key: Some("sk-route-removal-probe".to_string()),
+                    model: "probe-model".to_string(),
+                    max_tokens: 64,
+                    temperature: 0.1,
+                })
+                .with_content_egress_policy(allow),
+            ))),
+            openrouter_client: Arc::new(Mutex::new(Some(
+                OpenRouterClient::new(crate::llm::openrouter::OpenRouterConfig {
+                    base_url: base.clone(),
+                    ..crate::llm::openrouter::OpenRouterConfig::with_defaults(
+                        "sk-route-removal-probe".to_string(),
+                        "probe-model".to_string(),
+                    )
+                })
+                .with_content_egress_policy(allow),
+            ))),
+            mistralrs_engine: Arc::new(Mutex::new(mistralrs_engine)),
+        };
+        poison(&handles.llm_engine);
+        poison(&handles.api_client);
+        poison(&handles.openrouter_client);
+        poison(&handles.mistralrs_engine);
+
+        let api_route = authorize_route_dispatch(&LlmProvider::Api {
+            endpoint: base.clone(),
+            api_key: "sk-route-removal-probe".to_string(),
+            model: "probe-model".to_string(),
+        })
+        .expect("the loopback endpoint is authorized");
+        let openrouter_route = authorize_route_dispatch(&LlmProvider::OpenRouter {
+            model: "probe-model".to_string(),
+            base_url: base,
+            provider_order: None,
+            include_usage_in_stream: true,
+            api_key: "sk-route-removal-probe".to_string(),
+        })
+        .expect("OpenRouter is authorized");
+
+        let capture = ThreadLogCapture::start();
+        assert!(extract_native(&handles, "text", "speaker").is_none());
+        assert!(extract_api(&handles, &api_route, "text", "speaker", "").is_none());
+        assert!(extract_openrouter(&handles, &openrouter_route, "text", "speaker", "").is_none());
+        assert!(extract_mistralrs(&handles, "text", "speaker").is_none());
+        let logs = render(&capture.finish());
+
+        assert_eq!(
+            logs.matches("LLM extraction falling back: the backend slot is poisoned")
+                .count(),
+            4,
+            "{logs}"
+        );
+        // No backend was called: none logged a failure of its own, and nothing
+        // reached the endpoint.
+        assert!(!logs.contains("extraction failed"), "{logs}");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

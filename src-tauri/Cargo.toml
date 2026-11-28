@@ -111,9 +111,18 @@ wdio-e2e = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]
 rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "b50d4cb646c57fd0fd79452f71088d9a3e9521f7", default-features = false, features = ["feat_linux", "hotplug-recovery"] }
 # Held-descriptor filesystem inspection for the dormant credential-v2
 # filesystem policy and authority journal. `process` provides `geteuid`, so
-# the journal verifies ownership on the descriptor it uses. Exact version
-# already in the lock; no new package.
-rustix = { version = "=1.1.4", features = ["fs", "process"] }
+# the journal verifies ownership on the descriptor it uses. Raised from
+# 1.1.4 to meet the zbus 6 default runtime requirement (#152). Both targets
+# pin the same locked release.
+rustix = { version = "=1.1.5", features = ["fs", "process"] }
+# Dormant credential v2. Omit zbus tracing to keep wire metadata private.
+aes = { version = "0.8", features = ["zeroize"] }
+cbc = { version = "0.1", features = ["zeroize"] }
+crypto-bigint = { version = "0.7.11", default-features = false, features = ["zeroize"] }
+getrandom = "0.4"
+hkdf = "0.12"
+zbus = { version = "6.5", default-features = false, features = ["default-rt", "proxy"] }
+zruntime = { version = "0.2", default-features = false, features = ["helper"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "b50d4cb646c57fd0fd79452f71088d9a3e9521f7", default-features = false, features = ["feat_windows", "hotplug-recovery"] }
@@ -158,7 +167,7 @@ rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.gi
 # namespace lock, independent of `HOME`.
 nix = { version = "0.31.3", features = ["fs", "user"] }
 # Dormant credential-v2 macOS boundary: checked Security.framework Keychain
-# calls plus held-descriptor filesystem inspection. Every version below is the
+# calls. Each Security.framework dependency below uses the
 # one already resolved in the lock (via keyring/native-tls/rsac), so these add
 # direct edges only, no new packages. The Keychain calls need none of
 # security-framework's default TLS features (ALPN, session tickets), so this
@@ -166,7 +175,9 @@ nix = { version = "0.31.3", features = ["fs", "user"] }
 core-foundation = "=0.10.1"
 security-framework = { version = "=3.7.0", default-features = false }
 security-framework-sys = "=2.17.0"
-rustix = { version = "=1.1.4", features = ["fs", "process"] }
+# Held-descriptor inspection. Raised from 1.1.4 to meet the zbus 6 default
+# runtime requirement (#152). Both targets pin the same locked release.
+rustix = { version = "=1.1.5", features = ["fs", "process"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "std",
     "NSArray",
@@ -425,3 +436,10 @@ sentry = { version = "0.48.3", default-features = false, features = [
 [dev-dependencies]
 tauri = { version = "2.11.0", features = ["test"] }
 serde-saphyr = "0.0.28"
+
+# Run the same crypto known-answer tests on hosts without D-Bus.
+[target.'cfg(not(target_os = "linux"))'.dev-dependencies]
+aes = { version = "0.8", features = ["zeroize"] }
+cbc = { version = "0.1", features = ["zeroize"] }
+crypto-bigint = { version = "0.7.11", default-features = false, features = ["zeroize"] }
+hkdf = "0.12"
