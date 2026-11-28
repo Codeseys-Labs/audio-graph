@@ -37,7 +37,15 @@ fn staged_name(name: &str) -> String {
     format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple())
 }
 
-/// Whether `candidate` is a name [`staged_name`] produces for `name`.
+/// Whether `candidate` has exactly the shape [`staged_name`] produces for
+/// `name`: `.{name}.` and a `.tmp` suffix around a simple-form version 4
+/// UUID (32 lowercase hex digits, version digit `4`, variant digit one of
+/// `8`, `9`, `a`, `b`).
+///
+/// This is a reserved name inside the journal root, not proof of origin: a
+/// file someone else deliberately gives such a name is deleted as a stray
+/// staged file. A directory under such a name fails the sweep closed; any
+/// other entry, a link included, is removed itself, never what it points to.
 fn is_staged_name(candidate: &str, name: &str) -> bool {
     candidate
         .strip_prefix('.')
@@ -45,10 +53,13 @@ fn is_staged_name(candidate: &str, name: &str) -> bool {
         .and_then(|rest| rest.strip_prefix('.'))
         .and_then(|rest| rest.strip_suffix(".tmp"))
         .is_some_and(|token| {
+            let token = token.as_bytes();
             token.len() == 32
                 && token
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+                && token[12] == b'4'
+                && matches!(token[16], b'8' | b'9' | b'a' | b'b')
         })
 }
 
@@ -193,9 +204,13 @@ mod unix_held {
         /// Unlinks every staged file a failed discard left for `name`,
         /// relative to the held descriptor. Callers hold the authority
         /// mutation lock, so no other writer's staged file is in flight.
-        /// Anything that cannot be removed fails closed as `Unavailable`
-        /// rather than being ignored.
-        fn sweep_staged(&self, name: &str) -> Result<(), CredentialStoreFailure> {
+        /// Eligibility is by name alone (see [`is_staged_name`]). Anything
+        /// that cannot be removed fails closed as `Unavailable` rather than
+        /// being ignored.
+        pub(in crate::credentials::adapters) fn sweep_staged(
+            &self,
+            name: &str,
+        ) -> Result<(), CredentialStoreFailure> {
             let entries =
                 Dir::read_from(&self.fd).map_err(|_| CredentialStoreFailure::Unavailable)?;
             let mut strays = Vec::new();
@@ -690,9 +705,13 @@ mod windows_held {
         /// is in flight. Names come from listing the held directory's final
         /// path, never the caller's path, whose ancestors can be swapped; a
         /// name that no longer resolves in the held directory is skipped.
-        /// Anything that cannot be deleted fails closed as `Unavailable`
-        /// rather than being ignored.
-        fn sweep_staged(&self, name: &str) -> Result<(), CredentialStoreFailure> {
+        /// Eligibility is by name alone (see [`is_staged_name`]). Anything
+        /// that cannot be deleted fails closed as `Unavailable` rather than
+        /// being ignored.
+        pub(in crate::credentials::adapters) fn sweep_staged(
+            &self,
+            name: &str,
+        ) -> Result<(), CredentialStoreFailure> {
             let entries = std::fs::read_dir(&self.final_path)
                 .map_err(|_| CredentialStoreFailure::Unavailable)?;
             for entry in entries {

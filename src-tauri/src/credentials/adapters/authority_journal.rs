@@ -667,7 +667,8 @@ pub(super) mod tests {
     }
 
     /// A staged file whose discard failed is cleaned up by the next staging
-    /// in the same root.
+    /// in the same root. Only the exact shape of a generated staged name is
+    /// reserved: a lookalike whose token is not a version 4 UUID stays.
     #[test]
     fn the_next_replace_removes_a_stray_staged_file() {
         let base = scratch("stray-sweep");
@@ -679,10 +680,18 @@ pub(super) mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::write(&stray, b"stray-journal").expect("plant stray staged file");
+        let mut token = uuid::Uuid::new_v4().simple().to_string();
+        token.replace_range(12..13, "1");
+        let lookalike = root.join(format!(".{JOURNAL_FILE_NAME}.{token}.tmp"));
+        std::fs::write(&lookalike, b"not-ours").expect("plant lookalike");
 
         journal.replace(b"second-journal").expect("second replace");
 
         assert!(!stray.exists(), "stray staged file survived");
+        assert_eq!(
+            std::fs::read(&lookalike).expect("lookalike survives"),
+            b"not-ours"
+        );
         assert_eq!(journal.read(), Ok(Some(b"second-journal".to_vec())));
         std::fs::remove_dir_all(&base).expect("remove isolated stray-sweep directory");
     }
