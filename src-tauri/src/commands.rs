@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use audio_graph_ipc_contract::runtime_diagnostic::{
-    RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic, RuntimeOperation,
-    RuntimeSafeRecoveryAction,
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeSafeRecoveryAction,
 };
 use tauri::{Emitter, Manager, State};
 use tokio_util::sync::CancellationToken;
@@ -590,6 +590,10 @@ pub struct ProviderReadiness {
     pub openrouter_models: Vec<OpenRouterModel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<ProviderRuntimeReadiness>,
+    /// Typed cause of an `Error` status when the probe produced one. The UI
+    /// presents this code; `message` is then only the `runtime/<code>` token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<RuntimeDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_stt_fidelity: Option<EffectiveSttFidelity>,
 }
@@ -12478,6 +12482,7 @@ fn base_provider_readiness(
         language_catalog,
         openrouter_models: vec![],
         runtime: None,
+        diagnostic: None,
         effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
     }
 }
@@ -12520,6 +12525,7 @@ fn cancelled_provider_readiness(
         language_catalog,
         openrouter_models: vec![],
         runtime: None,
+        diagnostic: None,
         effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
     }
 }
@@ -12757,12 +12763,8 @@ async fn probe_provider_readiness(
                 }
                 _ => openrouter::DEFAULT_BASE_URL.to_string(),
             };
-            openrouter::test_connection(&api_key, &base_url)
-                .await
-                .map_err(AppError::Unknown)?;
-            let models = openrouter::list_models(&api_key, &base_url)
-                .await
-                .map_err(AppError::Unknown)?;
+            openrouter::test_connection(&api_key, &base_url).await?;
+            let models = openrouter::list_models(&api_key, &base_url).await?;
             let message = format!("OpenRouter API key is valid ({} models)", models.len());
             Ok(ProviderReadinessProbeResult {
                 message,
@@ -12871,6 +12873,7 @@ async fn refresh_provider_readiness(
                 language_catalog,
                 openrouter_models: probe.openrouter_models,
                 runtime: None,
+                diagnostic: None,
                 effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
             }
         }
@@ -12878,6 +12881,10 @@ async fn refresh_provider_readiness(
             let model_catalog = fixed_model_catalog_for_descriptor(descriptor);
             let voice_catalog = fixed_voice_catalog_for_descriptor(descriptor);
             let language_catalog = fixed_language_catalog_for_descriptor(descriptor);
+            let diagnostic = match &error {
+                AppError::RuntimeDiagnostic(diagnostic) => Some(diagnostic.clone()),
+                _ => None,
+            };
             ProviderReadiness {
                 provider_id: descriptor.id.to_string(),
                 status: ProviderReadinessStatus::Error,
@@ -12893,6 +12900,7 @@ async fn refresh_provider_readiness(
                 language_catalog,
                 openrouter_models: vec![],
                 runtime: None,
+                diagnostic,
                 effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
             }
         }
@@ -12918,6 +12926,7 @@ async fn refresh_provider_readiness(
                 language_catalog,
                 openrouter_models: vec![],
                 runtime: None,
+                diagnostic: None,
                 effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
             }
         }
@@ -13913,9 +13922,7 @@ pub async fn test_openrouter_connection_cmd(
 ) -> AppResult<String> {
     let api_key = openrouter_api_key_from_draft_or_store(api_key)?;
     let base_url = openrouter_base_url_or_default(base_url);
-    openrouter::test_connection(&api_key, &base_url)
-        .await
-        .map_err(AppError::Unknown)?;
+    openrouter::test_connection(&api_key, &base_url).await?;
     Ok("OpenRouter API key is valid".to_string())
 }
 
@@ -13929,7 +13936,7 @@ pub async fn list_openrouter_models_cmd(
     let base_url = openrouter_base_url_or_default(base_url);
     openrouter::list_models(&api_key, &base_url)
         .await
-        .map_err(AppError::Unknown)
+        .map_err(AppError::from)
 }
 
 /// Fetch OpenRouter provider metadata using only the saved backend credential.
@@ -13950,7 +13957,7 @@ async fn list_openrouter_providers_with_store(
     let base_url = openrouter_base_url_or_default(base_url);
     openrouter::list_providers(&api_key, &base_url)
         .await
-        .map_err(AppError::Unknown)
+        .map_err(AppError::from)
 }
 
 /// Fetch OpenRouter model endpoint metadata using only the saved backend credential.
@@ -13973,7 +13980,7 @@ async fn list_openrouter_model_endpoints_with_store(
     let base_url = openrouter_base_url_or_default(base_url);
     openrouter::list_model_endpoints(&api_key, &base_url, &model_id)
         .await
-        .map_err(AppError::Unknown)
+        .map_err(AppError::from)
 }
 
 fn openrouter_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<String> {
@@ -19980,6 +19987,67 @@ mod tests {
         assert_eq!(readiness.message, "Provider readiness check cancelled");
         let serialized = serde_json::to_string(&readiness).expect("serialize readiness");
         assert!(!serialized.contains("sk-secret-cancel"));
+    }
+
+    #[tokio::test]
+    async fn provider_readiness_carries_the_typed_cause_of_an_openrouter_refusal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let descriptor = crate::provider_registry::descriptor_by_id("llm.openrouter");
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openrouter_api_key = Some("readiness-key-canary".to_string());
+
+        for (status, code) in [
+            ("403 Forbidden", RuntimeErrorCode::PermissionDenied),
+            ("401 Unauthorized", RuntimeErrorCode::CredentialRejected),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock");
+            let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let body = "readiness-body-canary";
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+            let settings = crate::settings::AppSettings {
+                llm_provider: crate::settings::LlmProvider::OpenRouter {
+                    model: String::new(),
+                    base_url,
+                    provider_order: None,
+                    include_usage_in_stream: true,
+                    api_key: String::new(),
+                },
+                ..Default::default()
+            };
+
+            let readiness =
+                refresh_provider_readiness(descriptor, &settings, &store, 1, None).await;
+
+            assert_eq!(readiness.status, ProviderReadinessStatus::Error);
+            let Some(RuntimeDiagnostic::Runtime(detail)) = &readiness.diagnostic else {
+                panic!("no typed cause for {status}");
+            };
+            assert_eq!(detail.code, code);
+            let serialized = serde_json::to_string(&readiness).expect("serialize readiness");
+            for canary in ["readiness-key-canary", "readiness-body-canary"] {
+                assert!(!serialized.contains(canary), "{canary} in readiness");
+            }
+        }
     }
 
     #[test]

@@ -434,6 +434,45 @@ describe("ProviderReadinessPanel", () => {
     ).not.toBeInTheDocument();
   });
 
+  it.each([
+    ["en", "permission_denied", /denied access to this operation/i],
+    ["en", "credential_rejected", /rejected the credential/i],
+    ["pt", "permission_denied", /negou o acesso a esta operação/i],
+    ["pt", "credential_rejected", /rejeitou a credencial/i],
+  ] as const)("presents a typed readiness failure in %s (%s) as a sentence, never its token", (locale, code, sentence) => {
+    const { container } = render(
+      <ProviderReadinessPanel
+        entry={readiness({
+          provider_id: "llm.openrouter",
+          status: "error",
+          // What the backend sends beside the typed cause of a 403 or 401.
+          message: `runtime/${code}`,
+          diagnostic: {
+            kind: "runtime",
+            detail: {
+              code,
+              retryable: false,
+              recovery_action:
+                code === "credential_rejected"
+                  ? "reenter_credential"
+                  : "review_configuration",
+              context: { operation: "provider_readiness", transport: "http" },
+            },
+          },
+          credentials: [{ key: "openrouter_api_key", present: true }],
+        })}
+        loading={false}
+        t={i18n.getFixedT(locale)}
+      />,
+    );
+
+    // Once: a sentence that is its own next step is not repeated as one.
+    expect(screen.getAllByText(sentence)).toHaveLength(1);
+    expect(screen.getByRole("status")).toHaveTextContent(sentence);
+    expect(container).not.toHaveTextContent("runtime/");
+    expect(container).not.toHaveTextContent(code);
+  });
+
   it("guides unchecked saved credentials toward validation checks", () => {
     render(
       <ProviderReadinessPanel

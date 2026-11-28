@@ -1193,19 +1193,20 @@ fn sanitize_metadata_value(raw: &str) -> Option<String> {
 
 /// Hit `GET /api/v1/models` with the supplied API key + attribution headers.
 ///
-/// Returns `Ok(())` on HTTP 200, `Err(diagnostic)` on 401/403/network errors.
-/// Used by `test_openrouter_connection_cmd`.
-pub async fn test_connection(api_key: &str, base_url: &str) -> Result<(), String> {
+/// Returns `Ok(())` on HTTP 200 and the closed diagnostic otherwise. Used by
+/// `test_openrouter_connection_cmd` and the readiness probe.
+pub async fn test_connection(api_key: &str, base_url: &str) -> Result<(), RuntimeDiagnostic> {
     let operation = RuntimeOperation::ProviderReadiness;
     let url = openrouter_api_url(base_url, &["models"], operation);
-    get_catalog_response(api_key, url, operation)
-        .await
-        .map_err(|error| error.to_string())?;
+    get_catalog_response(api_key, url, operation).await?;
     Ok(())
 }
 
 /// Fetch the live OpenRouter model catalog.
-pub async fn list_models(api_key: &str, base_url: &str) -> Result<Vec<OpenRouterModel>, String> {
+pub async fn list_models(
+    api_key: &str,
+    base_url: &str,
+) -> Result<Vec<OpenRouterModel>, RuntimeDiagnostic> {
     let operation = RuntimeOperation::ModelDiscovery;
     let url = openrouter_api_url(base_url, &["models"], operation);
     let parsed: ModelsResponse = get_catalog_json(api_key, url).await?;
@@ -1216,7 +1217,7 @@ pub async fn list_models(api_key: &str, base_url: &str) -> Result<Vec<OpenRouter
 pub async fn list_providers(
     api_key: &str,
     base_url: &str,
-) -> Result<Vec<OpenRouterProvider>, String> {
+) -> Result<Vec<OpenRouterProvider>, RuntimeDiagnostic> {
     let parsed: ProvidersResponse =
         get_catalog_json(api_key, openrouter_providers_url(base_url)).await?;
     Ok(parsed.data)
@@ -1227,7 +1228,7 @@ pub async fn list_model_endpoints(
     api_key: &str,
     base_url: &str,
     model_id: &str,
-) -> Result<OpenRouterModelEndpoints, String> {
+) -> Result<OpenRouterModelEndpoints, RuntimeDiagnostic> {
     let url = openrouter_model_endpoints_url(base_url, model_id);
     let parsed: ModelEndpointsResponse = get_catalog_json(api_key, url).await?;
     Ok(parsed.data)
@@ -1236,14 +1237,13 @@ pub async fn list_model_endpoints(
 async fn get_catalog_json<T: serde::de::DeserializeOwned>(
     api_key: &str,
     url: Result<reqwest::Url, RuntimeDiagnostic>,
-) -> Result<T, String> {
+) -> Result<T, RuntimeDiagnostic> {
     let operation = RuntimeOperation::ModelDiscovery;
     get_catalog_response(api_key, url, operation)
-        .await
-        .map_err(|error| error.to_string())?
+        .await?
         .json()
         .await
-        .map_err(|error| HttpFailure::response(&error, http_context(operation)).to_string())
+        .map_err(|error| HttpFailure::response(&error, http_context(operation)).diagnostic)
 }
 
 async fn get_catalog_response(
@@ -3588,7 +3588,7 @@ mod tests {
         let err = test_connection("sk-bad", &base)
             .await
             .expect_err("test_connection must return Err on HTTP 401");
-        assert_eq!(err, "runtime/credential_rejected");
+        assert_eq!(err.to_string(), "runtime/credential_rejected");
     }
 
     #[tokio::test]
@@ -3605,7 +3605,7 @@ mod tests {
             .await
             .expect_err("test_connection must return Err on HTTP 403");
         // A valid key the provider will not let do this is not a bad key.
-        assert_eq!(err, "runtime/permission_denied");
+        assert_eq!(err.to_string(), "runtime/permission_denied");
     }
 
     #[tokio::test]
@@ -3630,7 +3630,7 @@ mod tests {
         )
         .await
         .expect_err("catalog HTTP error");
-        assert_eq!(err, "runtime/rate_limited");
+        assert_eq!(err.to_string(), "runtime/rate_limited");
         // Nothing on this path logs today; the capture is for the day something does.
         let observed = format!("{err}\n{}", render(&capture.finish()));
         assert_absent(

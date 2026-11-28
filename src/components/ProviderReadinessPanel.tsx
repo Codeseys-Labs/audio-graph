@@ -10,6 +10,7 @@ import type {
   ProviderSensitiveErrorPolicy,
   SttFidelityDegradation,
 } from "../types";
+import { runtimeDiagnosticPresentation } from "../utils/runtimeDiagnostic";
 import { providerRoadmapAuthLabel } from "./providerRegistryHelpers";
 import { readinessTone as statusTone } from "./settings/badgeTone";
 import { readinessChipTone } from "./settings/readinessTone";
@@ -471,6 +472,17 @@ function providerAuthRecoveryKey(message: string) {
   }
 }
 
+// A typed failure is presented from its closed code. The `message` the backend
+// sends with it is the bare `runtime/<code>` token, which is not copy.
+export function providerReadinessMessage(
+  entry: ProviderReadiness,
+  t: TFunction,
+): string {
+  return entry.diagnostic
+    ? t(runtimeDiagnosticPresentation(entry.diagnostic).translationKey)
+    : entry.message;
+}
+
 export function providerRecoveryAction(
   entry: ProviderReadiness,
   t: TFunction,
@@ -598,9 +610,13 @@ export default function ProviderReadinessPanel({
   if (!entry && !descriptor && !loading) return null;
 
   const catalogSummary = entry ? providerCatalogSummary(entry) : null;
+  const message = entry ? providerReadinessMessage(entry, t) : null;
   const recoveryAction = entry
     ? providerRecoveryAction(entry, t, descriptor)
     : null;
+  // An expired credential or a refused permission is its own next step: the
+  // recovery copy for it is the sentence already shown as the message.
+  const nextStep = recoveryAction === message ? null : recoveryAction;
   // The tone LAW (audio-graph-2554, settings T2; folded in for T3 /
   // audio-graph-9d2b — seed 73bf): this panel always describes the provider
   // actually selected right now (every call site passes the ACTIVE
@@ -654,7 +670,7 @@ export default function ProviderReadinessPanel({
         </div>
         {entry && (
           <p className="settings-provider-readiness__message">
-            {entry.message}
+            {message}
             {entry.stale ? ` ${t("settings.providerReadiness.stale")}` : ""}
             {catalogSummary
               ? ` ${providerCatalogLabel(catalogSummary, t)}`
@@ -662,10 +678,10 @@ export default function ProviderReadinessPanel({
           </p>
         )}
       </div>
-      {recoveryAction && (
+      {nextStep && (
         <p className="settings-provider-readiness__recovery">
           <span>{t("settings.providerReadiness.recoveryLabel")}</span>{" "}
-          {recoveryAction}
+          {nextStep}
         </p>
       )}
       {entry && (
