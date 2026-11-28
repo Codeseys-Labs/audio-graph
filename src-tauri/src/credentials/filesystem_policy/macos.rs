@@ -347,7 +347,7 @@ mod native {
         let raw_name = filesystem.f_fstypename.map(|byte| byte as u8);
         let mount = classify_darwin_mount_flags(filesystem.f_flags);
 
-        // rustix 1.1.4 exposes Darwin's libc fsid_t, whose locked definition is
+        // rustix 1.1.5 exposes Darwin's libc fsid_t, whose locked definition is
         // exactly two private i32 fields. `transmute` preserves those opaque
         // identity bits and statically rejects any future size change.
         let filesystem_identity =
