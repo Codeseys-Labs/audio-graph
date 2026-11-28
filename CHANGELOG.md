@@ -96,8 +96,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   draft and its repair, could send it without the restrictions it was queued
   under. A later save that changes the provider's endpoint, model, key,
   routing or privacy setting now stops work that is still queued, and stops a
-  retry or a repair that has not been sent yet. A request already on its way
-  is not stopped. Notes synthesis is also refused when those settings change
+  retry, a repair or a redirect that has not been sent yet. A request already
+  on its way is not stopped. The HTTP client no longer resends a request on
+  its own when an HTTP/2 server refuses it; the app's own retry does, after
+  the same check. Notes synthesis is also refused when those settings change
   between its approval and its start (#551).
 - A projection whose worker ended after its request was sent is now recorded
   under the destination it was sent to, not the one the session started with

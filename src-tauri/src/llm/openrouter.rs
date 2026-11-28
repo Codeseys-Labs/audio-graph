@@ -19,13 +19,15 @@ use audio_graph_ipc_contract::runtime_diagnostic::{
     RuntimeDiagnostic, RuntimeErrorCode as Code, RuntimeOperation,
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
 use crate::llm::admission::{ClientSlot, SendRefused, leave_to_send};
 use crate::llm::http_diag::{
-    HttpFailure, INFERENCE, diagnostic, http_context, same_origin_redirects,
+    HttpFailure, INFERENCE, SendError, diagnostic, http_context, is_refused_stream,
+    job_client_builder, same_origin_redirects, send_admitted,
 };
 use crate::llm::route::{
     ConstrainedDecodingGrade, RequestOutputForm, TerminalStatus, WireOutcome,
@@ -1370,6 +1372,8 @@ pub struct OpenRouterClient {
     /// For the copy an executor job sends from: the slot it was copied from.
     /// `None` for every other client, the slot's own included.
     admitted_from: Option<ClientSlot<OpenRouterClient>>,
+    /// Set once a transport attempt from this copy passed admission.
+    attempt_admitted: Arc<AtomicBool>,
 }
 
 impl OpenRouterClient {
@@ -1385,11 +1389,10 @@ impl OpenRouterClient {
             headers.insert("X-OpenRouter-Title", value);
         }
 
-        let client = reqwest::blocking::Client::builder()
+        let client = job_client_builder()
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_REQUEST_TIMEOUT)
             .default_headers(headers)
-            .redirect(same_origin_redirects())
             .build()
             .ok();
         #[cfg(test)]
@@ -1408,6 +1411,7 @@ impl OpenRouterClient {
                 "explicit_policy_required",
             ),
             admitted_from: None,
+            attempt_admitted: Arc::default(),
         }
     }
 
@@ -1449,6 +1453,7 @@ impl OpenRouterClient {
     /// Mark this client as an executor job's copy of the client in `slot`.
     pub(crate) fn admitted_from(mut self, slot: ClientSlot<Self>) -> Self {
         self.admitted_from = Some(slot);
+        self.attempt_admitted = Arc::default();
         self
     }
 
@@ -1461,6 +1466,19 @@ impl OpenRouterClient {
             }),
             None => Ok(()),
         }
+    }
+
+    /// [`Self::leave_to_send`] for a transport attempt about to start, which
+    /// is recorded once it passes.
+    fn admit_attempt(&self) -> Result<(), SendRefused> {
+        self.leave_to_send()?;
+        self.attempt_admitted.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether any transport attempt from this client passed admission.
+    pub(crate) fn attempt_was_admitted(&self) -> bool {
+        self.attempt_admitted.load(Ordering::Acquire)
     }
 
     /// Returns `true` when the config has the minimum fields populated to
@@ -1736,16 +1754,20 @@ impl OpenRouterClient {
             // Attempts are 1-based; the request body must be rebuilt each try
             // because `.json()` + `.send()` consume the builder.
             let attempt = attempt_number;
-            // Asked before every attempt, a retry after backoff included.
-            self.leave_to_send()
-                .map_err(|refused| HttpFailure::new(refused.report(), INFERENCE))?;
-            let outcome = client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", self.config.api_key))
-                .header("HTTP-Referer", &self.config.http_referer)
-                .header("X-OpenRouter-Title", &self.config.app_title)
-                .json(&request)
-                .send();
+            // Asked before every attempt, a retry after backoff and a
+            // same-origin redirect hop included.
+            let outcome = send_admitted(
+                &url,
+                || self.admit_attempt(),
+                |url| {
+                    client
+                        .post(url)
+                        .header("Authorization", format!("Bearer {}", self.config.api_key))
+                        .header("HTTP-Referer", &self.config.http_referer)
+                        .header("X-OpenRouter-Title", &self.config.app_title)
+                        .json(&request)
+                },
+            );
 
             match outcome {
                 Ok(response) => {
@@ -1803,7 +1825,7 @@ impl OpenRouterClient {
                         }
                     }
                 }
-                Err(e) => {
+                Err(SendError::Transport(e)) => {
                     if is_retryable_chat_transport_error(&e) && attempt < CHAT_MAX_ATTEMPTS {
                         log::warn!(
                             "OpenRouter chat completion transient transport error (attempt {attempt}/{CHAT_MAX_ATTEMPTS}); retrying"
@@ -1816,6 +1838,7 @@ impl OpenRouterClient {
                     }
                     return Err(HttpFailure::request(&e, INFERENCE));
                 }
+                Err(other) => return Err(other.into_failure()),
             }
         };
 
@@ -2150,7 +2173,9 @@ fn is_retryable_chat_status(status: reqwest::StatusCode) -> bool {
 /// auto-retry, which is the safe direction (M4 / audio-graph-7060 originally
 /// retried both).
 fn is_retryable_chat_transport_error(error: &reqwest::Error) -> bool {
-    error.is_connect()
+    // An HTTP/2 refusal says the request was not processed; the resend goes
+    // back through this loop, so it asks leave first.
+    error.is_connect() || is_refused_stream(error)
 }
 
 /// Whether a **body-decode** failure on an otherwise-successful (2xx) response
@@ -2752,6 +2777,15 @@ mod tests {
     async fn spawn_scripted_mock(
         responses: Vec<ScriptedResponse>,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_scripted_mock_hooked(responses, || {}).await
+    }
+
+    /// [`spawn_scripted_mock`], running `after_first` once the first request
+    /// has arrived and before it is answered.
+    async fn spawn_scripted_mock_hooked(
+        responses: Vec<ScriptedResponse>,
+        after_first: impl FnOnce() + Send + 'static,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind scripted mock");
@@ -2759,6 +2793,7 @@ mod tests {
         let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count_for_task = request_count.clone();
         tokio::spawn(async move {
+            let mut after_first = Some(after_first);
             for (status, status_text, extra_headers, body) in responses {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
@@ -2778,6 +2813,9 @@ mod tests {
                     }
                 }
                 count_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(hook) = after_first.take() {
+                    hook();
+                }
                 let response = format!(
                     "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                     status,
@@ -4467,6 +4505,74 @@ mod tests {
         ]));
         assert_eq!(chat(base).as_deref(), Ok("kept"));
         assert_eq!(requests.load(SeqCst), 2);
+    }
+
+    #[test]
+    fn a_save_between_a_post_and_its_redirect_stops_the_hop() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let allow = crate::asr::ProviderContentEgressPolicy::allow;
+        for save in [true, false] {
+            let slot: ClientSlot<OpenRouterClient> = Arc::new(std::sync::Mutex::new(None));
+            // What a settings save publishes: another client. Built here: a
+            // blocking client cannot be built on the mock's runtime.
+            let saved = OpenRouterClient::new(retry_test_config(
+                "http://127.0.0.1:9/elsewhere".to_string(),
+            ))
+            .with_content_egress_policy(allow());
+            let publish = {
+                let slot = slot.clone();
+                // A copy: the last one is dropped on this thread, not the
+                // mock's, as is the slot's previous client, which the job
+                // still holds.
+                let saved = saved.clone();
+                move || {
+                    if save {
+                        *slot.lock().unwrap() = Some(saved);
+                    }
+                }
+            };
+            let (base, requests) = rt.block_on(spawn_scripted_mock_hooked(
+                vec![
+                    (
+                        307,
+                        "Temporary Redirect",
+                        "Location: /moved/chat/completions\r\n",
+                        String::new(),
+                    ),
+                    (
+                        200,
+                        "OK",
+                        "",
+                        serde_json::json!({ "choices": [{ "message": { "content": "kept" } }] })
+                            .to_string(),
+                    ),
+                ],
+                publish,
+            ));
+            let client =
+                OpenRouterClient::new(retry_test_config(base)).with_content_egress_policy(allow());
+            *slot.lock().unwrap() = Some(client.clone());
+            let job = client.admitted_from(slot);
+            let (result, admitted) = std::thread::spawn(move || {
+                let result = job.chat_completion(vec![("user".into(), "hi".into())], false);
+                (result, job.attempt_was_admitted())
+            })
+            .join()
+            .unwrap();
+
+            // The POST passed admission either way.
+            assert!(admitted);
+            if save {
+                // The hop is a new attempt, refused: one request reached the server.
+                assert_eq!(result, Err("runtime/policy_blocked".to_string()));
+                assert_eq!(requests.load(SeqCst), 1);
+            } else {
+                assert_eq!(result.as_deref(), Ok("kept"));
+                assert_eq!(requests.load(SeqCst), 2);
+            }
+        }
     }
 
     #[test]

@@ -6,11 +6,15 @@
 
 use audio_graph_ipc_contract::runtime_diagnostic::{RuntimeDiagnostic, RuntimeErrorCode as Code};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
 use crate::llm::admission::{ClientSlot, SendRefused, leave_to_send};
-use crate::llm::http_diag::{HttpFailure, INFERENCE, SchemaRejection, same_origin_redirects};
+use crate::llm::http_diag::{
+    HttpFailure, INFERENCE, SchemaRejection, job_client_builder, send_admitted,
+};
 use crate::llm::route::{
     RequestOutputForm, WireOutcome, route_for_api_endpoint, sanitize_model_id,
     terminal_status_from_finish_reason,
@@ -244,15 +248,16 @@ pub struct ApiClient {
     /// For the copy an executor job sends from: the slot it was copied from.
     /// `None` for every other client, the slot's own included.
     admitted_from: Option<ClientSlot<ApiClient>>,
+    /// Set once a transport attempt from this copy passed admission.
+    attempt_admitted: Arc<AtomicBool>,
 }
 
 impl ApiClient {
     /// Create a new API client with the given configuration.
     pub fn new(config: ApiConfig) -> Self {
-        let client = reqwest::blocking::Client::builder()
+        let client = job_client_builder()
             .connect_timeout(API_CONNECT_TIMEOUT)
             .timeout(API_REQUEST_TIMEOUT)
-            .redirect(same_origin_redirects())
             .build()
             .ok();
         #[cfg(test)]
@@ -271,6 +276,7 @@ impl ApiClient {
                 "explicit_policy_required",
             ),
             admitted_from: None,
+            attempt_admitted: Arc::default(),
         }
     }
 
@@ -312,6 +318,7 @@ impl ApiClient {
     /// Mark this client as an executor job's copy of the client in `slot`.
     pub(crate) fn admitted_from(mut self, slot: ClientSlot<Self>) -> Self {
         self.admitted_from = Some(slot);
+        self.attempt_admitted = Arc::default();
         self
     }
 
@@ -324,6 +331,19 @@ impl ApiClient {
             }),
             None => Ok(()),
         }
+    }
+
+    /// [`Self::leave_to_send`] for a transport attempt about to start, which
+    /// is recorded once it passes.
+    fn admit_attempt(&self) -> Result<(), SendRefused> {
+        self.leave_to_send()?;
+        self.attempt_admitted.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether any transport attempt from this client passed admission.
+    pub(crate) fn attempt_was_admitted(&self) -> bool {
+        self.attempt_admitted.load(Ordering::Acquire)
     }
 
     /// Returns `true` if the client has a non-empty endpoint and model.
@@ -461,8 +481,6 @@ impl ApiClient {
         let ran_remotely =
             !crate::llm::route::endpoint_may_be_on_users_network(&self.config.endpoint);
 
-        let mut req = client.post(&url).json(&request);
-
         // Trim before deciding: a whitespace-only key ("   ") is effectively
         // unset, and sending it as a bearer token turns "no key" into a hard auth
         // failure (CodeRabbit api_client.rs:187).
@@ -472,16 +490,21 @@ impl ApiClient {
             .as_deref()
             .map(str::trim)
             .filter(|key| !key.is_empty());
-        if let Some(key) = key {
-            req = req.header("Authorization", format!("Bearer {}", key));
-        }
 
-        // Asked last, so only the send itself follows the answer.
-        self.leave_to_send()
-            .map_err(|refused| HttpFailure::new(refused.report(), INFERENCE))?;
-        let response = req
-            .send()
-            .map_err(|error| HttpFailure::request(&error, INFERENCE))?;
+        // Leave is asked last before every attempt, a same-origin redirect
+        // hop included, so only the send itself follows the answer.
+        let response = send_admitted(
+            &url,
+            || self.admit_attempt(),
+            |url| {
+                let builder = client.post(url).json(&request);
+                match key {
+                    Some(key) => builder.header("Authorization", format!("Bearer {key}")),
+                    None => builder,
+                }
+            },
+        )
+        .map_err(crate::llm::http_diag::SendError::into_failure)?;
 
         let status = response.status();
         if !status.is_success() {
