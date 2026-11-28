@@ -27,6 +27,8 @@ export interface ReviewTranscriptView {
   snapshot: ReviewSnapshot | null;
   /** A focus/lifecycle re-query is running over the shown snapshot. */
   refreshing: boolean;
+  /** The last re-query failed: `snapshot` was valid when read, may be old. */
+  stale: boolean;
   error: ReviewErrorCode | null;
   /** Re-run the query (retry after an error, or manual refresh). */
   retry: () => void;
@@ -42,6 +44,7 @@ export function useReviewTranscript(
   const status = useReviewStore((s) => s.status);
   const snapshot = useReviewStore((s) => s.snapshot);
   const refreshing = useReviewStore((s) => s.refreshing);
+  const stale = useReviewStore((s) => s.stale);
   const error = useReviewStore((s) => s.error);
 
   useEffect(() => {
@@ -72,8 +75,18 @@ export function useReviewTranscript(
       status: current && status !== "idle" ? status : "loading",
       snapshot: current ? snapshot : null,
       refreshing: current && refreshing,
+      stale: current && stale,
       error: current ? error : null,
       retry,
     };
-  }, [sessionId, storeSessionId, status, snapshot, refreshing, error, retry]);
+  }, [
+    sessionId,
+    storeSessionId,
+    status,
+    snapshot,
+    refreshing,
+    stale,
+    error,
+    retry,
+  ]);
 }

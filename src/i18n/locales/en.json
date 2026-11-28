@@ -825,12 +825,15 @@
     "load": "Load",
     "reviewLockedWhileLive": "Stop the live capture before opening a past session. Historical Review is locked so session data cannot mix.",
     "reviewNeedsCompletedWhileLive": "Only completed sessions can be opened while capture is running.",
+    "reviewLensLockedWhileLive": "Stop the live capture to use this view.",
     "review": {
       "transcriptTitle": "Session transcript",
       "transcriptLabel": "Session transcript",
       "loading": "Loading session transcript…",
       "unavailable": "This session's transcript is missing or could not be read.",
       "retry": "Try again",
+      "stale": "This transcript may be out of date: the latest refresh failed. Showing the last copy that loaded.",
+      "viewUnavailable": "This session could not be loaded.",
       "emptyTranscript": "This session has no transcript."
     },
     "delete": "Delete",

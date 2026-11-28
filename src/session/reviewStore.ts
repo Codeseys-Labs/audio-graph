@@ -56,7 +56,23 @@ interface ReviewState {
   snapshot: ReviewSnapshot | null;
   /** True while a re-query runs over an already-ready snapshot. */
   refreshing: boolean;
+  /**
+   * The last re-query failed, so `snapshot` was valid when read but may be out
+   * of date. Cleared by the next successful query. Never set without a
+   * snapshot (a first-load failure is `status: "error"` instead).
+   */
+  stale: boolean;
   error: ReviewErrorCode | null;
+  /**
+   * The session the user last explicitly chose in the Sessions browser. After
+   * a capture run ends, a lens that reads the global store must show that
+   * session's data, not whatever the live session left there, so the browser
+   * hydrates the global store for this id on demand. Lives outside the Review
+   * selection (and survives `close()`) because the browser can unmount
+   * between choosing a session and Stop.
+   */
+  lastSelectedSessionId: string | null;
+  markSessionSelected: (sessionId: string | null) => void;
   /** Open (or re-open) a session. Returns once its response settled/dropped. */
   select: (sessionId: string) => Promise<void>;
   /** Re-query the selected session, keeping the current snapshot meanwhile. */
@@ -103,20 +119,23 @@ export const useReviewStore = create<ReviewState>((set, get) => {
         snapshot: toSnapshot(sessionId, loaded),
         status: "ready",
         refreshing: false,
+        stale: false,
         error: null,
       });
     } catch {
       if (isStale()) return;
-      // A failed refresh keeps the last good snapshot visible; only a first
-      // load (no snapshot for this session yet) becomes the error state.
+      // A failed refresh keeps the last good snapshot (it was valid when
+      // read) but marks it `stale` so the pane can say it may be out of date
+      // and offer a retry; only a first load becomes the error state.
       if (get().snapshot?.sessionId === sessionId) {
-        set({ refreshing: false });
+        set({ refreshing: false, stale: true });
         return;
       }
       set({
         snapshot: null,
         status: "error",
         refreshing: false,
+        stale: false,
         error: "unavailable",
       });
     }
@@ -128,7 +147,11 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     status: "idle",
     snapshot: null,
     refreshing: false,
+    stale: false,
     error: null,
+    lastSelectedSessionId: null,
+    markSessionSelected: (sessionId) =>
+      set({ lastSelectedSessionId: sessionId }),
     select: (sessionId) => {
       const sameSession = get().snapshot?.sessionId === sessionId;
       set({
@@ -139,6 +162,7 @@ export const useReviewStore = create<ReviewState>((set, get) => {
         status: sameSession ? "ready" : "loading",
         snapshot: sameSession ? get().snapshot : null,
         refreshing: sameSession,
+        stale: sameSession ? get().stale : false,
         error: null,
       });
       return query(sessionId);
@@ -157,6 +181,7 @@ export const useReviewStore = create<ReviewState>((set, get) => {
         status: "idle",
         snapshot: null,
         refreshing: false,
+        stale: false,
         error: null,
       })),
   };

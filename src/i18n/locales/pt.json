@@ -825,12 +825,15 @@
     "load": "Carregar",
     "reviewLockedWhileLive": "Pare a captura ao vivo antes de abrir uma sessão anterior. A revisão do histórico fica bloqueada para não misturar dados entre sessões.",
     "reviewNeedsCompletedWhileLive": "Só é possível abrir sessões concluídas enquanto a captura está em andamento.",
+    "reviewLensLockedWhileLive": "Pare a captura ao vivo para usar esta visualização.",
     "review": {
       "transcriptTitle": "Transcrição da sessão",
       "transcriptLabel": "Transcrição da sessão",
       "loading": "Carregando a transcrição da sessão…",
       "unavailable": "A transcrição desta sessão está ausente ou não pôde ser lida.",
       "retry": "Tentar novamente",
+      "stale": "Esta transcrição pode estar desatualizada: a última atualização falhou. Mostrando a última cópia carregada.",
+      "viewUnavailable": "Não foi possível carregar esta sessão.",
       "emptyTranscript": "Esta sessão não tem transcrição."
     },
     "delete": "Excluir",

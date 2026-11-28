@@ -849,9 +849,7 @@ describe("SessionsBrowser component", () => {
         fireEvent.click(screen.getByRole("tab", { name: lens }));
         const panel = screen.getByRole("tabpanel");
         expect(
-          within(panel).getByText(
-            /stop the live capture before opening a past session/i,
-          ),
+          within(panel).getByText(/stop the live capture to use this view/i),
         ).toBeInTheDocument();
       }
       // The gated lenses did not fetch (their actions hydrate Live fields).
@@ -890,9 +888,17 @@ describe("SessionsBrowser component", () => {
       );
       expect(selectButton).toBeDisabled();
       expect(selectButton).toHaveAttribute(
-        "title",
+        "aria-describedby",
+        "sessions-live-review-rule",
+      );
+      // The rule is persistent visible text in the rail (not a hover-only
+      // `title` on a disabled button, which Tab skips).
+      expect(
+        document.getElementById("sessions-live-review-rule"),
+      ).toHaveTextContent(
         "Only completed sessions can be opened while capture is running.",
       );
+      expect(selectButton).not.toHaveAttribute("title");
       fireEvent.click(selectButton);
       expect(mockedInvoke).not.toHaveBeenCalledWith(
         "load_session",

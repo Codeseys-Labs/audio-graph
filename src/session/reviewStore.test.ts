@@ -131,11 +131,12 @@ describe("reviewStore", () => {
     expect(useReviewStore.getState().error).toBe("unavailable");
   });
 
-  it("keeps the last good snapshot when a refresh fails, and recovers on retry", async () => {
+  it("marks the last good snapshot stale when a refresh fails, and clears it on the next success", async () => {
     mockedInvoke.mockResolvedValueOnce(
       loadedSession("seg-1", "first", "Alice"),
     );
     await useReviewStore.getState().select("sess-a");
+    expect(useReviewStore.getState().stale).toBe(false);
 
     mockedInvoke.mockRejectedValueOnce(new Error("disk hiccup"));
     await useReviewStore.getState().refresh();
@@ -144,6 +145,7 @@ describe("reviewStore", () => {
       "first",
     );
     expect(useReviewStore.getState().refreshing).toBe(false);
+    expect(useReviewStore.getState().stale).toBe(true);
 
     mockedInvoke.mockResolvedValueOnce(
       loadedSession("seg-1", "finalized", "Alice"),
@@ -152,6 +154,20 @@ describe("reviewStore", () => {
     expect(useReviewStore.getState().snapshot?.transcript[0].text).toBe(
       "finalized",
     );
+    expect(useReviewStore.getState().stale).toBe(false);
+  });
+
+  it("does not carry a stale mark over to a different session", async () => {
+    mockedInvoke.mockResolvedValueOnce(loadedSession("a-1", "A", "Alice"));
+    await useReviewStore.getState().select("sess-a");
+    mockedInvoke.mockRejectedValueOnce(new Error("hiccup"));
+    await useReviewStore.getState().refresh();
+    expect(useReviewStore.getState().stale).toBe(true);
+
+    mockedInvoke.mockResolvedValueOnce(loadedSession("b-1", "B", "Bob"));
+    await useReviewStore.getState().select("sess-b");
+    expect(useReviewStore.getState().stale).toBe(false);
+    expect(useReviewStore.getState().snapshot?.sessionId).toBe("sess-b");
   });
 
   it("recovers from an error state via refresh()", async () => {

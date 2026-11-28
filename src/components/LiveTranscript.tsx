@@ -335,6 +335,22 @@ function LiveTranscript() {
           </button>
         </div>
       </div>
+      {review?.stale && review.status === "ready" && (
+        <div
+          className="mb-(--space-4) flex items-center justify-between gap-(--space-3) py-(--space-3) px-(--space-4) text-xs text-(--text-on-tint-warning) bg-(--tint-warning) border border-(--tint-border-warning) rounded-sm"
+          role="alert"
+        >
+          <span>{t("sessions.review.stale")}</span>
+          <button
+            type="button"
+            className="ag-btn-micro"
+            onClick={review.retry}
+            disabled={review.refreshing}
+          >
+            <Icon name="refresh" size={14} /> {t("sessions.review.retry")}
+          </button>
+        </div>
+      )}
       {exportError && (
         <div
           className="mb-(--space-4) py-(--space-3) px-(--space-4) text-xs text-(--text-on-tint-danger) bg-(--tint-danger) border border-(--tint-border-danger) rounded-sm"

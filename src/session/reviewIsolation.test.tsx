@@ -242,6 +242,48 @@ describe("Review pane isolation from Live (issue #140)", () => {
     expect(await screen.findByText("recovered line")).toBeInTheDocument();
   });
 
+  it("tells the user (en + pt) when a refresh failed and the shown transcript may be old, and recovers on retry", async () => {
+    mockedInvoke.mockResolvedValueOnce(
+      loadedSession("past-1", "historical line", "Alice"),
+    );
+    render(
+      <SessionViewProvider reviewSessionId="past">
+        <LiveTranscript />
+      </SessionViewProvider>,
+    );
+    await screen.findByText("historical line");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    // Window focus triggers the re-query, which fails.
+    mockedInvoke.mockRejectedValueOnce(new Error("disk hiccup"));
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/may be out of date/i);
+    expect(alert).not.toHaveTextContent(/disk hiccup/);
+    // The last good copy stays visible.
+    expect(screen.getByText("historical line")).toBeInTheDocument();
+
+    await act(async () => {
+      await i18n.changeLanguage("pt");
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      /pode estar desatualizada/i,
+    );
+    await act(async () => {
+      await i18n.changeLanguage("en");
+    });
+
+    mockedInvoke.mockResolvedValueOnce(
+      loadedSession("past-1", "refreshed line", "Alice"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    expect(await screen.findByText("refreshed line")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("exports the reviewed session by its own id, from the snapshot, with no backend command", async () => {
     mockedInvoke.mockResolvedValue(
       loadedSession("past-1", "historical line", "Alice"),
