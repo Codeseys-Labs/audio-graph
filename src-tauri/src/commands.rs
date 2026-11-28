@@ -1807,7 +1807,8 @@ fn can_publish<C: CachedLlmClient>(
 /// A slot changed by publication. Logged and dropped only after every lock
 /// is released.
 struct SlotChange<C> {
-    retired: Option<C>,
+    /// The replaced client, held only so it drops after the locks.
+    _retired: Option<C>,
     installed: bool,
 }
 
@@ -1836,7 +1837,7 @@ fn publish_client<C: CachedLlmClient>(
     };
     Some(SlotChange {
         installed: next.is_some(),
-        retired: std::mem::replace(slot, next),
+        _retired: std::mem::replace(slot, next),
     })
 }
 
