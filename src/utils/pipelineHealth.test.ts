@@ -1,6 +1,20 @@
 import { describe, expect, it } from "vitest";
+import type { RuntimeDiagnostic } from "../generated/runtimeDiagnostic";
 import type { PipelineStatus } from "../types";
 import { computeCompositeHealth } from "./pipelineHealth";
+
+// Closed, content-free diagnostic every `Error`/`Degraded` stage now carries
+// (#155) — the fixtures only need a contract-valid value; which one is
+// irrelevant to the behavior under test.
+const diagnostic: RuntimeDiagnostic = {
+  kind: "runtime",
+  detail: {
+    code: "unsupported",
+    retryable: false,
+    recovery_action: "review_configuration",
+    context: { operation: "transcription", transport: "native" },
+  },
+};
 
 const idle: PipelineStatus = {
   capture: { type: "Idle" },
@@ -44,7 +58,7 @@ describe("computeCompositeHealth", () => {
         pipelineStatus: {
           ...idle,
           asr: { type: "Running", processed_count: 12 },
-          graph: { type: "Error", message: "boom" },
+          graph: { type: "Error", diagnostic },
         },
       }),
     ).toBe("error");
@@ -86,7 +100,8 @@ describe("computeCompositeHealth", () => {
           ...idle,
           diarization: {
             type: "Degraded",
-            reason: "Speaker detection is running in basic mode",
+            reason: "engine_not_compiled",
+            diagnostic,
           },
         },
       }),
@@ -99,7 +114,7 @@ describe("computeCompositeHealth", () => {
         ...baseInput(),
         pipelineStatus: {
           ...idle,
-          capture: { type: "Error", message: "boom" },
+          capture: { type: "Error", diagnostic },
         },
         consumerDroppedChunks: 3,
       }),
@@ -112,8 +127,12 @@ describe("computeCompositeHealth", () => {
         ...baseInput(),
         pipelineStatus: {
           ...idle,
-          capture: { type: "Error", message: "boom" },
-          diarization: { type: "Degraded", reason: "basic mode" },
+          capture: { type: "Error", diagnostic },
+          diarization: {
+            type: "Degraded",
+            reason: "engine_not_compiled",
+            diagnostic,
+          },
         },
       }),
     ).toBe("error");

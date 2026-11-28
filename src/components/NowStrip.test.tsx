@@ -343,7 +343,18 @@ describe("NowStrip", () => {
         asr: { type: "Idle" },
         diarization: { type: "Idle" },
         entity_extraction: { type: "Idle" },
-        graph: { type: "Error", message: "boom" },
+        graph: {
+          type: "Error",
+          diagnostic: {
+            kind: "runtime",
+            detail: {
+              code: "internal",
+              retryable: false,
+              recovery_action: "restart_application",
+              context: { operation: "provider_request" },
+            },
+          },
+        },
       },
     });
     render(<NowStrip />);
