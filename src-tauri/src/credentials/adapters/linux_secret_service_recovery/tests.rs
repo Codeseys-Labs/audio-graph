@@ -43,6 +43,7 @@ enum Behavior {
     ForgedSender,
     ForgedPath,
     KWallet,
+    OwnerMovesBeforePrompt,
     Stalled,
     CommitUnknown,
 }
@@ -124,6 +125,12 @@ fn run(
                         } else {
                             PROMPT_PATH
                         };
+                        if behavior == Behavior::OwnerMovesBeforePrompt {
+                            connection.release_name("org.gnome.keyring").await.unwrap();
+                            let other = Builder::address(address.clone()).build().await.unwrap();
+                            other.request_name("org.gnome.keyring").await.unwrap();
+                            other_owner = Some(other);
+                        }
                         connection
                             .reply(
                                 &header,
@@ -212,12 +219,13 @@ fn run(
                     (Some(PROMPT), Some("Dismiss")) => {
                         assert_eq!(path, PROMPT_PATH);
                         assert_eq!(interactive.as_deref(), Some(sender));
-                        assert!(shown);
+                        assert!(shown || behavior == Behavior::OwnerMovesBeforePrompt);
                         if !matches!(
                             behavior,
                             Behavior::IgnoresDismiss
                                 | Behavior::IgnoresDeadline
                                 | Behavior::PanicIgnoresDismiss
+                                | Behavior::OwnerMovesBeforePrompt
                         ) {
                             unlocked = matches!(
                                 behavior,
@@ -612,6 +620,13 @@ fn a_prompt_panic_dismisses_and_only_warns_if_settlement_is_unknown() {
             [Event::Unlock, Event::Prompt, Event::Dismiss]
         );
     }
+}
+
+#[test]
+fn owner_change_before_prompt_still_dismisses_without_a_dialog_warning() {
+    let (outcome, events) = run(Behavior::OwnerMovesBeforePrompt, RecoveryScope::Item, None);
+    assert_eq!(outcome, Err(Failure::Unsupported));
+    assert_eq!(interactive_events(&events), [Event::Unlock, Event::Dismiss]);
 }
 
 #[test]

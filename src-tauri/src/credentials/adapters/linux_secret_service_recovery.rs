@@ -283,11 +283,13 @@ impl PromptGuard<'_, '_, '_> {
         wait: &Wait<'_>,
         #[cfg(test)] test: &TestOptions,
     ) -> Result<(), RecoveryFailure> {
+        let mut prompt_dispatched = false;
         let result = catch_interactive(async {
             let stream = wait.run(self.peer.subscribe(&self.path)).await?;
             let completions = self.completions.insert(stream);
             wait.run(async {
                 self.peer.require_current().await?;
+                prompt_dispatched = true;
                 self.peer
                     .call::<_, ()>(self.path.as_str(), PROMPT, PROMPT_METHOD, &(window,))
                     .await?;
@@ -320,15 +322,18 @@ impl PromptGuard<'_, '_, '_> {
                     Some(false) => Ok(()),
                     Some(true) => Err(stop.closed()),
                     None => {
-                        log::warn!(
-                            "Secret Service did not acknowledge dismissal. A dialog may still be open."
-                        );
+                        if prompt_dispatched {
+                            log::warn!(
+                                "Secret Service did not acknowledge dismissal. A dialog may still be open."
+                            );
+                        }
                         Err(stop.closed())
                     }
                 }
             }
             Err(()) => {
-                if !matches!(self.dismiss().await, Ok(Some(_))) {
+                let settlement = self.dismiss().await;
+                if prompt_dispatched && !matches!(settlement, Ok(Some(_))) {
                     log::warn!("Secret Service recovery panicked. A dialog may still be open.");
                 }
                 Err(RecoveryFailure::Uncertain)

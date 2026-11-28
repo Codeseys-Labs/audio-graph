@@ -229,6 +229,12 @@ fn production(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
                     after += skip_group(&tail[after..], "(", ")");
                 }
             }
+            if starts(&tail[after..], &["use"])
+                && let Some(end) = tail[after..].iter().position(|t| *t == Token::Code(";"))
+            {
+                at += after + end + 1;
+                continue;
+            }
             if (starts(&tail[after..], &["mod"]) || starts(&tail[after..], &["struct"]))
                 && let Some(body) = tail[after..]
                     .iter()
@@ -259,6 +265,10 @@ fn byte_value(token: &Token<'_>) -> Option<u8> {
             let number = number.trim_end_matches("u8").replace('_', "");
             if let Some(hex) = number.strip_prefix("0x") {
                 u8::from_str_radix(hex, 16).ok()
+            } else if let Some(octal) = number.strip_prefix("0o") {
+                u8::from_str_radix(octal, 8).ok()
+            } else if let Some(binary) = number.strip_prefix("0b") {
+                u8::from_str_radix(binary, 2).ok()
             } else {
                 number.parse().ok()
             }
@@ -566,7 +576,31 @@ fn inventory_rejects_scratch_source_bypasses() {
     let nested = "credentials/adapters/linux_secret_service_recovery/alternate.rs";
     let literal = "unexpected interactive method literal";
     let gate = "sealed gate implementation detail";
+    let valid = root.join(source);
+    for snippet in [
+        "#[cfg(test)] use zbus::{Connection, Message};",
+        "fn f() { let _ = std::str::from_utf8(&[0o104, 0o151, 0o163, 0o155, 0o151, 0o163, 0o163]); }",
+    ] {
+        fs::write(&valid, snippet).unwrap();
+        assert_eq!(scan(&root), Ok(()), "{snippet}");
+    }
+    fs::remove_file(valid).unwrap();
     let cases = [
+        (
+            source,
+            "use zbus::{Connection, Message};",
+            "raw D-Bus crate or send macro outside wire",
+        ),
+        (
+            source,
+            "fn f() { let _ = std::str::from_utf8(&[0o125,0o156,0o154,0o157,0o143,0o153]); }",
+            "interactive method from byte array",
+        ),
+        (
+            source,
+            "fn f() { let _ = std::str::from_utf8(&[0b01010101,0b01101110,0b01101100,0b01101111,0b01100011,0b01101011]); }",
+            "interactive method from byte array",
+        ),
         (source, r#"const A: &str = concat!("Un","lock");"#, literal),
         (source, r#"const A: &str = "\x50rompt";"#, literal),
         (source, r#"const A: &str = "\u{55}nlock";"#, literal),
