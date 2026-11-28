@@ -9,7 +9,7 @@ use super::service::{
     UntrackedRecordRepair,
 };
 use audio_graph_ipc_contract::credential_contract::{
-    BUILT_IN_CREDENTIAL_SET_IDS, CredentialOperationId, CredentialSetId,
+    BUILT_IN_CREDENTIAL_SET_IDS, CredentialOperationId, CredentialRevision, CredentialSetId,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,10 +68,24 @@ pub(crate) struct PlannedFault {
     pub(crate) after_effect: bool,
 }
 
+/// One call a [`FaultPlan`] saw, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TracedCall {
+    pub(crate) point: FaultPoint,
+    /// The call changed state; a call that refused before its effect did
+    /// not.
+    pub(crate) took_effect: bool,
+}
+
+/// Called at a free point: no session of the fake store is open, and a
+/// session, a lease read, a repair or a settings call is about to start.
+pub(crate) type FreePointHook = Arc<dyn Fn() + Send + Sync>;
+
 /// Failures injected in order across a fake store and a fake settings
 /// port that share the plan: only the first unfired fault is armed, so a
 /// fault's count starts once the one before it fired, whichever fake that
-/// was.
+/// was. The plan also traces every call it sees, and calls a hook at every
+/// free point, so a test can interleave another service there.
 pub(crate) struct FaultPlan {
     state: Mutex<FaultPlanState>,
 }
@@ -81,7 +95,13 @@ struct FaultPlanState {
     /// The first pending fault reached its call and fails once the call
     /// took effect.
     armed: bool,
-    fired: Vec<PlannedFault>,
+    /// Each fault that fired, with the index of its call in `calls`.
+    fired: Vec<(PlannedFault, usize)>,
+    calls: Vec<TracedCall>,
+    /// Faults and the trace concern only this thread's calls, when set.
+    thread: Option<std::thread::ThreadId>,
+    open_sessions: usize,
+    free_point: Option<FreePointHook>,
 }
 
 impl FaultPlan {
@@ -91,13 +111,37 @@ impl FaultPlan {
                 pending: faults.into_iter().collect(),
                 armed: false,
                 fired: Vec::new(),
+                calls: Vec::new(),
+                thread: None,
+                open_sessions: 0,
+                free_point: None,
             }),
         })
     }
 
-    /// The faults that fired since the last call, in order.
-    pub(crate) fn take_fired(&self) -> Vec<PlannedFault> {
-        std::mem::take(&mut self.lock().fired)
+    /// Applies the faults, and traces calls, only on the calling thread.
+    pub(crate) fn restrict_to_current_thread(&self) {
+        self.lock().thread = Some(std::thread::current().id());
+    }
+
+    /// Calls `hook` at every free point, on whichever thread reaches it.
+    pub(crate) fn on_free_point(&self, hook: FreePointHook) {
+        self.lock().free_point = Some(hook);
+    }
+
+    /// The calls traced since the last call, and each fault that fired in
+    /// them with its call's index there.
+    pub(crate) fn take_trace(&self) -> (Vec<TracedCall>, Vec<(PlannedFault, usize)>) {
+        let mut state = self.lock();
+        (
+            std::mem::take(&mut state.calls),
+            std::mem::take(&mut state.fired),
+        )
+    }
+
+    /// How many planned faults have not fired.
+    pub(crate) fn unfired(&self) -> usize {
+        self.lock().pending.len()
     }
 
     /// Drops every fault that has not fired.
@@ -113,9 +157,37 @@ impl FaultPlan {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn session_opened(&self) {
+        self.lock().open_sessions += 1;
+    }
+
+    fn session_closed(&self) {
+        self.lock().open_sessions -= 1;
+    }
+
+    fn free_point(&self) {
+        let hook = {
+            let state = self.lock();
+            if state.open_sessions > 0 {
+                return;
+            }
+            state.free_point.clone()
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// Before the call at `point` takes effect.
     fn before(&self, point: FaultPoint) -> Result<(), CredentialStoreFailure> {
         let mut state = self.lock();
+        if !state.concerns_this_thread() {
+            return Ok(());
+        }
+        state.calls.push(TracedCall {
+            point,
+            took_effect: false,
+        });
         let Some(head) = state.pending.front_mut() else {
             return Ok(());
         };
@@ -136,6 +208,12 @@ impl FaultPlan {
     /// After the call at `point` took effect.
     fn after(&self, point: FaultPoint) -> Result<(), CredentialStoreFailure> {
         let mut state = self.lock();
+        if !state.concerns_this_thread() {
+            return Ok(());
+        }
+        if let Some(call) = state.calls.last_mut() {
+            call.took_effect = true;
+        }
         if !state.armed || state.pending.front().is_none_or(|head| head.point != point) {
             return Ok(());
         }
@@ -145,12 +223,18 @@ impl FaultPlan {
 }
 
 impl FaultPlanState {
+    fn concerns_this_thread(&self) -> bool {
+        self.thread
+            .is_none_or(|thread| thread == std::thread::current().id())
+    }
+
     fn fire(&mut self) -> CredentialStoreFailure {
         let fault = self
             .pending
             .pop_front()
             .expect("only the first pending fault fires");
-        self.fired.push(fault);
+        let index = self.calls.len() - 1;
+        self.fired.push((fault, index));
         fault.failure
     }
 }
@@ -165,6 +249,9 @@ pub(crate) struct FakeCredentialStore {
     entry_reads: AtomicUsize,
     active_writes: AtomicUsize,
     authority: &'static str,
+    /// The plan's handle outside `state`, for free points, which come
+    /// before `state` is locked.
+    plan: Mutex<Option<Arc<FaultPlan>>>,
 }
 
 struct FakeCredentialState {
@@ -202,6 +289,7 @@ impl FakeCredentialStore {
             entry_reads: AtomicUsize::new(0),
             active_writes: AtomicUsize::new(0),
             authority,
+            plan: Mutex::new(None),
         }
     }
 
@@ -362,12 +450,49 @@ impl FakeCredentialStore {
         ));
     }
 
+    /// The revision of `set_id`'s active record, if it has one that
+    /// decodes.
+    pub(crate) fn active_revision(&self, set_id: &CredentialSetId) -> Option<CredentialRevision> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .active
+            .iter()
+            .find(|(candidate, _)| candidate == set_id)
+            .and_then(|(_, bytes)| {
+                CredentialRecordEnvelope::decode(&EncodedCredentialRecord::from_boundary_bytes(
+                    bytes.as_slice().to_vec(),
+                ))
+                .ok()
+            })
+            .map(|record| record.revision)
+    }
+
     /// Injects the store's part of `plan`.
     pub(crate) fn set_fault_plan(&self, plan: Arc<FaultPlan>) {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .plan = Some(plan);
+            .plan = Some(Arc::clone(&plan));
+        *self
+            .plan
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(plan);
+    }
+
+    fn plan(&self) -> Option<Arc<FaultPlan>> {
+        self.plan
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn free_point(&self) {
+        if let Some(plan) = self.plan() {
+            plan.free_point();
+        }
     }
 }
 
@@ -404,6 +529,7 @@ impl CredentialEntryStore for FakeCredentialStore {
         may_read: &dyn Fn(&AuthorityJournal) -> bool,
     ) -> Result<AuthoritativeActiveRead, CredentialStoreFailure> {
         self.entry_reads.fetch_add(1, Ordering::SeqCst);
+        self.free_point();
         let mut state = self
             .state
             .lock()
@@ -429,14 +555,20 @@ impl CredentialEntryStore for FakeCredentialStore {
         _operation_id: &CredentialOperationId,
         _set_id: &CredentialSetId,
     ) -> Result<Box<dyn CredentialMutationSession + '_>, CredentialStoreFailure> {
+        self.free_point();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.record_call(FakeStoreCall::BeginMutation)?;
+        let plan = self.plan();
+        if let Some(plan) = &plan {
+            plan.session_opened();
+        }
         Ok(Box::new(FakeMutationSession {
             state,
             active_writes: &self.active_writes,
+            plan,
         }))
     }
 
@@ -453,6 +585,7 @@ impl CredentialEntryStore for FakeCredentialStore {
         observed: &[ObservedActivation],
         admit: &dyn Fn(&AuthorityJournal) -> bool,
     ) -> Result<Option<Vec<UntrackedRecordRepair>>, CredentialStoreFailure> {
+        self.free_point();
         let mut state = self
             .state
             .lock()
@@ -508,11 +641,15 @@ impl CredentialEntryStore for FakeCredentialStore {
 struct FakeMutationSession<'a> {
     state: MutexGuard<'a, FakeCredentialState>,
     active_writes: &'a AtomicUsize,
+    plan: Option<Arc<FaultPlan>>,
 }
 
 impl Drop for FakeMutationSession<'_> {
     fn drop(&mut self) {
         self.state.calls.push(FakeStoreCall::EndMutation);
+        if let Some(plan) = &self.plan {
+            plan.session_closed();
+        }
     }
 }
 
@@ -645,11 +782,15 @@ impl CredentialMutationSession for FakeMutationSession<'_> {
 
 pub(crate) struct FakeSettingsActivationPort {
     state: Mutex<FakeSettingsState>,
+    /// The plan's handle outside `state`, for free points.
+    plan: Mutex<Option<Arc<FaultPlan>>>,
 }
 
 struct FakeSettingsState {
     current_revision: u64,
     pending: Option<(CredentialOperationId, u64, u64)>,
+    /// Operations whose settings write the restore fenced.
+    fenced: Vec<CredentialOperationId>,
     calls: Vec<FakeSettingsCall>,
     failures: Vec<(FakeSettingsCall, CredentialStoreFailure)>,
     after_effect_failures: Vec<(FakeSettingsCall, CredentialStoreFailure)>,
@@ -662,11 +803,13 @@ impl FakeSettingsActivationPort {
             state: Mutex::new(FakeSettingsState {
                 current_revision,
                 pending: None,
+                fenced: Vec::new(),
                 calls: Vec::new(),
                 failures: Vec::new(),
                 after_effect_failures: Vec::new(),
                 plan: None,
             }),
+            plan: Mutex::new(None),
         }
     }
 
@@ -691,6 +834,16 @@ impl FakeSettingsActivationPort {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pending
             .is_some()
+    }
+
+    /// The operation whose marker is pending, if any.
+    pub(crate) fn pending_operation(&self) -> Option<CredentialOperationId> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending
+            .as_ref()
+            .map(|(operation_id, _, _)| operation_id.clone())
     }
 
     pub(crate) fn fail_next(&self, call: FakeSettingsCall, failure: CredentialStoreFailure) {
@@ -718,7 +871,26 @@ impl FakeSettingsActivationPort {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .plan = Some(plan);
+            .plan = Some(Arc::clone(&plan));
+        *self
+            .plan
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(plan);
+    }
+
+    /// Locks the settings at a free point, after its hook ran.
+    fn lock_at_free_point(&self) -> MutexGuard<'_, FakeSettingsState> {
+        let plan = self
+            .plan
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(plan) = plan {
+            plan.free_point();
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -761,11 +933,11 @@ impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
         expected_revision: u64,
         proposed_revision: u64,
     ) -> Result<(), CredentialStoreFailure> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock_at_free_point();
         state.record_call(FakeSettingsCall::PersistPending)?;
+        if state.fenced.contains(operation_id) {
+            return Err(CredentialStoreFailure::RevisionConflict);
+        }
         if state.pending.is_some() {
             return Err(CredentialStoreFailure::OperationInProgress);
         }
@@ -783,10 +955,7 @@ impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
         operation_id: &CredentialOperationId,
         expected_revision: u64,
     ) -> Result<(), CredentialStoreFailure> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock_at_free_point();
         state.record_call(FakeSettingsCall::VerifyPending)?;
         if state.current_revision != expected_revision
             || state
@@ -806,10 +975,7 @@ impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
         operation_id: &CredentialOperationId,
         expected_revision: u64,
     ) -> Result<(), CredentialStoreFailure> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock_at_free_point();
         state.record_call(FakeSettingsCall::VerifyCommitted)?;
         if state.current_revision != expected_revision
             || state
@@ -829,19 +995,24 @@ impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
         operation_id: &CredentialOperationId,
         expected_revision: u64,
     ) -> Result<(), CredentialStoreFailure> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock_at_free_point();
         state.record_call(FakeSettingsCall::RestoreBackup)?;
-        let Some((pending_operation, backup, _)) = state.pending.as_ref() else {
-            return state.fail_after_effect(FakeSettingsCall::RestoreBackup);
+        let restored = match state.pending.as_ref() {
+            None => None,
+            Some((pending_operation, backup, _))
+                if pending_operation == operation_id && *backup == expected_revision =>
+            {
+                Some(*backup)
+            }
+            Some(_) => return Err(CredentialStoreFailure::RevisionConflict),
         };
-        if pending_operation != operation_id || *backup != expected_revision {
-            return Err(CredentialStoreFailure::RevisionConflict);
+        if let Some(backup) = restored {
+            state.current_revision = backup;
+            state.pending = None;
         }
-        state.current_revision = *backup;
-        state.pending = None;
+        if !state.fenced.contains(operation_id) {
+            state.fenced.push(operation_id.clone());
+        }
         state.fail_after_effect(FakeSettingsCall::RestoreBackup)
     }
 
@@ -850,10 +1021,7 @@ impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
         operation_id: &CredentialOperationId,
         committed_revision: u64,
     ) -> Result<(), CredentialStoreFailure> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock_at_free_point();
         state.record_call(FakeSettingsCall::ClearPending)?;
         if state.current_revision == committed_revision && state.pending.is_none() {
             return state.fail_after_effect(FakeSettingsCall::ClearPending);

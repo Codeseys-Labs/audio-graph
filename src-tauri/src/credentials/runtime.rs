@@ -4676,9 +4676,8 @@ mod tests {
                     .expect_err(case)
             } else {
                 // The commit loads the journal to check its target and
-                // stage settings, then to check that the activation can be
-                // compensated, and then to abort.
-                store.restore_journal_before_load(2, older);
+                // stage settings, and then to abort.
+                store.restore_journal_before_load(1, older);
                 settings.fail_next(
                     FakeSettingsCall::VerifyPending,
                     CredentialStoreFailure::RevisionConflict,
