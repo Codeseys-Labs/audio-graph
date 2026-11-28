@@ -365,11 +365,19 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
 
     fn publish(&self, path: &Path, bytes: &[u8]) -> Result<(), TranscriptCommitError> {
         #[cfg(test)]
-        let fault = if CUT.get() == Some(Cut::IntentPublish)
-            && path.extension() == Some(std::ffi::OsStr::new("attempt"))
-        {
-            CUT.set(None);
-            Some(super::super::canonical_durability::CanonicalDurabilityStage::ParentSync)
+        let fault = if path.extension() == Some(std::ffi::OsStr::new("attempt")) {
+            use super::super::canonical_durability::CanonicalDurabilityStage;
+            match CUT.get() {
+                Some(Cut::IntentStageWrite) => {
+                    CUT.set(None);
+                    Some(CanonicalDurabilityStage::Write)
+                }
+                Some(Cut::IntentPublish) => {
+                    CUT.set(None);
+                    Some(CanonicalDurabilityStage::ParentSync)
+                }
+                _ => None,
+            }
         } else {
             None
         };
@@ -409,6 +417,18 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
                             &staging, true,
                         )
                         .map_err(TranscriptCommitError::Rejected)?;
+                    #[cfg(test)]
+                    if fault
+                        == Some(super::super::canonical_durability::CanonicalDurabilityStage::Write)
+                    {
+                        temporary
+                            .write_all(&bytes[..bytes.len() / 2])
+                            .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
+                        return Err(io_failure(
+                            CanonicalAppendPhase::Write,
+                            io::ErrorKind::WriteZero.into(),
+                        ));
+                    }
                     temporary
                         .write_all(bytes)
                         .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
@@ -950,6 +970,7 @@ enum Cut {
     KillComplete,
     KillGroupTorn,
     KillGroupMember,
+    IntentStageWrite,
     IntentPublish,
     IntentResync,
     KillIntent,
@@ -1058,6 +1079,8 @@ fn write_frame(file: &mut File, bytes: &[u8]) -> Result<(), TranscriptCommitErro
             io::ErrorKind::Other.into(),
         ));
     }
+    #[cfg(test)]
+    tests::pause_before_frame_sync_if_armed();
     file.sync_all()
         .map_err(|e| io_failure(CanonicalAppendPhase::Sync, e))
 }

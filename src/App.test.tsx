@@ -1488,6 +1488,24 @@ describe("App — KG strip canvas row-swap attribute wiring (ticket W7, synthesi
 // convention this file shares with `App.contract.test.tsx` /
 // `App.shellLayout.test.tsx`.)
 describe("agent tile headerSlot wiring — grep-pin (ticket W8 review finding, updated ticket W9)", () => {
+  // This block used to inherit its store, credential mock and capturing flag
+  // from whichever describe ran before it (the KG-strip block ends with
+  // `isCapturing: true`), so the real-toggle test below could not find the
+  // agent tile whenever order changed (`bun run test:flake -- --shuffle`).
+  // Same setup as its siblings, and the capture is started in the test.
+  beforeEach(async () => {
+    await i18n.changeLanguage("en");
+    localStorage.clear();
+    mockedInvoke.mockReset();
+    mockCredentialPresence("openai_api_key");
+    seedStore();
+  });
+
+  afterEach(async () => {
+    await i18n.changeLanguage("en");
+    localStorage.clear();
+  });
+
   it("App.tsx wires AgentTileHeaderActions AND the ticket W9 Signal/All toggle into the agent WorkspaceTile's headerSlot, with the real filter value threaded to both", async () => {
     const { readFileSync } = await import("node:fs");
     const source = readFileSync("src/App.tsx", "utf8");
@@ -1530,6 +1548,9 @@ describe("agent tile headerSlot wiring — grep-pin (ticket W8 review finding, u
   it("clicking the real Signal/All toggle changes the filter value threaded into AgentProposalsPanel's real filter prop", async () => {
     render(<App />);
     await waitForStartupProbeToSettle();
+    act(() => {
+      useAudioGraphStore.setState({ isCapturing: true });
+    });
 
     const stub = screen.getByTestId("agent-stub");
     expect(stub).toHaveAttribute("data-agent-queue-filter", "signal");

@@ -16,6 +16,16 @@ const CHILD_TEST: &str =
     "persistence::canonical_log::transcript_commit::tests::interrupted_writer_child";
 const HANG_LIMIT: Duration = Duration::from_secs(60);
 
+thread_local! {
+    static BEFORE_FRAME_SYNC: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn pause_before_frame_sync_if_armed() {
+    if let Some(pause) = BEFORE_FRAME_SYNC.take() {
+        pause();
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     path: PathBuf,
@@ -1367,6 +1377,110 @@ fn release_transcript_receipt_latency() {
         );
         assert!(probe.writer.shutdown_with_timeout(HANG_LIMIT));
     }
+}
+
+#[test]
+fn descriptor_staging_write_fault_refuses_before_the_log_and_next_revision_can_commit() {
+    use crate::persistence::canonical_durability::CanonicalDurabilityStage;
+
+    for force_weak in [false, true] {
+        let fixture = Fixture::new();
+        let mut storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+        if force_weak {
+            storage.tier = None;
+        }
+        let seed = transcript_event("seed", "first");
+        storage.commit_after(&seed, Some(0)).unwrap();
+        let prefix = fs::read(&fixture.path).unwrap();
+        CUT.set(Some(Cut::IntentStageWrite));
+        let error = storage
+            .commit_after(&transcript_event("twig", "second"), Some(1))
+            .unwrap_err();
+        if storage.is_unqualified() {
+            assert_eq!(
+                error,
+                io_failure(CanonicalAppendPhase::Write, io::ErrorKind::WriteZero.into())
+            );
+        } else {
+            assert!(
+                matches!(error, TranscriptCommitError::Indeterminate(e) if e.stage == CanonicalDurabilityStage::Write)
+            );
+        }
+        let staging = fixture.path.with_added_extension("attempt-stage");
+        let torn_descriptor = fs::read(&staging).unwrap();
+        assert!(!torn_descriptor.is_empty());
+        assert!(serde_json::from_slice::<serde_json::Value>(&torn_descriptor).is_err());
+        assert!(
+            !fixture
+                .path
+                .with_added_extension("attempt")
+                .try_exists()
+                .unwrap()
+        );
+        assert!(!storage.has_pending_attempt());
+        assert_eq!(fs::read(&fixture.path).unwrap(), prefix);
+
+        let next = transcript_event("leaf", "third");
+        assert_eq!(storage.commit_after(&next, Some(1)).unwrap().sequence, 2);
+        assert!(!staging.try_exists().unwrap());
+        let events: Vec<_> = fixture
+            .replay()
+            .records
+            .into_iter()
+            .map(|row| row.payload)
+            .collect();
+        assert_eq!(events, [seed, next]);
+    }
+}
+
+#[test]
+fn grouped_worker_replies_remain_pending_until_the_frame_sync_completes() {
+    use crate::persistence::{TranscriptEventWriteMsg as Message, live_receipt, transcript_batch};
+    use crate::projections::TranscriptLedger;
+    use std::sync::{Mutex, atomic::AtomicBool};
+
+    let fixture = Fixture::new();
+    let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+    let seed = transcript_event("seed", "first");
+    storage.commit_after(&seed, Some(0)).unwrap();
+    let ledger = Arc::new(Mutex::new(
+        TranscriptLedger::replay(SESSION, [seed]).unwrap(),
+    ));
+    // Queue the entire group and its fence before starting the real worker.
+    let (tx, rx) = mpsc::sync_channel(8);
+    let mut tickets = Vec::new();
+    for event in group_events() {
+        let (reply, ticket) = live_receipt::channel(HANG_LIMIT, None);
+        tx.send(Message::Live(event, ledger.clone(), reply))
+            .unwrap();
+        tickets.push(ticket);
+    }
+    let (counts, groups) = mpsc::channel();
+    tx.send(Message::GroupCounts(counts)).unwrap();
+    tx.send(Message::Shutdown).unwrap();
+    let (entered, at_sync) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let path = fixture.path.clone();
+    let worker = std::thread::spawn(move || {
+        BEFORE_FRAME_SYNC.set(Some(Box::new(move || {
+            entered.send(()).unwrap();
+            resume.recv_timeout(HANG_LIMIT).unwrap();
+        })));
+        transcript_batch::run(rx, &storage, &path, SESSION, &AtomicBool::new(false));
+    });
+    at_sync.recv_timeout(HANG_LIMIT).unwrap();
+    assert!(tickets.iter().all(|ticket| ticket.is_waiting()));
+    assert_eq!(ledger.lock().unwrap().accepted_event_count, 1);
+    release.send(()).unwrap();
+    for (index, ticket) in tickets.into_iter().enumerate() {
+        let (published, receipt) = ticket.wait().unwrap();
+        assert!(published);
+        assert_eq!(receipt.sequence, 2 + index as u64);
+    }
+    assert_eq!(groups.recv_timeout(HANG_LIMIT).unwrap().unwrap(), (1, 3));
+    worker.join().unwrap();
+    assert_eq!(fixture.replay().records.len(), 4);
+    assert_eq!(ledger.lock().unwrap().accepted_event_count, 4);
 }
 
 #[test]
