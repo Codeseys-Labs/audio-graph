@@ -4,8 +4,9 @@ use super::domain::{
     AuthorityJournal, CredentialRecordEnvelope, CredentialStoreFailure, EncodedCredentialRecord,
 };
 use super::service::{
-    AuthoritativeActiveRead, AuthoritativeRepair, CredentialEntryStore, CredentialMutationSession,
-    CredentialSettingsActivationPort, UntrackedRecordOutcome, UntrackedRecordRepair,
+    AuthoritativeActiveRead, CredentialEntryStore, CredentialMutationSession,
+    CredentialSettingsActivationPort, ObservedActivation, UntrackedRecordOutcome,
+    UntrackedRecordRepair,
 };
 use audio_graph_ipc_contract::credential_contract::{
     BUILT_IN_CREDENTIAL_SET_IDS, CredentialOperationId, CredentialSetId,
@@ -29,7 +30,13 @@ pub(crate) enum FakeStoreCall {
     CommitJournal,
     EndMutation,
     RepairUntracked,
+    /// One built-in set's part of an untracked-record repair, after the
+    /// journal was admitted.
+    RepairSet,
 }
+
+/// The authority a fake store is bound to unless a test names another.
+pub(crate) const FAKE_AUTHORITY: &str = "fake-authority";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FakeSettingsCall {
@@ -44,6 +51,7 @@ pub(crate) struct FakeCredentialStore {
     state: Mutex<FakeCredentialState>,
     entry_reads: AtomicUsize,
     active_writes: AtomicUsize,
+    authority: &'static str,
 }
 
 struct FakeCredentialState {
@@ -57,6 +65,12 @@ struct FakeCredentialState {
 
 impl FakeCredentialStore {
     pub(crate) fn new(journal: AuthorityJournal) -> Self {
+        Self::bound_to(journal, FAKE_AUTHORITY)
+    }
+
+    /// A store bound to `authority`, as a store opened over another
+    /// authority pair would be.
+    pub(crate) fn bound_to(journal: AuthorityJournal, authority: &'static str) -> Self {
         Self {
             state: Mutex::new(FakeCredentialState {
                 journal,
@@ -68,6 +82,7 @@ impl FakeCredentialStore {
             }),
             entry_reads: AtomicUsize::new(0),
             active_writes: AtomicUsize::new(0),
+            authority,
         }
     }
 
@@ -214,48 +229,61 @@ impl CredentialEntryStore for FakeCredentialStore {
     }
 
     /// Models the native repair without guards: every staging record of a
-    /// set is untracked except the one of the journal's pending activation.
+    /// set is untracked except the one of the journal's pending activation
+    /// and the one of `observed`.
     fn repair_untracked_records(
         &self,
-        may_repair: &dyn Fn(&AuthorityJournal) -> bool,
-    ) -> Result<AuthoritativeRepair, CredentialStoreFailure> {
+        observed: Option<&ObservedActivation>,
+        admit: &dyn Fn(&AuthorityJournal) -> bool,
+    ) -> Result<Option<Vec<UntrackedRecordRepair>>, CredentialStoreFailure> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.record_call(FakeStoreCall::RepairUntracked)?;
         let journal = state.journal.clone();
-        if !may_repair(&journal) {
-            return Ok(AuthoritativeRepair {
-                journal,
-                sets: None,
-            });
+        if !admit(&journal) {
+            return Ok(None);
         }
         let mut sets = Vec::with_capacity(BUILT_IN_CREDENTIAL_SET_IDS.len());
         for built_in in BUILT_IN_CREDENTIAL_SET_IDS {
+            state.record_call(FakeStoreCall::RepairSet)?;
             let set_id = CredentialSetId::BuiltIn(*built_in);
-            let tracked = journal
+            let spared: Vec<&CredentialOperationId> = journal
                 .pending_activation
-                .as_ref()
+                .iter()
                 .filter(|pending| pending.set_id == set_id)
-                .map(|pending| pending.operation_id.clone());
+                .map(|pending| &pending.operation_id)
+                .chain(
+                    observed
+                        .filter(|observed| observed.set_id == set_id)
+                        .map(|observed| &observed.operation_id),
+                )
+                .collect();
             let before = state.staging.len();
             state.staging.retain(|(operation_id, staged, _)| {
-                *staged != set_id || tracked.as_ref() == Some(operation_id)
+                *staged != set_id || spared.contains(&operation_id)
             });
+            let kept = state.staging.iter().any(|(_, staged, _)| *staged == set_id);
             let outcome = if state.staging.len() != before {
                 UntrackedRecordOutcome::Removed
-            } else if tracked.is_some() {
+            } else if journal
+                .pending_activation
+                .as_ref()
+                .is_some_and(|pending| pending.set_id == set_id)
+                || kept
+            {
                 UntrackedRecordOutcome::Tracked
             } else {
                 UntrackedRecordOutcome::Clean
             };
             sets.push(UntrackedRecordRepair { set_id, outcome });
         }
-        Ok(AuthoritativeRepair {
-            journal,
-            sets: Some(sets),
-        })
+        Ok(Some(sets))
+    }
+
+    fn authority_instance(&self) -> &str {
+        self.authority
     }
 }
 

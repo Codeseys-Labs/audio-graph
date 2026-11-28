@@ -6,9 +6,10 @@
 //! `openat`; on Windows `NtCreateFile` with the held handle as its root), and
 //! each one is verified and hardened on the handle that is then used for I/O.
 //! All of this happens before a single journal byte is written. A directory
-//! this module creates is made durable in its parent before it is used.
-//! Every failure is a closed `CredentialStoreFailure`; no OS text or path
-//! leaves this module.
+//! this module creates is made durable in its parent before it is used, and a
+//! parent is synced only once its entry is verified to be the directory the
+//! caller holds. Every failure is a closed `CredentialStoreFailure`; no OS
+//! text or path leaves this module.
 
 use crate::credentials::domain::CredentialStoreFailure;
 use std::io::Read;
@@ -17,22 +18,85 @@ use std::io::Read;
 pub(in crate::credentials::adapters) use unix_held::{
     HeldDirectory, StagedFile, take_ownership_if_refused,
 };
-#[cfg(all(windows, test))]
-pub(in crate::credentials::adapters) use windows_held::open_directory_handle;
 #[cfg(windows)]
 pub(in crate::credentials::adapters) use windows_held::{
     HeldDirectory, StagedFile, take_ownership_if_refused, token_profile_directory,
+};
+#[cfg(all(windows, test))]
+pub(in crate::credentials::adapters) use windows_held::{
+    open_directory_handle, record_refused_owner_for_test,
 };
 
 /// Why a staged replacement did not report success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::credentials::adapters) enum PublishFailure {
+    /// Another opener holds the target without sharing delete, so the
+    /// kernel refused the rename before it changed any name. The target
+    /// still holds what it held, and the same rename can succeed once that
+    /// opener lets go.
+    Contended,
     /// The target provably still holds what it held before: the staged bytes
     /// never became visible under the target name.
     NotPublished,
     /// The rename may have taken effect, or took effect and could not be
     /// flushed to stable storage.
     Unknown,
+}
+
+/// What a parent sync does when the entry it would cover is a link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryLink {
+    /// An existing ancestor reached through a link: nothing this module
+    /// created, so the parent is left alone.
+    Skip,
+    /// A held root, or a directory this walk just created or opened without
+    /// following a link: a link there means the entry is not that directory.
+    Refuse,
+}
+
+/// Faults a test arms on its own thread for the next point that checks it.
+#[cfg(test)]
+pub(in crate::credentials::adapters) mod faults {
+    use std::cell::Cell;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(in crate::credentials::adapters) enum Fault {
+        /// Syncing the staged bytes fails.
+        StagedSync,
+        /// The rename reports an outcome it cannot classify, without having
+        /// taken effect.
+        RenameUnknownBeforeEffect,
+        /// The rename takes effect, then reports an outcome it cannot
+        /// classify.
+        RenameUnknownAfterEffect,
+        /// Syncing the renamed file fails (Windows flushes it; Unix synced it
+        /// before the rename).
+        PublishedFileSync,
+        /// Syncing the held directory after the rename fails.
+        HeldDirectorySync,
+        /// Syncing a parent once its entry is verified fails.
+        ParentSync,
+    }
+
+    thread_local! {
+        static ARMED: Cell<Option<Fault>> = const { Cell::new(None) };
+    }
+
+    /// Arms `fault` for the next point on this thread that checks it.
+    pub(in crate::credentials::adapters) fn arm(fault: Fault) {
+        ARMED.with(|armed| armed.set(Some(fault)));
+    }
+
+    /// Whether `fault` is armed on this thread; disarms it if so.
+    pub(super) fn fires(fault: Fault) -> bool {
+        ARMED.with(|armed| {
+            let fires = armed.get() == Some(fault);
+            if fires {
+                armed.set(None);
+            }
+            fires
+        })
+    }
 }
 
 /// Reads at most `limit` bytes: the reader is never asked for more, so an
@@ -93,7 +157,9 @@ fn is_staged_name(candidate: &str, name: &str) -> bool {
 
 #[cfg(unix)]
 mod unix_held {
-    use super::{PublishFailure, is_staged_name, read_at_most, split_parent, staged_name};
+    use super::{
+        EntryLink, PublishFailure, is_staged_name, read_at_most, split_parent, staged_name,
+    };
     use crate::credentials::domain::CredentialStoreFailure;
     use rustix::fd::{AsFd, OwnedFd};
     use rustix::fs::{
@@ -135,7 +201,9 @@ mod unix_held {
     /// the effective user, sets the owner-only mode on that descriptor, then
     /// re-reads it from the same descriptor. On macOS it also replaces any
     /// extended ACL with an empty one and proves no entry remains, so an
-    /// inherited allow entry cannot widen access beyond the mode bits.
+    /// inherited allow entry cannot widen access beyond the mode bits. A
+    /// regular file with another name is refused before its mode changes,
+    /// since the change would reach it under that name too.
     fn harden(
         fd: &OwnedFd,
         expected: FileType,
@@ -143,7 +211,10 @@ mod unix_held {
     ) -> Result<(), CredentialStoreFailure> {
         let owner = rustix::process::geteuid().as_raw();
         let stat = fstat(fd).map_err(|_| CredentialStoreFailure::PermissionHardeningFailed)?;
-        if FileType::from_raw_mode(stat.st_mode) != expected || stat.st_uid != owner {
+        if FileType::from_raw_mode(stat.st_mode) != expected
+            || stat.st_uid != owner
+            || (expected == FileType::RegularFile && stat.st_nlink != 1)
+        {
             return Err(CredentialStoreFailure::PermissionHardeningFailed);
         }
         fchmod(fd, mode(bits)).map_err(|_| CredentialStoreFailure::PermissionHardeningFailed)?;
@@ -166,43 +237,80 @@ mod unix_held {
         }
     }
 
-    /// Creates the directory `name` inside `parent` unless it exists, then
-    /// syncs `parent` either way: an entry another opener created may not be
-    /// synced yet, or its sync may have failed. The entry is durable before
-    /// anything is placed in it.
+    /// Syncs `parent` once its entry `name` is verified to be `child`, so
+    /// the barrier covers the entry the caller holds and not whatever an
+    /// ancestor swap put at the path.
+    fn sync_entry(
+        parent: &OwnedFd,
+        name: &OsStr,
+        child: &OwnedFd,
+        link: EntryLink,
+    ) -> Result<(), CredentialStoreFailure> {
+        let held = fstat(child).map_err(|_| CredentialStoreFailure::Unavailable)?;
+        let named = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| CredentialStoreFailure::Unavailable)?;
+        if link == EntryLink::Skip && FileType::from_raw_mode(named.st_mode) == FileType::Symlink {
+            return Ok(());
+        }
+        if named.st_dev != held.st_dev || named.st_ino != held.st_ino {
+            return Err(CredentialStoreFailure::Unavailable);
+        }
+        #[cfg(test)]
+        if super::faults::fires(super::faults::Fault::ParentSync) {
+            return Err(CredentialStoreFailure::Unavailable);
+        }
+        fsync(parent).map_err(|_| CredentialStoreFailure::Unavailable)
+    }
+
+    /// Syncs the directory containing `path` once its entry for `path` is
+    /// verified to be `child`. A filesystem root has no containing entry.
+    fn sync_parent_of(
+        path: &Path,
+        child: &OwnedFd,
+        link: EntryLink,
+    ) -> Result<(), CredentialStoreFailure> {
+        let Ok((parent, name)) = split_parent(path) else {
+            return Ok(());
+        };
+        let parent = openat(CWD, parent, DIRECTORY_FLAGS, Mode::empty()).map_err(open_failure)?;
+        sync_entry(&parent, name, child, link)
+    }
+
+    /// Creates the directory `name` inside `parent` unless it exists, opens
+    /// it relative to `parent` without following a link, and syncs `parent`
+    /// once its entry is verified to be the opened directory. It syncs an
+    /// entry another opener created too: that one may not be synced yet, or
+    /// its sync may have failed. The entry is durable before anything is
+    /// placed in it.
     fn create_child_directory(
         parent: &OwnedFd,
         name: &OsStr,
         bits: RawMode,
-    ) -> Result<(), CredentialStoreFailure> {
+    ) -> Result<OwnedFd, CredentialStoreFailure> {
         match mkdirat(parent, name, mode(bits)) {
-            Ok(()) | Err(Errno::EXIST) => {
-                fsync(parent).map_err(|_| CredentialStoreFailure::Unavailable)
-            }
-            Err(errno) => Err(open_failure(errno)),
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(errno) => return Err(open_failure(errno)),
         }
-    }
-
-    /// Syncs the directory containing `path`, so the entry naming `path` is
-    /// durable. A filesystem root has no containing entry to sync.
-    fn sync_parent_of(path: &Path) -> Result<(), CredentialStoreFailure> {
-        let Ok((parent, _)) = split_parent(path) else {
-            return Ok(());
-        };
-        let parent = openat(CWD, parent, DIRECTORY_FLAGS, Mode::empty()).map_err(open_failure)?;
-        fsync(&parent).map_err(|_| CredentialStoreFailure::Unavailable)
+        let child = openat(
+            parent,
+            name,
+            DIRECTORY_FLAGS | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(open_failure)?;
+        sync_entry(parent, name, &child, EntryLink::Refuse)?;
+        Ok(child)
     }
 
     /// Opens the directory `path`, first creating it and every missing
-    /// ancestor. Each directory this creates is made relative to its open
-    /// parent, which is synced, and then opened relative to that parent
-    /// without following a link. The deepest directory found present has
-    /// its own entry synced too: an earlier open may have created it and
-    /// failed to sync it.
+    /// ancestor (see [`create_child_directory`]). The deepest directory found
+    /// present has its entry synced too, unless that entry is a symlink,
+    /// which this module never creates: an earlier open may have created the
+    /// directory and failed to sync it.
     fn open_or_create_ancestor(path: &Path) -> Result<OwnedFd, CredentialStoreFailure> {
         match openat(CWD, path, DIRECTORY_FLAGS, Mode::empty()) {
             Ok(fd) => {
-                sync_parent_of(path)?;
+                sync_parent_of(path, &fd, EntryLink::Skip)?;
                 return Ok(fd);
             }
             Err(Errno::NOENT) => {}
@@ -210,14 +318,7 @@ mod unix_held {
         }
         let (parent, name) = split_parent(path)?;
         let parent = open_or_create_ancestor(parent)?;
-        create_child_directory(&parent, name, ANCESTOR_MODE)?;
-        openat(
-            &parent,
-            name,
-            DIRECTORY_FLAGS | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(open_failure)
+        create_child_directory(&parent, name, ANCESTOR_MODE)
     }
 
     impl HeldDirectory {
@@ -235,30 +336,39 @@ mod unix_held {
         }
 
         /// Opens the held root `path`, creating it and its missing ancestors
-        /// first. Whether this open created the root or found it, the entry
-        /// naming it is synced in its parent before it is returned, so no
-        /// opener relies on a sync another open may never have completed.
+        /// first. Whether this open created the root or found it, its entry
+        /// is synced in its parent, once verified to be the held root, before
+        /// it is returned, so no opener relies on a sync another open may
+        /// never have completed.
         pub(in crate::credentials::adapters) fn open_or_create(
             path: &Path,
         ) -> Result<Self, CredentialStoreFailure> {
             if let Some(held) = Self::open_existing(path)? {
-                sync_parent_of(path)?;
+                sync_parent_of(path, &held.fd, EntryLink::Refuse)?;
                 return Ok(held);
             }
             let (parent, name) = split_parent(path)?;
             let parent = open_or_create_ancestor(parent)?;
             // The umask can only remove bits, so the directory is never
             // broader than owner-only before it is hardened on its handle.
-            create_child_directory(&parent, name, DIRECTORY_MODE)?;
-            let fd = openat(
-                &parent,
-                name,
-                DIRECTORY_FLAGS | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )
-            .map_err(open_failure)?;
+            let fd = create_child_directory(&parent, name, DIRECTORY_MODE)?;
             harden(&fd, FileType::Directory, DIRECTORY_MODE)?;
             Ok(Self { fd })
+        }
+
+        /// Whether `path` still resolves to the held directory. A lock or a
+        /// journal reached through a held directory that is no longer at its
+        /// path is not the one another process opening that path now uses.
+        pub(in crate::credentials::adapters) fn is_at(
+            &self,
+            path: &Path,
+        ) -> Result<bool, CredentialStoreFailure> {
+            let held = fstat(&self.fd).map_err(|_| CredentialStoreFailure::Unavailable)?;
+            match statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(named) => Ok(named.st_dev == held.st_dev && named.st_ino == held.st_ino),
+                Err(Errno::NOENT | Errno::NOTDIR) => Ok(false),
+                Err(_) => Err(CredentialStoreFailure::Unavailable),
+            }
         }
 
         /// A second descriptor for the held directory, for inspecting the
@@ -380,6 +490,10 @@ mod unix_held {
 
         /// Flushes the staged bytes to the file.
         pub(in crate::credentials::adapters) fn sync(&mut self) -> std::io::Result<()> {
+            #[cfg(test)]
+            if super::faults::fires(super::faults::Fault::StagedSync) {
+                return Err(std::io::Error::other("injected staged sync failure"));
+            }
             self.file.sync_all()
         }
 
@@ -387,15 +501,28 @@ mod unix_held {
         /// directory, then flushes that directory so the rename itself is
         /// durable. POSIX `rename` leaves the target unaffected on every
         /// failure except `EIO`, so only that error and a failed directory
-        /// sync leave the outcome open.
+        /// sync leave the outcome open. After `EIO` the staged name is
+        /// unlinked if it still exists; a rename that took effect left none.
         pub(in crate::credentials::adapters) fn publish(mut self) -> Result<(), PublishFailure> {
             let directory = self.directory.fd.as_fd();
+            #[cfg(test)]
+            if super::faults::fires(super::faults::Fault::RenameUnknownBeforeEffect) {
+                return Err(PublishFailure::Unknown);
+            }
             match renameat(directory, self.temp.as_str(), directory, self.name.as_str()) {
                 Ok(()) => {}
                 Err(Errno::IO) => return Err(PublishFailure::Unknown),
                 Err(_) => return Err(PublishFailure::NotPublished),
             }
+            #[cfg(test)]
+            if super::faults::fires(super::faults::Fault::RenameUnknownAfterEffect) {
+                return Err(PublishFailure::Unknown);
+            }
             self.published = true;
+            #[cfg(test)]
+            if super::faults::fires(super::faults::Fault::HeldDirectorySync) {
+                return Err(PublishFailure::Unknown);
+            }
             fsync(directory).map_err(|_| PublishFailure::Unknown)
         }
 
@@ -414,38 +541,38 @@ mod unix_held {
     }
 
     /// An unprivileged process cannot give itself ownership of a file on
-    /// Unix, so a directory or child another user owns stays refused. This
-    /// only re-applies the owner-only modes to `path` and the `children`
-    /// that exist, and reports that no owner changed.
+    /// Unix, so a refusal for a directory or child another user owns stands,
+    /// and an ordinary open already re-applies the owner-only modes to what
+    /// this user owns. The repair therefore opens and changes nothing here,
+    /// so it cannot reach an object a moved path now names, nor a hard-linked
+    /// file under its other name.
     pub(in crate::credentials::adapters) fn take_ownership_if_refused(
-        path: &Path,
-        children: &[&str],
+        _path: &Path,
+        _children: &[&str],
     ) -> Result<bool, CredentialStoreFailure> {
-        let Some(held) = HeldDirectory::open_existing(path)? else {
-            return Ok(false);
-        };
-        for child in children {
-            held.open_child(child, OFlags::RDONLY)?;
-        }
         Ok(false)
     }
 }
 
 #[cfg(windows)]
 mod windows_held {
-    use super::{PublishFailure, is_staged_name, read_at_most, split_parent, staged_name};
+    use super::{
+        EntryLink, PublishFailure, is_staged_name, read_at_most, split_parent, staged_name,
+    };
     use crate::credentials::domain::CredentialStoreFailure;
     use ::windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use ::windows::Wdk::Storage::FileSystem::{
-        FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
-        FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
-        FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
+        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
+        FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS,
+        FILE_RENAME_REPLACE_IF_EXISTS, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformationEx,
+        NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
+        NtSetInformationFile,
     };
     use ::windows::Win32::Foundation::{
         CloseHandle, HANDLE, NO_ERROR, NTSTATUS, OBJ_CASE_INSENSITIVE, STATUS_ACCESS_DENIED,
         STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
         STATUS_NOT_SUPPORTED, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
-        STATUS_SHARING_VIOLATION, UNICODE_STRING,
+        STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION, UNICODE_STRING,
     };
     use ::windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use ::windows::Win32::Security::{
@@ -456,22 +583,23 @@ mod windows_held {
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
         FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-        FileDispositionInfo, FileIdInfo, FlushFileBuffers, GetFileInformationByHandleEx,
-        GetFinalPathNameByHandleW, READ_CONTROL, SYNCHRONIZE, SetFileInformationByHandle,
-        VOLUME_NAME_GUID, WRITE_DAC, WRITE_OWNER,
+        FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+        FILE_TRAVERSE, FileDispositionInfo, FileIdInfo, FileStandardInfo, FlushFileBuffers,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, READ_CONTROL, SYNCHRONIZE,
+        SetFileInformationByHandle, VOLUME_NAME_GUID, WRITE_DAC, WRITE_OWNER,
     };
     use ::windows::Win32::System::IO::IO_STATUS_BLOCK;
     use ::windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use ::windows::Win32::UI::Shell::GetUserProfileDirectoryW;
     use ::windows::core::PWSTR;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::fs::{File, OpenOptions};
     use std::io::{ErrorKind, Write};
-    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, PoisonError};
 
     const MAX_FINAL_PATH_UNITS: usize = 32_768;
 
@@ -485,6 +613,75 @@ mod windows_held {
         /// directory cannot be renamed while held, and NTFS refuses to rename
         /// an ancestor of a held directory.
         final_path: PathBuf,
+        /// The path this directory was opened by, which keys the ownership
+        /// refusals recorded for it and its children.
+        path: PathBuf,
+    }
+
+    /// The identity of an open object: its volume serial number and 128-bit
+    /// file ID.
+    type ObjectIdentity = (u64, [u8; 16]);
+
+    /// An object hardening refused because another principal owns it: the
+    /// directory path that reached it, its name in that directory for a
+    /// child, and its identity at the refusal.
+    struct RefusedOwner {
+        directory: PathBuf,
+        child: Option<String>,
+        identity: ObjectIdentity,
+    }
+
+    /// The ownership refusals this process has seen. An explicit ownership
+    /// repair changes only these objects, and only while the same path still
+    /// reaches the same object. Identities never leave this module.
+    static REFUSED_OWNERS: Mutex<Vec<RefusedOwner>> = Mutex::new(Vec::new());
+
+    fn record_refused_owner(directory: &Path, child: Option<&str>, object: &File) {
+        let Some(identity) = file_identity(object) else {
+            return;
+        };
+        let mut refused = REFUSED_OWNERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        refused.retain(|entry| entry.directory != directory || entry.child.as_deref() != child);
+        refused.push(RefusedOwner {
+            directory: directory.to_owned(),
+            child: child.map(str::to_owned),
+            identity,
+        });
+    }
+
+    fn refused_owner(directory: &Path, child: Option<&str>) -> Option<ObjectIdentity> {
+        REFUSED_OWNERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|entry| entry.directory == directory && entry.child.as_deref() == child)
+            .map(|entry| entry.identity)
+    }
+
+    fn forget_refused_owners(directory: &Path) {
+        REFUSED_OWNERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|entry| entry.directory != directory);
+    }
+
+    /// Records the object at `directory` (or its `child`) as refused for an
+    /// untrusted owner, as hardening would, without needing a foreign owner.
+    #[cfg(test)]
+    pub(in crate::credentials::adapters) fn record_refused_owner_for_test(
+        directory: &Path,
+        child: Option<&str>,
+    ) {
+        let path = child.map_or_else(|| directory.to_owned(), |child| directory.join(child));
+        let object = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0)
+            .share_mode(CHILD_SHARE.0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(path)
+            .expect("open the object to record as refused");
+        record_refused_owner(directory, child, &object);
     }
 
     pub(in crate::credentials::adapters) struct StagedFile<'directory> {
@@ -562,11 +759,43 @@ mod windows_held {
     /// Refuses an object whose owner could undo its hardening. Any owner keeps
     /// implicit `WRITE_DAC`, so a protected owner-only DACL means nothing on an
     /// object someone else owns. See `fs_util::owner_is_trusted` for which
-    /// owners are accepted.
-    fn require_trusted_owner(file: &File) -> Result<(), CredentialStoreFailure> {
+    /// owners are accepted. A refusal for an untrusted owner is recorded
+    /// under `directory` and `child`, the one object an explicit ownership
+    /// repair of that path may then change.
+    fn require_trusted_owner(
+        directory: &Path,
+        child: Option<&str>,
+        file: &File,
+    ) -> Result<(), CredentialStoreFailure> {
         match crate::fs_util::owner_is_trusted(file) {
             Ok(true) => Ok(()),
-            Ok(false) | Err(_) => Err(CredentialStoreFailure::PermissionHardeningFailed),
+            Ok(false) => {
+                record_refused_owner(directory, child, file);
+                Err(CredentialStoreFailure::PermissionHardeningFailed)
+            }
+            Err(_) => Err(CredentialStoreFailure::PermissionHardeningFailed),
+        }
+    }
+
+    /// Refuses a file with another name: hardening it, or taking ownership
+    /// of it, through this name would change it under the other name too.
+    fn require_single_name(file: &File) -> Result<(), CredentialStoreFailure> {
+        let mut info = FILE_STANDARD_INFO::default();
+        // SAFETY: `FileStandardInfo` writes exactly one `FILE_STANDARD_INFO`
+        // into `info`, which outlives the call; the handle stays open.
+        unsafe {
+            GetFileInformationByHandleEx(
+                HANDLE(file.as_raw_handle()),
+                FileStandardInfo,
+                std::ptr::addr_of_mut!(info).cast(),
+                size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        }
+        .map_err(|_| CredentialStoreFailure::PermissionHardeningFailed)?;
+        if info.NumberOfLinks == 1 {
+            Ok(())
+        } else {
+            Err(CredentialStoreFailure::PermissionHardeningFailed)
         }
     }
 
@@ -606,6 +835,10 @@ mod windows_held {
     /// working directory and refuses one paired with a root handle (measured
     /// on Windows 11 for #521).
     fn rename_within(file: &File, root: &File, name: &str) -> Result<(), PublishFailure> {
+        #[cfg(test)]
+        if super::faults::fires(super::faults::Fault::RenameUnknownBeforeEffect) {
+            return Err(PublishFailure::Unknown);
+        }
         let units: Vec<u16> = name.encode_utf16().collect();
         let name_bytes = units
             .len()
@@ -644,7 +877,13 @@ mod windows_held {
             )
         };
         if status.is_ok() {
+            #[cfg(test)]
+            if super::faults::fires(super::faults::Fault::RenameUnknownAfterEffect) {
+                return Err(PublishFailure::Unknown);
+            }
             Ok(())
+        } else if status == STATUS_SHARING_VIOLATION {
+            Err(PublishFailure::Contended)
         } else if rename_refused_before_effect(status) {
             Err(PublishFailure::NotPublished)
         } else {
@@ -652,15 +891,14 @@ mod windows_held {
         }
     }
 
-    /// Statuses with which the kernel refuses a rename request (a sharing or
-    /// access conflict, a name collision, or a request it does not support)
-    /// before it changes any name, so the target still holds what it held.
-    /// Every other failure leaves the outcome open.
+    /// Statuses other than a sharing violation with which the kernel refuses
+    /// a rename request (an access conflict, a name collision, or a request
+    /// it does not support) before it changes any name, so the target still
+    /// holds what it held. Every other failure leaves the outcome open.
     fn rename_refused_before_effect(status: NTSTATUS) -> bool {
         matches!(
             status,
-            STATUS_SHARING_VIOLATION
-                | STATUS_ACCESS_DENIED
+            STATUS_ACCESS_DENIED
                 | STATUS_OBJECT_NAME_COLLISION
                 | STATUS_INVALID_PARAMETER
                 | STATUS_INVALID_INFO_CLASS
@@ -680,52 +918,106 @@ mod windows_held {
             .map_err(|_| std::io::Error::from(ErrorKind::Other))
     }
 
-    /// Flushes the directory at `path` once an entry was created in it.
-    fn flush_directory_at(path: &Path) -> std::io::Result<()> {
-        let directory = OpenOptions::new()
-            .access_mode(FILE_ADD_SUBDIRECTORY.0 | SYNCHRONIZE.0)
-            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+    /// What a handle to an ancestor of a held root needs: to list it, create
+    /// a directory in it, flush it, and read its identity.
+    const ANCESTOR_ACCESS: u32 = FILE_LIST_DIRECTORY.0
+        | FILE_ADD_SUBDIRECTORY.0
+        | FILE_TRAVERSE.0
+        | FILE_READ_ATTRIBUTES.0
+        | SYNCHRONIZE.0;
+
+    /// Opens the existing directory `path` as an ancestor, following a final
+    /// junction as `create_dir_all` would.
+    fn open_ancestor(path: &Path) -> std::io::Result<File> {
+        OpenOptions::new()
+            .access_mode(ANCESTOR_ACCESS)
+            .share_mode(CHILD_SHARE.0)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
-            .open(path)?;
-        flush_directory(&directory)
+            .open(path)
     }
 
-    /// Flushes the directory containing `path`, so the entry naming `path`
-    /// is as durable as a flush makes it. A volume root has no containing
-    /// entry to flush.
-    fn flush_parent_of(path: &Path) -> Result<(), CredentialStoreFailure> {
-        let Ok((parent, _)) = split_parent(path) else {
+    /// Flushes `parent` once its entry `name` is verified to be `child`, so
+    /// the flush covers the entry the caller holds and not whatever an
+    /// ancestor swap put at the path.
+    fn flush_entry(
+        parent: &File,
+        name: &OsStr,
+        child: &File,
+        link: EntryLink,
+    ) -> Result<(), CredentialStoreFailure> {
+        let entry =
+            open_relative_entry(parent, name).map_err(|_| CredentialStoreFailure::Unavailable)?;
+        let attributes = entry
+            .metadata()
+            .map_err(|_| CredentialStoreFailure::Unavailable)?
+            .file_attributes();
+        if link == EntryLink::Skip && attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Ok(());
+        }
+        match (file_identity(&entry), file_identity(child)) {
+            (Some(named), Some(held)) if named == held => {}
+            _ => return Err(CredentialStoreFailure::Unavailable),
+        }
+        #[cfg(test)]
+        if super::faults::fires(super::faults::Fault::ParentSync) {
+            return Err(CredentialStoreFailure::Unavailable);
+        }
+        flush_directory(parent).map_err(|_| CredentialStoreFailure::Unavailable)
+    }
+
+    /// Flushes the directory containing `path` once its entry for `path` is
+    /// verified to be `child`. A volume root has no containing entry, and a
+    /// parent this user may not add to holds no entry this module created.
+    fn flush_parent_of(
+        path: &Path,
+        child: &File,
+        link: EntryLink,
+    ) -> Result<(), CredentialStoreFailure> {
+        let Ok((parent, name)) = split_parent(path) else {
             return Ok(());
         };
-        flush_directory_at(parent).map_err(|_| CredentialStoreFailure::Unavailable)
+        let parent = match open_ancestor(parent) {
+            Ok(parent) => parent,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return Ok(()),
+            Err(_) => return Err(CredentialStoreFailure::Unavailable),
+        };
+        flush_entry(&parent, name, child, link)
     }
 
-    /// Creates `path` and every missing ancestor with inherited security, as
-    /// `create_dir_all` would. The parent of each directory this creates, or
-    /// finds already created by a concurrent opener, is flushed before
-    /// anything is placed in it, and so is the parent of the deepest
-    /// directory found present: an earlier open may have created it and
-    /// failed to flush.
-    fn create_missing_directories(path: &Path) -> Result<(), CredentialStoreFailure> {
-        match std::fs::metadata(path) {
-            Ok(metadata) if metadata.is_dir() => return flush_parent_of(path),
-            Ok(_) => return Err(CredentialStoreFailure::Unavailable),
+    /// Opens the directory `path`, first creating it and every missing
+    /// ancestor with inherited security, as `create_dir_all` would. Each
+    /// directory is created and opened relative to its open parent, which
+    /// is flushed once its entry is verified to be that directory, an entry
+    /// a concurrent opener created included, before anything is placed in
+    /// it. The deepest directory found present has its entry flushed too,
+    /// unless that entry is a junction, which this module never creates: an
+    /// earlier open may have created the directory and failed to flush.
+    fn open_or_create_ancestor(path: &Path) -> Result<File, CredentialStoreFailure> {
+        match open_ancestor(path) {
+            Ok(directory) => {
+                flush_parent_of(path, &directory, EntryLink::Skip)?;
+                return Ok(directory);
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(_) => return Err(CredentialStoreFailure::Unavailable),
         }
-        let (parent, _) = split_parent(path)?;
-        create_missing_directories(parent)?;
-        match std::fs::create_dir(path) {
-            Ok(()) => flush_directory_at(parent).map_err(|_| CredentialStoreFailure::Unavailable),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                flush_directory_at(parent).map_err(|_| CredentialStoreFailure::Unavailable)
-            }
-            Err(_) => Err(CredentialStoreFailure::Unavailable),
-        }
+        let (parent, name) = split_parent(path)?;
+        let parent = open_or_create_ancestor(parent)?;
+        let directory = nt_create_relative(
+            &parent,
+            name,
+            ANCESTOR_ACCESS,
+            CHILD_SHARE,
+            FILE_OPEN_IF,
+            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(|_| CredentialStoreFailure::Unavailable)?;
+        flush_entry(&parent, name, &directory, EntryLink::Skip)?;
+        Ok(directory)
     }
 
     /// The volume serial number and 128-bit file ID of an open file.
-    fn file_identity(file: &File) -> Option<(u64, [u8; 16])> {
+    fn file_identity(file: &File) -> Option<ObjectIdentity> {
         let mut info = FILE_ID_INFO::default();
         // SAFETY: `FileIdInfo` writes exactly one `FILE_ID_INFO` into `info`,
         // which outlives the call; the handle stays open throughout.
@@ -806,27 +1098,74 @@ mod windows_held {
         }
     }
 
+    /// Refuses a refused directory that holds anything but `children` and
+    /// their staged files. Hardening a directory gives every existing child
+    /// that inherits from it the owner-only entry, so only a directory whose
+    /// children are all authority state is hardened by the repair.
+    fn require_only_authority_entries(
+        directory: &File,
+        children: &[&str],
+    ) -> Result<(), CredentialStoreFailure> {
+        let listed =
+            final_path(directory).ok_or(CredentialStoreFailure::PermissionHardeningFailed)?;
+        for entry in std::fs::read_dir(listed).map_err(|_| CredentialStoreFailure::Unavailable)? {
+            let entry = entry.map_err(|_| CredentialStoreFailure::Unavailable)?;
+            let authority_state = entry.file_name().to_str().is_some_and(|name| {
+                children
+                    .iter()
+                    .any(|child| name == *child || is_staged_name(name, child))
+            });
+            if !authority_state {
+                return Err(CredentialStoreFailure::PermissionHardeningFailed);
+            }
+        }
+        Ok(())
+    }
+
     /// Explicit repair of a root that hardening refused because another
-    /// principal owns it, or owns one of its `children`. Makes the process
-    /// user the owner of the directory at `path` and of each existing child
-    /// whose owner is not trusted (see `fs_util::owner_is_trusted`), then
-    /// hardens each one. Assigning oneself as owner needs `WRITE_OWNER` on
-    /// the object, which a DACL granting the user full control carries;
-    /// without it the refusal stands as `PermissionHardeningFailed`. Returns
-    /// whether any owner changed.
+    /// principal owns it, or owns one of its `children`. It changes only an
+    /// object whose refusal this process recorded for this path, and only
+    /// while the path still reaches that same object; any other object it
+    /// reaches is refused with `PermissionHardeningFailed` and left as it
+    /// is. A refused directory must hold nothing but authority state, and is
+    /// made the process user's and hardened; its children are then reached
+    /// through its handle. A child is changed only if it has no other name.
+    /// Assigning oneself as owner needs `WRITE_OWNER` on the object, which a
+    /// DACL granting the user full control carries; without it the refusal
+    /// stands. Returns whether any owner changed. With no recorded refusal
+    /// for `path` it opens nothing.
     pub(in crate::credentials::adapters) fn take_ownership_if_refused(
         path: &Path,
         children: &[&str],
     ) -> Result<bool, CredentialStoreFailure> {
+        let refused_directory = refused_owner(path, None);
+        if refused_directory.is_none()
+            && children
+                .iter()
+                .all(|child| refused_owner(path, Some(child)).is_none())
+        {
+            return Ok(false);
+        }
         let directory = match open_directory_with(path, WRITE_OWNER.0) {
             Ok(directory) => directory,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(open_failure(error.kind())),
         };
         require_kind(&directory, true)?;
-        let mut changed = take_ownership(&directory)?;
-        harden_directory(&directory)?;
+        let mut changed = false;
+        if let Some(refused) = refused_directory {
+            if file_identity(&directory) != Some(refused) {
+                return Err(CredentialStoreFailure::PermissionHardeningFailed);
+            }
+            require_only_authority_entries(&directory, children)?;
+            changed |= take_ownership(&directory)?;
+            harden_directory(&directory)?;
+        }
         for child in children {
+            let refused = refused_owner(path, Some(child));
+            if refused_directory.is_none() && refused.is_none() {
+                continue;
+            }
             let file = match open_relative(
                 &directory,
                 child,
@@ -839,9 +1178,14 @@ mod windows_held {
                 Err(error) => return Err(open_failure(error.kind())),
             };
             require_kind(&file, false)?;
+            require_single_name(&file)?;
+            if refused.is_some_and(|refused| file_identity(&file) != Some(refused)) {
+                return Err(CredentialStoreFailure::PermissionHardeningFailed);
+            }
             changed |= take_ownership(&file)?;
             harden(&file)?;
         }
+        forget_refused_owners(path);
         Ok(changed)
     }
 
@@ -855,18 +1199,18 @@ mod windows_held {
         CreateNew,
     }
 
-    /// Opens `name` inside the directory `root` is a handle to, resolved by
-    /// the kernel relative to that handle alone (the Windows counterpart of
-    /// `openat`), so no ancestor path is consulted. A final reparse point is
-    /// opened as itself, and a directory is refused.
-    fn open_relative(
+    /// `NtCreateFile` of `name` inside the directory `root` is a handle to,
+    /// resolved by the kernel relative to that handle alone (the Windows
+    /// counterpart of `openat`), so no ancestor path is consulted.
+    fn nt_create_relative(
         root: &File,
-        name: &str,
+        name: &OsStr,
         access: u32,
-        open: ChildOpen,
         share: FILE_SHARE_MODE,
+        disposition: NTCREATEFILE_CREATE_DISPOSITION,
+        options: NTCREATEFILE_CREATE_OPTIONS,
     ) -> std::io::Result<File> {
-        let units: Vec<u16> = name.encode_utf16().collect();
+        let units: Vec<u16> = name.encode_wide().collect();
         let length = units
             .len()
             .checked_mul(2)
@@ -885,11 +1229,6 @@ mod windows_held {
             SecurityDescriptor: std::ptr::null(),
             SecurityQualityOfService: std::ptr::null(),
         };
-        let disposition = match open {
-            ChildOpen::OpenExisting => FILE_OPEN,
-            ChildOpen::OpenOrCreate => FILE_OPEN_IF,
-            ChildOpen::CreateNew => FILE_CREATE,
-        };
         let mut handle = HANDLE::default();
         let mut status_block = IO_STATUS_BLOCK::default();
         // SAFETY: every pointer refers to a local that outlives the call, and
@@ -898,16 +1237,14 @@ mod windows_held {
         let status = unsafe {
             NtCreateFile(
                 &mut handle,
-                FILE_ACCESS_RIGHTS(
-                    access | FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0 | SYNCHRONIZE.0,
-                ),
+                FILE_ACCESS_RIGHTS(access),
                 &attributes,
                 &mut status_block,
                 None,
                 FILE_ATTRIBUTE_NORMAL,
                 share,
                 disposition,
-                FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+                options,
                 None,
                 0,
             )
@@ -917,11 +1254,50 @@ mod windows_held {
             return Ok(unsafe { File::from_raw_handle(handle.0) });
         }
         Err(std::io::Error::from(match status {
-            STATUS_OBJECT_NAME_NOT_FOUND => ErrorKind::NotFound,
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => ErrorKind::NotFound,
             STATUS_OBJECT_NAME_COLLISION => ErrorKind::AlreadyExists,
             STATUS_ACCESS_DENIED | STATUS_FILE_IS_A_DIRECTORY => ErrorKind::PermissionDenied,
             _ => ErrorKind::Other,
         }))
+    }
+
+    /// Opens the file `name` inside the directory `root` is a handle to (see
+    /// [`nt_create_relative`]). A final reparse point is opened as itself,
+    /// and a directory is refused.
+    fn open_relative(
+        root: &File,
+        name: &str,
+        access: u32,
+        open: ChildOpen,
+        share: FILE_SHARE_MODE,
+    ) -> std::io::Result<File> {
+        let disposition = match open {
+            ChildOpen::OpenExisting => FILE_OPEN,
+            ChildOpen::OpenOrCreate => FILE_OPEN_IF,
+            ChildOpen::CreateNew => FILE_CREATE,
+        };
+        nt_create_relative(
+            root,
+            OsStr::new(name),
+            access | FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0 | SYNCHRONIZE.0,
+            share,
+            disposition,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        )
+    }
+
+    /// Opens the entry `name` inside the directory `root` is a handle to as
+    /// itself, whatever its kind, a reparse point included, only to read its
+    /// attributes and identity.
+    fn open_relative_entry(root: &File, name: &OsStr) -> std::io::Result<File> {
+        nt_create_relative(
+            root,
+            name,
+            FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0,
+            CHILD_SHARE,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        )
     }
 
     const CHILD_SHARE: FILE_SHARE_MODE =
@@ -977,26 +1353,31 @@ mod windows_held {
                 Err(error) => return Err(open_failure(error.kind())),
             };
             require_kind(&handle, true)?;
-            require_trusted_owner(&handle)?;
+            require_trusted_owner(path, None, &handle)?;
             harden_directory(&handle)?;
             let final_path =
                 final_path(&handle).ok_or(CredentialStoreFailure::PermissionHardeningFailed)?;
-            Ok(Some(Self { handle, final_path }))
+            Ok(Some(Self {
+                handle,
+                final_path,
+                path: path.to_owned(),
+            }))
         }
 
         /// Opens the held root `path`, creating it and its missing ancestors
         /// first. Whether this open created the root or found it, its parent
-        /// is flushed before it is returned, so no opener relies on a flush
-        /// another open may never have completed.
+        /// is flushed, once its entry is verified to be the held root, before
+        /// it is returned, so no opener relies on a flush another open may
+        /// never have completed.
         pub(in crate::credentials::adapters) fn open_or_create(
             path: &Path,
         ) -> Result<Self, CredentialStoreFailure> {
             if let Some(held) = Self::open_existing(path)? {
-                flush_parent_of(path)?;
+                flush_parent_of(path, &held.handle, EntryLink::Refuse)?;
                 return Ok(held);
             }
-            let (parent, _) = split_parent(path)?;
-            create_missing_directories(parent)?;
+            let (parent_path, name) = split_parent(path)?;
+            let parent = open_or_create_ancestor(parent_path)?;
             // Created with its protected owner-only DACL, so no other principal
             // can open it between creation and hardening.
             match crate::fs_util::create_owner_only_directory(path) {
@@ -1004,8 +1385,34 @@ mod windows_held {
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(open_failure(error.kind())),
             }
-            flush_directory_at(parent).map_err(|_| CredentialStoreFailure::Unavailable)?;
-            Self::open_existing(path)?.ok_or(CredentialStoreFailure::Unavailable)
+            let held = Self::open_existing(path)?.ok_or(CredentialStoreFailure::Unavailable)?;
+            // The root was created and opened by path, so the parent this
+            // walk holds is flushed only if its entry is the held root.
+            flush_entry(&parent, name, &held.handle, EntryLink::Refuse)?;
+            Ok(held)
+        }
+
+        /// Whether `path` still resolves to the held directory. A lock or a
+        /// journal reached through a held directory that is no longer at its
+        /// path is not the one another process opening that path now uses.
+        pub(in crate::credentials::adapters) fn is_at(
+            &self,
+            path: &Path,
+        ) -> Result<bool, CredentialStoreFailure> {
+            let named = match OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0)
+                .share_mode(CHILD_SHARE.0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+                .open(path)
+            {
+                Ok(named) => named,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+                Err(_) => return Err(CredentialStoreFailure::Unavailable),
+            };
+            match (file_identity(&self.handle), file_identity(&named)) {
+                (Some(held), Some(named)) => Ok(held == named),
+                _ => Err(CredentialStoreFailure::Unavailable),
+            }
         }
 
         /// A second handle to the held directory, for inspecting the same
@@ -1030,7 +1437,7 @@ mod windows_held {
                 Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(open_failure(error.kind())),
             };
-            match self.verify_and_harden_child(&file) {
+            match self.verify_and_harden_child(name, &file) {
                 Ok(()) => Ok(Some(file)),
                 Err(failure) => {
                     if open == ChildOpen::CreateNew {
@@ -1041,7 +1448,11 @@ mod windows_held {
             }
         }
 
-        fn verify_and_harden_child(&self, file: &File) -> Result<(), CredentialStoreFailure> {
+        fn verify_and_harden_child(
+            &self,
+            name: &str,
+            file: &File,
+        ) -> Result<(), CredentialStoreFailure> {
             require_kind(file, false)?;
             // Redundant with the handle-relative open; kept so a resolution
             // outside the held directory can never pass silently.
@@ -1050,7 +1461,8 @@ mod windows_held {
             if child.parent() != Some(self.final_path.as_path()) {
                 return Err(CredentialStoreFailure::PermissionHardeningFailed);
             }
-            require_trusted_owner(file)?;
+            require_single_name(file)?;
+            require_trusted_owner(&self.path, Some(name), file)?;
             harden(file)
         }
 
@@ -1179,6 +1591,10 @@ mod windows_held {
 
         /// Flushes the staged bytes to the file.
         pub(in crate::credentials::adapters) fn sync(&mut self) -> std::io::Result<()> {
+            #[cfg(test)]
+            if super::faults::fires(super::faults::Fault::StagedSync) {
+                return Err(std::io::Error::other("injected staged sync failure"));
+            }
             match self.file.as_ref() {
                 Some(file) => file.sync_all(),
                 None => Err(std::io::Error::from(ErrorKind::BrokenPipe)),
@@ -1214,13 +1630,31 @@ mod windows_held {
                 Err(failure) => return Err(failure),
             }
             self.published = true;
-            let flushed = file
-                .sync_all()
-                .and_then(|()| flush_directory(&self.directory.handle));
+            let flushed = flush_publication(file, &self.directory.handle);
             drop(self.file.take());
             flushed.map_err(|_| PublishFailure::Unknown)
         }
+    }
 
+    /// Flushes a renamed file, then the held directory it was renamed in.
+    fn flush_publication(file: &File, directory: &File) -> std::io::Result<()> {
+        #[cfg(test)]
+        if super::faults::fires(super::faults::Fault::PublishedFileSync) {
+            return Err(std::io::Error::other(
+                "injected published file sync failure",
+            ));
+        }
+        file.sync_all()?;
+        #[cfg(test)]
+        if super::faults::fires(super::faults::Fault::HeldDirectorySync) {
+            return Err(std::io::Error::other(
+                "injected held directory sync failure",
+            ));
+        }
+        flush_directory(directory)
+    }
+
+    impl StagedFile<'_> {
         pub(in crate::credentials::adapters) fn commit(mut self) -> Result<(), PublishFailure> {
             self.sync().map_err(|_| PublishFailure::NotPublished)?;
             self.publish()

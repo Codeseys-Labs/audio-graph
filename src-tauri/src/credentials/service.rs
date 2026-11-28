@@ -76,10 +76,11 @@ pub(crate) enum UntrackedRecordOutcome {
     /// Untracked staging records, the set's staging guard, or both were
     /// removed.
     Removed,
-    /// Nothing untracked was found, and the journal's pending activation of
-    /// this set keeps its own staging record, and a guard in the pre-fix
-    /// format if there is one, since that guard may stand for it. Repair
-    /// again once that activation completes or is recovered.
+    /// Nothing untracked was found, and a pending activation of this set
+    /// keeps its own staging record, and a guard in the pre-fix format if
+    /// there is one, since that guard may stand for it: the journal's, or
+    /// the one this service last observed while its staging record exists.
+    /// Repair again once that activation completes or is recovered.
     Tracked,
     /// A guard in the pre-fix format was removed, with every staging record
     /// the journal history names for the set. That guard never named its
@@ -98,13 +99,13 @@ pub(crate) struct UntrackedRecordRepair {
     pub(crate) outcome: UntrackedRecordOutcome,
 }
 
-/// An untracked-record repair taken under one cooperating-process lock: the
-/// journal it was decided on and, unless the caller refused that journal,
-/// what was done for each built-in set.
-pub(crate) struct AuthoritativeRepair {
-    pub(crate) journal: AuthorityJournal,
-    /// `None` when the journal was refused and nothing was touched.
-    pub(crate) sets: Option<Vec<UntrackedRecordRepair>>,
+/// The pending activation a service last observed. A journal restored at
+/// the same epoch can omit an activation that is still live, so an explicit
+/// repair keeps the staging of this one as well as the journal's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedActivation {
+    pub(crate) set_id: CredentialSetId,
+    pub(crate) operation_id: CredentialOperationId,
 }
 
 /// What an explicit ownership repair of a store's authority state changed.
@@ -137,12 +138,19 @@ pub(crate) trait CredentialEntryStore: Send + Sync {
     ) -> Result<Box<dyn CredentialMutationSession + '_>, CredentialStoreFailure>;
 
     /// Explicit repair only; no ordinary operation calls it. Reads the
-    /// authoritative journal and, only if `may_repair` admits that journal,
+    /// authoritative journal and, only if `admit` adopts that journal,
     /// removes the native records it does not track, both under one lock.
+    /// The staging of `observed`, and a guard naming it, is kept too.
+    /// `None` when `admit` refused the journal and nothing was touched.
     fn repair_untracked_records(
         &self,
-        may_repair: &dyn Fn(&AuthorityJournal) -> bool,
-    ) -> Result<AuthoritativeRepair, CredentialStoreFailure>;
+        observed: Option<&ObservedActivation>,
+        admit: &dyn Fn(&AuthorityJournal) -> bool,
+    ) -> Result<Option<Vec<UntrackedRecordRepair>>, CredentialStoreFailure>;
+
+    /// The authority this store is bound to: it reads and writes only that
+    /// authority's journal and records. Internal; never shown or logged.
+    fn authority_instance(&self) -> &str;
 }
 
 fn verify_exact_store_readback(
@@ -1048,42 +1056,51 @@ impl CredentialService {
     /// does not track: an orphaned staging record and its guard, a guard in
     /// the format written before guards named their operation, or staging
     /// that survived a lost journal publication. No ordinary operation calls
-    /// it. It is decided on the journal the store reads under its lock, and
-    /// refused before any record is touched when that journal is older than
-    /// the one this service observed: a restored journal can omit staging
-    /// that is still in use. It changes no journal, so it emits no event.
+    /// it. It is decided on the journal the store reads under its lock,
+    /// which this service adopts before any record is touched, so a later
+    /// failure cannot leave it deciding on an older journal than one it
+    /// acted on; a journal older than the one this service observed is
+    /// refused instead, since it can omit staging that is still in use. The
+    /// staging of the pending activation this service last observed is kept
+    /// as well. It changes no journal, so it emits no event.
     pub(crate) fn repair_untracked_records(
         &self,
     ) -> Result<Vec<UntrackedRecordRepair>, CredentialError> {
         let operation_id = self.token_source.next_operation_id();
         let _permit = self.worker.admit_for(&operation_id, None)?;
-        let repair = self
-            .store
-            .repair_untracked_records(&|journal| {
-                journal.global_epoch
-                    >= self
-                        .journal
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .global_epoch
+        let observed = self
+            .journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending_activation
+            .as_ref()
+            .map(|pending| ObservedActivation {
+                set_id: pending.set_id.clone(),
+                operation_id: pending.operation_id.clone(),
+            });
+        self.store
+            .repair_untracked_records(observed.as_ref(), &|journal| {
+                self.cache_journal(journal.clone(), JournalOrigin::Authority)
             })
             .map_err(|failure| {
                 if failure == CredentialStoreFailure::StalledWorker {
                     self.worker.mark_stalled();
                 }
                 failure.into_public(None)
-            })?;
-        let store_wide_recovery = || {
-            content_free_error(
-                CredentialErrorCode::RecoveryRequired,
-                CredentialSafeRecoveryAction::Reconcile,
-                None,
-            )
-        };
-        if !self.cache_journal(repair.journal, JournalOrigin::Authority) {
-            return Err(store_wide_recovery());
-        }
-        repair.sets.ok_or_else(store_wide_recovery)
+            })?
+            .ok_or_else(|| {
+                content_free_error(
+                    CredentialErrorCode::RecoveryRequired,
+                    CredentialSafeRecoveryAction::Reconcile,
+                    None,
+                )
+            })
+    }
+
+    /// The authority the store under this service is bound to. Internal;
+    /// never shown or logged.
+    pub(crate) fn authority_instance(&self) -> &str {
+        self.store.authority_instance()
     }
 
     pub(crate) fn resolve_for_use(
@@ -2361,10 +2378,10 @@ impl CredentialService {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthoritativeActiveRead, AuthoritativeRepair, CredentialEntryStore,
-        CredentialMutationSession, CredentialResolution, CredentialService,
-        CredentialSettingsActivationPort, CredentialUseRequest, DeleteCredentialSet,
-        PrepareCredentialActivation, ReplaceCredentialSet, UntrackedRecordOutcome,
+        AuthoritativeActiveRead, CredentialEntryStore, CredentialMutationSession,
+        CredentialResolution, CredentialService, CredentialSettingsActivationPort,
+        CredentialUseRequest, DeleteCredentialSet, ObservedActivation, PrepareCredentialActivation,
+        ReplaceCredentialSet, UntrackedRecordOutcome, UntrackedRecordRepair,
         verify_exact_store_readback,
     };
     use crate::credentials::domain::{
@@ -2451,9 +2468,14 @@ mod tests {
 
         fn repair_untracked_records(
             &self,
-            may_repair: &dyn Fn(&AuthorityJournal) -> bool,
-        ) -> Result<AuthoritativeRepair, CredentialStoreFailure> {
-            self.inner.repair_untracked_records(may_repair)
+            observed: Option<&ObservedActivation>,
+            admit: &dyn Fn(&AuthorityJournal) -> bool,
+        ) -> Result<Option<Vec<UntrackedRecordRepair>>, CredentialStoreFailure> {
+            self.inner.repair_untracked_records(observed, admit)
+        }
+
+        fn authority_instance(&self) -> &str {
+            self.inner.authority_instance()
         }
     }
 
@@ -5942,5 +5964,43 @@ mod tests {
             UntrackedRecordOutcome::Removed
         );
         assert_eq!(store.staging_count(), 0);
+    }
+
+    /// The repair adopts the journal it was admitted on before it removes
+    /// anything. A repair that fails partway, after another process's commit
+    /// raised the epoch, therefore still leaves this service refusing a
+    /// journal older than the one it acted on.
+    #[test]
+    fn a_repair_that_fails_partway_still_refuses_an_older_journal_afterwards() {
+        let store = Arc::new(FakeCredentialStore::new(AuthorityJournal::new(
+            CredentialBackendKind::Native,
+        )));
+        let service = CredentialService::new(
+            store.clone(),
+            AuthorityJournal::new(CredentialBackendKind::Native),
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let older = store.journal_snapshot();
+        let mut newer = older.clone();
+        newer.global_epoch = 1;
+        store.restore_journal(newer);
+        store.fail_after(
+            FakeStoreCall::RepairSet,
+            1,
+            CredentialStoreFailure::Unavailable,
+        );
+
+        let failed = service
+            .repair_untracked_records()
+            .expect_err("the repair fails after its first set");
+        assert_eq!(failed.code, CredentialErrorCode::StoreUnavailable);
+        assert_eq!(service.snapshot_status().global_epoch, 1);
+
+        store.restore_journal(older);
+        let refused = service
+            .repair_untracked_records()
+            .expect_err("the older journal is refused");
+        assert_eq!(refused.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(refused.set_id, None);
     }
 }

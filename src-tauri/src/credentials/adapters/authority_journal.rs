@@ -292,10 +292,13 @@ fn inspect_held_root(
 /// boundary's lifetime. The paths are resolved once, when the boundary
 /// opens; every later read, publication, sweep and lock goes through the
 /// held handles, so a path whose ancestors change afterwards redirects
-/// nothing.
+/// nothing. Each lock acquisition checks that both paths still resolve to
+/// the held directories.
 pub(super) struct FileAuthorityJournalBoundary {
     root: HeldDirectory,
+    root_path: PathBuf,
     namespace_lock_root: HeldDirectory,
+    namespace_lock_path: PathBuf,
     file_system: Arc<dyn AtomicJournalFileSystem>,
 }
 
@@ -314,18 +317,20 @@ impl FileAuthorityJournalBoundary {
     }
 
     fn open(
-        root: PathBuf,
-        namespace_lock_root: PathBuf,
+        root_path: PathBuf,
+        namespace_lock_path: PathBuf,
         qualification: &dyn RootQualification,
         file_system: Arc<dyn AtomicJournalFileSystem>,
     ) -> Result<Self, CredentialStoreFailure> {
-        let namespace_lock_root = HeldDirectory::open_or_create(&namespace_lock_root)?;
+        let namespace_lock_root = HeldDirectory::open_or_create(&namespace_lock_path)?;
         qualification.qualify(&namespace_lock_root)?;
-        let root = HeldDirectory::open_or_create(&root)?;
+        let root = HeldDirectory::open_or_create(&root_path)?;
         qualification.qualify(&root)?;
         Ok(Self {
             root,
+            root_path,
             namespace_lock_root,
+            namespace_lock_path,
             file_system,
         })
     }
@@ -400,10 +405,11 @@ impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
         )
     }
 
-    /// A publication that provably left the previous journal in place is a
-    /// definite `Unavailable`, which latches nothing: another program holding
-    /// the journal open without sharing delete refuses the rename this way,
-    /// and the next operation can retry once it lets go. Only an outcome the
+    /// A publication that provably left the previous journal in place
+    /// latches nothing. Another program holding the journal open without
+    /// sharing delete refuses the rename with `OperationInProgress`, which a
+    /// caller that has changed nothing native can retry once it lets go; any
+    /// other definite refusal is `Unavailable`. Only an outcome the
     /// publication cannot rule out is `CommitUnknown`.
     fn replace(&self, bytes: &[u8]) -> Result<(), CredentialStoreFailure> {
         // The staged file is hardened before any byte is written; a
@@ -414,6 +420,7 @@ impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
         file.write_all(bytes)
             .map_err(|_| CredentialStoreFailure::Unavailable)?;
         file.commit().map_err(|failure| match failure {
+            PublishFailure::Contended => CredentialStoreFailure::OperationInProgress,
             PublishFailure::NotPublished => CredentialStoreFailure::Unavailable,
             PublishFailure::Unknown => CredentialStoreFailure::CommitUnknown,
         })?;
@@ -432,8 +439,13 @@ impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
     }
 
     /// The lock counts only while the lock file's name still designates the
-    /// file that was locked: otherwise another process opening the name
-    /// would lock a second file and both would proceed.
+    /// file that was locked and both held roots are still what their paths
+    /// resolve to. Otherwise another process opening those paths now would
+    /// lock a second file, or use another journal, and both would proceed.
+    /// A held root that moved is a closed `Unavailable`: only a reopen, which
+    /// resolves the paths again, can reach the directories other processes
+    /// use. A root moved after this check, while the lock is held, is not
+    /// detected until the next acquisition.
     fn acquire_mutation_lock(
         &self,
     ) -> Result<Box<dyn AuthorityMutationLock>, CredentialStoreFailure> {
@@ -453,6 +465,8 @@ impl AuthorityJournalBoundary for FileAuthorityJournalBoundary {
         if self
             .namespace_lock_root
             .names_file(NAMESPACE_LOCK_FILE_NAME, &lock.file)?
+            && self.namespace_lock_root.is_at(&self.namespace_lock_path)?
+            && self.root.is_at(&self.root_path)?
         {
             Ok(Box::new(lock))
         } else {
@@ -516,6 +530,7 @@ pub(super) mod tests {
         Open,
         Write,
         CommitRefused,
+        CommitContended,
         Commit,
         Readback,
         Mismatch,
@@ -560,6 +575,7 @@ pub(super) mod tests {
         fn commit(self: Box<Self>) -> Result<(), PublishFailure> {
             match self.cut {
                 AtomicFileCut::CommitRefused => return Err(PublishFailure::NotPublished),
+                AtomicFileCut::CommitContended => return Err(PublishFailure::Contended),
                 AtomicFileCut::Commit => return Err(PublishFailure::Unknown),
                 _ => {}
             }
@@ -743,6 +759,10 @@ pub(super) mod tests {
                 AtomicFileCut::CommitRefused,
                 CredentialStoreFailure::Unavailable,
             ),
+            (
+                AtomicFileCut::CommitContended,
+                CredentialStoreFailure::OperationInProgress,
+            ),
             (AtomicFileCut::Commit, CredentialStoreFailure::CommitUnknown),
             (
                 AtomicFileCut::Readback,
@@ -762,6 +782,7 @@ pub(super) mod tests {
                 AtomicFileCut::Open
                     | AtomicFileCut::Write
                     | AtomicFileCut::CommitRefused
+                    | AtomicFileCut::CommitContended
                     | AtomicFileCut::Commit
             ) {
                 assert_eq!(
@@ -893,8 +914,8 @@ pub(super) mod tests {
     /// Another program reading the journal (a scanner, an indexer) neither
     /// blocks a publication nor sees it change under its handle when it
     /// shares delete. One that refuses to share delete makes the publication
-    /// a definite failure that leaves the previous journal in place, and the
-    /// next publication succeeds once it lets go.
+    /// a definite, retryable `OperationInProgress` that leaves the previous
+    /// journal in place, and the next publication succeeds once it lets go.
     #[cfg(windows)]
     #[test]
     fn windows_a_journal_another_program_holds_open_is_replaced_or_definitely_refused() {
@@ -928,7 +949,7 @@ pub(super) mod tests {
         let refusing = open_with(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0);
         assert_eq!(
             journal.replace(b"third-journal"),
-            Err(CredentialStoreFailure::Unavailable)
+            Err(CredentialStoreFailure::OperationInProgress)
         );
         assert_eq!(journal.read(), Ok(Some(b"second-journal".to_vec())));
         assert!(staged_leftovers(&base.join("journal")).is_empty());
@@ -996,6 +1017,145 @@ pub(super) mod tests {
         );
         drop(journal);
         std::fs::remove_dir_all(&base).expect("remove isolated moved-root directory");
+    }
+
+    /// A lock taken through a held root that is no longer at its path is
+    /// not the lock another process opening that path now takes, so it is
+    /// refused. Moving either root and putting a new directory at its path
+    /// leaves the first boundary unable to lock, and the boundary opened
+    /// over the replacement locks as usual.
+    #[cfg(unix)]
+    #[test]
+    fn unix_a_moved_root_refuses_a_lock_another_opener_would_not_share() {
+        for moved in ["namespace", "journal"] {
+            let base = scratch("moved-lock-root");
+            let first = boundary(&base, "journal", "namespace").expect("open the first boundary");
+            std::fs::rename(base.join(moved), base.join("moved")).expect("move a held root");
+            let second =
+                boundary(&base, "journal", "namespace").expect("open over the replacement");
+
+            assert!(
+                matches!(
+                    first.acquire_mutation_lock(),
+                    Err(CredentialStoreFailure::Unavailable)
+                ),
+                "a moved {moved} root still locked"
+            );
+            drop(
+                second
+                    .acquire_mutation_lock()
+                    .expect("the replacement's boundary locks"),
+            );
+            drop((first, second));
+            std::fs::remove_dir_all(&base).expect("remove isolated moved-lock directory");
+        }
+    }
+
+    /// A journal with another name is refused before its mode changes, so
+    /// hardening never reaches the file under its other name.
+    #[cfg(unix)]
+    #[test]
+    fn unix_a_hard_linked_journal_is_refused_before_its_mode_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = scratch("hard-link");
+        let journal = boundary(&base, "journal", "namespace").expect("open boundary");
+        let outside = base.join("outside");
+        std::fs::write(&outside, b"outside").expect("write the other name");
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644))
+            .expect("set the other name's mode");
+        std::fs::hard_link(&outside, base.join("journal").join(JOURNAL_FILE_NAME))
+            .expect("link the journal name");
+
+        assert_eq!(
+            journal.read(),
+            Err(CredentialStoreFailure::PermissionHardeningFailed)
+        );
+        assert_eq!(unix_mode(&outside), 0o644);
+        drop(journal);
+        std::fs::remove_dir_all(&base).expect("remove isolated hard-link directory");
+    }
+
+    /// Each barrier of a publication can fail on its own. A failed sync of
+    /// the staged bytes is a definite failure. A rename whose outcome is
+    /// unknown, or a failed sync after the rename, is `CommitUnknown`, and
+    /// the journal then holds the previous or the new bytes, never neither:
+    /// a staged file that may be the published journal is never deleted.
+    /// Whatever staged file is left behind goes in the next sweep.
+    #[test]
+    fn each_publication_barrier_failure_leaves_one_whole_journal_and_a_sweepable_root() {
+        use super::held_directory::faults::{Fault, arm};
+
+        let mut cases = vec![
+            (
+                Fault::StagedSync,
+                CredentialStoreFailure::Unavailable,
+                b"old-journal",
+            ),
+            (
+                Fault::RenameUnknownBeforeEffect,
+                CredentialStoreFailure::CommitUnknown,
+                b"old-journal",
+            ),
+            (
+                Fault::RenameUnknownAfterEffect,
+                CredentialStoreFailure::CommitUnknown,
+                b"new-journal",
+            ),
+            (
+                Fault::HeldDirectorySync,
+                CredentialStoreFailure::CommitUnknown,
+                b"new-journal",
+            ),
+        ];
+        if cfg!(windows) {
+            cases.push((
+                Fault::PublishedFileSync,
+                CredentialStoreFailure::CommitUnknown,
+                b"new-journal",
+            ));
+        }
+        for (fault, expected, journal_after) in cases {
+            let base = scratch("barrier-fault");
+            let journal = boundary(&base, "journal", "namespace").expect("open boundary");
+            journal
+                .replace(b"old-journal")
+                .expect("publish the previous journal");
+
+            arm(fault);
+            assert_eq!(journal.replace(b"new-journal"), Err(expected), "{fault:?}");
+            assert_eq!(
+                journal.read(),
+                Ok(Some(journal_after.to_vec())),
+                "{fault:?}"
+            );
+            journal.remove_stray_staged().expect("sweep the root");
+            assert!(
+                staged_leftovers(&base.join("journal")).is_empty(),
+                "{fault:?}"
+            );
+
+            drop(journal);
+            std::fs::remove_dir_all(&base).expect("remove isolated barrier-fault directory");
+        }
+    }
+
+    /// A parent sync that fails while a root is opened fails the open, which
+    /// latches nothing: the next open syncs that parent and succeeds.
+    #[test]
+    fn a_failed_parent_sync_fails_the_open_until_an_open_syncs_it() {
+        use super::held_directory::faults::{Fault, arm};
+
+        let base = scratch("parent-sync-fault");
+        arm(Fault::ParentSync);
+        assert_eq!(
+            boundary(&base, "journal", "namespace").err(),
+            Some(CredentialStoreFailure::Unavailable)
+        );
+        let journal = boundary(&base, "journal", "namespace").expect("the next open syncs");
+        assert_eq!(journal.read(), Ok(None));
+        drop(journal);
+        std::fs::remove_dir_all(&base).expect("remove isolated parent-sync directory");
     }
 
     /// A staged file whose discard failed is cleaned up by the next staging
@@ -1736,7 +1896,7 @@ pub(super) mod tests {
         (base, held, decoy)
     }
 
-    #[cfg(windows)]
+    /// The staged files left in `root`.
     fn staged_leftovers(root: &Path) -> Vec<std::ffi::OsString> {
         std::fs::read_dir(root)
             .expect("list journal root")
@@ -2173,5 +2333,111 @@ pub(super) mod tests {
             .expect("publish into the repaired root");
         drop(journal);
         std::fs::remove_dir_all(&base).expect("remove isolated foreign-owner directory");
+    }
+
+    /// The explicit ownership repair changes only the object whose refusal
+    /// it recorded. Once an ancestor of the refused root is repointed, the
+    /// path reaches another directory, which the repair refuses with its
+    /// DACL untouched.
+    #[cfg(windows)]
+    #[test]
+    fn windows_the_ownership_repair_refuses_a_root_an_ancestor_swap_put_at_the_path() {
+        let base = scratch("windows-repair-swap");
+        let decoy = base.join("decoy").join("journal");
+        std::fs::create_dir_all(base.join("held").join("journal")).expect("create the held root");
+        std::fs::create_dir_all(&decoy).expect("create the decoy root");
+        windows_command(
+            "icacls.exe",
+            &[decoy.as_os_str(), "/grant".as_ref(), "*S-1-1-0:R".as_ref()],
+            &base,
+        );
+        let decoy_dacl = windows_dacl(&decoy, &base);
+        point_parent_junction(&base, "held");
+        let root = base.join("parent").join("journal");
+        super::held_directory::record_refused_owner_for_test(&root, None);
+        point_parent_junction(&base, "decoy");
+
+        assert_eq!(
+            super::take_ownership_if_refused(&root, &[JOURNAL_FILE_NAME]),
+            Err(CredentialStoreFailure::PermissionHardeningFailed)
+        );
+        assert_eq!(windows_dacl(&decoy, &base), decoy_dacl);
+
+        std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
+        std::fs::remove_dir_all(&base).expect("remove isolated repair-swap directory");
+    }
+
+    /// A journal with another name is refused before its DACL changes, by an
+    /// ordinary read and by the explicit ownership repair alike: changing it
+    /// through this name would change the file under its other name too.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_hard_linked_journal_is_refused_by_hardening_and_by_the_repair() {
+        let base = scratch("windows-hard-link");
+        let root = base.join("journal");
+        let journal = boundary(&base, "journal", "namespace").expect("open boundary");
+        let outside = base.join("outside.json");
+        std::fs::write(&outside, b"outside").expect("write the other name");
+        windows_command(
+            "icacls.exe",
+            &[
+                outside.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-1-0:R".as_ref(),
+            ],
+            &base,
+        );
+        let outside_dacl = windows_dacl(&outside, &base);
+        std::fs::hard_link(&outside, root.join(JOURNAL_FILE_NAME)).expect("link the journal name");
+
+        assert_eq!(
+            journal.read(),
+            Err(CredentialStoreFailure::PermissionHardeningFailed)
+        );
+        drop(journal);
+        super::held_directory::record_refused_owner_for_test(&root, Some(JOURNAL_FILE_NAME));
+        assert_eq!(
+            super::take_ownership_if_refused(&root, &[JOURNAL_FILE_NAME]),
+            Err(CredentialStoreFailure::PermissionHardeningFailed)
+        );
+        assert_eq!(windows_dacl(&outside, &base), outside_dacl);
+
+        std::fs::remove_dir_all(&base).expect("remove isolated hard-link directory");
+    }
+
+    /// While a process holds a root reached through a junction, the junction
+    /// can be pointed elsewhere, so another process opening the same paths
+    /// gets other directories. The first boundary's lock is then refused,
+    /// and the boundary opened over the new target locks as usual.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_root_whose_ancestor_was_repointed_refuses_the_lock() {
+        let base = scratch("windows-repointed-lock");
+        std::fs::create_dir_all(base.join("held")).expect("create the held parent");
+        std::fs::create_dir_all(base.join("decoy")).expect("create the decoy parent");
+        point_parent_junction(&base, "held");
+        let open = || {
+            FileAuthorityJournalBoundary::open_for_test(
+                base.join("parent").join("journal"),
+                base.join("parent").join("namespace"),
+            )
+        };
+        let first = open().expect("open the first boundary");
+        point_parent_junction(&base, "decoy");
+        let second = open().expect("open over the repointed junction");
+
+        assert!(matches!(
+            first.acquire_mutation_lock(),
+            Err(CredentialStoreFailure::Unavailable)
+        ));
+        drop(
+            second
+                .acquire_mutation_lock()
+                .expect("the repointed boundary locks"),
+        );
+
+        drop((first, second));
+        std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
+        std::fs::remove_dir_all(&base).expect("remove isolated repointed-lock directory");
     }
 }

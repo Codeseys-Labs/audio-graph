@@ -56,7 +56,12 @@ fall back to v1 or to a plaintext store. One explicit, noninteractive repair
 request takes ownership of refused authority state where the platform allows
 it and removes native records the authority journal does not track; it
 reopens only after it changed an owner or when such a record closed the
-runtime, and no ordinary operation runs any part of it.
+runtime, and no ordinary operation runs any part of it. It changes only
+objects whose ownership refusal this process recorded, while their paths
+still reach the same objects. Every reopen, whichever route starts it, keeps
+what the runtime adopted: a service bound to another authority, or over a
+journal older than the highest epoch the runtime observed, is refused as
+recovery-required, and only a restart adopts either.
 
 Atomic admission allows one live operation, not a backlog of mutations. An
 async deadline limits only the caller's wait: it neither cancels nor retries
