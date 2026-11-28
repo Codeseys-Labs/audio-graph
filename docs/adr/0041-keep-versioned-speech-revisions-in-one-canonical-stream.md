@@ -164,6 +164,33 @@ This record is accepted and constrains implementation through its Decision
 Outcome and Compliance sections. Acceptance is evidence only: it does not
 close or unblock a Seed, and queue changes remain conductor-owned.
 
+### First published release and interrupted writes
+
+Framed JSON payloads use shortest round-trip decimal spellings for finite
+floating-point values. Readers must recover the exact IEEE value, including
+signed zero, to verify the committed payload digest. This applies throughout
+nested payloads, including transcript start and end times and confidence.
+Readers preserve existing valid commitments and the original hash anchors
+of legacy JSONL prefixes.
+
+At the adoption of this amendment AudioGraph has never published a release.
+The first published release must include the precise framed reader and may
+also include the durable-receipt writer. Pre-amendment development builds are
+outside the downgrade boundary. The first published release establishes the
+minimum supported predecessor. For subsequent format changes item 9 requires
+the reader-first contract in the preceding release. Release qualification is
+tracked in #176.
+
+While a writer is alive it retains the exact attempted frame for retry.
+After restart, recovery verifies the preceding head. A complete matching frame
+crosses a fresh durability barrier and replays once. An interrupted attempt
+with only a torn suffix preserves those bytes as evidence outside replay.
+Recovery restores the verified prefix (including original absence), durably
+records a typed gap for load, timeline and export, and admits the next event
+at the sequence following that prefix. Exact provider redelivery after process
+death cannot be required because the provider connection and source audio may
+both be gone. Conflicting history remains a typed refusal.
+
 ## Consequences
 
 - **Positive:** One canonical sequence orders all legacy and v2 revisions, so
