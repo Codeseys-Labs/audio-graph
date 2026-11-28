@@ -493,7 +493,24 @@ function PipelineStatusBar() {
       className="flex items-center justify-center py-0 px-(--space-6) bg-bg-tertiary border-t border-(--edge) gap-(--space-1) text-[11px] h-(--space-9) shrink-0 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       aria-label={t("pipeline.label")}
       role="status"
+      aria-live="polite"
+      aria-atomic="false"
     >
+      {pipelineStatus.transcript_not_saving && (
+        <span className={STAGE_BASE}>
+          <Icon name="warning" size={14} />
+          {t(
+            `pipeline.transcriptNotSaving.${pipelineStatus.transcript_not_saving}`,
+          )}
+        </span>
+      )}
+      {!pipelineStatus.transcript_not_saving &&
+        pipelineStatus.transcript_crash_safety_unverified && (
+          <span className={STAGE_BASE}>
+            <Icon name="warning" size={14} />
+            {t("pipeline.transcriptCrashSafetyUnverified")}
+          </span>
+        )}
       {collapsed ? (
         <div className={STAGE_BASE}>
           <span

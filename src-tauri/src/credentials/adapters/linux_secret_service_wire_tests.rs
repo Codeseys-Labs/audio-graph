@@ -131,6 +131,8 @@ enum Scenario {
     UnlockedItemMissing,
     Disconnect,
     Silent,
+    SilentAtGet,
+    CloseFails,
     Denied,
     UnknownError,
 }
@@ -141,8 +143,14 @@ enum Call {
     Search,
     Attributes,
     Locked,
+    CollectionLocked,
     Session,
     Secret,
+    Close,
+    Create,
+    SetSecret,
+    Delete,
+    Dismiss,
 }
 
 struct Peer {
@@ -230,12 +238,17 @@ fn inspect_call(message: &Message) -> Call {
         (Some(SERVICE), Some("SearchItems")) => Call::Search,
         (Some(SERVICE), Some("OpenSession")) => Call::Session,
         (Some(ITEM), Some("GetSecret")) => Call::Secret,
+        (Some(SESSION_INTERFACE), Some("Close")) => Call::Close,
+        (Some("org.freedesktop.Secret.Collection"), Some("CreateItem")) => Call::Create,
+        (Some(ITEM), Some("SetSecret")) => Call::SetSecret,
+        (Some(ITEM), Some("Delete")) => Call::Delete,
+        (Some("org.freedesktop.Secret.Prompt"), Some("Dismiss")) => Call::Dismiss,
         (Some(PROPERTIES), Some("Get")) => {
             let (interface, property): (String, String) = message.body().deserialize().unwrap();
-            assert!(interface == ITEM);
-            match property.as_str() {
-                "Attributes" => Call::Attributes,
-                "Locked" => Call::Locked,
+            match (interface.as_str(), property.as_str()) {
+                (ITEM, "Attributes") => Call::Attributes,
+                (ITEM, "Locked") => Call::Locked,
+                ("org.freedesktop.Secret.Collection", "Locked") => Call::CollectionLocked,
                 _ => panic!("unexpected scripted property"),
             }
         }
@@ -351,6 +364,9 @@ async fn serve(
         Call::Secret => {
             let session: OwnedObjectPath = message.body().deserialize().unwrap();
             assert!(session == path(SESSION));
+            if scenario == Scenario::SilentAtGet {
+                return;
+            }
             if scenario == Scenario::RelockAtGet {
                 return reply_error(connection, message, "org.freedesktop.Secret.Error.IsLocked")
                     .await;
@@ -372,6 +388,14 @@ async fn serve(
                 )
                 .await
         }
+        Call::Close => {
+            assert_eq!(header.path().map(|path| path.as_str()), Some(SESSION));
+            if scenario == Scenario::CloseFails {
+                return reply_error(connection, message, "org.freedesktop.DBus.Error.Failed").await;
+            }
+            connection.reply(&header, &()).await
+        }
+        _ => panic!("unexpected mutation call in read test"),
     };
     replied.expect("reply on private test bus");
 }
@@ -403,6 +427,7 @@ fn scripted_reads_are_closed_flagged_and_redacted() {
         Session,
         Secret,
         Attributes,
+        Close,
     ];
     for (scenario, expected, calls) in [
         (Found, Ok(true), success_calls),
@@ -426,7 +451,7 @@ fn scripted_reads_are_closed_flagged_and_redacted() {
         (
             RelockAtGet,
             Err(Failure::Locked),
-            &[Search, Attributes, Call::Locked, Session, Secret],
+            &[Search, Attributes, Call::Locked, Session, Secret, Close],
         ),
         (
             PlainOnly,
@@ -436,18 +461,19 @@ fn scripted_reads_are_closed_flagged_and_redacted() {
         (
             PlainReply,
             Err(Failure::Unsupported),
-            &[Search, Attributes, Call::Locked, Session],
+            &[Search, Attributes, Call::Locked, Session, Close],
         ),
         (
             WrongSession,
             Err(Failure::CorruptRecord),
-            &[Search, Attributes, Call::Locked, Session, Secret],
+            &[Search, Attributes, Call::Locked, Session, Secret, Close],
         ),
         (
             AttributesChanged,
             Err(Failure::RevisionConflict),
             success_calls,
         ),
+        (CloseFails, Ok(true), success_calls),
         (Disconnect, Err(Failure::Unavailable), &[Search]),
         (Denied, Err(Failure::AccessDenied), &[Search]),
         (UnknownError, Err(Failure::Internal), &[Search]),
@@ -517,6 +543,7 @@ fn missing_unlocked_item_at_get_secret_is_absent() {
             Call::Locked,
             Call::Session,
             Call::Secret,
+            Call::Close,
         ],
     );
 }
@@ -600,6 +627,29 @@ fn unresponsive_peer_hits_deadline() {
 }
 
 #[test]
+fn read_timeout_closes_a_negotiated_session() {
+    let bus = Bus::start();
+    let peer = Peer::start(&bus, Scenario::SilentAtGet);
+    assert_eq!(
+        read_at(bus.address(), &wanted(), Duration::from_secs(2))
+            .unwrap_err()
+            .0,
+        Failure::Unavailable
+    );
+    assert_eq!(
+        peer.finish(),
+        [
+            Call::Search,
+            Call::Attributes,
+            Call::Locked,
+            Call::Session,
+            Call::Secret,
+            Call::Close
+        ]
+    );
+}
+
+#[test]
 fn unresponsive_bus_handshake_hits_deadline() {
     use std::os::unix::net::UnixListener;
 
@@ -646,7 +696,7 @@ fn plain_worker_thread_can_read_while_tokio_is_running() {
         worker.join().unwrap();
         assert!(read.unwrap().is_some());
     });
-    assert_eq!(peer.finish().last(), Some(&Call::Attributes));
+    assert_eq!(peer.finish().last(), Some(&Call::Close));
 }
 
 #[test]
@@ -669,5 +719,8 @@ fn current_thread_tokio_keeps_running_during_spawn_blocking_read() {
             .unwrap()
             .is_some()
     );
-    assert_eq!(peer.finish().last(), Some(&Call::Attributes));
+    assert_eq!(peer.finish().last(), Some(&Call::Close));
 }
+
+#[path = "linux_secret_service_mutations_tests.rs"]
+mod mutation_tests;

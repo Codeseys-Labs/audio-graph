@@ -8,7 +8,7 @@ mod crypto;
 #[cfg(target_os = "linux")]
 #[path = "."]
 mod linux {
-    use super::crypto::{ALGORITHM, Exchange};
+    use super::crypto::{ALGORITHM, CryptoError, Exchange, SessionKey};
     use crate::credentials::domain::CredentialStoreFailure as Failure;
     use serde::Serialize;
     use std::collections::BTreeMap;
@@ -31,8 +31,10 @@ mod linux {
     const SERVICE_NAME: &str = "org.freedesktop.secrets";
     const SERVICE_PATH: &str = "/org/freedesktop/secrets";
     const ITEM: &str = "org.freedesktop.Secret.Item";
+    const SESSION_INTERFACE: &str = "org.freedesktop.Secret.Session";
     const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
     const DEADLINE: Duration = Duration::from_secs(5);
+    const CLOSE_BUDGET: Duration = Duration::from_millis(125);
 
     pub(in super::super) type Attributes = BTreeMap<String, String>;
 
@@ -65,7 +67,7 @@ mod linux {
         }
     }
 
-    #[allow(dead_code)] // The next slice uses the alias to address a mutation.
+    #[allow(dead_code)] // This wire locator is opaque outside the client.
     pub(in super::super) struct DefaultCollection(OwnedObjectPath);
 
     type WireResult<T> = Result<T, WireError>;
@@ -97,8 +99,12 @@ mod linux {
         if attributes.is_empty() {
             return Err(Failure::Internal.into());
         }
-        drive(deadline, async {
-            Client::connect(address).await?.read_exact(attributes).await
+        drive(deadline, async |end| {
+            let read_by = end - CLOSE_BUDGET;
+            let mut client = until(read_by, Client::connect(address)).await?;
+            let result = until(read_by, client.read_exact(attributes)).await;
+            client.close_session(end).await;
+            result
         })
     }
 
@@ -106,29 +112,40 @@ mod linux {
         address: Address,
         deadline: Duration,
     ) -> WireResult<Option<DefaultCollection>> {
-        drive(deadline, async {
-            let client = Client::connect(address).await?;
-            let alias: OwnedObjectPath = client.service_call("ReadAlias", &("default",)).await?;
-            Ok((alias.as_str() != "/").then_some(DefaultCollection(alias)))
+        drive(deadline, async |end| {
+            until(end, async {
+                let client = Client::connect(address).await?;
+                Ok(client.default_collection().await?.map(DefaultCollection))
+            })
+            .await
         })
     }
 
-    /// One wall-clock deadline covers connect, handshake, and every request.
-    /// The timer drops the pending future and its connection on expiry.
-    fn drive<T>(timeout: Duration, work: impl Future<Output = WireResult<T>>) -> WireResult<T> {
-        let deadline = Instant::now() + timeout;
-        zbus::block_on(async {
-            let runtime = zruntime::SharedRuntime::current().map_err(|_| Failure::Unavailable)?;
-            runtime
-                .timeout_at(deadline, work)
-                .await
-                .map_err(|_| WireError(Failure::Unavailable))?
-        })
+    fn drive<T>(
+        timeout: Duration,
+        work: impl AsyncFnOnce(Instant) -> WireResult<T>,
+    ) -> WireResult<T> {
+        zbus::block_on(work(Instant::now() + timeout))
+    }
+
+    async fn until<T>(
+        deadline: Instant,
+        work: impl Future<Output = WireResult<T>>,
+    ) -> WireResult<T> {
+        if Instant::now() >= deadline {
+            return Err(Failure::Unavailable.into());
+        }
+        let runtime = zruntime::SharedRuntime::current().map_err(|_| Failure::Unavailable)?;
+        runtime
+            .timeout_at(deadline, work)
+            .await
+            .map_err(|_| WireError(Failure::Unavailable))?
     }
 
     struct Client {
         connection: Connection,
         owner: OwnedUniqueName,
+        session: Option<OwnedObjectPath>,
     }
 
     impl Client {
@@ -154,7 +171,11 @@ mod linux {
             )
             .await
             .map_err(unavailable_if_missing)?;
-            Ok(Self { connection, owner })
+            Ok(Self {
+                connection,
+                owner,
+                session: None,
+            })
         }
 
         async fn service_call<B, R>(&self, method: &str, body: &B) -> WireResult<R>
@@ -201,7 +222,16 @@ mod linux {
                 .map_err(|_| Failure::CorruptRecord.into())
         }
 
-        async fn read_exact(&self, attributes: &Attributes) -> WireResult<Option<SecretBytes>> {
+        async fn default_collection(&self) -> WireResult<Option<OwnedObjectPath>> {
+            let alias: OwnedObjectPath = self.service_call("ReadAlias", &("default",)).await?;
+            Ok((alias.as_str() != "/").then_some(alias))
+        }
+
+        async fn find_exact(
+            &self,
+            attributes: &Attributes,
+            allow_disappeared: bool,
+        ) -> WireResult<Option<OwnedObjectPath>> {
             let (unlocked, locked): SearchResults =
                 self.service_call("SearchItems", &(attributes,)).await?;
             let mut candidate = None;
@@ -213,7 +243,7 @@ mod linux {
                         Err(WireError(Failure::Missing)) if was_locked => {
                             return Err(Failure::Locked.into());
                         }
-                        Err(WireError(Failure::Missing)) => continue,
+                        Err(WireError(Failure::Missing)) if allow_disappeared => continue,
                         result => result?,
                     };
                     if &actual == attributes {
@@ -230,6 +260,13 @@ mod linux {
             if was_locked {
                 return Err(Failure::Locked.into());
             }
+            Ok(Some(item))
+        }
+
+        async fn read_exact(&mut self, attributes: &Attributes) -> WireResult<Option<SecretBytes>> {
+            let Some(item) = self.find_exact(attributes, true).await? else {
+                return Ok(None);
+            };
             match self.read_unlocked_candidate(&item, attributes).await {
                 Ok(secret) => Ok(Some(secret)),
                 Err(WireError(Failure::Missing)) => Ok(None),
@@ -238,36 +275,65 @@ mod linux {
         }
 
         async fn read_unlocked_candidate(
-            &self,
+            &mut self,
             item: &OwnedObjectPath,
             attributes: &Attributes,
         ) -> WireResult<SecretBytes> {
-            if bool::try_from(self.property(item, "Locked").await?)
-                .map_err(|_| Failure::CorruptRecord)?
-            {
+            self.require_unlocked(item, ITEM).await?;
+            let key = self.open_session().await?;
+            self.get_secret(item, attributes, &key).await
+        }
+
+        async fn require_unlocked(
+            &self,
+            path: &OwnedObjectPath,
+            interface: &str,
+        ) -> WireResult<()> {
+            let locked: OwnedVariant = self
+                .call(path.as_str(), PROPERTIES, "Get", &(interface, "Locked"))
+                .await?;
+            if bool::try_from(locked).map_err(|_| Failure::CorruptRecord)? {
                 return Err(Failure::Locked.into());
             }
+            Ok(())
+        }
 
-            let exchange = {
-                let mut entropy = Zeroizing::new([0; 32]);
-                getrandom::fill(entropy.as_mut()).map_err(|_| Failure::Unavailable)?;
-                Exchange::new(&entropy).map_err(|_| Failure::Internal)?
-            };
+        async fn open_session(&mut self) -> WireResult<SessionKey> {
+            let exchange = Exchange::generate().map_err(map_crypto_error)?;
             let public_key = Variant::from(exchange.public_key().to_vec());
             let (peer_key, session): (OwnedVariant, OwnedObjectPath) = self
                 .service_call("OpenSession", &(ALGORITHM, public_key))
                 .await?;
-            if session.as_str() == "/" || matches!(&*peer_key, Variant::Str(_)) {
+            if session.as_str() == "/" {
+                return Err(Failure::Unsupported.into());
+            }
+            self.session = Some(session);
+            if matches!(&*peer_key, Variant::Str(_)) {
                 return Err(Failure::Unsupported.into());
             }
             let peer_key = Vec::<u8>::try_from(peer_key).map_err(|_| Failure::CorruptRecord)?;
-            let key = exchange
+            exchange
                 .finish(&peer_key)
-                .map_err(|_| Failure::CorruptRecord)?;
+                .map_err(|_| Failure::CorruptRecord.into())
+        }
+
+        fn session_path(&self) -> WireResult<&OwnedObjectPath> {
+            self.session
+                .as_ref()
+                .ok_or_else(|| Failure::Internal.into())
+        }
+
+        async fn get_secret(
+            &self,
+            item: &OwnedObjectPath,
+            attributes: &Attributes,
+            key: &SessionKey,
+        ) -> WireResult<SecretBytes> {
+            let session = self.session_path()?;
             let (reply_session, iv, encrypted, _content_type): SecretReply = self
-                .call(item.as_str(), ITEM, "GetSecret", &(&session,))
+                .call(item.as_str(), ITEM, "GetSecret", &(session,))
                 .await?;
-            if reply_session != session {
+            if &reply_session != session {
                 return Err(Failure::CorruptRecord.into());
             }
             if self.attributes(item).await? != *attributes {
@@ -278,6 +344,26 @@ mod linux {
                 .map_err(|_| Failure::CorruptRecord)?;
             Ok(SecretBytes(secret))
         }
+
+        async fn close_session(&mut self, by: Instant) {
+            if let Some(session) = self.session.take() {
+                // Preserve the outcome if cleanup fails. Disconnect also retires
+                // the session when the transport is still usable by the peer.
+                let _: WireResult<()> = until(
+                    by,
+                    self.call(session.as_str(), SESSION_INTERFACE, "Close", &()),
+                )
+                .await;
+            }
+        }
+    }
+
+    fn map_crypto_error(error: CryptoError) -> WireError {
+        match error {
+            CryptoError::EntropyUnavailable => Failure::Unavailable,
+            _ => Failure::Internal,
+        }
+        .into()
     }
 
     async fn flagged_call<B, R>(
@@ -346,11 +432,17 @@ mod linux {
         .into()
     }
 
+    #[path = "linux_secret_service_mutations.rs"]
+    mod mutations;
     #[cfg(test)]
     #[path = "linux_secret_service_wire_tests.rs"]
     mod tests;
+    pub(in super::super) use mutations::{MutationOutcome, delete_exact, write_exact};
 }
 
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)] // The factory remains dormant.
+pub(super) use linux::{MutationOutcome, delete_exact, write_exact};
 #[cfg(target_os = "linux")]
 #[allow(unused_imports)] // The factory remains dormant.
 pub(super) use linux::{read_default_alias, read_exact};
