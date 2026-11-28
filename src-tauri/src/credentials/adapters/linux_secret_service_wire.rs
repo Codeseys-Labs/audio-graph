@@ -126,7 +126,18 @@ mod linux {
         timeout: Duration,
         work: impl AsyncFnOnce(Instant) -> WireResult<T>,
     ) -> WireResult<T> {
+        ensure_worker_context()?;
         zbus::block_on(work(Instant::now() + timeout))
+    }
+
+    pub(in super::super) fn ensure_worker_context() -> WireResult<()> {
+        if tokio::runtime::Handle::try_current().is_ok()
+            || zruntime::SharedRuntime::running().is_some()
+            || zruntime::LocalRuntime::running().is_some()
+        {
+            return Err(Failure::Unsupported.into());
+        }
+        Ok(())
     }
 
     pub(in super::super) async fn until<T>(
@@ -160,6 +171,10 @@ mod linux {
                 .build()
                 .await
                 .map_err(|_| Failure::Unavailable)?;
+            Self::bind(connection).await
+        }
+
+        async fn bind(connection: Connection) -> WireResult<Self> {
             // Pin the provider for the entire operation. A new owner cannot
             // answer a request intended for the old owner's item or session.
             let owner = flagged_call(
@@ -450,9 +465,9 @@ mod linux {
     #[path = "linux_secret_service_wire_tests.rs"]
     pub(in super::super) mod tests;
     pub(in super::super) use mutations::{MutationOutcome, delete_exact, write_exact};
+    pub(in super::super) use recovery_target::{LockedTarget, locked_target};
     #[cfg(test)]
-    pub(in super::super) use recovery_target::locked_target_at;
-    pub(in super::super) use recovery_target::{LockedTarget, RecoveryScope, locked_target};
+    pub(in super::super) use recovery_target::{attributes_for, locked_target_at};
 }
 
 #[cfg(all(target_os = "linux", test))]
@@ -462,7 +477,7 @@ pub(super) use linux::tests as scripted_peer;
 #[cfg(target_os = "linux")]
 #[allow(unused_imports)] // The factory remains dormant.
 pub(super) use linux::{
-    LockedTarget, RecoveryScope, WireError, locked_target, map_error as recovery_error,
+    LockedTarget, WireError, ensure_worker_context, locked_target, map_error as recovery_error,
     until as recovery_until,
 };
 #[cfg(target_os = "linux")]

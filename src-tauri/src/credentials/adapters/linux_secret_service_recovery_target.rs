@@ -1,10 +1,11 @@
 //! Noninteractive lock evidence and a fresh, read-only verifier.
 
 use super::*;
+use crate::credentials::adapters::keyring_entry::EntryLocator;
 use crate::credentials::adapters::native_interaction::{ForbidPrompt, ensure_forbid_prompt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in super::super::super) enum RecoveryScope {
+enum RecoveryScope {
     Item,
     DefaultCollection,
 }
@@ -20,32 +21,30 @@ pub(in super::super::super) struct LockedTarget {
     scope: RecoveryScope,
 }
 
-/// Dedicated worker only. An unlocked or absent match yields no unlock target.
+/// Dedicated worker only. Accept only locators minted by the application's
+/// credential adapter. Use the default collection only for an absent item.
 #[cfg_attr(test, allow(dead_code))]
 pub(in super::super::super) fn locked_target(
     prompt: &ForbidPrompt<'_>,
-    attributes: Attributes,
-    scope: RecoveryScope,
+    locator: &EntryLocator,
 ) -> WireResult<Option<LockedTarget>> {
-    locked_target_at(session_address()?, prompt, attributes, scope)
+    locked_target_at(session_address()?, prompt, locator)
 }
 
 pub(in super::super::super) fn locked_target_at(
     address: Address,
     prompt: &ForbidPrompt<'_>,
-    attributes: Attributes,
-    scope: RecoveryScope,
+    locator: &EntryLocator,
 ) -> WireResult<Option<LockedTarget>> {
     ensure_forbid_prompt(prompt)?;
-    if attributes.is_empty() {
-        return Err(Failure::Internal.into());
-    }
+    let attributes = attributes_for(locator);
     drive(DEADLINE, async |end| {
         until(end, async {
             let client = Client::connect(address.clone()).await?;
-            let Some((path, true)) = candidate(&client, &attributes, scope).await? else {
+            let (path, scope, locked) = candidate(&client, &attributes).await?;
+            if !locked {
                 return Ok(None);
-            };
+            }
             Ok(Some(LockedTarget {
                 address,
                 owner: client.owner,
@@ -59,19 +58,42 @@ pub(in super::super::super) fn locked_target_at(
     })
 }
 
+pub(in super::super::super) fn attributes_for(locator: &EntryLocator) -> Attributes {
+    Attributes::from([
+        ("xdg:schema".to_owned(), locator.service().to_owned()),
+        ("service".to_owned(), locator.service().to_owned()),
+        ("account".to_owned(), locator.account().to_owned()),
+    ])
+}
+
 impl LockedTarget {
     pub(in super::super::super) fn path(&self) -> &OwnedObjectPath {
         &self.path
     }
 
-    /// A distinct connection. Revalidate the exact target before the policy
-    /// layer can send an unlock, and never resolve a replacement target.
-    pub(in super::super::super) async fn connect_for_recovery(
+    pub(in super::super::super) fn address(&self) -> &Address {
+        &self.address
+    }
+
+    /// Inspect a connection opened by the capability-bearing recovery child.
+    /// This function cannot produce or hand out a raw connection.
+    pub(in super::super::super) async fn check_recovery_connection(
         &self,
-    ) -> WireResult<Option<(Connection, OwnedUniqueName)>> {
-        let client = self.connect().await?;
+        connection: &Connection,
+    ) -> WireResult<(OwnedUniqueName, u32, bool)> {
+        let client = Client::bind(connection.clone()).await?;
+        self.check_binding(&client)?;
         let locked = self.current_lock(&client).await?;
-        Ok(locked.then_some((client.connection, client.owner)))
+        let pid = flagged_call(
+            connection,
+            BUS,
+            BUS_PATH,
+            BUS,
+            "GetConnectionUnixProcessID",
+            &(client.owner.as_str(),),
+        )
+        .await?;
+        Ok((client.owner, pid, locked))
     }
 
     /// Verification is a distinct five-second transaction. It consumes
@@ -105,16 +127,23 @@ impl LockedTarget {
 
     async fn connect(&self) -> WireResult<Client> {
         let client = Client::connect(self.address.clone()).await?;
-        if client.owner != self.owner || client.connection.server_guid() != &self.bus {
-            return Err(Failure::Unavailable.into());
-        }
+        self.check_binding(&client)?;
         Ok(client)
     }
 
+    fn check_binding(&self, client: &Client) -> WireResult<()> {
+        if client.owner != self.owner || client.connection.server_guid() != &self.bus {
+            return Err(Failure::Unavailable.into());
+        }
+        Ok(())
+    }
+
     async fn current_lock(&self, client: &Client) -> WireResult<bool> {
-        match candidate(client, &self.attributes, self.scope).await? {
-            Some((path, locked)) if path == self.path => Ok(locked),
-            _ => Err(Failure::RevisionConflict.into()),
+        let (path, scope, locked) = candidate(client, &self.attributes).await?;
+        if path == self.path && scope == self.scope {
+            Ok(locked)
+        } else {
+            Err(Failure::RevisionConflict.into())
         }
     }
 }
@@ -122,26 +151,15 @@ impl LockedTarget {
 async fn candidate(
     client: &Client,
     attributes: &Attributes,
-    scope: RecoveryScope,
-) -> WireResult<Option<(OwnedObjectPath, bool)>> {
-    let (path, interface) = match scope {
-        RecoveryScope::Item => {
-            let Some((path, was_locked)) = client.exact_candidate(attributes, false).await? else {
-                return Ok(None);
-            };
-            if was_locked {
-                return Ok(Some((path, true)));
-            }
-            (path, ITEM)
-        }
-        RecoveryScope::DefaultCollection => {
-            let path = client
-                .default_collection()
-                .await?
-                .ok_or(Failure::Unavailable)?;
-            (path, COLLECTION)
-        }
-    };
-    let locked = client.locked(&path, interface).await?;
-    Ok(Some((path, locked)))
+) -> WireResult<(OwnedObjectPath, RecoveryScope, bool)> {
+    if let Some((path, was_locked)) = client.exact_candidate(attributes, false).await? {
+        let locked = was_locked || client.locked(&path, ITEM).await?;
+        return Ok((path, RecoveryScope::Item, locked));
+    }
+    let path = client
+        .default_collection()
+        .await?
+        .ok_or(Failure::Unavailable)?;
+    let locked = client.locked(&path, COLLECTION).await?;
+    Ok((path, RecoveryScope::DefaultCollection, locked))
 }

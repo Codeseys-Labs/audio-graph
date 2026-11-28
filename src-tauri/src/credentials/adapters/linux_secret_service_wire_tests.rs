@@ -25,7 +25,7 @@ pub(in crate::credentials::adapters) const ATTRIBUTE: &str = "attribute canary t
 pub(in crate::credentials::adapters) const LOCATOR: &str = "locator_canary";
 
 pub(in crate::credentials::adapters) fn wanted() -> Attributes {
-    Attributes::from([("slot".to_owned(), ATTRIBUTE.to_owned())])
+    attributes_for(&crate::credentials::adapters::keyring_entry::EntryLocator::authority())
 }
 
 pub(in crate::credentials::adapters) struct Bus {
@@ -35,10 +35,10 @@ pub(in crate::credentials::adapters) struct Bus {
 }
 
 impl Bus {
-    pub(in crate::credentials::adapters) fn start() -> Self {
+    fn configure() -> Self {
         let root = std::env::temp_dir().join(format!("ag-bus-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).expect("create private bus directory");
-        let mut bus = Self {
+        let bus = Self {
             root,
             daemon: None,
             address: String::new(),
@@ -72,10 +72,15 @@ impl Bus {
             ),
         )
         .unwrap();
+        bus
+    }
+
+    pub(in crate::credentials::adapters) fn start() -> Self {
+        let mut bus = Self::configure();
         bus.daemon = Some(
             Command::new("dbus-daemon")
                 .arg("--config-file")
-                .arg(config)
+                .arg(bus.root.join("session.conf"))
                 .args(["--nofork", "--print-address=1"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -725,27 +730,46 @@ fn plain_worker_thread_can_read_while_tokio_is_running() {
 }
 
 #[test]
-fn current_thread_tokio_keeps_running_during_spawn_blocking_read() {
+fn runtime_contexts_refuse_blocking_facades_without_sending_messages() {
     let bus = Bus::start();
     let peer = Peer::start(&bus, Scenario::Found);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .unwrap();
-    let address = bus.address();
-    let read = runtime.block_on(async {
+    let read = |context| {
+        read_at(bus.address(), &wanted(), DEADLINE)
+            .expect_err(context)
+            .0
+    };
+    runtime.block_on(async {
+        assert_eq!(read("Tokio task"), Failure::Unsupported);
+        let address = bus.address();
         let worker = tokio::task::spawn_blocking(move || read_at(address, &wanted(), DEADLINE));
-        tokio::time::timeout(GUARD, worker).await
+        let read = tokio::time::timeout(GUARD, worker).await.unwrap().unwrap();
+        assert_eq!(read.unwrap_err().0, Failure::Unsupported);
     });
     runtime.shutdown_timeout(GUARD);
-    assert!(
-        read.expect("runtime deadline")
-            .expect("blocking worker")
+    let address = bus.address();
+    let code = zbus::block_on(async {
+        zruntime::spawn(async move { read_at(address, &wanted(), DEADLINE).unwrap_err().0 })
+            .await
             .unwrap()
-            .is_some()
-    );
-    assert_eq!(peer.finish().last(), Some(&Call::Close));
+    });
+    assert_eq!(code, Failure::Unsupported);
+    let local = zruntime::LocalRuntime::new().unwrap();
+    let address = bus.address();
+    let task = local.spawn("test runtime guard", async move {
+        read_at(address, &wanted(), DEADLINE)
+            .expect_err("zruntime local task")
+            .0
+    });
+    assert_eq!(local.block_on(task).unwrap(), Failure::Unsupported);
+    assert!(peer.finish().is_empty());
 }
 
 #[path = "linux_secret_service_mutations_tests.rs"]
 mod mutation_tests;
+
+#[path = "linux_secret_service_qualification_tests.rs"]
+mod qualification_tests;
