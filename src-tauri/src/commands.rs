@@ -21275,7 +21275,8 @@ mod tests {
             .unwrap()
             .insert_synthetic_handle("system", false);
         publish_manager_capture(&state);
-        let synthetic_capture = json!({ "captureId": { "epoch": 0, "seq": 0 } });
+        let synthetic_capture =
+            json!({ "captureId": { "epoch": 0, "seq": 0 }, "expectedGeneration": 1 });
         let mut settings = AppSettings {
             asr_provider: crate::settings::AsrProvider::LocalWhisper,
             llm_provider: LlmProvider::Api {

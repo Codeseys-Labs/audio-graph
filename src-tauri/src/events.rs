@@ -1376,6 +1376,7 @@ mod tests {
                 "capture_state": {"id": {"epoch": 3, "seq": 0}, "phase": "running"},
                 "retired_through": {"epoch": 3, "seq": 0},
                 "transcription": {"capture": {"epoch": 3, "seq": 0}, "generation": transcription.generation},
+                "transcription_generation": transcription.generation,
                 "realtime": {"gemini": true, "converse": false, "openai_realtime": false},
                 "session": {"id": "session-1", "epoch": 0},
                 "backpressure": [{"capture": {"epoch": 3, "seq": 0}, "source_index": 1}],

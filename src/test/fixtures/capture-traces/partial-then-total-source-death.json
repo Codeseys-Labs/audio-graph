@@ -22,7 +22,7 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
+        "id": "a19e14f3-d6a4-41fe-b23b-2b2871c1391d",
         "epoch": 0
       },
       "backpressure": [],
@@ -66,53 +66,7 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
-        "epoch": 0
-      },
-      "backpressure": [],
-      "capture": {
-        "type": "Running",
-        "processed_count": 0
-      },
-      "pipeline": {
-        "type": "Running",
-        "processed_count": 0
-      },
-      "asr": {
-        "type": "Idle"
-      },
-      "diarization": {
-        "type": "Idle"
-      },
-      "entity_extraction": {
-        "type": "Idle"
-      },
-      "graph": {
-        "type": "Idle"
-      }
-    },
-    {
-      "revision": 4,
-      "capture_state": {
-        "id": {
-          "epoch": 1,
-          "seq": 1
-        },
-        "phase": "running"
-      },
-      "retired_through": {
-        "epoch": 1,
-        "seq": 0
-      },
-      "transcription": null,
-      "transcription_generation": 0,
-      "realtime": {
-        "gemini": false,
-        "converse": false,
-        "openai_realtime": false
-      },
-      "session": {
-        "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
+        "id": "a19e14f3-d6a4-41fe-b23b-2b2871c1391d",
         "epoch": 0
       },
       "backpressure": [],
@@ -158,7 +112,53 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
+        "id": "a19e14f3-d6a4-41fe-b23b-2b2871c1391d",
+        "epoch": 0
+      },
+      "backpressure": [],
+      "capture": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "pipeline": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "asr": {
+        "type": "Idle"
+      },
+      "diarization": {
+        "type": "Idle"
+      },
+      "entity_extraction": {
+        "type": "Idle"
+      },
+      "graph": {
+        "type": "Idle"
+      }
+    },
+    {
+      "revision": 4,
+      "capture_state": {
+        "id": {
+          "epoch": 1,
+          "seq": 1
+        },
+        "phase": "running"
+      },
+      "retired_through": {
+        "epoch": 1,
+        "seq": 0
+      },
+      "transcription": null,
+      "transcription_generation": 0,
+      "realtime": {
+        "gemini": false,
+        "converse": false,
+        "openai_realtime": false
+      },
+      "session": {
+        "id": "a19e14f3-d6a4-41fe-b23b-2b2871c1391d",
         "epoch": 0
       },
       "backpressure": [],
@@ -204,7 +204,7 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
+        "id": "a19e14f3-d6a4-41fe-b23b-2b2871c1391d",
         "epoch": 0
       },
       "backpressure": [],
@@ -249,7 +249,7 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
+        "id": "a19e14f3-d6a4-41fe-b23b-2b2871c1391d",
         "epoch": 0
       },
       "backpressure": [],
@@ -294,7 +294,7 @@
       "openai_realtime": false
     },
     "session": {
-      "id": "6fc7ec86-6b3b-4659-a8c9-086aac34d3de",
+      "id": "a19e14f3-d6a4-41fe-b23b-2b2871c1391d",
       "epoch": 0
     },
     "backpressure": [],

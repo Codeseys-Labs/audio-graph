@@ -28,7 +28,7 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "3f55c950-ebd5-4f89-a295-778bb18a52ad",
+        "id": "847c5ec7-4124-4b3c-a0ca-e5579aace05c",
         "epoch": 0
       },
       "backpressure": [],
@@ -77,7 +77,7 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "3f55c950-ebd5-4f89-a295-778bb18a52ad",
+        "id": "847c5ec7-4124-4b3c-a0ca-e5579aace05c",
         "epoch": 0
       },
       "backpressure": [],
@@ -122,7 +122,7 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "3f55c950-ebd5-4f89-a295-778bb18a52ad",
+        "id": "847c5ec7-4124-4b3c-a0ca-e5579aace05c",
         "epoch": 0
       },
       "backpressure": [],
@@ -167,7 +167,7 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "3f55c950-ebd5-4f89-a295-778bb18a52ad",
+        "id": "847c5ec7-4124-4b3c-a0ca-e5579aace05c",
         "epoch": 0
       },
       "backpressure": [],
@@ -218,62 +218,7 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "3f55c950-ebd5-4f89-a295-778bb18a52ad",
-        "epoch": 0
-      },
-      "backpressure": [],
-      "capture": {
-        "type": "Running",
-        "processed_count": 0
-      },
-      "pipeline": {
-        "type": "Idle"
-      },
-      "asr": {
-        "type": "Running",
-        "processed_count": 0
-      },
-      "diarization": {
-        "type": "Running",
-        "processed_count": 0
-      },
-      "entity_extraction": {
-        "type": "Running",
-        "processed_count": 0
-      },
-      "graph": {
-        "type": "Running",
-        "processed_count": 0
-      }
-    },
-    {
-      "revision": 6,
-      "capture_state": {
-        "id": {
-          "epoch": 1,
-          "seq": 1
-        },
-        "phase": "running"
-      },
-      "retired_through": {
-        "epoch": 1,
-        "seq": 0
-      },
-      "transcription": {
-        "capture": {
-          "epoch": 1,
-          "seq": 1
-        },
-        "generation": 2
-      },
-      "transcription_generation": 2,
-      "realtime": {
-        "gemini": false,
-        "converse": false,
-        "openai_realtime": false
-      },
-      "session": {
-        "id": "3f55c950-ebd5-4f89-a295-778bb18a52ad",
+        "id": "847c5ec7-4124-4b3c-a0ca-e5579aace05c",
         "epoch": 0
       },
       "backpressure": [],
@@ -328,7 +273,62 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "3f55c950-ebd5-4f89-a295-778bb18a52ad",
+        "id": "847c5ec7-4124-4b3c-a0ca-e5579aace05c",
+        "epoch": 0
+      },
+      "backpressure": [],
+      "capture": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "pipeline": {
+        "type": "Idle"
+      },
+      "asr": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "diarization": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "entity_extraction": {
+        "type": "Running",
+        "processed_count": 0
+      },
+      "graph": {
+        "type": "Running",
+        "processed_count": 0
+      }
+    },
+    {
+      "revision": 6,
+      "capture_state": {
+        "id": {
+          "epoch": 1,
+          "seq": 1
+        },
+        "phase": "running"
+      },
+      "retired_through": {
+        "epoch": 1,
+        "seq": 0
+      },
+      "transcription": {
+        "capture": {
+          "epoch": 1,
+          "seq": 1
+        },
+        "generation": 2
+      },
+      "transcription_generation": 2,
+      "realtime": {
+        "gemini": false,
+        "converse": false,
+        "openai_realtime": false
+      },
+      "session": {
+        "id": "847c5ec7-4124-4b3c-a0ca-e5579aace05c",
         "epoch": 0
       },
       "backpressure": [],
@@ -377,7 +377,7 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "3f55c950-ebd5-4f89-a295-778bb18a52ad",
+        "id": "847c5ec7-4124-4b3c-a0ca-e5579aace05c",
         "epoch": 0
       },
       "backpressure": [],
@@ -426,7 +426,7 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "3f55c950-ebd5-4f89-a295-778bb18a52ad",
+        "id": "847c5ec7-4124-4b3c-a0ca-e5579aace05c",
         "epoch": 0
       },
       "backpressure": [],
@@ -471,7 +471,7 @@
         "openai_realtime": false
       },
       "session": {
-        "id": "3f55c950-ebd5-4f89-a295-778bb18a52ad",
+        "id": "847c5ec7-4124-4b3c-a0ca-e5579aace05c",
         "epoch": 0
       },
       "backpressure": [],
@@ -517,7 +517,7 @@
       "openai_realtime": false
     },
     "session": {
-      "id": "3f55c950-ebd5-4f89-a295-778bb18a52ad",
+      "id": "847c5ec7-4124-4b3c-a0ca-e5579aace05c",
       "epoch": 0
     },
     "backpressure": [],
