@@ -650,6 +650,49 @@ mod tests {
         std::fs::remove_dir_all(&base).expect("remove isolated replace test directory");
     }
 
+    /// A staged file whose discard failed is cleaned up by the next staging
+    /// in the same root.
+    #[test]
+    fn the_next_replace_removes_a_stray_staged_file() {
+        let base = scratch("stray-sweep");
+        let root = base.join("journal");
+        let journal = boundary(&base, "journal", "namespace");
+        journal.replace(b"first-journal").expect("first replace");
+        let stray = root.join(format!(
+            ".{JOURNAL_FILE_NAME}.{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&stray, b"stray-journal").expect("plant stray staged file");
+
+        journal.replace(b"second-journal").expect("second replace");
+
+        assert!(!stray.exists(), "stray staged file survived");
+        assert_eq!(journal.read(), Ok(Some(b"second-journal".to_vec())));
+        std::fs::remove_dir_all(&base).expect("remove isolated stray-sweep directory");
+    }
+
+    /// A stray that cannot be removed is reported as a closed failure
+    /// rather than left behind in silence, and nothing is published.
+    #[test]
+    fn a_stray_that_cannot_be_removed_fails_the_replace_closed() {
+        let base = scratch("stray-refused");
+        let root = base.join("journal");
+        let journal = boundary(&base, "journal", "namespace");
+        journal.replace(b"first-journal").expect("first replace");
+        std::fs::create_dir(root.join(format!(
+            ".{JOURNAL_FILE_NAME}.{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        )))
+        .expect("plant unremovable stray");
+
+        assert_eq!(
+            journal.replace(b"second-journal"),
+            Err(CredentialStoreFailure::Unavailable)
+        );
+        assert_eq!(journal.read(), Ok(Some(b"first-journal".to_vec())));
+        std::fs::remove_dir_all(&base).expect("remove isolated stray-refused directory");
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_wrong_type_and_symlink_hardening_returns_typed_permission_failure() {
@@ -1192,23 +1235,22 @@ mod tests {
             base.join("namespace"),
             Arc::new(SwapBeforeStaging { base: base.clone() }),
         );
-        assert_eq!(
-            journal.replace(b"journal"),
-            Err(CredentialStoreFailure::PermissionHardeningFailed)
-        );
+        // Every child of the held root is opened relative to its handle, so
+        // the swapped ancestor never comes into play: the journal lands in
+        // the held root and nothing at all reaches the decoy.
+        assert_eq!(journal.replace(b"journal"), Ok(()));
 
         assert_protected_owner_only(&windows_dacl(&held, &base));
         assert_eq!(windows_dacl(&decoy, &base), decoy_dacl);
-        assert!(!held.join(JOURNAL_FILE_NAME).exists());
-        assert!(!decoy.join(JOURNAL_FILE_NAME).exists());
-        for entry in std::fs::read_dir(&decoy).expect("list decoy root") {
-            let entry = entry.expect("decoy entry");
-            assert_eq!(
-                entry.metadata().expect("decoy entry metadata").len(),
-                0,
-                "journal bytes reached the decoy"
-            );
-        }
+        assert_eq!(
+            std::fs::read(held.join(JOURNAL_FILE_NAME)).expect("read held journal"),
+            b"journal"
+        );
+        assert_eq!(
+            std::fs::read_dir(&decoy).expect("list decoy root").count(),
+            0,
+            "an entry reached the decoy"
+        );
 
         std::fs::remove_dir(base.join("parent")).expect("remove parent junction");
         std::fs::remove_dir_all(&base).expect("remove isolated Windows swap test directory");
@@ -1259,7 +1301,7 @@ mod tests {
     }
 
     /// Points the ancestor at the decoy after the staged bytes are flushed and
-    /// before they are published, then points it back for the readback.
+    /// before they are published, and leaves it there through the readback.
     #[cfg(windows)]
     struct SwapBetweenFlushAndRename {
         base: PathBuf,
@@ -1281,9 +1323,7 @@ mod tests {
             let Self { mut staged, base } = *self;
             staged.sync()?;
             point_parent_junction(&base, "decoy");
-            let published = staged.publish();
-            point_parent_junction(&base, "held");
-            published
+            staged.publish()
         }
     }
 
