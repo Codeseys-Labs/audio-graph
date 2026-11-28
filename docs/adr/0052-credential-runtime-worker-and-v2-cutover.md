@@ -93,6 +93,28 @@ neither: it is a retryable `operation_in_progress` for that request alone.
 It closes nothing, and an open it refuses leaves the runtime in the state it
 had before the attempt.
 
+A settings activation writes the journal and the credential records under
+one lock and the settings under the settings store's own, and the commit
+writes its settings without holding the journal's. Every write to any of
+them is conditional on the state its decision was based on, and a path
+that supersedes another writer first invalidates that writer's
+precondition.
+Each journal step of an activation is a compare-and-set from the stage it
+leaves, the recovery mark included: a step or mark that finds the
+activation moved on changes nothing, and a recovery that meets it decides
+again on a fresh read. Record writes happen in a journal session that
+checked the activation's stage and records. The one write made outside any
+journal session, the commit's settings write, is conditional on the
+settings revision, on no marker pending, and on its operation not being
+fenced. Restoring an activation's settings backup fences its operation in
+the settings store, atomically with the restore, and every path that
+releases a reservation without completing the activation (an abort, a
+recovery that settles it as no change) restores first. A commit that had
+not written its settings when another service settled its activation
+therefore never writes them afterwards. The fence is permanent, one entry
+per activation rolled back, since nothing tells the settings store that no
+holder of that prepared activation remains.
+
 The store's file state is built against one adversary: another local
 principal who can create, rename or replace entries in the store's
 directories or in one of their ancestors while the app runs, trying to make

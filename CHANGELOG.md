@@ -97,7 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that signal both once the journal shows it. An activation commit refuses
   a set whose record changed, or a staging record that is not its own,
   before any setting changes, and a retry of an activation that already
-  took a step is left for recovery instead of aborting it.
+  took a step is left for recovery instead of aborting it. With two
+  services over one store, a recovery or abort that settles an activation
+  without completing it fences the activation's settings write first, so a
+  commit still running cannot write its settings afterwards, and a stale
+  recovery mark never overwrites a stage another service reached.
 
 ### Fixed
 
