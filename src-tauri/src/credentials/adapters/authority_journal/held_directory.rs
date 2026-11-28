@@ -369,6 +369,14 @@ mod windows_held {
         .map_err(|_| std::io::Error::from(ErrorKind::Other))
     }
 
+    /// The `FILE_RENAME_INFORMATION` length for a target name of `name_bytes`
+    /// bytes. The WDK documents the minimum as
+    /// `sizeof(FILE_RENAME_INFORMATION) + FileNameLength`; the structure's own
+    /// one-unit `FileName` array and trailing padding are not credited.
+    fn rename_information_length(name_bytes: usize) -> Option<usize> {
+        size_of::<FILE_RENAME_INFORMATION>().checked_add(name_bytes)
+    }
+
     /// Renames the open `file` to `name` inside the directory `root` is a
     /// handle to, replacing an existing entry. Both objects are named by
     /// handle: the kernel resolves `name` relative to `root` and nothing
@@ -380,13 +388,13 @@ mod windows_held {
         let invalid = || std::io::Error::from(ErrorKind::InvalidInput);
         let units: Vec<u16> = name.encode_utf16().collect();
         let name_bytes = units.len().checked_mul(2).ok_or_else(invalid)?;
-        let length = (std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName) + name_bytes)
-            .max(size_of::<FILE_RENAME_INFORMATION>());
+        let length = rename_information_length(name_bytes).ok_or_else(invalid)?;
         // `u64` storage gives the 8-byte alignment the structure needs.
-        let mut buffer = vec![0_u64; length.div_ceil(8)];
+        let mut buffer = vec![0_u64; length.div_ceil(size_of::<u64>())];
         let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-        // SAFETY: `buffer` is aligned for and at least as large as the header
-        // plus `units`, and is written only within those bounds.
+        // SAFETY: `buffer` is aligned for the structure and holds at least
+        // `length` bytes, which covers the header plus `units` copied at the
+        // `FileName` offset; nothing is written past that.
         unsafe {
             (*info).Anonymous.ReplaceIfExists = true;
             (*info).RootDirectory = HANDLE(root.as_raw_handle());
@@ -406,7 +414,7 @@ mod windows_held {
                 HANDLE(file.as_raw_handle()),
                 &mut status_block,
                 info.cast_const().cast(),
-                u32::try_from(buffer.len() * size_of::<u64>()).map_err(|_| invalid())?,
+                u32::try_from(length).map_err(|_| invalid())?,
                 FileRenameInformation,
             )
         };
@@ -628,6 +636,27 @@ mod windows_held {
             {
                 let _ = dispose(&file);
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{FILE_RENAME_INFORMATION, rename_information_length};
+
+        /// The length passed to the kernel is the documented minimum,
+        /// `sizeof(FILE_RENAME_INFORMATION) + FileNameLength`, not the
+        /// `FileName` offset plus the name, which is short by the structure's
+        /// one-unit array and padding.
+        #[test]
+        fn rename_information_length_is_the_documented_minimum() {
+            let name_bytes = "authority-journal.json".encode_utf16().count() * 2;
+            let length = rename_information_length(name_bytes).expect("in range");
+
+            assert_eq!(length, size_of::<FILE_RENAME_INFORMATION>() + name_bytes);
+            assert!(length > std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName) + name_bytes);
+            #[cfg(target_pointer_width = "64")]
+            assert_eq!(size_of::<FILE_RENAME_INFORMATION>(), 24);
+            assert_eq!(rename_information_length(usize::MAX), None);
         }
     }
 }
