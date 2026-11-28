@@ -144,6 +144,30 @@ describe("PipelineStatusBar", () => {
   });
 
   it.each([
+    ["en", "Some captions in this session could not be saved."],
+    ["pt", "Não foi possível salvar algumas legendas desta sessão."],
+  ])("keeps the %s caption loss visible after saving resumes until rotation", async (locale, sentence) => {
+    const previous = i18n.language;
+    await i18n.changeLanguage(locale);
+    const view = render(<PipelineStatusBar />);
+    try {
+      publish({
+        ...allIdle(),
+        transcript_not_saving: "storage_full",
+        transcript_captions_lost: true,
+      });
+      const notice = within(screen.getByRole("status")).getByText(sentence);
+      publish({ ...allIdle(), transcript_captions_lost: true });
+      expect(screen.getByText(sentence)).toBe(notice);
+      publish(allIdle());
+      expect(notice).not.toBeInTheDocument();
+    } finally {
+      view.unmount();
+      await i18n.changeLanguage(previous);
+    }
+  });
+
+  it.each([
     ["en", "Transcript saved. Crash recovery is unverified on this storage."],
     [
       "pt",

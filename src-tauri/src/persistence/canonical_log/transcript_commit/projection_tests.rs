@@ -156,16 +156,18 @@ fn startup_recovers_the_transcript_before_a_projection_attempt_and_replays_each_
         let interrupted = fs::read(&f.projection.path).unwrap();
         super::tests::kill_at_writer_checkpoint(&f.transcript.path, "complete", || {});
         // An unresolved transcript attempt postpones decisions on its dependent log.
-        recover_projection_directory(&f.root).unwrap();
+        recover_projection_directory(&f.root, "fresh-session").unwrap();
         assert!(descriptor.exists());
         assert_eq!(fs::read(&f.projection.path).unwrap(), interrupted);
         let mut transcript_receipts = Vec::new();
         for _ in 0..2 {
-            recover_in_directory(&f.root.join("transcripts"), |_, _, receipt| {
-                transcript_receipts.push(receipt.sequence)
-            })
+            recover_in_directory(
+                &f.root.join("transcripts"),
+                "fresh-session",
+                |_, _, receipt| transcript_receipts.push(receipt.sequence),
+            )
             .unwrap();
-            recover_projection_directory(&f.root).unwrap();
+            recover_projection_directory(&f.root, "fresh-session").unwrap();
         }
         assert_eq!(transcript_receipts, [2]);
         assert!(!descriptor.exists());

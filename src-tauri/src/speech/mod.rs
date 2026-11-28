@@ -2913,9 +2913,16 @@ type LiveTranscriptResult = Result<
 /// on the writer's recovery path. Keep the capture's publication context until
 /// one of them claims the outcome. In particular, the recovery worker must not
 /// infer provider turn markers or re-read current LLM settings for this event.
-type PublishRevision = Box<dyn Fn(LiveTranscriptResult, bool) -> bool + Send + Sync>;
+type PublishRevision = Box<dyn Fn(LiveTranscriptResult, bool, u64) -> bool + Send + Sync>;
+
+// Local ticket order distinguishes a late receipt from the outcome of a newer revision.
+fn next_publication_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 struct PendingPublication {
+    id: u64,
     session: String,
     event: crate::projections::TranscriptEvent,
     action: Mutex<Option<PublishRevision>>,
@@ -2930,9 +2937,10 @@ impl PendingPublication {
     fn register(
         session: String,
         payload: &events::AsrSpanRevisionPayload,
-        publish: impl Fn(LiveTranscriptResult, bool) -> bool + Send + Sync + 'static,
+        publish: impl Fn(LiveTranscriptResult, bool, u64) -> bool + Send + Sync + 'static,
     ) -> Arc<Self> {
         let publication = Arc::new(Self {
+            id: next_publication_id(),
             session,
             event: payload.clone().into(),
             action: Mutex::new(Some(Box::new(publish))),
@@ -2980,19 +2988,13 @@ impl PendingPublication {
     }
 
     fn observe(&self, receipt: LiveTranscriptResult, recovered: bool) -> bool {
-        use crate::persistence::canonical_log::TranscriptCommitError;
-        let uncertain = matches!(
-            &receipt,
-            Err(TranscriptCommitError::AckTimeout
-                | TranscriptCommitError::ReplyLost
-                | TranscriptCommitError::ConfirmationPending)
-        );
+        let uncertain = receipt.as_ref().is_err_and(save_confirmation_pending);
         let mut slot = self.action.lock().unwrap_or_else(|p| p.into_inner());
         if uncertain {
             // Serialize the pending status with resolution of this exact ticket.
             return slot
                 .as_ref()
-                .is_some_and(|publish| publish(receipt, recovered));
+                .is_some_and(|publish| publish(receipt, recovered, self.id));
         }
         let action = slot.take();
         drop(slot);
@@ -3000,7 +3002,7 @@ impl PendingPublication {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|p| !std::ptr::eq(p.as_ref(), self));
-        action.is_some_and(|publish| publish(receipt, recovered))
+        action.is_some_and(|publish| publish(receipt, recovered, self.id))
     }
 }
 
@@ -3055,7 +3057,7 @@ impl TranscriptProcessingContext {
     ) -> Arc<PendingPublication> {
         let ctx = self.clone();
         let revision = payload.clone();
-        PendingPublication::register(session.clone(), payload, move |receipt, recovered| {
+        PendingPublication::register(session.clone(), payload, move |receipt, recovered, id| {
             // Rotation swaps the display writer, scheduler and buffers together.
             // Finish this generation's publication before it can reset any of them.
             let _publication = ctx
@@ -3070,6 +3072,7 @@ impl TranscriptProcessingContext {
                 Some(&ctx.projection_dispatch_context()),
                 &revision,
                 &session,
+                id,
                 receipt,
             ) {
                 publish(&ctx, revision.clone(), recovered);
@@ -3094,6 +3097,19 @@ impl TranscriptProcessingContext {
     }
 }
 
+fn save_confirmation_pending(
+    error: &crate::persistence::canonical_log::TranscriptCommitError,
+) -> bool {
+    use crate::persistence::canonical_log::TranscriptCommitError as Error;
+    matches!(
+        error,
+        Error::AckTimeout
+            | Error::ReplyLost
+            | Error::ConfirmationPending
+            | Error::StorageFullConfirmationPending
+    )
+}
+
 fn transcript_saving_failure(
     error: &crate::persistence::canonical_log::TranscriptCommitError,
 ) -> Option<events::TranscriptSavingFailure> {
@@ -3109,6 +3125,9 @@ fn transcript_saving_failure(
             Some(Saving::ConfirmationDelayed)
         }
         Error::WriterAbsent => Some(Saving::WriterAbsent),
+        Error::FrameWriteStorageFull | Error::StorageFullConfirmationPending => {
+            Some(Saving::StorageFull)
+        }
         _ if error.is_storage_full() => Some(Saving::StorageFull),
         Error::QueueFull
         | Error::UncommittedAttempt
@@ -3126,29 +3145,61 @@ fn transcript_saving_failure(
 /// Returns true when the visible storage status changed.
 fn update_transcript_saving_status(
     status: &mut PipelineStatus,
+    id: u64,
     result: &LiveTranscriptResult,
 ) -> bool {
     use crate::persistence::canonical_durability::CanonicalDurabilityBarrier;
+    use events::TranscriptSavingFailure::{ConfirmationDelayed, StorageFull};
 
     let was = (
         status.transcript_not_saving,
+        status.transcript_captions_lost,
         status.transcript_crash_safety_unverified,
     );
     match result {
         Ok((_, receipt)) => {
-            status.transcript_not_saving = None;
+            status.pending_transcript_saves.remove(&id);
+            if id >= status.latest_transcript_save.0 {
+                status.latest_transcript_save = (id, None);
+            }
             status.transcript_crash_safety_unverified =
                 receipt.barrier == CanonicalDurabilityBarrier::SyncedUnqualified;
         }
         Err(error) => {
-            let Some(failure) = transcript_saving_failure(error) else {
+            if let Some(reason) = transcript_saving_failure(error) {
+                if save_confirmation_pending(error) {
+                    // A waiter can report its timeout after the resolver has
+                    // already identified ENOSPC for this same ticket.
+                    let pending = status.pending_transcript_saves.entry(id).or_insert(reason);
+                    if reason == StorageFull {
+                        *pending = StorageFull;
+                    }
+                } else {
+                    status.pending_transcript_saves.remove(&id);
+                    status.transcript_captions_lost = true;
+                    if id >= status.latest_transcript_save.0 {
+                        status.latest_transcript_save = (id, Some(reason));
+                    }
+                }
+            } else if status.pending_transcript_saves.remove(&id).is_none() {
                 return false;
-            };
-            status.transcript_not_saving = Some(failure);
+            }
         }
     }
+    status.transcript_not_saving = if status
+        .pending_transcript_saves
+        .values()
+        .any(|v| *v == StorageFull)
+    {
+        Some(StorageFull)
+    } else {
+        status.latest_transcript_save.1.or_else(|| {
+            (!status.pending_transcript_saves.is_empty()).then_some(ConfirmationDelayed)
+        })
+    };
     was != (
         status.transcript_not_saving,
+        status.transcript_captions_lost,
         status.transcript_crash_safety_unverified,
     )
 }
@@ -3156,10 +3207,7 @@ fn update_transcript_saving_status(
 fn report_transcript_commit(result: LiveTranscriptResult) -> bool {
     match result {
         Ok((publish, _)) => publish,
-        Err(error)
-            if transcript_saving_failure(&error)
-                == Some(events::TranscriptSavingFailure::ConfirmationDelayed) =>
-        {
+        Err(error) if save_confirmation_pending(&error) => {
             log::warn!("transcript save confirmation pending");
             false
         }
@@ -3215,10 +3263,12 @@ fn record_asr_span_revision_event_and_observe_projection(
         projection_dispatch,
         payload,
         &expected_session,
+        next_publication_id(),
         receipt,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn observe_transcript_receipt(
     status: Option<(&AppHandle, &RwLock<PipelineStatus>)>,
     transcript_ledger: &Arc<Mutex<crate::projections::TranscriptLedger>>,
@@ -3226,6 +3276,7 @@ fn observe_transcript_receipt(
     projection_dispatch: Option<&ProjectionDispatchContext>,
     payload: &events::AsrSpanRevisionPayload,
     expected_session: &str,
+    publication_id: u64,
     receipt: LiveTranscriptResult,
 ) -> bool {
     let changed = {
@@ -3235,7 +3286,8 @@ fn observe_transcript_receipt(
         }
         status.and_then(|(app, status)| {
             let mut status = status.write().unwrap_or_else(|p| p.into_inner());
-            update_transcript_saving_status(&mut status, &receipt).then(|| (app, status.clone()))
+            update_transcript_saving_status(&mut status, publication_id, &receipt)
+                .then(|| (app, status.clone()))
         })
     };
     if let Some((app, status)) = changed {
@@ -6889,8 +6941,9 @@ pub(crate) fn run_speech_processor_diarization_only(
                 let projection_dispatch = projection_dispatch.clone();
                 let speaker_info = diarized.speaker_info;
                 let session = active_session_id_snapshot(&shared.active_session_id);
+                let owner = session.clone();
                 let revision = asr_payload.clone();
-                PendingPublication::register(session.clone(), &asr_payload, move |receipt, _| {
+                PendingPublication::register(owner, &asr_payload, move |receipt, _, id| {
                     let _publication = shared
                         .projection_runtime
                         .transcript_publication
@@ -6903,6 +6956,7 @@ pub(crate) fn run_speech_processor_diarization_only(
                         Some(&projection_dispatch),
                         &revision,
                         &session,
+                        id,
                         receipt,
                     ) {
                         return false;
@@ -13320,6 +13374,7 @@ mod tests_status {
             ] {
                 assert!(!super::update_transcript_saving_status(
                     &mut status,
+                    1,
                     &Err(error)
                 ));
                 assert_eq!(status.transcript_not_saving, previous);
@@ -13332,22 +13387,37 @@ mod tests_status {
         };
         assert!(super::update_transcript_saving_status(
             &mut status,
+            1,
             &Ok((true, receipt))
         ));
         assert!(status.transcript_crash_safety_unverified);
         assert_eq!(status.transcript_not_saving, None);
         assert!(!super::update_transcript_saving_status(
             &mut status,
+            1,
             &Ok((true, receipt))
         ));
         assert!(super::update_transcript_saving_status(
             &mut status,
+            2,
             &Err(Error::AckTimeout)
         ));
         assert_eq!(
             status.transcript_not_saving,
             Some(events::TranscriptSavingFailure::ConfirmationDelayed)
         );
+        // An unrelated success and a second pending revision must each
+        // leave the first ticket's warning intact.
+        super::update_transcript_saving_status(&mut status, 3, &Ok((true, receipt)));
+        super::update_transcript_saving_status(&mut status, 4, &Err(Error::ConfirmationPending));
+        super::update_transcript_saving_status(&mut status, 4, &Ok((true, receipt)));
+        assert_eq!(
+            status.transcript_not_saving,
+            Some(events::TranscriptSavingFailure::ConfirmationDelayed)
+        );
+        super::update_transcript_saving_status(&mut status, 2, &Ok((true, receipt)));
+        assert_eq!(status.transcript_not_saving, None);
+        assert!(!status.transcript_captions_lost);
     }
 
     #[test]
@@ -14446,7 +14516,151 @@ mod tests_status {
         target_os = "macos",
         ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
     )]
+    fn recovered_singleton_publishes_its_caption_and_turn_before_the_superseding_revision() {
+        exercise_superseding_live_revision(false);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+    )]
+    fn an_older_recovery_receipt_preserves_the_loss_of_the_refused_newer_caption() {
+        exercise_superseding_live_revision(true);
+    }
+
+    fn exercise_superseding_live_revision(refuse_newer: bool) {
+        use events::TranscriptSavingFailure::{ConfirmationDelayed, WriteFailed};
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_tempdir("live-supersession");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        app.projection_lane_stopping.store(true, Ordering::SeqCst);
+        let session = app.current_session_id();
+        let source = format!("worker-{session}");
+        let ctx = super::shared_to_transcript_context(
+            moonshine_shared_for_app(&app, super::shared_test_app_handle()),
+            LlmProvider::default(),
+            false,
+            "soniox",
+        );
+        let count = Arc::new(AtomicU64::new(0));
+        let mut receipts = super::ProviderReceipts::new(&ctx, &count, &count);
+        let turns = PublicationCapture::start(events::TURN_EVENT, &source);
+        let submit = |receipts: &mut super::ProviderReceipts, word: &str, index: u64| {
+            let mut row = projection_asr_payload(word, 1, word, true);
+            row.provider = "soniox".into();
+            row.source_id = source.clone();
+            row.start_time = index as f64;
+            row.end_time = row.start_time + 0.5;
+            row.end_of_turn = true;
+            row.speaker_id = Some("oak".into());
+            row.speaker_label = Some("oak".into());
+            let turn = super::revision_end_of_turn("soniox", &row);
+            receipts.submit(&ctx, row, index, turn);
+        };
+        let status = || {
+            let status = app.pipeline_status.read().unwrap();
+            (
+                status.transcript_not_saving,
+                status.transcript_captions_lost,
+            )
+        };
+        let captions = || {
+            app.transcript_buffer
+                .read()
+                .unwrap()
+                .iter()
+                .map(|s| s.text.clone())
+                .collect::<Vec<_>>()
+        };
+        let bound = Duration::from_secs(60);
+        let _ack_bound = crate::persistence::TestLiveAckBound::set(bound);
+        let (begin, failed, resume) = app
+            .transcript_event_writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .pause_recovery_after_next_sync_failure();
+        submit(&mut receipts, "reed", 1);
+        begin.send(()).unwrap();
+        failed.recv_timeout(bound).unwrap();
+        receipts.publish();
+        assert_eq!(status(), (Some(ConfirmationDelayed), false));
+        assert!(captions().is_empty());
+        assert!(turns.received.try_recv().is_err());
+
+        // Queue the second revision before releasing the first fault. Its
+        // own request, rather than an idle tick, must reverify the older frame.
+        let second_fault = refuse_newer.then(|| {
+            app.transcript_event_writer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .pause_after_next_recovery_sync_failure()
+        });
+        submit(&mut receipts, "fern", 2);
+        resume.send(()).unwrap();
+        if let Some((begin, failed, resume)) = second_fault {
+            begin.send(()).unwrap();
+            failed.recv_timeout(bound).unwrap();
+            receipts.publish();
+            assert_eq!(status(), (Some(WriteFailed), true));
+            assert!(captions().is_empty());
+            assert!(turns.received.try_recv().is_err());
+            resume.send(()).unwrap();
+        }
+        assert_eq!(turns.received.recv_timeout(bound).unwrap(), "reed");
+        assert_eq!(captions(), ["reed"]);
+        assert_eq!(app.speaker_timeline.lock().unwrap().accepted_event_count, 1);
+        if refuse_newer {
+            assert_eq!(status(), (Some(WriteFailed), true));
+            submit(&mut receipts, "leaf", 3);
+        } else {
+            // The worker has delivered the recovered first receipt. The
+            // provider still owns the unobserved second ticket.
+            assert_eq!(status(), (None, false));
+        }
+        receipts.publish();
+        let last = if refuse_newer { "leaf" } else { "fern" };
+        assert_eq!(turns.received.recv_timeout(bound).unwrap(), last);
+        assert!(turns.received.try_recv().is_err());
+        assert_eq!(captions(), ["reed", last]);
+        assert_eq!(app.speaker_timeline.lock().unwrap().accepted_event_count, 2);
+        let disk = load_transcript_events(&session).unwrap();
+        assert_eq!(
+            disk.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+            ["reed", last]
+        );
+        assert_eq!(
+            *app.transcript_ledger.lock().unwrap(),
+            TranscriptLedger::replay(&session, disk).unwrap()
+        );
+        assert_eq!(status(), (None, refuse_newer));
+        if refuse_newer {
+            assert!(matches!(
+                app.rotate_session("renewed-session"),
+                crate::state::RotateOutcome::Rotated(_)
+            ));
+            assert_eq!(status(), (None, false));
+        }
+        drain_app_writers(&app);
+        drop(ctx);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+    )]
     fn next_distinct_revision_restores_live_recording_after_a_transient_full_disk() {
+        let _ack_bound = crate::persistence::TestLiveAckBound::set(Duration::from_secs(60));
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -14462,17 +14676,7 @@ mod tests_status {
         );
         let extractions = Arc::new(AtomicU64::new(0));
         let graph_updates = Arc::new(AtomicU64::new(0));
-        let publish = |span, word| {
-            super::emit_provider_span_revision_payload(
-                projection_asr_payload(span, 1, word, true),
-                None,
-                None,
-                &ctx,
-                1,
-                &extractions,
-                &graph_updates,
-            )
-        };
+        let mut receipts = super::ProviderReceipts::new(&ctx, &extractions, &graph_updates);
         let (begin, failed, resume) = app
             .transcript_event_writer
             .lock()
@@ -14481,26 +14685,51 @@ mod tests_status {
             .unwrap()
             .pause_recovery_after_next_disk_full();
         begin.send(()).unwrap();
-        assert!(!publish("reed", "pond"));
+        receipts.submit(
+            &ctx,
+            projection_asr_payload("reed", 1, "pond", true),
+            1,
+            None,
+        );
         failed.recv_timeout(Duration::from_secs(60)).unwrap();
-        // ENOSPC happened after the descriptor was installed. The writer
-        // still owes the live client a conclusive disposition for this attempt.
+        receipts.publish();
         assert_eq!(
             app.pipeline_status.read().unwrap().transcript_not_saving,
-            Some(events::TranscriptSavingFailure::ConfirmationDelayed)
+            Some(events::TranscriptSavingFailure::StorageFull)
         );
+        assert!(app.pipeline_status.read().unwrap().transcript_captions_lost);
         assert!(app.transcript_buffer.read().unwrap().is_empty());
         assert_eq!(
             app.transcript_ledger.lock().unwrap().accepted_event_count,
             0
         );
 
+        receipts.submit(
+            &ctx,
+            projection_asr_payload("branch", 1, "fern", true),
+            2,
+            None,
+        );
         resume.send(()).unwrap();
-        assert!(publish("branch", "fern"));
+        // This FIFO control returns after cleanup and the second commit,
+        // while the provider still owns the second, unobserved receipt.
+        app.transcript_event_writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .group_counts();
+        assert_eq!(
+            app.pipeline_status.read().unwrap().transcript_not_saving,
+            Some(events::TranscriptSavingFailure::StorageFull)
+        );
+        assert!(app.pipeline_status.read().unwrap().transcript_captions_lost);
+        receipts.publish();
         assert_eq!(
             app.pipeline_status.read().unwrap().transcript_not_saving,
             None
         );
+        assert!(app.pipeline_status.read().unwrap().transcript_captions_lost);
         let session = app.current_session_id();
         let disk = load_transcript_events(&session).unwrap();
         assert_eq!(disk.len(), 1);
@@ -14947,7 +15176,7 @@ mod tests_status {
         // Make even the event identity and content identical. Only the session
         // distinguishes this waiting live publication from the crashed one.
         let publication =
-            super::PendingPublication::register(active.clone(), &payload, move |receipt, _| {
+            super::PendingPublication::register(active.clone(), &payload, move |receipt, _, id| {
                 if receipt.is_ok() {
                     calls.fetch_add(1, Ordering::SeqCst);
                     return super::observe_transcript_receipt(
@@ -14957,12 +15186,20 @@ mod tests_status {
                         Some(&dispatch),
                         &observed_payload,
                         &active,
+                        id,
                         receipt,
                     );
                 }
                 false
             });
-        crate::persistence::transcript_startup::recover_at_startup();
+        // Plugin initialization finishes during build. The first load can run
+        // even before Tauri's application setup callback and see the receipt.
+        let _runtime = tauri::test::mock_builder()
+            .plugin(crate::persistence::transcript_startup::plugin(
+                app.current_session_id(),
+            ))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
         let (review, portable, review_notes, review_graph) =
             tauri::async_runtime::block_on(async {
                 let review = crate::commands::load_session(historical.into())

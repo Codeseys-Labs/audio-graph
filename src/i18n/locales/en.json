@@ -1449,6 +1449,7 @@
     "stageCapture": "Capture",
     "stageResample": "Resample",
     "stageAsr": "ASR",
+    "transcriptCaptionsLost": "Some captions in this session could not be saved.",
     "transcriptCrashSafetyUnverified": "Transcript saved. Crash recovery is unverified on this storage.",
     "transcriptNotSaving": {
       "confirmation_delayed": "Transcript save confirmation pending",

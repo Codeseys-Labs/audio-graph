@@ -27,7 +27,11 @@ impl Drop for Delivery {
 
 type Shared = Arc<(Mutex<State>, Condvar)>;
 pub(crate) type LatePublication = Arc<dyn Fn(LiveTranscriptResult) + Send + Sync>;
-pub(crate) struct LiveReply(Shared, Option<LatePublication>);
+pub(crate) struct LiveReply {
+    shared: Shared,
+    publication: Option<LatePublication>,
+    started: bool,
+}
 pub(crate) struct PendingLiveTranscript {
     shared: Shared,
     deadline: Instant,
@@ -39,7 +43,11 @@ pub(super) fn channel(
 ) -> (LiveReply, PendingLiveTranscript) {
     let shared = Arc::new((Mutex::new(State::Waiting), Condvar::new()));
     (
-        LiveReply(shared.clone(), publication),
+        LiveReply {
+            shared: shared.clone(),
+            publication,
+            started: false,
+        },
         PendingLiveTranscript {
             shared,
             deadline: Instant::now() + timeout,
@@ -48,15 +56,25 @@ pub(super) fn channel(
 }
 
 impl LiveReply {
+    pub(super) fn mark_started(&mut self) {
+        self.started = true;
+    }
+    pub(super) fn suppress_unqueued_publication(&mut self) {
+        self.publication = None;
+    }
     pub(super) fn finish(mut self, result: LiveTranscriptResult) {
+        self.started = true;
+        self.deliver(result);
+    }
+    fn deliver(&mut self, result: LiveTranscriptResult) {
         let delivery = Delivery {
-            unpublished: self.1.take(),
+            unpublished: self.publication.take(),
             result,
         };
-        let mut state = self.0.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.shared.0.lock().unwrap_or_else(|p| p.into_inner());
         if matches!(*state, State::Waiting) {
             *state = State::Ready(delivery);
-            self.0.1.notify_one();
+            self.shared.1.notify_one();
         } else {
             drop(state);
             drop(delivery);
@@ -66,10 +84,16 @@ impl LiveReply {
 
 impl Drop for LiveReply {
     fn drop(&mut self) {
-        let mut state = self.0.0.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.started {
+            // A queued message behind Shutdown can never reach the append.
+            // Settle even a timed-out ticket through its late owner.
+            self.deliver(Err(TranscriptCommitError::UncommittedAttempt));
+            return;
+        }
+        let mut state = self.shared.0.lock().unwrap_or_else(|p| p.into_inner());
         if matches!(*state, State::Waiting) {
             *state = State::Disconnected;
-            self.0.1.notify_one();
+            self.shared.1.notify_one();
         }
     }
 }

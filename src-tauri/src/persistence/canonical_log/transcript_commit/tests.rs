@@ -105,10 +105,14 @@ fn writer_boundary_errors_withhold_acknowledgement_and_retry_keeps_only_verified
         let error = commit_transcript(&fixture.path, SESSION, &second).unwrap_err();
         assert_eq!(
             error,
-            TranscriptCommitError::Io {
-                phase,
-                kind,
-                code: None
+            if cut == Cut::Full {
+                TranscriptCommitError::FrameWriteStorageFull
+            } else {
+                TranscriptCommitError::Io {
+                    phase,
+                    kind,
+                    code: None,
+                }
             }
         );
         let diagnostic = format!("{error:?}");
@@ -802,9 +806,11 @@ fn interrupted_first_revision_preserves_the_legacy_display_and_leaves_sequence_o
     assert_legacy_visible();
     let interrupted = fs::read(&fixture.path).unwrap();
     assert!(!interrupted.is_empty());
-    let fresh_writer = fixture.writer_for(&Uuid::new_v4().to_string());
+    let fresh_session = Uuid::new_v4().to_string();
+    let fresh_writer = fixture.writer_for(&fresh_session);
     crate::persistence::transcript_startup::recover_in_directory(
         fixture.path.parent().unwrap(),
+        &fresh_session,
         |_, _, _| panic!("a torn first member cannot yield a receipt"),
     )
     .unwrap();
@@ -859,6 +865,7 @@ fn startup_for_a_fresh_session_recovers_a_torn_frame_and_records_a_gap_at_the_ol
     let fresh_writer = fixture.writer_for(&fresh_session);
     crate::persistence::transcript_startup::recover_in_directory(
         fixture.path.parent().unwrap(),
+        &fresh_session,
         |_, _, _| panic!("a torn first member cannot yield a receipt"),
     )
     .unwrap();
@@ -921,6 +928,7 @@ fn startup_delivers_a_kept_group_in_order_without_new_speech_or_a_second_notific
     for _ in 0..2 {
         crate::persistence::transcript_startup::recover_in_directory(
             fixture.path.parent().unwrap(),
+            "fresh-session",
             |session, event, receipt| {
                 assert_eq!(session, SESSION);
                 confirmations.push((event.clone(), receipt.sequence));
@@ -1061,6 +1069,27 @@ fn stopped_after_second_frame(fixture: &Fixture) -> PreparedTranscriptStorage {
         })
     ));
     storage
+}
+
+#[test]
+fn startup_leaves_the_active_sessions_pending_lease_and_receipt_with_its_writer() {
+    let fixture = Fixture::new();
+    let active = stopped_after_second_frame(&fixture);
+    let descriptor = fixture.path.with_added_extension("attempt");
+    let before = fs::read(&descriptor).unwrap();
+    crate::persistence::transcript_startup::recover_in_directory(
+        fixture.path.parent().unwrap(),
+        SESSION,
+        |_, _, _| panic!("the active writer owns this receipt"),
+    )
+    .unwrap();
+    assert_eq!(fs::read(descriptor).unwrap(), before);
+    assert!(active.has_pending_attempt());
+    active.resolve_pending().unwrap();
+    let kept = active.take_recovered();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].receipt.sequence, 2);
+    assert_eq!(kept[0].event, transcript_event("leaf", CONTENT));
 }
 
 #[test]
@@ -1431,6 +1460,94 @@ fn descriptor_staging_write_fault_refuses_before_the_log_and_next_revision_can_c
             .collect();
         assert_eq!(events, [seed, next]);
     }
+}
+
+#[test]
+fn shutdown_refuses_queued_live_replies_and_releases_the_abandoned_owner() {
+    use crate::persistence::{TranscriptEventWriteMsg as Message, live_receipt, transcript_batch};
+    use crate::projections::TranscriptLedger;
+    use std::sync::{Mutex, atomic::AtomicBool};
+
+    let fixture = Fixture::new();
+    let storage = PreparedTranscriptStorage::open(&fixture.path, SESSION).unwrap();
+    let (tx, rx) = mpsc::sync_channel(3);
+    tx.send(Message::Shutdown).unwrap();
+    let ledger = Arc::new(Mutex::new(TranscriptLedger::new(SESSION)));
+    let (result, late) = mpsc::channel();
+    let owner: live_receipt::LatePublication = Arc::new(move |reply| result.send(reply).unwrap());
+    let retained = Arc::downgrade(&owner);
+    let (reply, waiting) = live_receipt::channel(HANG_LIMIT, None);
+    tx.send(Message::Live(
+        transcript_event("stem", "green"),
+        ledger.clone(),
+        reply,
+    ))
+    .unwrap();
+    let (reply, abandoned) = live_receipt::channel(Duration::ZERO, Some(owner));
+    tx.send(Message::Live(
+        transcript_event("fern", "leaf"),
+        ledger.clone(),
+        reply,
+    ))
+    .unwrap();
+    assert_eq!(abandoned.wait(), Err(TranscriptCommitError::AckTimeout));
+
+    transcript_batch::run(
+        rx,
+        &storage,
+        &fixture.path,
+        SESSION,
+        &AtomicBool::new(false),
+    );
+    assert_eq!(
+        waiting.wait(),
+        Err(TranscriptCommitError::UncommittedAttempt)
+    );
+    assert_eq!(
+        late.try_recv().unwrap(),
+        Err(TranscriptCommitError::UncommittedAttempt)
+    );
+    assert!(retained.upgrade().is_none());
+    assert!(!fixture.path.try_exists().unwrap());
+    assert_eq!(ledger.lock().unwrap().accepted_event_count, 0);
+}
+
+#[test]
+fn a_failed_recovered_ledger_install_allows_the_next_revision_to_rebuild() {
+    use crate::projections::TranscriptLedger;
+    let fixture = Fixture::new();
+    let writer = fixture.writer();
+    let client = writer.client();
+    let ledger = Arc::new(std::sync::Mutex::new(TranscriptLedger::new(SESSION)));
+    let seed = transcript_event("oak", "first");
+    let submit = |event: &TranscriptEvent| {
+        client
+            .submit_live_observed(event, ledger.clone(), HANG_LIMIT, None)
+            .unwrap()
+    };
+    submit(&seed).wait().unwrap();
+    let mut second = transcript_event("oak", "second");
+    second.revision_number = seed.revision_number + 1;
+    let (begin, cut, resume) = writer.pause_recovery_after_next_sync_failure();
+    let pending = submit(&second);
+    begin.send(()).unwrap();
+    cut.recv_timeout(HANG_LIMIT).unwrap();
+    assert_eq!(
+        pending.wait(),
+        Err(TranscriptCommitError::ConfirmationPending)
+    );
+    // The display row now conflicts with the kept frame at the next sequence.
+    ledger.lock().unwrap().latest_spans[0].revision_number = second.revision_number + 1;
+    let next = transcript_event("fern", "third");
+    let ticket = submit(&next);
+    resume.send(()).unwrap();
+    assert_eq!(ticket.wait().unwrap().1.sequence, 3);
+    assert_eq!(
+        *ledger.lock().unwrap(),
+        TranscriptLedger::replay(SESSION, [seed, second, next]).unwrap()
+    );
+    assert_eq!(fixture.replay().records.len(), 3);
+    assert!(writer.shutdown_with_timeout(HANG_LIMIT));
 }
 
 #[test]

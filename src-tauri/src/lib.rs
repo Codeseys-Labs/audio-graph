@@ -463,7 +463,10 @@ pub fn run() {
                 let _ = win.show();
                 let _ = win.set_focus();
             }
-        }));
+        }))
+        .plugin(crate::persistence::transcript_startup::plugin(
+            initial_session_id,
+        ));
 
     // Portable desktop shell E2E (seed audio-graph-f9e0, Wave 3): the embedded
     // `@wdio/tauri-service` provider needs these two plugins registered inside
@@ -527,10 +530,7 @@ pub fn run() {
             // overrides the compiled-in default (Info) and is the level
             // every subsequent `set_log_level` command will persist to.
             let handle = app.handle();
-            // Historical loads must see recovered frames even if capture is
-            // never started. The receipt handler can now access managed state.
             crate::persistence::register_app_handle(handle.clone());
-            crate::persistence::transcript_startup::recover_at_startup();
             let loaded_settings = crate::settings::load_settings_with_status(handle);
             let load_status = loaded_settings.status;
             let mut settings = loaded_settings.settings;

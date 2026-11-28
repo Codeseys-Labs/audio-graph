@@ -1449,6 +1449,7 @@
     "stageCapture": "Captura",
     "stageResample": "Reamostragem",
     "stageAsr": "ASR",
+    "transcriptCaptionsLost": "Não foi possível salvar algumas legendas desta sessão.",
     "transcriptCrashSafetyUnverified": "Transcrição salva. A recuperação após uma falha não foi verificada neste armazenamento.",
     "transcriptNotSaving": {
       "confirmation_delayed": "Aguardando confirmação do salvamento da transcrição",

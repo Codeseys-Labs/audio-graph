@@ -1866,7 +1866,9 @@ pub(super) use transcript_commit::{
     read_committed_projection,
 };
 #[cfg(test)]
-pub(super) use transcript_commit::{simulate_disk_full, simulate_failed_sync};
+pub(super) use transcript_commit::{
+    simulate_disk_full, simulate_failed_recovery_sync, simulate_failed_sync,
+};
 
 struct FrameBasis<'a> {
     session_id: &'a str,

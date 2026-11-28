@@ -21,6 +21,10 @@ pub enum TranscriptCommitError {
     ReplyLost,
     AckTimeout,
     ConfirmationPending,
+    /// Storage filled after bytes might have been written. Resolution is still owed.
+    StorageFullConfirmationPending,
+    /// The first write of a new frame returned ENOSPC and wrote no bytes.
+    FrameWriteStorageFull,
     UncommittedAttempt,
     UnsupportedRepository,
     InvalidAddress,
@@ -44,6 +48,7 @@ pub enum TranscriptCommitError {
 impl TranscriptCommitError {
     pub(crate) fn is_storage_full(&self) -> bool {
         let (kind, code) = match self {
+            Self::FrameWriteStorageFull | Self::StorageFullConfirmationPending => return true,
             Self::Io { kind, code, .. } => (*kind, *code),
             Self::Indeterminate(e) => (e.kind, e.raw_os_error),
             Self::Rejected(CanonicalDurabilityRejection::IoFailedBeforeMutation {
@@ -744,7 +749,7 @@ impl<'a, E: CommitPayload> Commit<'a, E> {
             .map_err(TranscriptCommitError::Rejected)?;
         file.seek(SeekFrom::Start(frame.base_byte_len))
             .map_err(|e| io_failure(CanonicalAppendPhase::Write, e))?;
-        write_frame(&mut file, &frame.frame)?;
+        write_new_frame(&mut file, &frame.frame)?;
         let namespace = if first_create {
             self.sync_namespace()?
         } else {
@@ -990,6 +995,10 @@ pub(in crate::persistence) fn simulate_failed_sync() {
     CUT.set(Some(Cut::Sync));
 }
 #[cfg(test)]
+pub(in crate::persistence) fn simulate_failed_recovery_sync() {
+    CUT.set(Some(Cut::RecoverySync));
+}
+#[cfg(test)]
 pub(in crate::persistence) fn simulate_disk_full() {
     CUT.set(Some(Cut::Full));
 }
@@ -1008,6 +1017,18 @@ fn kill_at(cut: Cut) {
         wait_for_kill();
     }
 }
+// An error from the single File::write call wrote zero bytes. This proves
+// refusal only for a fresh append. During a rewrite the old bytes may match.
+fn write_new_frame(file: &mut File, bytes: &[u8]) -> Result<(), TranscriptCommitError> {
+    write_frame(file, bytes).map_err(|error| match &error {
+        TranscriptCommitError::Io {
+            phase: CanonicalAppendPhase::Write,
+            ..
+        } if error.is_storage_full() => TranscriptCommitError::FrameWriteStorageFull,
+        _ => error,
+    })
+}
+
 fn write_frame(file: &mut File, bytes: &[u8]) -> Result<(), TranscriptCommitError> {
     #[cfg(test)]
     let cut = match CUT.get() {
